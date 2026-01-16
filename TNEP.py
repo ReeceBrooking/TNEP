@@ -1,6 +1,5 @@
 import tensorflow as tf
 import numpy as np
-from keras.src.ops import polar
 from tensorflow.keras import layers, Model, Sequential, optimizers, losses
 from DescriptorBuilder import DescriptorBuilder
 from SNES import SNES
@@ -68,8 +67,7 @@ class TNEP(layers.Layer):
         Returns:
             F : [N]  per-atom scalar output (e.g., energy contribution)
         """
-        # Ensure integer types
-    #    Z = tf.cast(Z, tf.int32)
+
         N = tf.shape(Z)[0]
 
         # Gather per-type parameters - Change to take an input from parameter vector ss?
@@ -83,9 +81,7 @@ class TNEP(layers.Layer):
         # Hidden layer: h = act(q W0_t + b0_t)
         # q: [N, dim_q]
         # We want: [N, num_neurons1]
-        #print(descriptors.shape)
         q_exp = tf.expand_dims(descriptors, axis=1)        # [N, 1, dim_q]
-        #print(q_exp.shape)
         h = tf.matmul(q_exp, W0_t)               # [N, 1, num_neurons1]
         h = tf.squeeze(h, axis=1) + b0_t         # [N, num_neurons1]
         h = self.activation(h)                   # [N, num_neurons1]
@@ -94,7 +90,8 @@ class TNEP(layers.Layer):
         # (elementwise dot over last dim)
         E = tf.reduce_sum(h * W1_t, axis = 1)     # single value scalar
         E = E + self.b1                          # global bias
-        # Partial Force calculations - return Energy and Force predictions
+
+        # TODO Partial Force calculations - return Energy and Force predictions
         if self.cfg.target_mode == 0:
             E = tf.reduce_sum(E)
             return E
@@ -113,23 +110,18 @@ class TNEP(layers.Layer):
 
     def fit(self, train_data, val_data):
         # needs to init an optimizer, passing itself and the arguments
-        train_targets = train_data["targets"]
-        train_z = train_data["Z_int"]
-        train_descriptors = train_data["descriptors"]
-        val_targets = val_data["targets"]
-        val_z = val_data["Z_int"]
-        val_descriptors = val_data["descriptors"]
         optimizer = SNES(self)
-        history = optimizer.fit(train_descriptors, train_targets, train_z, val_descriptors, val_targets, val_z)
+        history = optimizer.fit(train_data, val_data)
         # performs n generation loops, calculating fitness and updating parameter values
-        # returns a TNEP model with updated parameters
         return history
 
     def score(self, test_data):
         test_descriptors = test_data["descriptors"]
+        test_positions = test_data["positions"]
         test_targets = test_data["targets"]
         test_z = test_data["Z_int"]
-        predictions = [self.predict(test_descriptors[i], test_z) for i in range(len(test_descriptors))]
+        box = test_data["box"]
+        predictions = [self.predict(test_descriptors[i], test_positions[i], test_z, box) for i in range(len(test_descriptors))]
         predictions_tf = tf.convert_to_tensor(predictions, dtype=tf.float32)
         loss = tf.square(predictions_tf - test_targets)
         total_loss = tf.reduce_sum(loss, axis=-1)

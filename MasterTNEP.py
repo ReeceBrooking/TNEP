@@ -16,28 +16,11 @@ import matplotlib.pyplot as plt
     7. Validation step
 """
 
-# inputs = read data file
-
-#cfg = TNEPconfig()
-#data = "read cfg.data_path"
 """ 
     R = [N, 3]
     Z = [N]
     box = [3, 3]
 """
-# Needs to loop through every structure in the dataset and append descriptors to a master array
-#descriptors = DescriptorBuilder(cfg).build_descriptors(R, Z, box)
-#cfg.dim_q = descriptors.shape[-1]
-#cfg.num_types = Z.shape[0]
-# Divide train and test data
-""" 
-    Option 1. Keep all info (Descriptors, Atom type) in one tensor/matrix
-    Option 2. Keep descriptors and atoms types separate
-"""
-#model = TNEP(cfg)
-#model = model.fit(train_descriptors, train_targets, cfg)
-#test_values = model.predict(test_descriptors)
-#model.score(test_values, test_targets)
 
 def collect(file : str):
     # read R, Z and target values from file
@@ -80,7 +63,7 @@ def split(
     else:
         n_structures = len(positions)
     assert (
-        len(types) == len(targets) == len(types_int)
+        len(types) == len(targets) == len(types_int) == len(positions)
     ), "Dataset lists must have same length"
 
     rng = np.random.default_rng(cfg.seed)
@@ -140,8 +123,11 @@ def train_split(dataset_positions, dataset_types, dataset_targets, dataset_types
     return train_data, test_data, val_data
 
 cfg = TNEPconfig()
+# Read dataset from train.xyz
 dataset_positions, dataset_types, dataset_targets, dataset_types_int, box, num_types = collect(cfg.data_path)
+# Split dataset into train, test, and validation sets
 train_data, test_data, val_data = train_split(dataset_positions, dataset_types, dataset_targets, dataset_types_int, box, cfg)
+# Build radial and angular descriptors
 builder = DescriptorBuilder(cfg)
 for i in range(len(train_data["R"])):
     train_data["descriptors"][i] = builder.build_descriptors(train_data["R"][i], train_data["box"])
@@ -152,13 +138,11 @@ for j in range(len(test_data["R"])):
 
 cfg.dim_q = train_data["descriptors"][0].shape[-1]
 cfg.num_types = num_types
-#print(num_types)
+
 model = TNEP(cfg)
 history = model.fit(train_data, val_data)
 print(model.score(test_data))
 plot_snes_history(history)
-
-
 
 """ TESTING 
 13

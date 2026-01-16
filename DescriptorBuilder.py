@@ -25,7 +25,6 @@ class DescriptorBuilder(layers.Layer):
         """
         inputs = (R, Z, box)
         R:   [N,3]  Cartesian Å
-        Z:   [N]    int types (unused here but kept for extensibility)
         box: [3,3]  lattice vectors
 
         returns Q: [N, D] per-atom descriptor
@@ -37,14 +36,12 @@ class DescriptorBuilder(layers.Layer):
 
         # Mask to exclude self-interactions i=j
         mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
-#        print(mask)
+
         # ========================
         # 1) Radial 2-body block
         # ========================
-        # Phi_r[i,j,k] = r_ij^k * fc(r_ij), k=0..K_radial
+        # Chebyshev radial basis
         phi_r = self.radial_basis(rij)                      # [N,N,K_radial+1]
-#        print(phi_r.shape, mask.shape)
-       # phi_r = tf.cast(phi_r, tf.float32)
         phi_r *= tf.expand_dims(mask, -1)          # zero out j=i
 
         # Sum over neighbors j to get per-atom radial features
@@ -98,12 +95,10 @@ class DescriptorBuilder(layers.Layer):
         """Return Rj - Ri wrapped by MIC for triclinic/orthorhombic cell.
            Ri,Rj: [...,3], box: [3,3] (rows = lattice vectors)."""
         box_inv = tf.linalg.inv(box)
- #       box_inv = tf.cast(box_inv, tf.float32)
         si = tf.einsum('ij,bj->bi', box_inv, Ri)  # fractional
         sj = tf.einsum('ij,bj->bi', box_inv, Rj)
         ds = sj - si
         ds -= tf.round(ds)  # wrap to [-0.5,0.5)
- #       ds = tf.cast(ds, tf.float32)
         dr = tf.einsum('ij,bj->bi', box, ds)  # back to Cartesian
         return dr
 
@@ -123,7 +118,7 @@ class DescriptorBuilder(layers.Layer):
                                               tf.reshape(Rj_t, [-1, 3]),
                                               box)
         dr = tf.reshape(dr_flat, [N, N, 3])
-        rij = tf.linalg.norm(dr, axis=-1) #+ 1e-16
+        rij = tf.linalg.norm(dr, axis=-1)
         return dr, rij
 
     @tf.function(
@@ -141,13 +136,38 @@ class DescriptorBuilder(layers.Layer):
         ]
     )
     def radial_basis(self, rij):
-        """Polynomial-with-cutoff basis: phi_k(r)= r^k * fc(r), k = 0..K."""
-        feats = [tf.ones_like(rij)]
-        for k in range(1, self.K_radial + 1):
-            feats.append(tf.pow(rij, k))
-        phi = tf.stack(feats, axis=-1)  # [..., K+1]
         fc = self.cutoff(rij)
-        return phi * tf.expand_dims(fc, -1)  # , Phi, fc
+        # scaled distance
+        # rcinv = tf.constant(1.0, tf.float32) / self.rc
+        t = rij / self.rc # r/rc
+
+        # x = 2*(t-1)^2 - 1
+        x = 2.0 * tf.square(t - 1.0) - 1.0
+
+        # Build Chebyshev T_n(x) up to n=K_radial
+        # T0 = 1, T1 = x
+        T0 = tf.ones_like(x)
+        T1 = x
+
+        feats = []
+
+        # n=0: fn0 = fc
+        feats.append(fc)
+
+        if self.K_radial >= 1:
+            # n=1: fn1 = 0.5*(x+1)*fc
+            feats.append(0.5 * (x + 1.0) * fc)
+
+        # n>=2
+        for n in range(2, self.K_radial + 1):
+            Tn = 2.0 * x * T1 - T0
+            fn = 0.5 * (Tn + 1.0) * fc
+            feats.append(fn)
+            T0, T1 = T1, Tn
+
+        # Stack last axis => [..., K+1]
+        phi = tf.stack(feats, axis=-1)
+        return phi
 
     ## Angular Basis
     @tf.function(
@@ -166,35 +186,38 @@ class DescriptorBuilder(layers.Layer):
         """
         # 1. Compute pairwise distances and cutoff
         # dr, rij = pairwise_displacements(R, box)
-        fc = self.cutoff(rij)
+    #    fc = self.cutoff(rij)
 
         # 2. Compute cos(theta_ijk)
         # Expand to compare every pair of neighbors j,k
-        Rj = tf.expand_dims(dr, 2)  # [N, M, 1, 3]
-        Rk = tf.expand_dims(dr, 1)  # [N, 1, M, 3]
-        dot = tf.reduce_sum(Rj * Rk, axis=-1)  # [N, M, M]
-        rij_mag = tf.expand_dims(rij, 2)
-        rik_mag = tf.expand_dims(rij, 1)
-        cos_theta = dot / (rij_mag * rik_mag + 1e-8)
-        cos_theta = tf.clip_by_value(cos_theta, -1.0, 1.0)  # Why clip?
+    #    Rj = tf.expand_dims(dr, 2)  # [N, M, 1, 3]
+    #    Rk = tf.expand_dims(dr, 1)  # [N, 1, M, 3]
+    #    dot = tf.reduce_sum(Rj * Rk, axis=-1)  # [N, M, M]
+    #    rij_mag = tf.expand_dims(rij, 2)
+    #    rik_mag = tf.expand_dims(rij, 1)
+    #    cos_theta = dot / (rij_mag * rik_mag + 1e-8)
+    #    cos_theta = tf.clip_by_value(cos_theta, -1.0, 1.0)  # Why clip?
 
         # 3. Compute Legendre polynomials up to Lmax
-        P = [tf.ones_like(cos_theta)]  # P0(x) = 1
-        if self.Lmax >= 1:
-            P.append(cos_theta)  # P1(x) = x
-        if self.Lmax >= 2:
-            P.append(0.5 * (3 * cos_theta ** 2 - 1))  # P2(x)
-        P = tf.stack(P, axis=-1)  # [N, M, M, Lmax+1]
+    #    P = [tf.ones_like(cos_theta)]  # P0(x) = 1
+    #    if self.Lmax >= 1:
+    #        P.append(cos_theta)  # P1(x) = x
+    #    if self.Lmax >= 2:
+    #        P.append(0.5 * (3 * cos_theta ** 2 - 1))  # P2(x)
+    #    P = tf.stack(P, axis=-1)  # [N, M, M, Lmax+1]
 
         # 4. Compute radial terms
-        r_terms = [tf.pow(rij_mag, n) * tf.pow(rik_mag, n) for n in range(self.n_radial_ang)]  # verify
-        r_terms = tf.stack(r_terms, axis=-1)  # [N, M, M, n_radial]
+#        r_terms = [tf.pow(rij_mag, n) * tf.pow(rik_mag, n) for n in range(self.n_radial_ang)]  # verify
+#        r_terms = tf.stack(r_terms, axis=-1)  # [N, M, M, n_radial]
 
         # 5. Multiply cutoff * radial * angular
-        fc_pair = tf.expand_dims(fc, 2) * tf.expand_dims(fc, 1)  # [N, M, M]
-        fc_pair = tf.expand_dims(fc_pair, -1)  # [N, M, M, 1]
-        fc_pair = tf.expand_dims(fc_pair, -1)  # [N, M, M, 1, 1]
-        features = fc_pair * tf.expand_dims(r_terms, -1) * tf.expand_dims(P, -2)  # verify
+ #       fc_pair = tf.expand_dims(fc, 2) * tf.expand_dims(fc, 1)  # [N, M, M]
+ #       fc_pair = tf.expand_dims(fc_pair, -1)  # [N, M, M, 1]
+ #       fc_pair = tf.expand_dims(fc_pair, -1)  # [N, M, M, 1, 1]
+ #       features = fc_pair * tf.expand_dims(r_terms, -1) * tf.expand_dims(P, -2)  # verify
+
+        r_terms = self.radial_basis(rij)
+
 
         # features shape: [N, M, M, n_radial, Lmax+1]
         return features

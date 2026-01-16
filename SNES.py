@@ -29,11 +29,6 @@ class SNES:
           num = dim       (version == 3)
           num = dim / T   (version != 3, with T = num_types)
           η_σ = (3 + log(num)) / (5 * sqrt(num)) / 2
-
-    Differences from C++:
-      - No GPU, curand, or file I/O.
-      - We assume fitness for each individual is provided by the user.
-      - We treat 'types' abstractly via a type_of_variable array.
     """
 
     def __init__(self, model):
@@ -98,24 +93,20 @@ class SNES:
 
         λ = self.cfg.pop_size
 
-        #ranks = np.argsort(fitness_matrix, axis = 0)
         ranks = np.arange(λ)
         ranks += 1
-        #print(ranks)
 
         raw = np.log(λ * 0.5 + 1.0) - np.log(ranks)
         raw = np.maximum(0.0, raw)     # max(0, ...)
 
         # sum the columns and divide columns by sum if more than zero
         sum = tf.reduce_sum(raw).numpy()
-        #print(sum)
 
         if sum > 0:
             raw /= sum
         # normalize to sum = 1
         utilities = raw - 1.0 / λ
         print("utilities = ", utilities)
-        #print(tf.reduce_sum(utilities))
         return utilities
 
     # ------------------------------------------------------------------ #
@@ -178,9 +169,6 @@ class SNES:
             grad_sigma += utilities[i] * (s[i]**2 - 1.0)
 
         # Update μ and σ
-        # C++:
-        #   g_mu[v]    += sigma * gradient_mu;
-        #   g_sigma[v]  = sigma * exp(eta_sigma * gradient_sigma);
         self.mu += self.sigma * grad_mu
         self.sigma = self.sigma * np.exp(self.eta_sigma * grad_sigma)
 
@@ -234,30 +222,25 @@ class SNES:
                 _set_model_params(self.model, W0, b0, W1, b1)
 
                 # 2. Compute fitness per individual and type
-                # This should be performed over the entire batch for each sample and summed, batch element selection should be random
                 mse = 0.0
                 mse = tf.convert_to_tensor(mse, dtype = float)
                 for j in range(cfg.batch_size):
-                    # Change to random sample selector from training dataset
-                    #print(j)
+                    # TODO Change to random sample selector from training dataset
                     descriptors = train_descriptors[j]
                     targets = train_targets[j]
                     Z = train_z[j]
                     positions = train_positions[j]
                     box = train_data["box"]
-                    #fitness = FitnessCalc(self.model)
-                    #fitness_matrix[i] += fitness.calculate(descriptors, Z, targets)
-                    # Loss function
+
+                    # TODO Loss function
                     """ 
                         Temporary FitnessCalc replacement
                     """
-                    # Forward pass – adapt as needed (per-atom vs per-structure)
+                    # Forward pass
                     y_pred = self.model.predict(descriptors, positions, Z, box)
-                    # print(y_pred)
 
                     # MSE per-sample
                     mse += loss_fn(targets, y_pred)  # same shape as targets
-#                    print("mean squared error = ", mse)
 
                 # RMSE
                 rmse = tf.sqrt(mse)
@@ -269,17 +252,11 @@ class SNES:
 
             print(fitness_matrix)
             avg_fitness = tf.reduce_mean(fitness_matrix)
-            # Rank fitness and calculate utilities
+            # Rank fitness and index to utilities
             ranks = np.argsort(fitness_matrix)
             s_sorted = np.zeros_like(s)
             for r in range(len(ranks)):
                 s_sorted[ranks[r]] = s[r]
-            #s = np.take_along_axis(s, ranks, axis=1)
-#            print(ranks)
-#            print("before = ", s)
-#            print("after = ", s_sorted)
-            #utilities = self.compute_utilities(fitness_matrix)
-            # utilities need to be indexed by each sample deviation s and specific to each atom type
 
             # 3. SNES update
             self.update(self.utilities, s_sorted)
@@ -302,22 +279,22 @@ class SNES:
         val_targets = val_data["targets"]
         box = val_data["box"]
         for j in range(self.cfg.val_size):
-            # Change to random sample selector from training dataset
-            # print(j)
+            # TODO Change to random sample selector from validation dataset
             loss_fn = tf.keras.losses.MeanSquaredError(reduction="none")
             descriptors = val_descriptors[j]
             positions = val_positions[j]
             z = val_z[j]
             targets = val_targets[j]
-            # fitness = FitnessCalc(self.model)
-            # fitness_matrix[i] += fitness.calculate(descriptors, Z, targets)
+
             # Loss function
             """ 
                 Temporary FitnessCalc replacement
             """
-            # Forward pass – adapt as needed (per-atom vs per-structure)
+            # Forward pass
             y_pred = self.model.predict(descriptors, positions, z, box)
+
             mse += loss_fn(targets, y_pred)
+
         # RMSE
         rmse = tf.sqrt(mse)
         fitness = tf.reduce_sum(rmse)
