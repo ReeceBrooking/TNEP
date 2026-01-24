@@ -28,6 +28,7 @@ class TNEP(layers.Layer):
         self.num_neurons = cfg.num_neurons
         self.activation = tf.keras.activations.get(cfg.activation)
         self.builder = DescriptorBuilder(cfg)
+        self.optimizer = SNES(self)
 
         # W0[t] : [dim_q, num_neurons1]  (input -> hidden)
         self.W0 = self.add_weight(
@@ -89,14 +90,13 @@ class TNEP(layers.Layer):
         h = tf.squeeze(h, axis=1) + b0_t         # [N, num_neurons1]
         h = self.activation(h)                   # [N, num_neurons1]
 
-        # TODO Partial Force calculations - return Energy and Force predictions
         if self.cfg.target_mode == 0:
             # Output layer: F_i = h_i · W1_t + b1
             # (elementwise dot over last dim)
             E = tf.reduce_sum(h * W1_t, axis=1)  # single value scalar
             E = E + self.b1  # global bias
             E = tf.reduce_sum(E)
-            return E
+            return -E
         elif self.cfg.target_mode == 1:
             dr, rij = self.builder.pairwise_displacements(tf.convert_to_tensor(positions, dtype=tf.float32), tf.convert_to_tensor(box, dtype=tf.float32))
             mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
@@ -122,6 +122,7 @@ class TNEP(layers.Layer):
             print("dipole calculated == " + str(dipole))
             return dipole
         elif self.cfg.target_mode == 2:
+            # TODO Polarizability calc
             return pol
         else:
             print("target mode not supported")
@@ -129,21 +130,20 @@ class TNEP(layers.Layer):
 
     def fit(self, train_data, val_data):
         # needs to init an optimizer, passing itself and the arguments
-        optimizer = SNES(self)
-        history = optimizer.fit(train_data, val_data)
+        history = self.optimizer.fit(train_data, val_data)
         # performs n generation loops, calculating fitness and updating parameter values
         return history
 
     def score(self, test_data):
         test_descriptors = test_data["descriptors"]
+        test_gradients = test_data["gradients"]
         test_positions = test_data["positions"]
         test_targets = test_data["targets"]
         test_z = test_data["Z_int"]
-        box = test_data["box"]
-        predictions = [self.predict(test_descriptors[i], test_positions[i], test_z, box) for i in range(len(test_descriptors))]
+        boxes = test_data["boxes"]
+        predictions = [self.predict(test_descriptors[i], test_gradients[i], test_positions[i], test_z[i], boxes[i]) for i in range(len(test_descriptors))]
         predictions_tf = tf.convert_to_tensor(predictions, dtype=tf.float32)
-        loss = tf.square(predictions_tf - test_targets)
-        total_loss = tf.reduce_sum(loss, axis=-1)
-        mean_loss = tf.reduce_mean(total_loss)
-        rmse_loss = tf.sqrt(mean_loss)
+        diff = predictions_tf - test_targets
+        mse = tf.reduce_mean(tf.square(diff))
+        rmse_loss = tf.sqrt(mse)
         return rmse_loss

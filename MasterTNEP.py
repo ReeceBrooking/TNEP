@@ -78,7 +78,8 @@ def split(
     val_grad = gradients[n_test:2*n_test]
     train_grad = gradients[2*n_test:n_structures]
 
-    target = ""
+    if cfg.target_mode == 0:
+        target = "energy"
     if cfg.target_mode == 1:
         target = "dipole"
     elif cfg.target_mode == 2:
@@ -101,12 +102,12 @@ def split(
 
     return train_data, test_data, val_data
 
-def plot_snes_history(history, logy=True):
-    g = np.asarray(history["gen"])
+def plot_snes_history(history, logy=False):
+    g = np.asarray(history["generation"])
 
     plt.figure()
-    plt.plot(g, history["train_mean"], label="Train RMSE")
-    plt.plot(g, history["val_mean"], label="Val RMSE")
+    plt.plot(g, history["train_loss"], label="Train RMSE")
+    plt.plot(g, history["val_loss"], label="Val RMSE")
 
     plt.xlabel("generation")
     plt.ylabel("fitness (lower is better)")
@@ -199,18 +200,11 @@ def build_descriptors(dataset, types, num_types, cfg):
         dataset_gradients.append(gradients_sorted)
     return dataset_descriptors, dataset_gradients
 
-#def specify_target(dataset, target_mode : int):
-#   if target_mode == 1:
-#        for i in range(len(dataset["targets"])):
-#            dataset["targets"][i] = tf.convert_to_tensor(dataset["targets"][i]["dipole"], dtype = tf.float32)
-#    elif target_mode == 2:
-#        for i in range(len(dataset["targets"])):
-#            dataset["targets"][i] = tf.convert_to_tensor(dataset["targets"][i]["pol"], dtype = tf.float32)
-#    return dataset
-
 cfg = TNEPconfig()
 # Read dataset from train.xyz
 dataset, dataset_types_int, types, num_types = collect(cfg.data_path)
+print(dataset[0].info)
+print(len(dataset))
 cfg.randomise(dataset)
 #print(dataset[0].numbers, dataset[0].positions, dataset[0].symbols, dataset[0].info)
 # Split dataset into train, test, and validation sets
@@ -226,9 +220,12 @@ cfg.num_types = num_types
 
 model = TNEP(cfg)
 history = model.fit(train_data, val_data)
-#print(model.score(test_data))
-#plot_snes_history(history)
+print(model.score(test_data))
+plot_snes_history(history)
 print("Run complete!")
+
+
+
 """
     base = (
         "soap_turbo l_max=8 alpha_max={8 8 8 8 8 8} "
@@ -239,67 +236,3 @@ print("Run complete!")
         "radial_enhancement=1 compress_mode=trivial central_weight={1. 1. 1. 1. 1. 1.} "
         "species_Z={6 8 16 1 7 17} n_species=6"
     )"""
-""" TESTING 
-13
-Lattice="100.0 0.0 0.0 0.0 100.0 0.0 0.0 0.0 100.0" Properties=species:S:1:pos:R:3 dipole="0.162 0.0276 0.0046" pol="100.229691 3.510598 0.085722 3.510598 93.638814 -0.07923 0.085722 -0.07923 56.957231" pbc="T T T"
-C       47.60422226      49.50684576      49.99673171
-C       49.10610401      49.54948269      49.99979367
-C       49.84597752      50.71065284      49.99805309
-O       49.31389644      51.97280217      49.99249935
-S       51.57359926      50.41035399      50.00158503
-C       51.30182690      48.68910323      50.00613259
-C       49.96279409      48.40102279      50.00436524
-H       47.18186935      50.51907360      50.00749184
-H       47.21919638      48.97000312      50.87720929
-H       47.22173428      48.99045553      49.10288397
-H       50.02767742      52.63278090      49.99968036
-H       52.15408054      48.01737124      50.01019019
-H       49.58113384      47.37959045      50.00673140
-"""
-"""
-Z = [0, 0, 0, 1, 2, 0, 0, 3, 3, 3, 3, 3, 3]
-
-Z = tf.convert_to_tensor(Z)
-
-R = [
-    [47.60422226, 49.50684576, 49.99673171],
-    [49.10610401, 49.54948269, 49.99979367],
-    [49.84597752, 50.71065284, 49.99805309],
-    [49.31389644, 51.97280217, 49.99249935],
-    [51.57359926, 50.41035399, 50.00158503],
-    [51.30182690, 48.68910323, 50.00613259],
-    [49.96279409, 48.40102279, 50.00436524],
-    [47.18186935, 50.51907360, 50.00749184],
-    [47.21919638, 48.97000312, 50.87720929],
-    [47.22173428, 48.99045553, 49.10288397],
-    [50.02767742, 52.63278090, 49.99968036],
-    [52.15408054, 48.01737124, 50.01019019],
-    [49.58113384, 47.37959045, 50.00673140]
-]
-
-R = tf.convert_to_tensor(R)
-#print(R.shape)
-
-box = [
-    [100.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 100.0]
-]
-
-box = tf.convert_to_tensor(box)
-
-cfg = TNEPconfig()
-descriptors = DescriptorBuilder(cfg).build_descriptors(R, box)
-descriptors = tf.expand_dims(descriptors, axis=0) # imitate full dataset dimensions
-print("descriptors=", descriptors)
-cfg.dim_q = descriptors.shape[-1]
-cfg.num_types = 4
-
-model = TNEP(cfg)
-predictions = model.predict(descriptors[0], Z)
-print("before fitting = ", predictions)
-
-targets = [[-10.0]]
-targets = tf.convert_to_tensor(targets)
-model = model.fit(descriptors, targets, Z)
-predictions = model.predict(descriptors[0], Z)
-print("after fitting = ", predictions)
-"""

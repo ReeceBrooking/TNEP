@@ -57,6 +57,31 @@ class SNES:
     # ------------------------------------------------------------------ #
     # η_sigma and utilities                                              #
     # ------------------------------------------------------------------ #
+    def calc_rmse(self, y_true, y_pred):
+        """
+        Explicit RMSE.
+
+        Parameters
+        ----------
+        y_true : tf.Tensor or array
+            Shape: (...)  (scalar, vector, or tensor)
+        y_pred : tf.Tensor or array
+            Same shape as y_true
+
+        Returns
+        -------
+        float
+            Root mean squared error
+        """
+        y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
+        y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+
+        diff = y_pred - y_true
+        mse = tf.reduce_mean(tf.square(diff))
+        rmse_val = tf.sqrt(mse)
+
+        return float(rmse_val.numpy())
+
     def compute_eta_sigma(self) -> float:
         """
         Mirror C++:
@@ -71,7 +96,8 @@ class SNES:
           - We guard against division by zero when num_types == 0 by
             using num_types = 1 in that case.
         """
-        num = float(self.dim_q)
+        #num = float(self.dim_q)
+        num = float(self.dim)
 
         # Avoid weird edge cases
         num = max(num, 1.0)
@@ -129,6 +155,7 @@ class SNES:
         # s_(p,v) ~ N(0, 1)
         s = self.rng.standard_normal(size=(self.cfg.pop_size, self.dim))
         # z_(p,v) = μ_v + σ_v * s_(p,v)
+        print(s)
         samples = self.mu + s * self.sigma
         return samples, s
 
@@ -214,20 +241,24 @@ class SNES:
         }
         for gen in range(cfg.num_generations):
             # 1. Sample population and reconstruct weights and biases
+#            print("pop_size", self.cfg.pop_size, "dim", self.dim)
             samples, s = self.ask()
+#            print("samples shape", samples.shape, "s shape", s.shape)
+#            print("mu shape", self.mu.shape, "sigma shape", self.sigma.shape)
             # cycle through each sample
             fitness_matrix = np.zeros(shape = cfg.pop_size, dtype = float)
-            loss_fn = tf.keras.losses.MeanSquaredError(reduction="none")
+#            loss_fn = tf.keras.losses.MeanSquaredError()
             for i in range(cfg.pop_size):
                 W0, b0, W1, b1 = self.reconstruct_params(samples[i])
                 # update model layers with sample weights and biases
                 _set_model_params(self.model, W0, b0, W1, b1)
 
                 # 2. Compute fitness per individual and type
-                mse = 0.0
-                mse = tf.convert_to_tensor(mse, dtype = float)
-                for j in range(cfg.batch_size):
-                    # TODO Change to random sample selector from training dataset
+                rmse = []
+                rng = np.random.default_rng()
+                indices = np.arange(len(train_positions))
+                rng.shuffle(indices)
+                for j in indices[:cfg.batch_size]:
                     descriptors = train_descriptors[j]
                     gradients = train_gradients[j]
                     targets = train_targets[j]
@@ -235,57 +266,65 @@ class SNES:
                     positions = train_positions[j]
                     box = boxes[j]
 
-                    # TODO Loss function
-                    """ 
-                        Temporary FitnessCalc replacement
-                    """
                     # Forward pass
                     y_pred = self.model.predict(descriptors, gradients, positions, Z, box)
 
                     # MSE per-sample
-                    assert tf.shape(targets) == tf.shape(y_pred)
-                    mse += loss_fn(targets, y_pred)  # same shape as targets
+#                    print(tf.shape(y_pred), tf.shape(targets))
+ #                   print(tf.shape(y_pred) == tf.shape(targets))
+#                    assert tf.shape(targets) == tf.shape(y_pred)
+#                    mse += loss_fn(targets, y_pred)  # same shape as targets
+                    rmse.append(self.calc_rmse(targets, y_pred))
 
                 # RMSE
-                rmse = tf.sqrt(mse)
 
                 # Total fitness = sum over features
-                fitness_matrix[i] = tf.reduce_sum(rmse)
+                fitness_matrix[i] = tf.reduce_mean(rmse)
 
                 assert fitness_matrix.shape[0] == cfg.pop_size
 
             print("Fitness matrix at generation " + str(gen) + " = " + str(fitness_matrix))
+            tf.convert_to_tensor(fitness_matrix, dtype = tf.float32)
             avg_fitness = tf.reduce_mean(fitness_matrix)
             # Rank fitness and index to utilities
             ranks = np.argsort(fitness_matrix)
-            s_sorted = np.zeros_like(s)
-            for r in range(len(ranks)):
-                s_sorted[ranks[r]] = s[r]
+            s_sorted = s[ranks]
+#            s_sorted = np.zeros_like(s)
+#            for r in range(len(ranks)):
+#                s_sorted[ranks[r]] = s[r]
 
             # 3. SNES update
-            self.update(self.utilities, s_sorted)
             val_fitness = self.validate(val_data)
+            self.update(self.utilities, s_sorted)
+#            print("sigma min/mean/max:", self.sigma.min(), self.sigma.mean(), self.sigma.max())
             history["generation"].append(gen)
             history["train_loss"].append(avg_fitness)
             history["val_loss"].append(val_fitness)
+            W0, b0, W1, b1 = self.reconstruct_params(self.mu)
+            _set_model_params(self.model, W0, b0, W1, b1)
 
         # 4. Reconstruct weights from flat parameter vector and update model
-        W0, b0, W1, b1 = self.reconstruct_params(self.mu)
-        _set_model_params(self.model, W0, b0, W1, b1)
+#        W0, b0, W1, b1 = self.reconstruct_params(self.mu)
+#        _set_model_params(self.model, W0, b0, W1, b1)
 
         return history
 
     def validate(self, val_data):
-        mse = 0.0
+        rmse = []
         val_descriptors = val_data["descriptors"]
         val_gradients = val_data["gradients"]
         val_positions = val_data["positions"]
         val_z = val_data["Z_int"]
         val_targets = val_data["targets"]
         boxes = val_data["boxes"]
-        for j in range(self.cfg.val_size):
-            # TODO Change to random sample selector from validation dataset
-            loss_fn = tf.keras.losses.MeanSquaredError(reduction="none")
+
+        rng = np.random.default_rng()
+        indices = np.arange(len(val_positions))
+        rng.shuffle(indices)
+
+        for j in indices[:self.cfg.val_size]:
+
+ #           loss_fn = tf.keras.losses.MeanSquaredError(reduction="none")
             descriptors = val_descriptors[j]
             gradients = val_gradients[j]
             positions = val_positions[j]
@@ -294,17 +333,15 @@ class SNES:
             box = boxes[j]
 
             # Loss function
-            """ 
-                Temporary FitnessCalc replacement
-            """
+
             # Forward pass
             y_pred = self.model.predict(descriptors, gradients, positions, Z, box)
 
-            mse += loss_fn(targets, y_pred)
+ #           mse += loss_fn(targets, y_pred)
+            rmse.append(self.calc_rmse(targets, y_pred))
 
         # RMSE
-        rmse = tf.sqrt(mse)
-        fitness = tf.reduce_sum(rmse)
+        fitness = tf.reduce_mean(rmse)
         return fitness
 
     def reconstruct_params(self, param_vector):

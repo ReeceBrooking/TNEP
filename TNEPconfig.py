@@ -1,14 +1,14 @@
 import numpy as np
 
 class TNEPconfig:
-    data_path: str = "train.xyz"
+    data_path: str = "PEStrain.xyz"
     num_neurons: int = 64
     # Number of structures used in each train step
     batch_size: int = 10
     # Number of samples made in each train generation
-    pop_size: int = 8
+    pop_size: int = 16
     # Number of training generations (number of updates to the model)
-    num_generations: int = 10
+    num_generations: int = 50
 
     n_radial: int = 3
     n_radial_ang: int = 3
@@ -22,13 +22,13 @@ class TNEPconfig:
     init_sigma: float = 0.1
     seed: int | None = None
     # 0 : PES, 1 : Dipole, 2 : Polarizability
-    target_mode : int = 1
+    target_mode : int = 0
     # Test split ratio
     test_ratio : float = 0.2
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N : int = 50
+    total_N : int = 100
     # Number of structures in each validation step
-    val_size : int = 10
+    val_size : int = 5
 
     dim_q: int
     num_types: int
