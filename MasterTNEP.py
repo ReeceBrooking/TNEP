@@ -1,10 +1,14 @@
 import tensorflow as tf
 import numpy as np
+
 from TNEP import TNEP
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
 from ase.io import read
+from ase import Atoms
 import matplotlib.pyplot as plt
+from quippy.descriptors import Descriptor
+from quippy.convert import ase_to_quip
 
 """ 
     1. Collect inputs (Z, R, config) and divide train/test data
@@ -25,31 +29,99 @@ import matplotlib.pyplot as plt
 def collect(file : str):
     # read R, Z and target values from file
     dataset = read(file, index=":")
-    dataset_positions = []
-    dataset_types = []
-    dataset_targets = []
-    box = dataset[0].cell.array
-    for structure in dataset:
-        dataset_positions.append(structure.positions)
-        dataset_types.append(structure.numbers)
-        dataset_targets.append(structure.info)
-    dataset_types_int = dataset_types
+    dataset_types_int = []
     types = []
-    for i in range(len(dataset_types)):
-        for j in range(len(dataset_types[i])):
-            z = dataset_types[i][j]
+
+# TODO needs to sort them so that they are in correct atomic order
+    for structure in dataset:
+        structure_types_int = np.zeros_like(structure.numbers)
+
+        for i in range(len(structure.numbers)):
+            z = structure.numbers[i]
             if z not in types:
                 types.append(z)
-            dataset_types_int[i][j] = np.where(types == z)[0]
+            structure_types_int[i] = np.where(types == z)[0]
+
+        dataset_types_int.append(structure_types_int)
     num_types = len(types)
-    return dataset_positions, dataset_types, dataset_targets, dataset_types_int, box, num_types
+
+    base = (
+        "soap_turbo l_max=8 "
+        "rcut_hard=3.7 rcut_soft=3.2 basis=poly3gauss scaling_mode=polynomial add_species=F "
+        "radial_enhancement=1 compress_mode=trivial "
+    )
+
+    alpha_max = " alpha_max={"
+    atom_sigma_r = " atom_sigma_r={"
+    atom_sigma_t = " atom_sigma_t={"
+    atom_sigma_r_scaling = " atom_sigma_r_scaling={"
+    atom_sigma_t_scaling = " atom_sigma_t_scaling={"
+    amplitude_scaling = " amplitude_scaling={"
+    central_weight = " central_weight={"
+
+    for a in range(num_types):
+        alpha_max += "8 "
+        atom_sigma_r += "0.5 "
+        atom_sigma_t += "0.5 "
+        atom_sigma_r_scaling += "0.0 "
+        atom_sigma_t_scaling += "0.0 "
+        amplitude_scaling += "1.0 "
+        central_weight += "1. "
+
+    alpha_max += "}"
+    atom_sigma_r += "}"
+    atom_sigma_t += "}"
+    atom_sigma_r_scaling += "}"
+    atom_sigma_t_scaling += "}"
+    amplitude_scaling += "}"
+    central_weight += "}"
+
+    n_species = " n_species=" + str(num_types)
+
+    species_Z = " species_Z={"
+    for type in types:
+        species_Z += str(type) + " "
+    species_Z += "}"
+
+    base += species_Z + n_species + alpha_max + atom_sigma_r + atom_sigma_t + atom_sigma_r_scaling + atom_sigma_t_scaling + amplitude_scaling + central_weight
+
+    print(base)
+    # centers: H, C, O, S respectively
+    builders = [Descriptor(base + f" central_index={k}") for k in np.arange(num_types, dtype=int) + 1]
+    outs = [b.calc(dataset[0], grad=True) for b in builders]
+
+    descriptors = []
+    center_index = []
+    gradients = []
+    grad_indexes = []
+
+    print(outs[0]["ci"])
+    for out in outs:
+        for data in out["data"]:
+            descriptors.append(data)
+        for index in out["ci"]:
+            center_index.append(index)
+        assert len(center_index) == len(descriptors)
+        for j in range(len(out["grad_index_0based"])):
+            if out["grad_index_0based"][j][0] not in grad_indexes:
+                grad_indexes.append(out["grad_index_0based"][j][0])
+                gradients.append(out["grad_data"][j])
+            else:
+                gradients[-1] += out["grad_data"][j]
+
+    descriptors_sorted = np.zeros_like(descriptors)
+    gradients_sorted = np.zeros_like(gradients)
+    for k in range(len(center_index)):
+        descriptors_sorted[center_index[k] - 1] = descriptors[k]
+    for z in range(len(grad_indexes)):
+        gradients_sorted[grad_indexes[z]] = gradients[z]
+
+    return dataset, descriptors, dataset_types_int, num_types
 
 def split(
-    positions,
-    types,
-    types_int,
-    targets,
-    box,
+    dataset,
+    descriptors,
+    dataset_types_int,
     cfg
 ):
     """
@@ -61,10 +133,10 @@ def split(
     if cfg.total_N is not None:
         n_structures = cfg.total_N
     else:
-        n_structures = len(positions)
-    assert (
-        len(types) == len(targets) == len(types_int) == len(positions)
-    ), "Dataset lists must have same length"
+        n_structures = len(dataset)
+#    assert (
+#        len(types) == len(targets) == len(types_int) == len(positions)
+#    ), "Dataset lists must have same length"
 
     rng = np.random.default_rng(cfg.seed)
     indices = np.arange(n_structures)
@@ -75,19 +147,25 @@ def split(
     val_idx = indices[n_test:2*n_test]
     train_idx = indices[2*n_test:]
 
-    def subset(idxs):
+    target = ""
+    if cfg.target_mode == 1:
+        target = "dipole"
+    elif cfg.target_mode == 2:
+        target = "pol"
+
+    def subset(idxs, target):
         return {
-            "R": [tf.convert_to_tensor(positions[i], dtype = tf.float32) for i in idxs],
-            "Z": [types[i] for i in idxs],
-            "Z_int": [tf.convert_to_tensor(types_int[i], dtype = tf.int32) for i in idxs],
-            "targets": [targets[i] for i in idxs],
-            "box": tf.convert_to_tensor(box, dtype = tf.float32),  # shared
-            "descriptors": [None] * n_structures
+            "R": [tf.convert_to_tensor(dataset[i].positions, dtype = tf.float32) for i in idxs],
+            "Z": [dataset[i].numbers for i in idxs],
+            "Z_int": [tf.convert_to_tensor(dataset_types_int[i], dtype = tf.int32) for i in idxs],
+            "targets": [tf.convert_to_tensor(dataset[i].info[target], dtype = tf.float32) for i in idxs],
+            "box": [tf.convert_to_tensor(dataset[i].cell.array, dtype = tf.float32) for i in idxs],  # shared
+            "descriptors": [descriptors[i] for i in idxs]
         }
 
-    train_data = subset(train_idx)
-    test_data = subset(test_idx)
-    val_data = subset(val_idx)
+    train_data = subset(train_idx, target)
+    test_data = subset(test_idx, target)
+    val_data = subset(val_idx, target)
 
     return train_data, test_data, val_data
 
@@ -106,44 +184,62 @@ def plot_snes_history(history, logy=True):
     plt.title("SNES fitness vs generation")
     plt.show()
 
-def specify_target(dataset, target_mode : int):
-    if target_mode == 1:
-        for i in range(len(dataset["targets"])):
-            dataset["targets"][i] = tf.convert_to_tensor(dataset["targets"][i]["dipole"], dtype = tf.float32)
-    elif target_mode == 2:
-        for i in range(len(dataset["targets"])):
-            dataset["targets"][i] = tf.convert_to_tensor(dataset["targets"][i]["pol"], dtype = tf.float32)
-    return dataset
-
-def train_split(dataset_positions, dataset_types, dataset_targets, dataset_types_int, box, cfg):
-    train_data, test_data, val_data = split(dataset_positions, dataset_types, dataset_types_int, dataset_targets, box, cfg)
-    train_data = specify_target(train_data, cfg.target_mode)
-    test_data = specify_target(test_data, cfg.target_mode)
-    val_data = specify_target(val_data, cfg.target_mode)
-    return train_data, test_data, val_data
+#def specify_target(dataset, target_mode : int):
+#   if target_mode == 1:
+#        for i in range(len(dataset["targets"])):
+#            dataset["targets"][i] = tf.convert_to_tensor(dataset["targets"][i]["dipole"], dtype = tf.float32)
+#    elif target_mode == 2:
+#        for i in range(len(dataset["targets"])):
+#            dataset["targets"][i] = tf.convert_to_tensor(dataset["targets"][i]["pol"], dtype = tf.float32)
+#    return dataset
 
 cfg = TNEPconfig()
 # Read dataset from train.xyz
-dataset_positions, dataset_types, dataset_targets, dataset_types_int, box, num_types = collect(cfg.data_path)
+dataset, descriptors, dataset_types_int, num_types = collect(cfg.data_path)
+print(dataset[0].numbers, dataset[0].positions, dataset[0].symbols, dataset[0].info)
 # Split dataset into train, test, and validation sets
-train_data, test_data, val_data = train_split(dataset_positions, dataset_types, dataset_targets, dataset_types_int, box, cfg)
+#train_data, test_data, val_data = split(dataset, descriptors, dataset_types_int, cfg)
+print(dataset[0])
+
+#print(outs[0])
+#print(tf.shape(outs[0]["data"]))
+#print(tf.shape(outs[0]["data"]), tf.shape(outs[0]["grad_data"]))
+#print(tf.shape(outs[1]["data"]), tf.shape(outs[1]["grad_data"]))
+#print(tf.shape(outs[2]["data"]), tf.shape(outs[2]["grad_data"]))
+#print(tf.shape(outs[3]["data"]), tf.shape(outs[3]["grad_data"]))
+
+print(descriptors_sorted, gradients_sorted)
+print(tf.shape(descriptors_sorted), tf.shape(gradients_sorted))
+
+#descriptors = builder.calc(dataset[0], grad=True)
+#print(descriptors)
 # Build radial and angular descriptors
-builder = DescriptorBuilder(cfg)
-for i in range(len(train_data["R"])):
-    train_data["descriptors"][i] = builder.build_descriptors(train_data["R"][i], train_data["box"])
-    print([i + 1], " structure has been described for train set")
-for j in range(len(test_data["R"])):
-    test_data["descriptors"][j] = builder.build_descriptors(test_data["R"][j], test_data["box"])
-    print([j + 1], " structure has been described for test set")
+#builder = DescriptorBuilder(cfg)
+#for i in range(len(train_data["R"])):
+#    train_data["descriptors"][i] = builder.build_descriptors(train_data["R"][i], train_data["box"])
+#    print([i + 1], " structure has been described for train set")
+#for j in range(len(test_data["R"])):
+#    test_data["descriptors"][j] = builder.build_descriptors(test_data["R"][j], test_data["box"])
+#    print([j + 1], " structure has been described for test set")
 
-cfg.dim_q = train_data["descriptors"][0].shape[-1]
-cfg.num_types = num_types
+#cfg.dim_q = train_data["descriptors"][0].shape[-1]
+#cfg.num_types = num_types
 
-model = TNEP(cfg)
-history = model.fit(train_data, val_data)
-print(model.score(test_data))
-plot_snes_history(history)
+#model = TNEP(cfg)
+#history = model.fit(train_data, val_data)
+#print(model.score(test_data))
+#plot_snes_history(history)
 
+"""
+    base = (
+        "soap_turbo l_max=8 alpha_max={8 8 8 8 8 8} "
+        "atom_sigma_r={0.5 0.5 0.5 0.5 0.5 0.5} atom_sigma_t={0.5 0.5 0.5 0.5 0.5 0.5} "
+        "atom_sigma_r_scaling={0.0 0.0 0.0 0.0 0.0 0.0} atom_sigma_t_scaling={0.0 0.0 0.0 0.0 0.0 0.0} "
+        "rcut_hard=3.7 rcut_soft=3.2 basis=poly3gauss scaling_mode=polynomial add_species=F "
+        "amplitude_scaling={1.0 1.0 1.0 1.0 1.0 1.0} "
+        "radial_enhancement=1 compress_mode=trivial central_weight={1. 1. 1. 1. 1. 1.} "
+        "species_Z={6 8 16 1 7 17} n_species=6"
+    )"""
 """ TESTING 
 13
 Lattice="100.0 0.0 0.0 0.0 100.0 0.0 0.0 0.0 100.0" Properties=species:S:1:pos:R:3 dipole="0.162 0.0276 0.0046" pol="100.229691 3.510598 0.085722 3.510598 93.638814 -0.07923 0.085722 -0.07923 56.957231" pbc="T T T"

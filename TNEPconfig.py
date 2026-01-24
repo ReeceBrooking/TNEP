@@ -24,7 +24,7 @@ class TNEPconfig:
     # Test split ratio
     test_ratio : float = 0.2
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N : int = 100
+    total_N : int = 10
     # Number of structures in each validation step
     val_size : int = 10
 
