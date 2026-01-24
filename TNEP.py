@@ -27,6 +27,7 @@ class TNEP(layers.Layer):
         self.num_types = cfg.num_types
         self.num_neurons = cfg.num_neurons
         self.activation = tf.keras.activations.get(cfg.activation)
+        self.builder = DescriptorBuilder(cfg)
 
         # W0[t] : [dim_q, num_neurons1]  (input -> hidden)
         self.W0 = self.add_weight(
@@ -97,8 +98,7 @@ class TNEP(layers.Layer):
             E = tf.reduce_sum(E)
             return E
         elif self.cfg.target_mode == 1:
-            builder = DescriptorBuilder(self.cfg)
-            dr, rij = builder.pairwise_displacements(positions, box)
+            dr, rij = self.builder.pairwise_displacements(tf.convert_to_tensor(positions, dtype=tf.float32), tf.convert_to_tensor(box, dtype=tf.float32))
             mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
             rij2 = tf.square(rij) * mask
             # tanh derivative
@@ -111,8 +111,6 @@ class TNEP(layers.Layer):
             de_da_exp = tf.expand_dims(de_da, axis=1)  # [N, 1, H]
             de_dq = tf.matmul(de_da_exp, W0_t, transpose_b=True)
             de_dq = tf.squeeze(de_dq, axis=1)
-            print(tf.shape(de_dq))
-            print("I worked!")
             de_dr = tf.einsum(
                 "idk,ik->id",
                 gradients,
@@ -121,7 +119,7 @@ class TNEP(layers.Layer):
 #            print(tf.shape(de_dr))
             dipole = reduce_sum(tf.matmul(rij2, de_dr), axis=0)
 #            print(tf.shape(dipole))
-            print(dipole)
+            print("dipole calculated == " + str(dipole))
             return dipole
         elif self.cfg.target_mode == 2:
             return pol

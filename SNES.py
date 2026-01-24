@@ -243,9 +243,8 @@ class SNES:
                     y_pred = self.model.predict(descriptors, gradients, positions, Z, box)
 
                     # MSE per-sample
-                    print(tf.shape(targets), tf.shape(y_pred))
+                    assert tf.shape(targets) == tf.shape(y_pred)
                     mse += loss_fn(targets, y_pred)  # same shape as targets
-                    print(mse)
 
                 # RMSE
                 rmse = tf.sqrt(mse)
@@ -255,7 +254,7 @@ class SNES:
 
                 assert fitness_matrix.shape[0] == cfg.pop_size
 
-            print(fitness_matrix)
+            print("Fitness matrix at generation " + str(gen) + " = " + str(fitness_matrix))
             avg_fitness = tf.reduce_mean(fitness_matrix)
             # Rank fitness and index to utilities
             ranks = np.argsort(fitness_matrix)
