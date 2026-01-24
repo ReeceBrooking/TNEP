@@ -204,6 +204,7 @@ class SNES:
         train_positions = train_data["positions"]
         train_z = train_data["Z_int"]
         train_targets = train_data["targets"]
+        boxes = train_data["boxes"]
         cfg = self.cfg
         history = {
             "generation": [],
@@ -230,7 +231,7 @@ class SNES:
                     targets = train_targets[j]
                     Z = train_z[j]
                     positions = train_positions[j]
-                    box = train_data["box"]
+                    box = boxes[j]
 
                     # TODO Loss function
                     """ 
@@ -277,7 +278,7 @@ class SNES:
         val_positions = val_data["positions"]
         val_z = val_data["Z_int"]
         val_targets = val_data["targets"]
-        box = val_data["box"]
+        boxes = val_data["box"]
         for j in range(self.cfg.val_size):
             # TODO Change to random sample selector from validation dataset
             loss_fn = tf.keras.losses.MeanSquaredError(reduction="none")
@@ -285,6 +286,7 @@ class SNES:
             positions = val_positions[j]
             z = val_z[j]
             targets = val_targets[j]
+            box = boxes[j]
 
             # Loss function
             """ 

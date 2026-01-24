@@ -1,5 +1,6 @@
 import tensorflow as tf
 import numpy as np
+from numpy.matlib import empty
 
 from TNEP import TNEP
 from TNEPconfig import TNEPconfig
@@ -43,8 +44,79 @@ def collect(file : str):
             structure_types_int[i] = np.where(types == z)[0]
 
         dataset_types_int.append(structure_types_int)
-    num_types = len(types)
 
+    return dataset, dataset_types_int, types, len(types)
+
+def split(
+    dataset,
+    descriptors,
+    gradients,
+    dataset_types_int,
+    cfg
+):
+    """
+    Split dataset into train and test sets while preserving indexing.
+
+    Returns:
+        train_data, test_data (both dicts)
+    """
+
+    indices = cfg.indices
+    n_structures = len(indices)
+
+    n_test = int(cfg.test_ratio * n_structures)
+
+    test_idx = indices[:n_test]
+    val_idx = indices[n_test:2*n_test]
+    train_idx = indices[2*n_test:n_structures]
+
+    test_desc = descriptors[:n_test]
+    val_desc = descriptors[n_test:2*n_test]
+    train_desc = descriptors[2*n_test:n_structures]
+
+    test_grad = gradients[:n_test]
+    val_grad = gradients[n_test:2*n_test]
+    train_grad = gradients[2*n_test:n_structures]
+
+    target = ""
+    if cfg.target_mode == 1:
+        target = "dipole"
+    elif cfg.target_mode == 2:
+        target = "pol"
+
+    def subset(idxs, descriptors, gradients, target):
+        return {
+            "positions": [tf.convert_to_tensor(dataset[i].positions, dtype = tf.float32) for i in idxs],
+            "Z": [dataset[i].numbers for i in idxs],
+            "Z_int": [tf.convert_to_tensor(dataset_types_int[i], dtype = tf.int32) for i in idxs],
+            "targets": [tf.convert_to_tensor(dataset[i].info[target], dtype = tf.float32) for i in idxs],
+            "boxes": [tf.convert_to_tensor(dataset[i].cell.array, dtype = tf.float32) for i in idxs],  # shared
+            "descriptors": [tf.convert_to_tensor(descriptor, dtype = tf.float32) for descriptor in descriptors],
+            "gradients": [tf.convert_to_tensor(gradient, dtype = tf.float32) for gradient in gradients]
+        }
+
+    train_data = subset(train_idx, train_desc, train_grad, target)
+    test_data = subset(test_idx, test_desc, test_grad, target)
+    val_data = subset(val_idx, val_desc, val_grad, target)
+
+    return train_data, test_data, val_data
+
+def plot_snes_history(history, logy=True):
+    g = np.asarray(history["gen"])
+
+    plt.figure()
+    plt.plot(g, history["train_mean"], label="Train RMSE")
+    plt.plot(g, history["val_mean"], label="Val RMSE")
+
+    plt.xlabel("generation")
+    plt.ylabel("fitness (lower is better)")
+    if logy:
+        plt.yscale("log")
+    plt.legend()
+    plt.title("SNES fitness vs generation")
+    plt.show()
+
+def build_descriptors(dataset, types, num_types, cfg):
     base = (
         "soap_turbo l_max=8 "
         "rcut_hard=3.7 rcut_soft=3.2 basis=poly3gauss scaling_mode=polynomial add_species=F "
@@ -86,103 +158,46 @@ def collect(file : str):
     base += species_Z + n_species + alpha_max + atom_sigma_r + atom_sigma_t + atom_sigma_r_scaling + atom_sigma_t_scaling + amplitude_scaling + central_weight
 
     print(base)
-    # centers: H, C, O, S respectively
-    builders = [Descriptor(base + f" central_index={k}") for k in np.arange(num_types, dtype=int) + 1]
-    outs = [b.calc(dataset[0], grad=True) for b in builders]
 
-    descriptors = []
-    center_index = []
-    gradients = []
-    grad_indexes = []
+    builders = [Descriptor(base + f" central_index={k}") for k in (np.arange(num_types, dtype=int) + 1)]
+    dataset_descriptors = []
+    dataset_gradients = []
 
-    print(outs[0]["ci"])
-    for out in outs:
-        for data in out["data"]:
-            descriptors.append(data)
-        for index in out["ci"]:
-            center_index.append(index)
-        assert len(center_index) == len(descriptors)
-        for j in range(len(out["grad_index_0based"])):
-            if out["grad_index_0based"][j][0] not in grad_indexes:
-                grad_indexes.append(out["grad_index_0based"][j][0])
-                gradients.append(out["grad_data"][j])
-            else:
-                gradients[-1] += out["grad_data"][j]
+    for i in cfg.indices:
+        outs = [b.calc(dataset[i], grad=True) for b in builders]
 
-    descriptors_sorted = np.zeros_like(descriptors)
-    gradients_sorted = np.zeros_like(gradients)
-    for k in range(len(center_index)):
-        descriptors_sorted[center_index[k] - 1] = descriptors[k]
-    for z in range(len(grad_indexes)):
-        gradients_sorted[grad_indexes[z]] = gradients[z]
+        descriptors = []
+        center_index = []
+        gradients = []
+        grad_indexes = []
 
-    return dataset, descriptors, dataset_types_int, num_types
+        for out in outs:
+            #print(out)
+            data = out.get("data")
+            if data is None or data.size == 0 or data.shape[1] == 0:
+                continue
+            #print(out["ci"])
+            for data in out["data"]:
+                descriptors.append(data)
+            for index in out["ci"]:
+                center_index.append(index)
+            assert len(center_index) == len(descriptors)
+            for j in range(len(out["grad_index_0based"])):
+                if out["grad_index_0based"][j][0] not in grad_indexes:
+                    grad_indexes.append(out["grad_index_0based"][j][0])
+                    gradients.append(out["grad_data"][j])
+                else:
+                    gradients[-1] += out["grad_data"][j]
 
-def split(
-    dataset,
-    descriptors,
-    dataset_types_int,
-    cfg
-):
-    """
-    Split dataset into train and test sets while preserving indexing.
-
-    Returns:
-        train_data, test_data (both dicts)
-    """
-    if cfg.total_N is not None:
-        n_structures = cfg.total_N
-    else:
-        n_structures = len(dataset)
-#    assert (
-#        len(types) == len(targets) == len(types_int) == len(positions)
-#    ), "Dataset lists must have same length"
-
-    rng = np.random.default_rng(cfg.seed)
-    indices = np.arange(n_structures)
-    rng.shuffle(indices)
-
-    n_test = int(cfg.test_ratio * n_structures)
-    test_idx = indices[:n_test]
-    val_idx = indices[n_test:2*n_test]
-    train_idx = indices[2*n_test:]
-
-    target = ""
-    if cfg.target_mode == 1:
-        target = "dipole"
-    elif cfg.target_mode == 2:
-        target = "pol"
-
-    def subset(idxs, target):
-        return {
-            "R": [tf.convert_to_tensor(dataset[i].positions, dtype = tf.float32) for i in idxs],
-            "Z": [dataset[i].numbers for i in idxs],
-            "Z_int": [tf.convert_to_tensor(dataset_types_int[i], dtype = tf.int32) for i in idxs],
-            "targets": [tf.convert_to_tensor(dataset[i].info[target], dtype = tf.float32) for i in idxs],
-            "box": [tf.convert_to_tensor(dataset[i].cell.array, dtype = tf.float32) for i in idxs],  # shared
-            "descriptors": [descriptors[i] for i in idxs]
-        }
-
-    train_data = subset(train_idx, target)
-    test_data = subset(test_idx, target)
-    val_data = subset(val_idx, target)
-
-    return train_data, test_data, val_data
-
-def plot_snes_history(history, logy=True):
-    g = np.asarray(history["gen"])
-
-    plt.figure()
-    plt.plot(g, history["train_mean"], label="Train RMSE")
-    plt.plot(g, history["val_mean"], label="Val RMSE")
-
-    plt.xlabel("generation")
-    plt.ylabel("fitness (lower is better)")
-    if logy:
-        plt.yscale("log")
-    plt.legend()
-    plt.title("SNES fitness vs generation")
-    plt.show()
+        descriptors_sorted = np.zeros_like(descriptors)
+        gradients_sorted = np.zeros_like(gradients)
+        for k in range(len(center_index)):
+            descriptors_sorted[center_index[k] - 1] = descriptors[k]
+        for z in range(len(grad_indexes)):
+            gradients_sorted[grad_indexes[z]] = gradients[z]
+        dataset_descriptors.append(descriptors_sorted)
+        dataset_gradients.append(gradients_sorted)
+    return dataset_descriptors, dataset_gradients
 
 #def specify_target(dataset, target_mode : int):
 #   if target_mode == 1:
@@ -195,41 +210,25 @@ def plot_snes_history(history, logy=True):
 
 cfg = TNEPconfig()
 # Read dataset from train.xyz
-dataset, descriptors, dataset_types_int, num_types = collect(cfg.data_path)
-print(dataset[0].numbers, dataset[0].positions, dataset[0].symbols, dataset[0].info)
+dataset, dataset_types_int, types, num_types = collect(cfg.data_path)
+cfg.randomise(dataset)
+#print(dataset[0].numbers, dataset[0].positions, dataset[0].symbols, dataset[0].info)
 # Split dataset into train, test, and validation sets
-#train_data, test_data, val_data = split(dataset, descriptors, dataset_types_int, cfg)
-print(dataset[0])
-
-#print(outs[0])
-#print(tf.shape(outs[0]["data"]))
-#print(tf.shape(outs[0]["data"]), tf.shape(outs[0]["grad_data"]))
-#print(tf.shape(outs[1]["data"]), tf.shape(outs[1]["grad_data"]))
-#print(tf.shape(outs[2]["data"]), tf.shape(outs[2]["grad_data"]))
-#print(tf.shape(outs[3]["data"]), tf.shape(outs[3]["grad_data"]))
-
-print(descriptors_sorted, gradients_sorted)
-print(tf.shape(descriptors_sorted), tf.shape(gradients_sorted))
-
-#descriptors = builder.calc(dataset[0], grad=True)
-#print(descriptors)
-# Build radial and angular descriptors
-#builder = DescriptorBuilder(cfg)
+descriptors, gradients = build_descriptors(dataset, types, num_types, cfg)
+train_data, test_data, val_data = split(dataset, descriptors, gradients, dataset_types_int, cfg)
+#print(len(train_data["Z"][0]), tf.shape(train_data["descriptors"][0]))
 #for i in range(len(train_data["R"])):
-#    train_data["descriptors"][i] = builder.build_descriptors(train_data["R"][i], train_data["box"])
-#    print([i + 1], " structure has been described for train set")
-#for j in range(len(test_data["R"])):
-#    test_data["descriptors"][j] = builder.build_descriptors(test_data["R"][j], test_data["box"])
-#    print([j + 1], " structure has been described for test set")
+#    assert len(train_data["Z"][i]) == tf.shape(train_data["descriptors"][i])[0]
+#    print("Number of atoms and descriptors in structure " + str(i) + " have been verified")
 
-#cfg.dim_q = train_data["descriptors"][0].shape[-1]
-#cfg.num_types = num_types
+cfg.dim_q = train_data["descriptors"][0].shape[-1]
+cfg.num_types = num_types
 
-#model = TNEP(cfg)
-#history = model.fit(train_data, val_data)
+model = TNEP(cfg)
+history = model.fit(train_data, val_data)
 #print(model.score(test_data))
 #plot_snes_history(history)
-
+print("Run complete!")
 """
     base = (
         "soap_turbo l_max=8 alpha_max={8 8 8 8 8 8} "

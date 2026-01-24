@@ -100,8 +100,8 @@ class TNEP(layers.Layer):
             dr, rij = builder.pairwise_displacements(positions, box)
             mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
             rij2 = tf.square(rij) * mask
-
-            return dipole
+            print("I worked!")
+            return
         elif self.cfg.target_mode == 2:
             return pol
         else:

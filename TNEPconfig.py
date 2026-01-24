@@ -1,3 +1,5 @@
+import numpy as np
+
 class TNEPconfig:
     data_path: str = "train.xyz"
     num_neurons: int = 64
@@ -30,3 +32,13 @@ class TNEPconfig:
 
     dim_q: int
     num_types: int
+    indices : np.ndarray
+
+    def randomise(self, dataset):
+        rng = np.random.default_rng(self.seed)
+        indices = np.arange(len(dataset))
+        rng.shuffle(indices)
+        if self.total_N is not None:
+            self.indices = indices[:self.total_N]
+        else:
+            self.indices = indices
