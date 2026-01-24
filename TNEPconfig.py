@@ -4,7 +4,7 @@ class TNEPconfig:
     data_path: str = "train.xyz"
     num_neurons: int = 64
     # Number of structures used in each train step
-    batch_size: int = 80
+    batch_size: int = 10
     # Number of samples made in each train generation
     pop_size: int = 8
     # Number of training generations (number of updates to the model)
@@ -26,7 +26,7 @@ class TNEPconfig:
     # Test split ratio
     test_ratio : float = 0.2
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N : int = 10
+    total_N : int = 50
     # Number of structures in each validation step
     val_size : int = 10
 

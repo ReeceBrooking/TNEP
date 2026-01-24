@@ -1,6 +1,8 @@
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras import layers, Model, Sequential, optimizers, losses
+from tensorflow.python.ops.ragged.ragged_math_ops import reduce_sum
+
 from DescriptorBuilder import DescriptorBuilder
 from SNES import SNES
 from TNEPconfig import TNEPconfig
@@ -59,7 +61,7 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-    def predict(self, descriptors, positions, Z, box):
+    def predict(self, descriptors, gradients, positions, Z, box):
         """
         q : [N, dim_q]  per-atom descriptors
         Z : [N]        integer atom types (0..num_types-1)
@@ -86,13 +88,12 @@ class TNEP(layers.Layer):
         h = tf.squeeze(h, axis=1) + b0_t         # [N, num_neurons1]
         h = self.activation(h)                   # [N, num_neurons1]
 
-        # Output layer: F_i = h_i · W1_t + b1
-        # (elementwise dot over last dim)
-        E = tf.reduce_sum(h * W1_t, axis = 1)     # single value scalar
-        E = E + self.b1                          # global bias
-
         # TODO Partial Force calculations - return Energy and Force predictions
         if self.cfg.target_mode == 0:
+            # Output layer: F_i = h_i · W1_t + b1
+            # (elementwise dot over last dim)
+            E = tf.reduce_sum(h * W1_t, axis=1)  # single value scalar
+            E = E + self.b1  # global bias
             E = tf.reduce_sum(E)
             return E
         elif self.cfg.target_mode == 1:
@@ -100,8 +101,28 @@ class TNEP(layers.Layer):
             dr, rij = builder.pairwise_displacements(positions, box)
             mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
             rij2 = tf.square(rij) * mask
+            # tanh derivative
+            dtanh = 1.0 - tf.square(h)  # [N, H]
+
+            # ∂e_i / ∂a_i
+            de_da = dtanh * W1_t  # [N, H]
+
+            # ∂e_i / ∂q_i = W0_t · de_da
+            de_da_exp = tf.expand_dims(de_da, axis=1)  # [N, 1, H]
+            de_dq = tf.matmul(de_da_exp, W0_t, transpose_b=True)
+            de_dq = tf.squeeze(de_dq, axis=1)
+            print(tf.shape(de_dq))
             print("I worked!")
-            return
+            de_dr = tf.einsum(
+                "idk,ik->id",
+                gradients,
+                de_dq
+            )  # [N_atoms, 3]
+#            print(tf.shape(de_dr))
+            dipole = reduce_sum(tf.matmul(rij2, de_dr), axis=0)
+#            print(tf.shape(dipole))
+            print(dipole)
+            return dipole
         elif self.cfg.target_mode == 2:
             return pol
         else:

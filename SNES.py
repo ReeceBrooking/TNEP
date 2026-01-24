@@ -201,6 +201,7 @@ class SNES:
             Each entry is (num_types+1,) array of best fitness per type.
         """
         train_descriptors = train_data["descriptors"]
+        train_gradients = train_data["gradients"]
         train_positions = train_data["positions"]
         train_z = train_data["Z_int"]
         train_targets = train_data["targets"]
@@ -228,6 +229,7 @@ class SNES:
                 for j in range(cfg.batch_size):
                     # TODO Change to random sample selector from training dataset
                     descriptors = train_descriptors[j]
+                    gradients = train_gradients[j]
                     targets = train_targets[j]
                     Z = train_z[j]
                     positions = train_positions[j]
@@ -238,10 +240,12 @@ class SNES:
                         Temporary FitnessCalc replacement
                     """
                     # Forward pass
-                    y_pred = self.model.predict(descriptors, positions, Z, box)
+                    y_pred = self.model.predict(descriptors, gradients, positions, Z, box)
 
                     # MSE per-sample
+                    print(tf.shape(targets), tf.shape(y_pred))
                     mse += loss_fn(targets, y_pred)  # same shape as targets
+                    print(mse)
 
                 # RMSE
                 rmse = tf.sqrt(mse)
@@ -275,16 +279,18 @@ class SNES:
     def validate(self, val_data):
         mse = 0.0
         val_descriptors = val_data["descriptors"]
+        val_gradients = val_data["gradients"]
         val_positions = val_data["positions"]
         val_z = val_data["Z_int"]
         val_targets = val_data["targets"]
-        boxes = val_data["box"]
+        boxes = val_data["boxes"]
         for j in range(self.cfg.val_size):
             # TODO Change to random sample selector from validation dataset
             loss_fn = tf.keras.losses.MeanSquaredError(reduction="none")
             descriptors = val_descriptors[j]
+            gradients = val_gradients[j]
             positions = val_positions[j]
-            z = val_z[j]
+            Z = val_z[j]
             targets = val_targets[j]
             box = boxes[j]
 
@@ -293,7 +299,7 @@ class SNES:
                 Temporary FitnessCalc replacement
             """
             # Forward pass
-            y_pred = self.model.predict(descriptors, positions, z, box)
+            y_pred = self.model.predict(descriptors, gradients, positions, Z, box)
 
             mse += loss_fn(targets, y_pred)
 
