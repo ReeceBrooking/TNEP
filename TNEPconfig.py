@@ -1,14 +1,14 @@
 import numpy as np
 
 class TNEPconfig:
-    data_path: str = "PEStrain.xyz"
+    data_path: str = "train.xyz"
     num_neurons: int = 64
     # Number of structures used in each train step
     batch_size: int = 10
     # Number of samples made in each train generation
     pop_size: int = 16
     # Number of training generations (number of updates to the model)
-    num_generations: int = 50
+    num_generations: int = 20
 
     n_radial: int = 3
     n_radial_ang: int = 3
@@ -22,7 +22,7 @@ class TNEPconfig:
     init_sigma: float = 0.1
     seed: int | None = None
     # 0 : PES, 1 : Dipole, 2 : Polarizability
-    target_mode : int = 0
+    target_mode : int = 1
     # Test split ratio
     test_ratio : float = 0.2
     # None : uses entire dataset, int : defines maximum structures to use in training
@@ -32,11 +32,12 @@ class TNEPconfig:
 
     dim_q: int
     num_types: int
+    types = []
     indices : np.ndarray
 
     def randomise(self, dataset):
         rng = np.random.default_rng(self.seed)
-        indices = np.arange(len(dataset))
+        indices = np.arange(len(dataset), dtype=int)
         rng.shuffle(indices)
         if self.total_N is not None:
             self.indices = indices[:self.total_N]

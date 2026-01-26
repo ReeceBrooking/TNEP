@@ -155,7 +155,7 @@ class SNES:
         # s_(p,v) ~ N(0, 1)
         s = self.rng.standard_normal(size=(self.cfg.pop_size, self.dim))
         # z_(p,v) = μ_v + σ_v * s_(p,v)
-        print(s)
+    #    print(s)
         samples = self.mu + s * self.sigma
         return samples, s
 
@@ -227,8 +227,10 @@ class SNES:
         history : list of np.ndarray
             Each entry is (num_types+1,) array of best fitness per type.
         """
+        print("Fitting model...")
         train_descriptors = train_data["descriptors"]
         train_gradients = train_data["gradients"]
+        train_grad_index = train_data["grad_index"]
         train_positions = train_data["positions"]
         train_z = train_data["Z_int"]
         train_targets = train_data["targets"]
@@ -241,13 +243,11 @@ class SNES:
         }
         for gen in range(cfg.num_generations):
             # 1. Sample population and reconstruct weights and biases
-#            print("pop_size", self.cfg.pop_size, "dim", self.dim)
             samples, s = self.ask()
-#            print("samples shape", samples.shape, "s shape", s.shape)
-#            print("mu shape", self.mu.shape, "sigma shape", self.sigma.shape)
+
             # cycle through each sample
             fitness_matrix = np.zeros(shape = cfg.pop_size, dtype = float)
-#            loss_fn = tf.keras.losses.MeanSquaredError()
+
             for i in range(cfg.pop_size):
                 W0, b0, W1, b1 = self.reconstruct_params(samples[i])
                 # update model layers with sample weights and biases
@@ -265,9 +265,10 @@ class SNES:
                     Z = train_z[j]
                     positions = train_positions[j]
                     box = boxes[j]
+                    grad_index = train_grad_index[j]
 
                     # Forward pass
-                    y_pred = self.model.predict(descriptors, gradients, positions, Z, box)
+                    y_pred = self.model.predict(descriptors, gradients, grad_index, positions, Z, box)
 
                     # MSE per-sample
 #                    print(tf.shape(y_pred), tf.shape(targets))
@@ -283,29 +284,25 @@ class SNES:
 
                 assert fitness_matrix.shape[0] == cfg.pop_size
 
-            print("Fitness matrix at generation " + str(gen) + " = " + str(fitness_matrix))
+#            print("Fitness matrix at generation " + str(gen) + " = " + str(fitness_matrix))
             tf.convert_to_tensor(fitness_matrix, dtype = tf.float32)
             avg_fitness = tf.reduce_mean(fitness_matrix)
             # Rank fitness and index to utilities
             ranks = np.argsort(fitness_matrix)
             s_sorted = s[ranks]
-#            s_sorted = np.zeros_like(s)
-#            for r in range(len(ranks)):
-#                s_sorted[ranks[r]] = s[r]
 
             # 3. SNES update
             val_fitness = self.validate(val_data)
             self.update(self.utilities, s_sorted)
-#            print("sigma min/mean/max:", self.sigma.min(), self.sigma.mean(), self.sigma.max())
+
             history["generation"].append(gen)
             history["train_loss"].append(avg_fitness)
             history["val_loss"].append(val_fitness)
+
+            # 4. Reconstruct weights from flat parameter vector and update model
             W0, b0, W1, b1 = self.reconstruct_params(self.mu)
             _set_model_params(self.model, W0, b0, W1, b1)
-
-        # 4. Reconstruct weights from flat parameter vector and update model
-#        W0, b0, W1, b1 = self.reconstruct_params(self.mu)
-#        _set_model_params(self.model, W0, b0, W1, b1)
+            print("Generation " + str(gen + 1) + "/" + str(cfg.num_generations) + " finished with " + str(cfg.batch_size * (gen + 1)) + " batches completed.")
 
         return history
 
@@ -313,6 +310,7 @@ class SNES:
         rmse = []
         val_descriptors = val_data["descriptors"]
         val_gradients = val_data["gradients"]
+        val_grad_index = val_data["grad_index"]
         val_positions = val_data["positions"]
         val_z = val_data["Z_int"]
         val_targets = val_data["targets"]
@@ -324,9 +322,9 @@ class SNES:
 
         for j in indices[:self.cfg.val_size]:
 
- #           loss_fn = tf.keras.losses.MeanSquaredError(reduction="none")
             descriptors = val_descriptors[j]
             gradients = val_gradients[j]
+            grad_index = val_grad_index[j]
             positions = val_positions[j]
             Z = val_z[j]
             targets = val_targets[j]
@@ -335,9 +333,7 @@ class SNES:
             # Loss function
 
             # Forward pass
-            y_pred = self.model.predict(descriptors, gradients, positions, Z, box)
-
- #           mse += loss_fn(targets, y_pred)
+            y_pred = self.model.predict(descriptors, gradients, grad_index, positions, Z, box)
             rmse.append(self.calc_rmse(targets, y_pred))
 
         # RMSE

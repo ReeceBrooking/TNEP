@@ -2,6 +2,7 @@ import tensorflow as tf
 import numpy as np
 from tensorflow.keras import layers, Model, Sequential, optimizers, losses
 from TNEPconfig import TNEPconfig
+from quippy.descriptors import Descriptor
 
 class DescriptorBuilder(layers.Layer):
     """
@@ -15,72 +16,91 @@ class DescriptorBuilder(layers.Layer):
         super().__init__(**kwargs)
 
         # Angular 3-body basis parameters
-        self.K_radial = cfg.n_radial
-        self.Lmax = cfg.Lmax
-        self.n_radial_ang = cfg.n_radial_ang
-        self.rc = tf.constant(cfg.rc, tf.float32)
-        self.pi = tf.constant(np.pi, tf.float32)
+        self.cfg = cfg
+        self.types = cfg.types
+        self.num_types = cfg.num_types
+        self.rc = cfg.rc
 
-    def build_descriptors(self, R, box):
-        """
-        inputs = (R, Z, box)
-        R:   [N,3]  Cartesian Å
-        box: [3,3]  lattice vectors
+        base = (
+            "soap_turbo l_max=8 "
+            "rcut_hard=3.7 rcut_soft=3.2 basis=poly3gauss scaling_mode=polynomial add_species=F "
+            "radial_enhancement=1 compress_mode=trivial "
+        )
 
-        returns Q: [N, D] per-atom descriptor
-        """
-        N = tf.shape(R)[0]
+        alpha_max = " alpha_max={"
+        atom_sigma_r = " atom_sigma_r={"
+        atom_sigma_t = " atom_sigma_t={"
+        atom_sigma_r_scaling = " atom_sigma_r_scaling={"
+        atom_sigma_t_scaling = " atom_sigma_t_scaling={"
+        amplitude_scaling = " amplitude_scaling={"
+        central_weight = " central_weight={"
 
-        # --- Pairwise displacements and distances (PBC) ---
-        dr, rij = self.pairwise_displacements(R, box)  # dr: [N,N,3], rij: [N,N]
+        for a in range(self.num_types):
+            alpha_max += "8 "
+            atom_sigma_r += "0.5 "
+            atom_sigma_t += "0.5 "
+            atom_sigma_r_scaling += "0.0 "
+            atom_sigma_t_scaling += "0.0 "
+            amplitude_scaling += "1.0 "
+            central_weight += "1. "
 
-        # Mask to exclude self-interactions i=j
-        mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
+        alpha_max += "}"
+        atom_sigma_r += "}"
+        atom_sigma_t += "}"
+        atom_sigma_r_scaling += "}"
+        atom_sigma_t_scaling += "}"
+        amplitude_scaling += "}"
+        central_weight += "}"
 
-        # ========================
-        # 1) Radial 2-body block
-        # ========================
-        # Chebyshev radial basis
-        phi_r = self.radial_basis(rij)                      # [N,N,K_radial+1]
-        phi_r *= tf.expand_dims(mask, -1)          # zero out j=i
+        n_species = " n_species=" + str(self.num_types)
 
-        # Sum over neighbors j to get per-atom radial features
-        # q_r[i,k] = Σ_j Phi_r[i,j,k]
-        q_r = tf.reduce_sum(phi_r, axis=1)         # [N, K_radial+1]
+        species_Z = " species_Z={"
+        for type in self.types:
+            species_Z += str(type) + " "
+        species_Z += "}"
 
-        # =========================
-        # 2) Angular 3-body block
-        # =========================
-        # Use dr as neighbor vectors per central atom:
-        # for each i, neighbors j have vectors dr[i,j,:]
-        # angular_basis returns: [N, N, N, n_radial_ang, Lmax+1]
-        ang_feat = self.angular_basis(dr,
-                                 rij,
-                                      )  # [N,N,N,n_radial_ang,Lmax+1]
+        base += species_Z + n_species + alpha_max + atom_sigma_r + atom_sigma_t + atom_sigma_r_scaling + atom_sigma_t_scaling + amplitude_scaling + central_weight
 
-        # Build pair mask to exclude:
-        #  - j = i (no self neighbor)
-        #  - k = i (no self neighbor)
-        mask_ij = tf.expand_dims(mask, 2)          # [N,N,1]
-        mask_ik = tf.expand_dims(mask, 1)          # [N,1,N]
-        pair_mask = mask_ij * mask_ik              # [N,N,N] covers every i=j=k possibility?
+        self.builders = [Descriptor(base + f" central_index={k}") for k in (np.arange(self.num_types, dtype=int) + 1)]
+    # TODO Explore SparseTensor Class
+    def build_descriptors(self, dataset):
+        dataset_descriptors = []
+        dataset_gradients = []
+        dataset_grad_index = []
 
-        # Apply mask to angular features
-        ang_feat = ang_feat * tf.expand_dims(tf.expand_dims(pair_mask, -1), -1)
-        # shape still [N,N,N,n_radial_ang,Lmax+1]
+        for structure in dataset:
+            outs = [b.calc(structure, grad=True) for b in self.builders]
 
-        # Sum over neighbor pairs (j,k) to get per-atom angular invariants
-        # q_ang[i, n, l] = Σ_j Σ_k ang_feat[i,j,k,n,l]
-        q_ang = tf.reduce_sum(ang_feat, axis=[1, 2])          # [N, n_radial_ang, Lmax+1]
+            descriptors = [[] for _ in range(len(structure))]
+            gradients = [[] for _ in range(len(structure))]
+            grad_indexes = [[] for _ in range(len(structure))]
 
-        # Flatten angular channels
-        q_ang = tf.reshape(q_ang, [N, -1])                    # [N, n_radial_ang*(Lmax+1)]
+            for out in outs:
+                # print(out)
+                data = out.get("data")
+                if data is None or data.size == 0 or data.shape[1] == 0:
+                    continue
+                # print(out["ci"])
+                for k in range(len(out["ci"])):
+                    descriptors[out["ci"][k] - 1].append(out["data"][k])
+                #            for index in out["ci"]:
+                #                center_index.append(index)
+                #            assert len(center_index) == len(descriptors)
+                for j in range(len(out["grad_index_0based"])):
+                    center = out["grad_index_0based"][j][0]
+                    neighbour = out["grad_index_0based"][j][1]
+                    gradients[center].append(out["grad_data"][j])
+                    grad_indexes[center].append(neighbour)
+            for i in range(len(gradients)):
+                gradients[i] = tf.convert_to_tensor(gradients[i], dtype=tf.float32)
 
-        # =========================
-        # 3) Concatenate descriptors
-        # =========================
-        descriptors = tf.concat([q_r, q_ang], axis=-1)                  # [N, D]
-        return descriptors
+            descriptors = tf.convert_to_tensor(descriptors, dtype=tf.float32)
+            descriptors = tf.squeeze(descriptors, axis=1)
+            #        print(descriptors.shape)
+            dataset_descriptors.append(descriptors)
+            dataset_gradients.append(gradients)
+            dataset_grad_index.append(grad_indexes)
+        return dataset_descriptors, dataset_gradients, dataset_grad_index
 
     # Neighbour List Function
     ## Enforce PBC by choosing closest possible image
@@ -130,11 +150,13 @@ class DescriptorBuilder(layers.Layer):
         x = tf.clip_by_value(rij / self.rc, 0.0, 1.0)
         return 0.5 * (tf.cos(self.pi * x) + 1.0)
 
+    """
     @tf.function(
         input_signature=[
             tf.TensorSpec(shape=[None, None], dtype=tf.float32),
         ]
     )
+
     def radial_basis(self, rij):
         fc = self.cutoff(rij)
         # scaled distance
@@ -178,12 +200,12 @@ class DescriptorBuilder(layers.Layer):
     )
     def angular_basis(self, dr, rij):
         """
-        R: [N, M, 3] neighbor vectors for each central atom
-        cutoff: scalar cutoff distance
-        Lmax: max angular degree (e.g., 2)
-        n_radial: number of radial basis functions
-        Returns: angular features [N, M, M, n_radial, Lmax+1]
-        """
+ #       R: [N, M, 3] neighbor vectors for each central atom
+ #       cutoff: scalar cutoff distance
+ #       Lmax: max angular degree (e.g., 2)
+ #       n_radial: number of radial basis functions
+ #       Returns: angular features [N, M, M, n_radial, Lmax+1]
+    """
         # 1. Compute pairwise distances and cutoff
         # dr, rij = pairwise_displacements(R, box)
     #    fc = self.cutoff(rij)
@@ -221,3 +243,4 @@ class DescriptorBuilder(layers.Layer):
 
         # features shape: [N, M, M, n_radial, Lmax+1]
         return features
+    """

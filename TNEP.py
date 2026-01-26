@@ -63,7 +63,7 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-    def predict(self, descriptors, gradients, positions, Z, box):
+    def predict(self, descriptors, gradients, grad_index, positions, Z, box):
         """
         q : [N, dim_q]  per-atom descriptors
         Z : [N]        integer atom types (0..num_types-1)
@@ -86,7 +86,9 @@ class TNEP(layers.Layer):
         # q: [N, dim_q]
         # We want: [N, num_neurons1]
         q_exp = tf.expand_dims(descriptors, axis=1)        # [N, 1, dim_q]
+#        print(q_exp.shape, W0_t.shape)
         h = tf.matmul(q_exp, W0_t)               # [N, 1, num_neurons1]
+#        print(tf.shape(h))
         h = tf.squeeze(h, axis=1) + b0_t         # [N, num_neurons1]
         h = self.activation(h)                   # [N, num_neurons1]
 
@@ -101,23 +103,19 @@ class TNEP(layers.Layer):
             dr, rij = self.builder.pairwise_displacements(tf.convert_to_tensor(positions, dtype=tf.float32), tf.convert_to_tensor(box, dtype=tf.float32))
             mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
             rij2 = tf.square(rij) * mask
-            # tanh derivative
-            dtanh = 1.0 - tf.square(h)  # [N, H]
 
-            # ∂e_i / ∂a_i
-            de_da = dtanh * W1_t  # [N, H]
+            forces = self.calc_forces(h, gradients, W1_t, W0_t)
+            dipole = []
 
-            # ∂e_i / ∂q_i = W0_t · de_da
-            de_da_exp = tf.expand_dims(de_da, axis=1)  # [N, 1, H]
-            de_dq = tf.matmul(de_da_exp, W0_t, transpose_b=True)
-            de_dq = tf.squeeze(de_dq, axis=1)
-            de_dr = tf.einsum(
-                "idk,ik->id",
-                gradients,
-                de_dq
-            )  # [N_atoms, 3]
+            for i in range(len(forces)):
+                dipole_i = tf.zeros(3, dtype=tf.float32)
+                for j in range(len(forces[i])):
+                    dipole_i += rij2[i, grad_index[i][j]] * forces[i][j]
+                dipole.append(dipole_i)
+
+            dipole = tf.convert_to_tensor(dipole, dtype=tf.float32)
 #            print(tf.shape(de_dr))
-            dipole = reduce_sum(tf.matmul(rij2, de_dr), axis=0)
+            dipole = -tf.reduce_sum(dipole, axis=0)
 #            print(tf.shape(dipole))
             print("dipole calculated == " + str(dipole))
             return dipole
@@ -128,6 +126,21 @@ class TNEP(layers.Layer):
             print("target mode not supported")
             return
 
+    def calc_forces(self, h, gradients, W1_t, W0_t):
+        dtanh = 1.0 - tf.square(h)  # [N, H]
+        de_da = dtanh * W1_t  # [N, H]
+        de_da_exp = tf.expand_dims(de_da, axis=1)  # [N, 1, H]
+        de_dq = tf.matmul(de_da_exp, W0_t, transpose_b=True)
+        de_dq = tf.squeeze(de_dq, axis=1)
+#        print("Energy derivative is shape: " + str(de_dq.shape))
+
+        forces = []
+        for i in range(len(gradients)):
+            force_i = tf.reduce_sum(de_dq[i] * gradients[i], axis=-1)
+            forces.append(force_i)
+#        print("Forces is shape: " + str(len(forces)) + str(forces[0].shape))
+        return forces
+
     def fit(self, train_data, val_data):
         # needs to init an optimizer, passing itself and the arguments
         history = self.optimizer.fit(train_data, val_data)
@@ -137,11 +150,12 @@ class TNEP(layers.Layer):
     def score(self, test_data):
         test_descriptors = test_data["descriptors"]
         test_gradients = test_data["gradients"]
+        test_grad_index = test_data["grad_index"]
         test_positions = test_data["positions"]
         test_targets = test_data["targets"]
         test_z = test_data["Z_int"]
         boxes = test_data["boxes"]
-        predictions = [self.predict(test_descriptors[i], test_gradients[i], test_positions[i], test_z[i], boxes[i]) for i in range(len(test_descriptors))]
+        predictions = [self.predict(test_descriptors[i], test_gradients[i], test_grad_index[i], test_positions[i], test_z[i], boxes[i]) for i in range(len(test_descriptors))]
         predictions_tf = tf.convert_to_tensor(predictions, dtype=tf.float32)
         diff = predictions_tf - test_targets
         mse = tf.reduce_mean(tf.square(diff))
