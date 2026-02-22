@@ -84,6 +84,17 @@ def split(dataset, dataset_types_int, cfg):
     val_descriptors, val_gradients, val_grad_index = builder.build_descriptors(val_dataset)
     test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(test_dataset)
 
+    """
+    # Scale descriptors to [-1, 1] per component using train set statistics
+    q_min, q_max = DescriptorBuilder.compute_scaling(train_descriptors)
+    train_descriptors, train_gradients = DescriptorBuilder.apply_scaling(
+        train_descriptors, train_gradients, q_min, q_max)
+    val_descriptors, val_gradients = DescriptorBuilder.apply_scaling(
+        val_descriptors, val_gradients, q_min, q_max)
+    test_descriptors, test_gradients = DescriptorBuilder.apply_scaling(
+        test_descriptors, test_gradients, q_min, q_max)
+    """
+
     if cfg.target_mode == 0:
         target = "energy"
     if cfg.target_mode == 1:

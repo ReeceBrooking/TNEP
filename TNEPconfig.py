@@ -10,7 +10,7 @@ class TNEPconfig:
     data_path: str = "train.xyz"
     num_neurons: int = 64
     # Number of structures used in each train step
-    batch_size: int = 20
+    batch_size: int = 10
     # Number of samples made in each train generation
     pop_size: int = 64
     # Number of training generations (number of updates to the model)

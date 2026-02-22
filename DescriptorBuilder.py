@@ -66,6 +66,7 @@ class DescriptorBuilder(layers.Layer):
         base += species_Z + n_species + alpha_max + atom_sigma_r + atom_sigma_t + atom_sigma_r_scaling + atom_sigma_t_scaling + amplitude_scaling + central_weight
 
         self.builders = [Descriptor(base + f" central_index={k}") for k in (np.arange(self.num_types, dtype=int) + 1)]
+
     def build_descriptors(self, dataset):
         """Compute SOAP descriptors and their gradients for every structure.
 
@@ -120,6 +121,69 @@ class DescriptorBuilder(layers.Layer):
             dataset_gradients.append(gradients)
             dataset_grad_index.append(grad_indexes)
         return dataset_descriptors, dataset_gradients, dataset_grad_index
+
+    @staticmethod
+    def compute_scaling(descriptors):
+        """Compute per-component min and max from a list of descriptor tensors.
+
+        Should be called on the training set only. The returned q_min and
+        q_max are then used to scale train, val, and test sets identically.
+
+        Args:
+            descriptors : list of [N_i, dim_q] tensors (one per structure)
+
+        Returns:
+            q_min : [dim_q] tensor — per-component minimum across all atoms
+            q_max : [dim_q] tensor — per-component maximum across all atoms
+        """
+        all_q = tf.concat(descriptors, axis=0)  # [total_atoms, dim_q]
+        q_min = tf.reduce_min(all_q, axis=0)    # [dim_q]
+        q_max = tf.reduce_max(all_q, axis=0)    # [dim_q]
+        return q_min, q_max
+
+    @staticmethod
+    def apply_scaling(descriptors, gradients, q_min, q_max):
+        """Scale descriptors to [-1, 1] and apply the same factor to gradients.
+
+        Scaling:  q_scaled = 2 * (q - q_min) / (q_max - q_min) - 1
+        The gradient transforms by the chain rule:
+            dq_scaled/dR = dq/dR * 2 / (q_max - q_min)
+
+        Components where q_max == q_min (constant) are left at zero.
+
+        Args:
+            descriptors : list of [N_i, dim_q] tensors
+            gradients   : list of (list of N_i tensors each [M_i, 3, dim_q])
+            q_min       : [dim_q] tensor from compute_scaling
+            q_max       : [dim_q] tensor from compute_scaling
+
+        Returns:
+            scaled_descriptors : same structure, values in [-1, 1]
+            scaled_gradients   : same structure, scaled by 2 / (q_max - q_min)
+        """
+        q_range = q_max - q_min
+        # Avoid division by zero for constant components
+        safe_range = tf.where(q_range > 0, q_range, tf.ones_like(q_range))
+        scale = 2.0 / safe_range  # [dim_q]
+
+        scaled_descriptors = []
+        for q in descriptors:
+            q_scaled = (q - q_min) * scale - 1.0
+            # Zero out constant components (where q_range == 0)
+            q_scaled = tf.where(q_range > 0, q_scaled, tf.zeros_like(q_scaled))
+            scaled_descriptors.append(q_scaled)
+
+        scaled_gradients = []
+        for struct_grads in gradients:
+            scaled_struct = []
+            for g in struct_grads:
+                # g: [M_i, 3, dim_q] — scale along the dim_q axis
+                g_scaled = g * scale
+                g_scaled = tf.where(q_range > 0, g_scaled, tf.zeros_like(g_scaled))
+                scaled_struct.append(g_scaled)
+            scaled_gradients.append(scaled_struct)
+
+        return scaled_descriptors, scaled_gradients
 
     @tf.function(
     input_signature=[

@@ -169,16 +169,18 @@ class SNES:
             samples, s = self.ask()
             fitness_matrix = np.zeros(shape=cfg.pop_size, dtype=float)
 
-            # Evaluate each candidate on a random batch of structures
+            # Select one random batch per generation — shared across all candidates
+            batch_indices = np.arange(len(train_positions))
+            self.rng.shuffle(batch_indices)
+            batch_indices = batch_indices[:cfg.batch_size]
+
+            # Evaluate each candidate on the same batch
             for i in range(cfg.pop_size):
                 W0, b0, W1, b1 = self.reconstruct_params(samples[i])
                 _set_model_params(self.model, W0, b0, W1, b1)
 
                 rmse = []
-                rng = np.random.default_rng()
-                indices = np.arange(len(train_positions))
-                rng.shuffle(indices)
-                for j in indices[:cfg.batch_size]:
+                for j in batch_indices:
                     y_pred = self.model.predict(
                         train_descriptors[j], train_gradients[j],
                         train_grad_index[j], train_positions[j],
@@ -226,9 +228,8 @@ class SNES:
         val_targets = val_data["targets"]
         boxes = val_data["boxes"]
 
-        rng = np.random.default_rng()
         indices = np.arange(len(val_positions))
-        rng.shuffle(indices)
+        self.rng.shuffle(indices)
 
         for j in indices[:self.cfg.val_size]:
             y_pred = self.model.predict(
