@@ -1,7 +1,6 @@
 import numpy as np
 import tensorflow as tf
 from TNEPconfig import TNEPconfig
-from FitnessCalc import FitnessCalc
 
 def _set_model_params(model, W0, b0, W1, b1):
     model.W0.assign(W0)
