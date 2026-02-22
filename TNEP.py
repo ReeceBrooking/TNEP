@@ -1,21 +1,29 @@
 import tensorflow as tf
 import numpy as np
-from tensorflow.keras import layers, Model, Sequential, optimizers, losses
-from tensorflow.python.ops.ragged.ragged_math_ops import reduce_sum
+from tensorflow.keras import layers
 
 from DescriptorBuilder import DescriptorBuilder
 from SNES import SNES
 from TNEPconfig import TNEPconfig
 
 class TNEP(layers.Layer):
-    """
-    TensorFlow/Keras implementation of the TNEP per-type 1-hidden-layer ANN.
+    """Per-type single-hidden-layer ANN for predicting energy, dipole, or polarizability.
 
-    - Input: per-atom descriptor q_i (dim_q) and atom type Z_i in [0, num_types)
-    - For each type t:
-        h_i = act(q_i W0[t] + b0[t])          # hidden layer
-        F_i = h_i · w1[t] + b1               # scalar output per atom
-    - b1 is a global scalar bias shared by all types (like annmb.b1).
+    Forward pass per atom i with type t:
+        a_i  = q_i @ W0[t] + b0[t]           # [num_neurons]
+        h_i  = tanh(a_i)                      # [num_neurons]
+        U_i  = h_i · W1[t] + b1              # scalar
+
+    Weights:
+        W0 : [num_types, dim_q, num_neurons]  input -> hidden
+        b0 : [num_types, num_neurons]         hidden bias
+        W1 : [num_types, num_neurons]         hidden -> scalar
+        b1 : ()                               global scalar bias
+
+    Prediction modes (cfg.target_mode):
+        0 (PES)    : E = -sum_i U_i                                   -> scalar
+        1 (Dipole) : μ = -sum_i sum_j |r_ij|² * (dU_i/dr_ij_vec)     -> [3]
+        2 (Polar.) : not yet implemented
     """
 
     def __init__(self,
@@ -30,7 +38,7 @@ class TNEP(layers.Layer):
         self.builder = DescriptorBuilder(cfg)
         self.optimizer = SNES(self)
 
-        # W0[t] : [dim_q, num_neurons1]  (input -> hidden)
+        # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type
         self.W0 = self.add_weight(
             name="W0",
             shape=(cfg.num_types, cfg.dim_q, cfg.num_neurons),
@@ -38,7 +46,7 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        # b0[t] : [num_neurons1]  (hidden bias)
+        # b0 : [num_types, num_neurons] — hidden bias per type
         self.b0 = self.add_weight(
             name="b0",
             shape=(cfg.num_types, cfg.num_neurons),
@@ -46,8 +54,7 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        # W1[t] : [num_neurons1]  (hidden -> scalar)
-        # in the C++ code this is stored as an array of length num_neurons1
+        # W1 : [num_types, num_neurons] — hidden-to-scalar weights per type
         self.W1 = self.add_weight(
             name="W1",
             shape=(cfg.num_types, cfg.num_neurons),
@@ -55,7 +62,7 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        # global scalar bias b1 (shared across all types)
+        # b1 : () — global scalar bias shared across all types
         self.b1 = self.add_weight(
             name="b1",
             shape=(),
@@ -64,60 +71,65 @@ class TNEP(layers.Layer):
         )
 
     def predict(self, descriptors, gradients, grad_index, positions, Z, box):
-        """
-        q : [N, dim_q]  per-atom descriptors
-        Z : [N]        integer atom types (0..num_types-1)
+        """Run the forward pass for a single structure.
+
+        Args:
+            descriptors : [N, dim_q]         per-atom SOAP descriptors
+            gradients   : list of N tensors, each [M_i, 3, dim_q]
+                          dq_i/dR_j for each neighbour j (M_i neighbours,
+                          3 Cartesian components, dim_q descriptor dims)
+            grad_index  : list of N lists, each [M_i] int
+                          neighbour atom indices corresponding to gradients
+            positions   : [N, 3]             Cartesian atom positions
+            Z           : [N]               integer type indices (0..num_types-1)
+            box         : [3, 3]             lattice vectors (rows)
 
         Returns:
-            F : [N]  per-atom scalar output (e.g., energy contribution)
+            target_mode 0: scalar total energy
+            target_mode 1: [3] dipole vector
         """
-
         N = tf.shape(Z)[0]
 
-        # Gather per-type parameters - Change to take an input from parameter vector ss?
-        # W0_t: [N, dim_q, num_neurons1]
-        # b0_t: [N, num_neurons1]
-        # W1_t: [N, num_neurons1]
-        W0_t = tf.gather(self.W0, Z)   # index by type
-        b0_t = tf.gather(self.b0, Z)
-        W1_t = tf.gather(self.W1, Z)
+        # Gather per-type weights for each atom
+        W0_t = tf.gather(self.W0, Z)   # [N, dim_q, num_neurons]
+        b0_t = tf.gather(self.b0, Z)   # [N, num_neurons]
+        W1_t = tf.gather(self.W1, Z)   # [N, num_neurons]
 
-        # Hidden layer: h = act(q W0_t + b0_t)
-        # q: [N, dim_q]
-        # We want: [N, num_neurons1]
-        q_exp = tf.expand_dims(descriptors, axis=1)        # [N, 1, dim_q]
-#        print(q_exp.shape, W0_t.shape)
-        h = tf.matmul(q_exp, W0_t)               # [N, 1, num_neurons1]
-#        print(tf.shape(h))
-        h = tf.squeeze(h, axis=1) + b0_t         # [N, num_neurons1]
-        h = self.activation(h)                   # [N, num_neurons1]
+        # Hidden layer: h_i = tanh(q_i @ W0[t_i] + b0[t_i])
+        q_exp = tf.expand_dims(descriptors, axis=1)  # [N, 1, dim_q]
+        h = tf.matmul(q_exp, W0_t)                   # [N, 1, num_neurons]
+        h = tf.squeeze(h, axis=1) + b0_t              # [N, num_neurons]
+        h = self.activation(h)                         # [N, num_neurons]
 
         if self.cfg.target_mode == 0:
-            # Output layer: F_i = h_i · W1_t + b1
-            # (elementwise dot over last dim)
-            E = tf.reduce_sum(h * W1_t, axis=1)  # single value scalar
-            E = E + self.b1  # global bias
+            # PES: E = -sum_i (h_i . W1[t_i] + b1)
+            E = tf.reduce_sum(h * W1_t, axis=1)  # [N] per-atom energies
+            E = E + self.b1
             E = tf.reduce_sum(E)
             return -E
         elif self.cfg.target_mode == 1:
-            dr, rij = self.builder.pairwise_displacements(tf.convert_to_tensor(positions, dtype=tf.float32), tf.convert_to_tensor(box, dtype=tf.float32))
-            mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
-            rij2 = tf.square(rij) * mask
+            # Dipole: μ = -sum_i sum_{j!=i} |r_ij|^2 * (dU_i/dr_ij_vec)
+            dr, rij = self.builder.pairwise_displacements(
+                tf.convert_to_tensor(positions, dtype=tf.float32),
+                tf.convert_to_tensor(box, dtype=tf.float32))
+            mask = 1.0 - tf.eye(N, dtype=tf.float32)
+            rij2 = tf.square(rij) * mask  # [N, N] squared scalar distances, self-terms zeroed
 
+            # dU_i/dr_ij_vec for all atoms and their neighbours
             forces = self.calc_forces(h, gradients, W1_t, W0_t)
-            dipole = []
 
+            # Assemble dipole: weight each force by squared distance
+            dipole = []
             for i in range(len(forces)):
                 dipole_i = tf.zeros(3, dtype=tf.float32)
                 for j in range(len(forces[i])):
-                    dipole_i += rij2[i, grad_index[i][j]] * forces[i][j]
+                    neighbor_idx = grad_index[i][j]
+                    rij2_val = rij2[i, neighbor_idx]       # scalar |r_ij|^2
+                    dipole_i += rij2_val * forces[i][j]    # scalar * [3]
                 dipole.append(dipole_i)
 
-            dipole = tf.convert_to_tensor(dipole, dtype=tf.float32)
-#            print(tf.shape(de_dr))
-            dipole = -tf.reduce_sum(dipole, axis=0)
-#            print(tf.shape(dipole))
-            print("dipole calculated == " + str(dipole))
+            dipole = tf.convert_to_tensor(dipole, dtype=tf.float32)  # [N, 3]
+            dipole = -tf.reduce_sum(dipole, axis=0)                  # [3]
             return dipole
         elif self.cfg.target_mode == 2:
             # TODO Polarizability calc
@@ -127,27 +139,63 @@ class TNEP(layers.Layer):
             return
 
     def calc_forces(self, h, gradients, W1_t, W0_t):
-        dtanh = 1.0 - tf.square(h)  # [N, H]
-        de_da = dtanh * W1_t  # [N, H]
-        de_da_exp = tf.expand_dims(de_da, axis=1)  # [N, 1, H]
-        de_dq = tf.matmul(de_da_exp, W0_t, transpose_b=True)
-        de_dq = tf.squeeze(de_dq, axis=1)
-#        print("Energy derivative is shape: " + str(de_dq.shape))
+        """Compute dU_i/dR_j for every atom i and its neighbours j via chain rule.
 
+        Chain rule: dU_i/dR_j = sum_q (dU_i/dq_iq) * (dq_iq/dR_j)
+
+        Args:
+            h         : [N, num_neurons]          hidden activations tanh(a)
+            gradients : list of N tensors, each [M_i, 3, dim_q]
+                        descriptor gradients dq_i/dR_j from quippy
+            W1_t      : [N, num_neurons]          per-atom output weights
+            W0_t      : [N, dim_q, num_neurons]   per-atom input weights
+
+        Returns:
+            forces : list of N tensors, each [M_i, 3]
+                     dU_i/dR_j (3-vector per neighbour)
+        """
+        # dU/dh * dh/da = W1 * (1 - tanh^2(a))
+        dtanh = 1.0 - tf.square(h)                               # [N, H]
+        de_da = dtanh * W1_t                                      # [N, H]
+        # dU/dq = dU/da @ W0^T
+        de_da_exp = tf.expand_dims(de_da, axis=1)                 # [N, 1, H]
+        de_dq = tf.matmul(de_da_exp, W0_t, transpose_b=True)     # [N, 1, dim_q]
+        de_dq = tf.squeeze(de_dq, axis=1)                        # [N, dim_q]
+
+        # Contract dU/dq with dq/dR_j for each atom
         forces = []
         for i in range(len(gradients)):
+            # de_dq[i]: [dim_q] broadcasts with gradients[i]: [M_i, 3, dim_q]
+            # sum over dim_q (axis=-1) -> [M_i, 3]
             force_i = tf.reduce_sum(de_dq[i] * gradients[i], axis=-1)
             forces.append(force_i)
-#        print("Forces is shape: " + str(len(forces)) + str(forces[0].shape))
         return forces
 
     def fit(self, train_data, val_data):
-        # needs to init an optimizer, passing itself and the arguments
+        """Train the model using the SNES evolutionary optimizer.
+
+        Args:
+            train_data : dict with keys descriptors, gradients, grad_index,
+                         positions, Z_int, targets, boxes (lists over structures)
+            val_data   : same structure, used for validation each generation
+
+        Returns:
+            history : dict with keys generation, train_loss, val_loss (lists)
+        """
         history = self.optimizer.fit(train_data, val_data)
-        # performs n generation loops, calculating fitness and updating parameter values
         return history
 
     def score(self, test_data):
+        """Evaluate RMSE over all structures in test_data.
+
+        Args:
+            test_data : dict, same structure as train_data
+
+        Returns:
+            rmse : scalar tf.Tensor
+                   For PES: RMSE over scalar energies.
+                   For dipole: RMSE over all 3 components across structures.
+        """
         test_descriptors = test_data["descriptors"]
         test_gradients = test_data["gradients"]
         test_grad_index = test_data["grad_index"]

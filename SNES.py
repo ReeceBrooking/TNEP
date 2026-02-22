@@ -3,31 +3,27 @@ import tensorflow as tf
 from TNEPconfig import TNEPconfig
 
 def _set_model_params(model, W0, b0, W1, b1):
+    """Assign weight arrays directly into the TNEP model's tf.Variables."""
     model.W0.assign(W0)
     model.b0.assign(b0)
     model.W1.assign(W1)
     model.b1.assign(b1)
 
 class SNES:
-    """
-    Python SNES that mirrors the GPUMD C++ SNES.
+    """Separable Natural Evolution Strategy optimizer for TNEP.
 
-    Core features mirrored:
-      - Sampling: z = μ + σ * s, with s ~ N(0,1).
-      - Utilities: log-shaped, clipped with max(0, ...), normalized,
-        then shifted to sum to zero.
-      - Per-type ranking: for each type t, we sort the population by
-        fitness[:, t] and store type-specific rankings.
-      - Per-dimension updates: each variable v looks at the ranking
-        of its own type (type_of_variable[v]) and uses that to pair s
-        and utilities.
-      - Updates:
-          μ_v    ← μ_v + σ_v * Σ_p u_p s_(p,v)
-          σ_v    ← σ_v * exp(η_σ * Σ_p u_p (s_(p,v)^2 - 1))
-      - η_σ: computed from dimensionality as in C++:
-          num = dim       (version == 3)
-          num = dim / T   (version != 3, with T = num_types)
-          η_σ = (3 + log(num)) / (5 * sqrt(num)) / 2
+    Maintains a diagonal Gaussian search distribution N(μ, diag(σ²)) over
+    the flattened parameter vector of the TNEP model.  Each generation:
+      1. Sample pop_size candidates: z_p = μ + σ * s_p,  s_p ~ N(0,1)
+      2. Evaluate fitness (RMSE) for each candidate on a random batch
+      3. Rank candidates by fitness, pair with log-shaped utilities
+      4. Update:  μ  ← μ + σ * Σ_p u_p * s_p
+                  σ  ← σ * exp(η_σ * Σ_p u_p * (s_p² - 1))
+
+    Total parameter count = num_types * dim_q * num_neurons   (W0)
+                          + num_types * num_neurons            (b0)
+                          + num_types * num_neurons            (W1)
+                          + 1                                  (b1)
     """
 
     def __init__(self, model):
@@ -37,40 +33,29 @@ class SNES:
         self.batch_size = self.cfg.batch_size
         self.rng = np.random.default_rng(self.cfg.seed)
 
-        # total number of parameters in TNEP
+        # Total number of trainable parameters
         n_W0 = self.cfg.num_types * self.cfg.dim_q * self.cfg.num_neurons
         n_b0 = self.cfg.num_types * self.cfg.num_neurons
         n_W1 = self.cfg.num_types * self.cfg.num_neurons
         n_b1 = 1
-
         self.dim = n_W0 + n_b0 + n_W1 + n_b1
 
-        # Mean and std vectors: μ, σ
-        self.mu = self.rng.uniform(-0.5, 0.5, size=self.dim)   # like C++ (r1 - 0.5)*2
-        self.sigma = np.full(self.dim, self.cfg.init_sigma, float)  # para.sigma0
+        # Search distribution parameters: μ (mean) and σ (std dev)
+        self.mu = self.rng.uniform(-0.5, 0.5, size=self.dim)
+        self.sigma = np.full(self.dim, self.cfg.init_sigma, float)
 
-        # Precompute η_sigma as in C++ SNES constructor
         self.eta_sigma = self.compute_eta_sigma()
         self.utilities = self.compute_utilities()
 
-    # ------------------------------------------------------------------ #
-    # η_sigma and utilities                                              #
-    # ------------------------------------------------------------------ #
     def calc_rmse(self, y_true, y_pred):
-        """
-        Explicit RMSE.
+        """Compute RMSE between prediction and target.
 
-        Parameters
-        ----------
-        y_true : tf.Tensor or array
-            Shape: (...)  (scalar, vector, or tensor)
-        y_pred : tf.Tensor or array
-            Same shape as y_true
+        Args:
+            y_true : scalar or [3] tensor — target value
+            y_pred : same shape as y_true — predicted value
 
-        Returns
-        -------
-        float
-            Root mean squared error
+        Returns:
+            float — root mean squared error over all elements
         """
         y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
         y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
@@ -82,39 +67,27 @@ class SNES:
         return float(rmse_val.numpy())
 
     def compute_eta_sigma(self) -> float:
-        """
-        Mirror C++:
+        """Compute the σ learning rate from total parameter dimensionality.
 
-            int num = number_of_variables;
-            if (para.version != 3) {
-                num /= para.num_types;
-            }
-            eta_sigma = (3.0f + std::log(num)) / (5.0f * sqrt(num)) / 2.0f;
-
-        Notes:
-          - We guard against division by zero when num_types == 0 by
-            using num_types = 1 in that case.
+        Returns:
+            η_σ : float — controls how fast σ adapts.
+                  η_σ = (3 + ln(dim)) / (5 * sqrt(dim)) / 2
         """
-        #num = float(self.dim_q)
         num = float(self.dim)
-
-        # Avoid weird edge cases
         num = max(num, 1.0)
         eta_sigma = (3.0 + np.log(num)) / (5.0 * np.sqrt(num)) / 2.0
         return float(eta_sigma)
 
     def compute_utilities(self) -> np.ndarray:
-        """
-        Mirror SNES::calculate_utility():
+        """Precompute rank-based utility weights for the population.
 
-            for n in 0..popsize-1:
-                utility[n] = max(0, log(λ*0.5 + 1) - log(n+1))
-            normalize to sum=1
-            then utility[n] = utility[n]/sum - 1/λ
+        Utilities are log-shaped and zero-centred so that top-ranked
+        individuals contribute positive gradient and bottom-ranked
+        contribute negative.  Computed once at init.
 
-        In C++ these are later used for all types (same u for each type).
+        Returns:
+            utilities : ndarray [pop_size] — weights indexed by rank (0 = best).
         """
-        # Utilities should be calculated in init stage, then applied as a map to the sorted fitness matrix to avoid computing utilities over and over again
 
         λ = self.cfg.pop_size
 
@@ -122,109 +95,61 @@ class SNES:
         ranks += 1
 
         raw = np.log(λ * 0.5 + 1.0) - np.log(ranks)
-        raw = np.maximum(0.0, raw)     # max(0, ...)
+        raw = np.maximum(0.0, raw)
 
-        # sum the columns and divide columns by sum if more than zero
-        sum = tf.reduce_sum(raw).numpy()
-
-        if sum > 0:
-            raw /= sum
-        # normalize to sum = 1
+        # Normalise to sum=1, then shift to zero-mean
+        total = tf.reduce_sum(raw).numpy()
+        if total > 0:
+            raw /= total
         utilities = raw - 1.0 / λ
         print("utilities = ", utilities)
         return utilities
 
-    # ------------------------------------------------------------------ #
-    # Sampling: create population (gpu_create_population)                #
-    # ------------------------------------------------------------------ #
     def ask(self):
+        """Sample pop_size candidate parameter vectors from N(μ, diag(σ²)).
+
+        Returns:
+            samples : ndarray [pop_size, dim] — candidate parameter vectors
+            s       : ndarray [pop_size, dim] — standard normal noise used
         """
-        Sample a population from N(μ, diag(σ²)).
-
-        Mirrors gpu_create_population:
-
-            s ~ N(0,1)
-            population = μ + σ * s
-
-        Returns
-        -------
-        population : (popsize, dim) array
-            Candidate parameter vectors.
-        """
-        # s_(p,v) ~ N(0, 1)
         s = self.rng.standard_normal(size=(self.cfg.pop_size, self.dim))
-        # z_(p,v) = μ_v + σ_v * s_(p,v)
-    #    print(s)
         samples = self.mu + s * self.sigma
         return samples, s
 
-    # ------------------------------------------------------------------ #
-    # Update: use per-type ranking + utilities to update μ, σ           #
-    # ------------------------------------------------------------------ #
     def update(self, utilities, s):
+        """Update μ and σ using fitness-ranked noise vectors.
+
+        Args:
+            utilities : ndarray [pop_size]     rank-based weights (best first)
+            s         : ndarray [pop_size, dim] noise vectors sorted by fitness
+                        (s[0] = noise of best individual, s[-1] = worst)
+
+        Mutates self.mu and self.sigma in place.
         """
-        Update μ and σ using provided fitnesses and stored samples s.
-
-        Parameters
-        ----------
-        fitness_matrix : np.ndarray, shape (popsize, total_types)
-            fitness_matrix[p, t] should be the (scalar) total loss
-            for individual p and type t, including regularization
-            etc. This mirrors the 'fitness[p + (7*t + 0)*population_size]'
-            column used in C++ when sorting.
-
-            - Smaller is better (we MINIMIZE).
-            - total_types = num_types + 1, index t in [0..num_types].
-
-        Behavior:
-          - For each type t, we sort the population indices by
-            fitness_matrix[:, t] ascending → index[t, :]
-          - For each variable v, we look up type = type_of_variable[v],
-            and use index[type, :] as the ordering for s_(p,v).
-          - We then apply the same μ/σ update as gpu_update_mu_and_sigma.
-        """
-        cfg = self.cfg
-
         grad_mu = np.zeros(self.dim, dtype=float)
         grad_sigma = np.zeros(self.dim, dtype=float)
 
-        for i in range(cfg.pop_size):
-
-            # accumulate gradients
+        for i in range(self.cfg.pop_size):
             grad_mu    += utilities[i] * s[i]
             grad_sigma += utilities[i] * (s[i]**2 - 1.0)
 
-        # Update μ and σ
         self.mu += self.sigma * grad_mu
         self.sigma = self.sigma * np.exp(self.eta_sigma * grad_sigma)
 
-    # ------------------------------------------------------------------ #
-    # Complete optimization loop (CPU-only version of SNES::compute)    #
-    # ------------------------------------------------------------------ #
     def fit(self, train_data, val_data):
-        """
-        Run SNES for a fixed number of generations (training mode only).
+        """Run the SNES training loop for num_generations generations.
 
-        Parameters
-        ----------
-        fitness_fn : callable
-            Function that takes population (popsize, dim) and returns
-            fitness_matrix (popsize, num_types + 1), where each entry
-            is the scalar 'total loss' for that type, to be minimized.
-        n_generations : int
-            Number of SNES generations.
-        callback : callable or None
-            If given, called as:
-                callback(gen, mu, sigma, best_fitness_per_type)
+        Each generation: sample pop_size candidates, evaluate each on a
+        random batch of batch_size structures, rank by RMSE, update μ/σ.
+        After updating, sets the model weights to the current μ.
 
-        Returns
-        -------
-        mu : (dim,) array
-            Final μ.
-        sigma : (dim,) array
-            Final σ.
-        history : list of np.ndarray
-            Each entry is (num_types+1,) array of best fitness per type.
+        Args:
+            train_data : dict with keys descriptors, gradients, grad_index,
+                         positions, Z_int, targets, boxes (lists over structures)
+            val_data   : same structure, used for validation each generation
+
+        Returns:
+            history : dict with keys generation, train_loss, val_loss (lists)
         """
         print("Fitting model...")
         train_descriptors = train_data["descriptors"]
@@ -241,56 +166,33 @@ class SNES:
             "val_loss": [],
         }
         for gen in range(cfg.num_generations):
-            # 1. Sample population and reconstruct weights and biases
             samples, s = self.ask()
+            fitness_matrix = np.zeros(shape=cfg.pop_size, dtype=float)
 
-            # cycle through each sample
-            fitness_matrix = np.zeros(shape = cfg.pop_size, dtype = float)
-
+            # Evaluate each candidate on a random batch of structures
             for i in range(cfg.pop_size):
                 W0, b0, W1, b1 = self.reconstruct_params(samples[i])
-                # update model layers with sample weights and biases
                 _set_model_params(self.model, W0, b0, W1, b1)
 
-                # 2. Compute fitness per individual and type
                 rmse = []
                 rng = np.random.default_rng()
                 indices = np.arange(len(train_positions))
                 rng.shuffle(indices)
                 for j in indices[:cfg.batch_size]:
-                    descriptors = train_descriptors[j]
-                    gradients = train_gradients[j]
-                    targets = train_targets[j]
-                    Z = train_z[j]
-                    positions = train_positions[j]
-                    box = boxes[j]
-                    grad_index = train_grad_index[j]
+                    y_pred = self.model.predict(
+                        train_descriptors[j], train_gradients[j],
+                        train_grad_index[j], train_positions[j],
+                        train_z[j], boxes[j])
+                    rmse.append(self.calc_rmse(train_targets[j], y_pred))
 
-                    # Forward pass
-                    y_pred = self.model.predict(descriptors, gradients, grad_index, positions, Z, box)
-
-                    # MSE per-sample
-#                    print(tf.shape(y_pred), tf.shape(targets))
- #                   print(tf.shape(y_pred) == tf.shape(targets))
-#                    assert tf.shape(targets) == tf.shape(y_pred)
-#                    mse += loss_fn(targets, y_pred)  # same shape as targets
-                    rmse.append(self.calc_rmse(targets, y_pred))
-
-                # RMSE
-
-                # Total fitness = sum over features
                 fitness_matrix[i] = tf.reduce_mean(rmse)
 
-                assert fitness_matrix.shape[0] == cfg.pop_size
-
-#            print("Fitness matrix at generation " + str(gen) + " = " + str(fitness_matrix))
-            tf.convert_to_tensor(fitness_matrix, dtype = tf.float32)
             avg_fitness = tf.reduce_mean(fitness_matrix)
-            # Rank fitness and index to utilities
+
+            # Rank by fitness (ascending) and pair with utilities for update
             ranks = np.argsort(fitness_matrix)
             s_sorted = s[ranks]
 
-            # 3. SNES update
             val_fitness = self.validate(val_data)
             self.update(self.utilities, s_sorted)
 
@@ -298,14 +200,23 @@ class SNES:
             history["train_loss"].append(avg_fitness)
             history["val_loss"].append(val_fitness)
 
-            # 4. Reconstruct weights from flat parameter vector and update model
+            # Set model weights to the updated mean
             W0, b0, W1, b1 = self.reconstruct_params(self.mu)
             _set_model_params(self.model, W0, b0, W1, b1)
-            print("Generation " + str(gen + 1) + "/" + str(cfg.num_generations) + " finished with " + str(cfg.batch_size * (gen + 1)) + " batches completed.")
+            print(f"Generation {gen + 1}/{cfg.num_generations} complete, "
+                  f"train RMSE: {float(avg_fitness):.4f}, val RMSE: {float(val_fitness):.4f}")
 
         return history
 
     def validate(self, val_data):
+        """Compute mean RMSE on a random subset of val_size validation structures.
+
+        Args:
+            val_data : dict, same structure as train_data
+
+        Returns:
+            fitness : scalar tf.Tensor — mean RMSE across sampled structures
+        """
         rmse = []
         val_descriptors = val_data["descriptors"]
         val_gradients = val_data["gradients"]
@@ -320,22 +231,11 @@ class SNES:
         rng.shuffle(indices)
 
         for j in indices[:self.cfg.val_size]:
+            y_pred = self.model.predict(
+                val_descriptors[j], val_gradients[j], val_grad_index[j],
+                val_positions[j], val_z[j], boxes[j])
+            rmse.append(self.calc_rmse(val_targets[j], y_pred))
 
-            descriptors = val_descriptors[j]
-            gradients = val_gradients[j]
-            grad_index = val_grad_index[j]
-            positions = val_positions[j]
-            Z = val_z[j]
-            targets = val_targets[j]
-            box = boxes[j]
-
-            # Loss function
-
-            # Forward pass
-            y_pred = self.model.predict(descriptors, gradients, grad_index, positions, Z, box)
-            rmse.append(self.calc_rmse(targets, y_pred))
-
-        # RMSE
         fitness = tf.reduce_mean(rmse)
         return fitness
 
@@ -384,5 +284,4 @@ class SNES:
         W1 = W1_flat.reshape((T, H))
         b1 = float(b1_flat[0])
 
-        # Add per type handling
         return W0, b0, W1, b1
