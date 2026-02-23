@@ -217,9 +217,13 @@ train_data, test_data, val_data = split(dataset, dataset_types_int, cfg)
 
 # dim_q is determined by the SOAP descriptor size
 cfg.dim_q = train_data["descriptors"][0].shape[-1]
+print("Dimension of q: " + str(cfg.dim_q))
 
 model = TNEP(cfg)
+print("Model Parameters: " + str(model.optimizer.dim))
+
 history = model.fit(train_data, val_data)
 print("Model test set RMSE: " + str(model.score(test_data)))
 print("Run complete!")
+
 plot_snes_history(history)

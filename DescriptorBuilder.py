@@ -26,7 +26,7 @@ class DescriptorBuilder(layers.Layer):
         self.rc = cfg.rc
 
         base = (
-            "soap_turbo l_max=8 "
+            "soap_turbo l_max=3 "
             "rcut_hard=3.7 rcut_soft=3.2 basis=poly3gauss scaling_mode=polynomial add_species=F "
             "radial_enhancement=1 compress_mode=trivial "
         )
@@ -40,7 +40,7 @@ class DescriptorBuilder(layers.Layer):
         central_weight = " central_weight={"
 
         for a in range(self.num_types):
-            alpha_max += "8 "
+            alpha_max += "3 "
             atom_sigma_r += "0.5 "
             atom_sigma_t += "0.5 "
             atom_sigma_r_scaling += "0.0 "
