@@ -12,27 +12,36 @@ class TNEPconfig:
     # Number of structures used in each train step
     batch_size: int = 10
     # Number of samples made in each train generation
-    pop_size: int = 100
+    pop_size: int | None = None
     # Number of training generations (number of updates to the model)
-    num_generations: int = 40
+    num_generations: int = 100
 
-    n_radial: int = 3
-    n_radial_ang: int = 3
-    Lmax: int = 2
+    # SOAP Turbo descriptor parameters
+    l_max: int = 3
+    alpha_max: int = 3
 
     # Cutoff radius value
     rc: float = 6.0
 
+    # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
+    toggle_regularization: bool = True
+    lambda_1: float | None = None
+    lambda_2: float | None = None
+
+    # Early stopping patience (None = disabled)
+    patience: int | None = 20
+
     activation: str = 'tanh'
     # Initial distribution standard deviation
     init_sigma: float = 0.1
+    # Seed for randomisation
     seed: int | None = None
     # 0 : PES, 1 : Dipole, 2 : Polarizability
     target_mode : int = 1
     # Test split ratio
     test_ratio : float = 0.2
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N : int = 800
+    total_N : int = 1000
     # Number of structures in each validation step
     val_size : int = 10
 

@@ -23,7 +23,13 @@ class TNEP(layers.Layer):
     Prediction modes (cfg.target_mode):
         0 (PES)    : E = -sum_i U_i                                   -> scalar
         1 (Dipole) : μ = -sum_i sum_j |r_ij|² * (dU_i/dr_ij_vec)     -> [3]
-        2 (Polar.) : not yet implemented
+        2 (Polar.) : α[6] via dual ANN (scalar + tensor)              -> [6]
+
+    For mode 2 (polarizability), a second "scalar ANN" is added:
+        W0_pol, b0_pol, W1_pol, b1_pol
+    The scalar ANN computes per-atom F_pol -> diagonal components.
+    The tensor ANN (primary W0/b0/W1/b1) computes forces -> off-diagonal + virial.
+    Output: [xx, yy, zz, xy, yz, zx]
     """
 
     def __init__(self,
@@ -70,6 +76,33 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
+        # Scalar ANN for polarizability mode (target_mode == 2)
+        if cfg.target_mode == 2:
+            self.W0_pol = self.add_weight(
+                name="W0_pol",
+                shape=(cfg.num_types, cfg.dim_q, cfg.num_neurons),
+                initializer="glorot_uniform",
+                trainable=True,
+            )
+            self.b0_pol = self.add_weight(
+                name="b0_pol",
+                shape=(cfg.num_types, cfg.num_neurons),
+                initializer="zeros",
+                trainable=True,
+            )
+            self.W1_pol = self.add_weight(
+                name="W1_pol",
+                shape=(cfg.num_types, cfg.num_neurons),
+                initializer="glorot_uniform",
+                trainable=True,
+            )
+            self.b1_pol = self.add_weight(
+                name="b1_pol",
+                shape=(),
+                initializer="zeros",
+                trainable=True,
+            )
+
     def predict(self, descriptors, gradients, grad_index, positions, Z, box):
         """Run the forward pass for a single structure.
 
@@ -87,6 +120,7 @@ class TNEP(layers.Layer):
         Returns:
             target_mode 0: scalar total energy
             target_mode 1: [3] dipole vector
+            target_mode 2: [6] polarizability tensor [xx, yy, zz, xy, yz, zx]
         """
         N = tf.shape(Z)[0]
 
@@ -132,7 +166,49 @@ class TNEP(layers.Layer):
             dipole = -tf.reduce_sum(dipole, axis=0)                  # [3]
             return dipole
         elif self.cfg.target_mode == 2:
-            # TODO Polarizability calc
+            # Polarizability via dual ANN (GPUMD tnep.cu apply_ann_pol)
+            # Scalar ANN -> per-atom F_pol -> diagonal polarizability
+            # Tensor ANN -> forces via descriptor gradients -> off-diagonal
+            dr, rij = self.builder.pairwise_displacements(
+                tf.convert_to_tensor(positions, dtype=tf.float32),
+                tf.convert_to_tensor(box, dtype=tf.float32))
+            mask = 1.0 - tf.eye(N, dtype=tf.float32)
+
+            # --- Scalar ANN (polarizability-specific weights) ---
+            W0p_t = tf.gather(self.W0_pol, Z)  # [N, dim_q, H]
+            b0p_t = tf.gather(self.b0_pol, Z)  # [N, H]
+            W1p_t = tf.gather(self.W1_pol, Z)  # [N, H]
+
+            h_pol = tf.matmul(q_exp, W0p_t)                    # [N, 1, H]
+            h_pol = tf.squeeze(h_pol, axis=1) + b0p_t           # [N, H]
+            h_pol = self.activation(h_pol)                       # [N, H]
+            F_pol = tf.reduce_sum(h_pol * W1p_t, axis=1) + self.b1_pol  # [N]
+
+            # Diagonal: alpha_aa = sum_i(F_pol_i) + sum_ij(-r_ij_a * f_ij_a)
+            scalar_sum = tf.reduce_sum(F_pol)  # scalar
+
+            # --- Tensor ANN (primary weights) -> forces ---
+            forces = self.calc_forces(h, gradients, W1_t, W0_t)
+
+            # Assemble 6-component polarizability: [xx, yy, zz, xy, yz, zx]
+            # Component pairs: (0,0), (1,1), (2,2), (0,1), (1,2), (2,0)
+            comp_pairs = [(0, 0), (1, 1), (2, 2), (0, 1), (1, 2), (2, 0)]
+            pol = tf.zeros(6, dtype=tf.float32)
+
+            for i in range(len(forces)):
+                for j_idx in range(len(forces[i])):
+                    neighbor = grad_index[i][j_idx]
+                    r_vec = dr[i, neighbor]         # [3] displacement vector
+                    f_vec = forces[i][j_idx]        # [3] force vector
+
+                    for c, (a, b) in enumerate(comp_pairs):
+                        contrib = -r_vec[a] * f_vec[b]
+                        pol = pol + tf.one_hot(c, 6, dtype=tf.float32) * contrib
+
+            # Add scalar ANN contribution to diagonal components
+            for c in range(3):  # xx, yy, zz
+                pol = pol + tf.one_hot(c, 6, dtype=tf.float32) * scalar_sum
+
             return pol
         else:
             print("target mode not supported")

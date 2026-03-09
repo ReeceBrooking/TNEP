@@ -85,29 +85,37 @@ def split(dataset, dataset_types_int, cfg):
     test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(test_dataset)
 
     """
-    # Scale descriptors to [-1, 1] per component using train set statistics
-    q_min, q_max = DescriptorBuilder.compute_scaling(train_descriptors)
+    # Scale descriptors by inverse range (GPUMD q_scaler convention)
+    q_scaler = DescriptorBuilder.compute_q_scaler(train_descriptors)
     train_descriptors, train_gradients = DescriptorBuilder.apply_scaling(
-        train_descriptors, train_gradients, q_min, q_max)
+        train_descriptors, train_gradients, q_scaler)
     val_descriptors, val_gradients = DescriptorBuilder.apply_scaling(
-        val_descriptors, val_gradients, q_min, q_max)
+        val_descriptors, val_gradients, q_scaler)
     test_descriptors, test_gradients = DescriptorBuilder.apply_scaling(
-        test_descriptors, test_gradients, q_min, q_max)
+        test_descriptors, test_gradients, q_scaler)
     """
 
     if cfg.target_mode == 0:
         target = "energy"
-    if cfg.target_mode == 1:
+    elif cfg.target_mode == 1:
         target = "dipole"
     elif cfg.target_mode == 2:
         target = "pol"
+
+    def _extract_target(structure, target_key):
+        """Extract target, converting 9-component polarizability to 6-component if needed."""
+        raw = np.asarray(structure.info[target_key], dtype=np.float32)
+        if raw.size == 9:
+            # Flattened 3x3 row-major -> unique [xx, yy, zz, xy, yz, zx]
+            raw = raw[[0, 4, 8, 1, 5, 6]]
+        return tf.convert_to_tensor(raw, dtype=tf.float32)
 
     def subset(input, descriptors, gradients, grad_index, types_int, target):
         return {
             "positions": [tf.convert_to_tensor(structure.positions, dtype = tf.float32) for structure in input],
             "Z": [structure.numbers for structure in input],
             "Z_int": [tf.convert_to_tensor(structure_types_int, dtype = tf.int32) for structure_types_int in types_int],
-            "targets": [tf.convert_to_tensor(structure.info[target], dtype = tf.float32) for structure in input],
+            "targets": [_extract_target(structure, target) for structure in input],
             "boxes": [tf.convert_to_tensor(structure.cell.array, dtype = tf.float32) for structure in input],
             "descriptors": descriptors,
             "gradients": gradients,
@@ -178,11 +186,32 @@ def print_dipole_statistics(dataset, target_key="dipole"):
     print(f"  |μ| range: [{norms.min():.4f}, {norms.max():.4f}]")
     print(f"  |μ| mean:  {norms.mean():.4f}  std: {norms.std():.4f}")
 
+def print_polarizability_statistics(dataset, target_key="pol"):
+    """Print min/max/mean/std of polarizability targets across the dataset.
+
+    Args:
+        dataset    : list of ase.Atoms with info[target_key] = [6] or [9] array
+        target_key : str key in Atoms.info holding the polarizability tensor
+    """
+    pols = []
+    for s in dataset:
+        raw = np.asarray(s.info[target_key], dtype=np.float32)
+        if raw.size == 9:
+            raw = raw[[0, 4, 8, 1, 5, 6]]
+        pols.append(raw)
+    pols = np.array(pols)
+    labels = ["xx", "yy", "zz", "xy", "yz", "zx"]
+    print("=== Polarizability Target Statistics ===")
+    print(f"  N structures: {len(pols)}")
+    for i, lbl in enumerate(labels):
+        print(f"  {lbl}: [{pols[:,i].min():.4f}, {pols[:,i].max():.4f}]  "
+              f"mean={pols[:,i].mean():.4f}  std={pols[:,i].std():.4f}")
+
 cfg = TNEPconfig()
 
 # Load raw dataset and assign initial type indices
 dataset, dataset_types_int = collect(cfg)
-print("Number of species in dataset: " + str(cfg.num_types))
+print("Number of species in raw dataset: " + str(cfg.num_types))
 print("Number of structures in raw dataset: " + str(len(dataset)))
 
 # Filter to structures containing only C, H, O (Z = 6, 1, 8)
@@ -209,6 +238,8 @@ print("Species after filter: " + str(cfg.types) + " (" + str(cfg.num_types) + " 
 
 if cfg.target_mode == 1:
     print_dipole_statistics(dataset)
+elif cfg.target_mode == 2:
+    print_polarizability_statistics(dataset)
 
 cfg.randomise(dataset)
 
@@ -221,6 +252,9 @@ print("Dimension of q: " + str(cfg.dim_q))
 
 model = TNEP(cfg)
 print("Model Parameters: " + str(model.optimizer.dim))
+print("Population Size: " + str(model.optimizer.pop_size))
+print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
+print("Parameter Root " + str(np.sqrt(model.optimizer.dim)))
 
 history = model.fit(train_data, val_data)
 print("Model test set RMSE: " + str(model.score(test_data)))
