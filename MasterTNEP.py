@@ -37,9 +37,10 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     print("Number of species in raw dataset: " + str(cfg.num_types))
     print("Number of structures in raw dataset: " + str(len(dataset)))
 
-    # Filter to structures containing only C, H, O (Z = 6, 1, 8)
-    dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=[6, 1, 8])
-    print("After C/H/O filter: " + str(len(dataset)) + " structures")
+    # Filter by species if configured
+    if cfg.allowed_species is not None:
+        dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species)
+        print("After species filter: " + str(len(dataset)) + " structures")
 
     # Recompute type list and indices after filtering
     cfg.num_types = 0
