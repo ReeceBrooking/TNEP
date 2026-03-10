@@ -11,6 +11,9 @@ class TNEPconfig:
     """
 
     data_path: str = "train.xyz"
+    # Filter dataset to structures containing only these species
+    # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
+    allowed_species: list[int | str] | None = None
     num_neurons: int = 30
     # Number of structures used in each train step
     batch_size: int | None = 50
