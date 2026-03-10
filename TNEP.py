@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras import layers
+from typing import Callable
 
 from DescriptorBuilder import DescriptorBuilder
 from SNES import SNES
@@ -34,7 +37,7 @@ class TNEP(layers.Layer):
 
     def __init__(self,
                  cfg: TNEPconfig,
-                 **kwargs):
+                 **kwargs) -> None:
         super().__init__(**kwargs)
         self.cfg = cfg
         self.dim_q = cfg.dim_q
@@ -103,8 +106,9 @@ class TNEP(layers.Layer):
                 trainable=True,
             )
 
-    def predict(self, descriptors, gradients, grad_index, positions, Z, box,
-                atom_mask, neighbor_mask):
+    def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,
+                positions: tf.Tensor, Z: tf.Tensor, box: tf.Tensor,
+                atom_mask: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:
         """Run the forward pass for a single structure using padded tensors.
 
         Args:
@@ -207,7 +211,8 @@ class TNEP(layers.Layer):
                                   0.0, 0.0, 0.0])
             return pol
 
-    def calc_forces(self, h, gradients, W1_t, W0_t, neighbor_mask):
+    def calc_forces(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
+                    W0_t: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:
         """Compute dU_i/dR_j for every atom i and its neighbours j via chain rule.
 
         Vectorized version — no Python loops. Uses padded gradient tensors.
@@ -233,7 +238,8 @@ class TNEP(layers.Layer):
         forces = forces * neighbor_mask[:, :, tf.newaxis]
         return forces
 
-    def fit(self, train_data, val_data, plot_callback=None):
+    def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor],
+            plot_callback: Callable | None = None) -> dict:
         """Train the model using the SNES evolutionary optimizer.
 
         Args:
@@ -248,7 +254,7 @@ class TNEP(layers.Layer):
         history = self.optimizer.fit(train_data, val_data, plot_callback=plot_callback)
         return history
 
-    def score(self, test_data):
+    def score(self, test_data: dict[str, tf.Tensor]) -> tuple[dict[str, tf.Tensor], tf.Tensor]:
         """Evaluate RMSE, R², per-component R², and cosine similarity.
 
         Args:
@@ -308,9 +314,12 @@ class TNEP(layers.Layer):
         return metrics, preds
 
     @tf.function
-    def predict_batch(self, descriptors, gradients, grad_index, positions, Z,
-                      boxes, atom_mask, neighbor_mask,
-                      W0, b0, W1, b1, W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None):
+    def predict_batch(self, descriptors: tf.Tensor, gradients: tf.Tensor,
+                      grad_index: tf.Tensor, positions: tf.Tensor, Z: tf.Tensor,
+                      boxes: tf.Tensor, atom_mask: tf.Tensor, neighbor_mask: tf.Tensor,
+                      W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor, b1: tf.Tensor,
+                      W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
+                      W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures with explicit weight tensors.
 
         Weights are passed explicitly (not read from self) so this method can
@@ -368,7 +377,8 @@ class TNEP(layers.Layer):
             tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
             return tf.zeros([tf.shape(descriptors)[0], 1])
 
-    def _calc_forces_batch(self, h, gradients, W1_t, W0_t, neighbor_mask):
+    def _calc_forces_batch(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
+                           W0_t: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:
         """Batched calc_forces: [B,A,H] inputs -> [B,A,M,3] forces."""
         dtanh = 1.0 - tf.square(h)                                    # [B, A, H]
         de_da = dtanh * W1_t                                           # [B, A, H]
@@ -377,7 +387,8 @@ class TNEP(layers.Layer):
         forces = forces * neighbor_mask[:, :, :, tf.newaxis]
         return forces
 
-    def _pairwise_displacements_batch(self, positions, boxes):
+    def _pairwise_displacements_batch(self, positions: tf.Tensor,
+                                      boxes: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
         """Batched pairwise displacements under minimum image convention.
 
         Args:
@@ -399,8 +410,9 @@ class TNEP(layers.Layer):
         rij = tf.linalg.norm(dr, axis=-1)                          # [B, A, A]
         return dr, rij
 
-    def _dipole_batch(self, forces, positions, boxes, grad_index,
-                      atom_mask, neighbor_mask):
+    def _dipole_batch(self, forces: tf.Tensor, positions: tf.Tensor, boxes: tf.Tensor,
+                      grad_index: tf.Tensor, atom_mask: tf.Tensor,
+                      neighbor_mask: tf.Tensor) -> tf.Tensor:
         """Batched dipole prediction.
 
         Args:
@@ -433,9 +445,12 @@ class TNEP(layers.Layer):
         dipole = -tf.reduce_sum(dipole_contribs, axis=[1, 2])            # [B, 3]
         return dipole
 
-    def _polarizability_batch(self, descriptors, forces, positions, boxes, Z,
-                              grad_index, atom_mask, neighbor_mask,
-                              W0_pol, b0_pol, W1_pol, b1_pol):
+    def _polarizability_batch(self, descriptors: tf.Tensor, forces: tf.Tensor,
+                              positions: tf.Tensor, boxes: tf.Tensor, Z: tf.Tensor,
+                              grad_index: tf.Tensor, atom_mask: tf.Tensor,
+                              neighbor_mask: tf.Tensor, W0_pol: tf.Tensor,
+                              b0_pol: tf.Tensor, W1_pol: tf.Tensor,
+                              b1_pol: tf.Tensor) -> tf.Tensor:
         """Batched polarizability via dual ANN (GPUMD approach).
 
         Scalar ANN (W0_pol..b1_pol) -> isotropic diagonal.

@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import numpy as np
+
 
 class TNEPconfig:
     """Holds all hyperparameters and runtime state for a TNEP training run.
@@ -10,18 +13,27 @@ class TNEPconfig:
     data_path: str = "train.xyz"
     num_neurons: int = 30
     # Number of structures used in each train step
-    batch_size: int | None = None
+    batch_size: int | None = 50
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 40000
+    num_generations: int = 10000
 
     # SOAP Turbo descriptor parameters
     l_max: int = 4
     alpha_max: int = 4
-
-    # Cutoff radius value
-    rc: float = 6.0
+    rcut_hard: float = 3.7
+    rcut_soft: float = 3.2
+    basis: str = "poly3gauss"
+    scaling_mode: str = "polynomial"
+    radial_enhancement: int = 1
+    compress_mode: str = "trivial"
+    atom_sigma_r: float = 0.5
+    atom_sigma_t: float = 0.5
+    atom_sigma_r_scaling: float = 0.0
+    atom_sigma_t_scaling: float = 0.0
+    amplitude_scaling: float = 1.0
+    central_weight: float = 1.0
 
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
@@ -29,7 +41,7 @@ class TNEPconfig:
     lambda_2: float | None = 0.001
 
     # Early stopping patience (None = disabled)
-    patience: int | None = None
+    patience: int | None = 5000
 
     # Sigma reset: reinitialise sigma when it collapses and training stagnates
     # None = disabled; int = generations stagnating + small sigma to trigger reset
@@ -43,13 +55,13 @@ class TNEPconfig:
     # Seed for randomisation
     seed: int | None = None
     # 0 : PES, 1 : Dipole, 2 : Polarizability
-    target_mode : int = 1
+    target_mode: int = 1
     # Test split ratio
-    test_ratio : float = 0.2
+    test_ratio: float = 0.2
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N : int = None
+    total_N: int | None = None
     # Number of structures in each validation step (None = use entire val set)
-    val_size : int | None = None
+    val_size: int | None = None
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
     population_chunk_size: int | None = 20
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
@@ -58,17 +70,21 @@ class TNEPconfig:
     # Periodic plotting interval (None = disabled; int = plot every N generations)
     plot_interval: int | None = None
 
-    # Save model after training (None = disabled; str = file path)
-    save_path: str | None = "tnep_model.npz"
+    # Save model after training (None = disabled; "auto" = auto-generate name; str = explicit path)
+    save_path: str | None = "auto"
     # Save final plots to directory (None = disabled; str = directory path)
-    save_plots: str | None = "plots"
+    save_plots: str | None = None #"plots"
+    # Show plots interactively (True = plt.show(), False = close after saving)
+    show_plots: bool = True
+    # Show extra info in progress bar (L1, L2 regularisation)
+    debug: bool = False
 
     dim_q: int
     num_types: int
-    types = []
-    indices : np.ndarray
+    types: list[int] = []
+    indices: np.ndarray
 
-    def randomise(self, dataset):
+    def randomise(self, dataset: list) -> None:
         """Shuffle dataset indices and truncate to total_N.
 
         Sets self.indices : ndarray [total_N] of shuffled structure indices.

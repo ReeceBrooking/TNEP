@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras import layers
 from TNEPconfig import TNEPconfig
 from quippy.descriptors import Descriptor
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ase import Atoms
 
 class DescriptorBuilder(layers.Layer):
     """Builds SOAP-turbo descriptors and their gradients using quippy.
@@ -17,18 +23,20 @@ class DescriptorBuilder(layers.Layer):
 
     def __init__(self,
                  cfg: TNEPconfig,
-                 **kwargs):
+                 **kwargs) -> None:
         super().__init__(**kwargs)
 
         self.cfg = cfg
         self.types = cfg.types
         self.num_types = cfg.num_types
-        self.rc = cfg.rc
 
         base = (
             f"soap_turbo l_max={cfg.l_max} "
-            "rcut_hard=3.7 rcut_soft=3.2 basis=poly3gauss scaling_mode=polynomial add_species=F "
-            "radial_enhancement=1 compress_mode=trivial "
+            f"rcut_hard={cfg.rcut_hard} rcut_soft={cfg.rcut_soft} "
+            f"basis={cfg.basis} scaling_mode={cfg.scaling_mode} "
+            f"add_species=F "
+            f"radial_enhancement={cfg.radial_enhancement} "
+            f"compress_mode={cfg.compress_mode} "
         )
 
         alpha_max = " alpha_max={"
@@ -41,12 +49,12 @@ class DescriptorBuilder(layers.Layer):
 
         for a in range(self.num_types):
             alpha_max += f"{cfg.alpha_max} "
-            atom_sigma_r += "0.5 "
-            atom_sigma_t += "0.5 "
-            atom_sigma_r_scaling += "0.0 "
-            atom_sigma_t_scaling += "0.0 "
-            amplitude_scaling += "1.0 "
-            central_weight += "1. "
+            atom_sigma_r += f"{cfg.atom_sigma_r} "
+            atom_sigma_t += f"{cfg.atom_sigma_t} "
+            atom_sigma_r_scaling += f"{cfg.atom_sigma_r_scaling} "
+            atom_sigma_t_scaling += f"{cfg.atom_sigma_t_scaling} "
+            amplitude_scaling += f"{cfg.amplitude_scaling} "
+            central_weight += f"{cfg.central_weight} "
 
         alpha_max += "}"
         atom_sigma_r += "}"
@@ -67,7 +75,7 @@ class DescriptorBuilder(layers.Layer):
 
         self.builders = [Descriptor(base + f" central_index={k}") for k in (np.arange(self.num_types, dtype=int) + 1)]
 
-    def build_descriptors(self, dataset):
+    def build_descriptors(self, dataset: list[Atoms]) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
         """Compute SOAP descriptors and their gradients for every structure.
 
         Runs each per-type quippy Descriptor with grad=True, then collects
@@ -123,7 +131,7 @@ class DescriptorBuilder(layers.Layer):
         return dataset_descriptors, dataset_gradients, dataset_grad_index
 
     @staticmethod
-    def compute_q_scaler(descriptors):
+    def compute_q_scaler(descriptors: list[tf.Tensor]) -> tf.Tensor:
         """Compute per-component scaling factors from descriptor range.
 
         Matches GPUMD's find_max_min kernel:
@@ -147,7 +155,7 @@ class DescriptorBuilder(layers.Layer):
         return q_scaler
 
     @staticmethod
-    def apply_scaling(descriptors, gradients, q_scaler):
+    def apply_scaling(descriptors: list[tf.Tensor], gradients: list[list[tf.Tensor]], q_scaler: tf.Tensor) -> tuple[list[tf.Tensor], list[list[tf.Tensor]]]:
         """Scale descriptors and gradients by q_scaler (GPUMD convention).
 
         Matches GPUMD's apply_ann kernel:
@@ -184,7 +192,7 @@ class DescriptorBuilder(layers.Layer):
         tf.TensorSpec(shape=[3, 3], dtype=tf.float32),
     ]
 )
-    def _minimum_image_displacement(self, Ri, Rj, box):
+    def _minimum_image_displacement(self, Ri: tf.Tensor, Rj: tf.Tensor, box: tf.Tensor) -> tf.Tensor:
         """Compute displacement vectors Rj - Ri under minimum image convention.
 
         Args:
@@ -209,7 +217,7 @@ class DescriptorBuilder(layers.Layer):
             tf.TensorSpec(shape=[3, 3], dtype=tf.float32),
         ]
     )
-    def pairwise_displacements(self, R, box):
+    def pairwise_displacements(self, R: tf.Tensor, box: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
         """Compute all pairwise displacement vectors and scalar distances under MIC.
 
         Args:

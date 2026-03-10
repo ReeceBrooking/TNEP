@@ -1,9 +1,16 @@
+from __future__ import annotations
+
+import sys
 import time
 import numpy as np
 import tensorflow as tf
+from typing import TYPE_CHECKING, Callable
 from TNEPconfig import TNEPconfig
 
-def _set_model_params(model, *params):
+if TYPE_CHECKING:
+    from TNEP import TNEP
+
+def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight arrays directly into the TNEP model's tf.Variables.
 
     For modes 0/1: (W0, b0, W1, b1)
@@ -39,7 +46,7 @@ class SNES:
                           + 1                                  (b1)
     """
 
-    def __init__(self, model):
+    def __init__(self, model: TNEP) -> None:
         self.model = model
         self.cfg = model.cfg
         self.dim_q = self.cfg.dim_q
@@ -84,7 +91,7 @@ class SNES:
         self.eta_sigma = self.compute_eta_sigma()
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
-    def compute_regularization(self, param_vector):
+    def compute_regularization(self, param_vector: tf.Tensor | np.ndarray) -> tuple[float, float]:
         """Compute L1 and L2 regularization penalties (GPUMD formula).
 
         Works with both numpy arrays and TF tensors.
@@ -148,7 +155,7 @@ class SNES:
         print("utilities = ", utilities)
         return utilities
 
-    def ask(self):
+    def ask(self) -> tuple[tf.Tensor, tf.Tensor]:
         """Sample pop_size candidate parameter vectors from N(mu, diag(sigma^2)).
 
         All operations run on GPU via TensorFlow.
@@ -161,7 +168,7 @@ class SNES:
         samples = self.mu + s * self.sigma
         return samples, s
 
-    def update(self, utilities, s):
+    def update(self, utilities: tf.Tensor, s: tf.Tensor) -> None:
         """Update mu and sigma using fitness-ranked noise vectors.
 
         All operations run on GPU via TensorFlow.
@@ -179,7 +186,7 @@ class SNES:
         self.mu.assign_add(self.sigma * grad_mu)
         self.sigma.assign(self.sigma * tf.exp(self.eta_sigma * grad_sigma))
 
-    def fit(self, train_data, val_data, plot_callback=None):
+    def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor], plot_callback: Callable | None = None) -> dict:
         """Run the SNES training loop using GPU-batched population evaluation.
 
         All sampling, ranking, and update operations run on GPU.
@@ -225,6 +232,7 @@ class SNES:
         best_mu = tf.identity(self.mu)
         best_sigma = tf.identity(self.sigma)
         gens_without_improvement = 0
+        train_start = time.perf_counter()
 
         for gen in range(cfg.num_generations):
             t0 = time.perf_counter()
@@ -292,9 +300,24 @@ class SNES:
             history["sigma_mean"].append(float(tf.reduce_mean(self.sigma)))
             history["sigma_median"].append(float(np.median(self.sigma.numpy())))
 
-            print(f"Generation {gen + 1}/{cfg.num_generations} complete, "
-                  f"train RMSE: {avg_fitness:.4f}, val RMSE: {float(val_fitness):.4f}, "
-                  f"L1: {gen_l1:.6f}, L2: {gen_l2:.6f}")
+            # Progress bar
+            frac = (gen + 1) / cfg.num_generations
+            bar_len = 30
+            filled = int(bar_len * frac)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            elapsed = time.perf_counter() - train_start
+            eta = elapsed / frac * (1 - frac) if frac > 0 else 0
+            elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+            eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
+            line = (f"\r{bar} {gen + 1}/{cfg.num_generations} "
+                    f"train RMSE: {avg_fitness:.4f}  "
+                    f"val RMSE: {float(val_fitness):.4f}  "
+                    f"best val RMSE: {best_val_loss:.4f}  "
+                    f"elapsed: {elapsed_str}  ETA: {eta_str}")
+            if cfg.debug:
+                line += f"  L1: {gen_l1:.6f}  L2: {gen_l2:.6f}"
+            sys.stdout.write(line)
+            sys.stdout.flush()
 
             # Early stopping
             val_loss_scalar = float(val_fitness)
@@ -307,7 +330,7 @@ class SNES:
                 gens_without_improvement += 1
 
             if cfg.patience is not None and gens_without_improvement >= cfg.patience:
-                print(f"Early stopping at generation {gen + 1} "
+                print(f"\nEarly stopping at generation {gen + 1} "
                       f"(no improvement for {cfg.patience} generations)")
                 self.mu.assign(best_mu)
                 self.sigma.assign(best_sigma)
@@ -319,7 +342,7 @@ class SNES:
                 sigma_collapsed = mean_sigma < (cfg.sigma_reset_threshold * cfg.init_sigma)
                 if (gens_without_improvement >= cfg.sigma_reset_patience
                         and sigma_collapsed):
-                    print(f"Sigma reset at generation {gen + 1}: "
+                    print(f"\nSigma reset at generation {gen + 1}: "
                           f"mean sigma {mean_sigma:.6f} < threshold, "
                           f"stagnant for {gens_without_improvement} gens")
                     self.sigma.assign(tf.fill([self.dim], cfg.init_sigma))
@@ -347,16 +370,16 @@ class SNES:
                     params = self.reconstruct_params_tf(self.mu)
                     _set_model_params(self.model, *params)
 
-        # Restore best parameters into model for downstream score() calls
-        if cfg.patience is not None:
-            self.mu.assign(best_mu)
-            self.sigma.assign(best_sigma)
+        print()  # newline after progress bar
+        # Always restore best parameters into model for downstream score() calls
+        self.mu.assign(best_mu)
+        self.sigma.assign(best_sigma)
         params = self.reconstruct_params_tf(self.mu)
         _set_model_params(self.model, *params)
 
         return history
 
-    def validate(self, val_data, mu_tf=None):
+    def validate(self, val_data: dict[str, tf.Tensor], mu_tf: tf.Tensor | None = None) -> float:
         """Compute mean RMSE on a subset of validation structures using batched predict.
 
         Args:
@@ -407,7 +430,7 @@ class SNES:
         rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
         return float(rmse)
 
-    def reconstruct_params(self, param_vector):
+    def reconstruct_params(self, param_vector: np.ndarray) -> tuple:
         """Reconstruct TNEP parameters from a flat numpy vector.
 
         For modes 0/1: returns (W0, b0, W1, b1)
@@ -446,7 +469,7 @@ class SNES:
 
         return W0, b0, W1, b1
 
-    def reconstruct_params_tf(self, param_vectors):
+    def reconstruct_params_tf(self, param_vectors: tf.Tensor) -> tuple:
         """Reconstruct TNEP weight tensors from flat vectors using TF ops.
 
         Works inside @tf.function. Handles single [dim] or batched [P, dim] vectors.
@@ -491,7 +514,7 @@ class SNES:
 
         return W0, b0, W1, b1
 
-    def compute_regularization_tf(self, param_vectors):
+    def compute_regularization_tf(self, param_vectors: tf.Tensor) -> tf.Tensor:
         """Compute L1+L2 regularization for batched parameter vectors.
 
         Args:
@@ -505,7 +528,7 @@ class SNES:
             tf.reduce_sum(tf.square(param_vectors), axis=1) / self.dim)
         return l1 + l2
 
-    def evaluate_population(self, samples_tf, batch_data):
+    def evaluate_population(self, samples_tf: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
         """Evaluate all SNES candidates on a batch of structures on GPU.
 
         Chunks along both population (population_chunk_size) and structure
@@ -568,7 +591,7 @@ class SNES:
         return fitness
 
     @tf.function
-    def _evaluate_chunk(self, chunk_samples, batch_data):
+    def _evaluate_chunk(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
         """Evaluate a chunk of C candidates on B structures.
 
         Returns sum of squared errors (not RMSE) so that structure chunks
