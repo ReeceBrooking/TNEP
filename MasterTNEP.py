@@ -42,8 +42,8 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species)
         print("After species filter: " + str(len(dataset)) + " structures")
 
-    # Recompute type list and indices after filtering
-    cfg.num_types = 0
+    # Recompute type list and indices (needed after filtering, and to normalise
+    # the inconsistent indexing from collect())
     cfg.types = []
     for struct in dataset:
         for z in struct.numbers:
