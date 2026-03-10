@@ -13,14 +13,14 @@ class TNEPconfig:
     data_path: str = "train.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
-    allowed_species: list[int | str] | None = None
+    species_filter: list[int | str] | None = None
     num_neurons: int = 30
     # Number of structures used in each train step
     batch_size: int | None = 50
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 10000
+    num_generations: int = 20000
 
     # SOAP Turbo descriptor parameters
     l_max: int = 4
@@ -76,9 +76,11 @@ class TNEPconfig:
     # Total RAM in MB (None = auto-detect via psutil; set manually to override)
     ram_mb: int | None = None
     # Total GPU memory in MB (None = auto-detect via TF; set manually if detection fails)
-    gpu_memory_mb: int | None = None
+    gpu_memory_mb: int | None = 12288
     # Reset sigma to init_sigma at the start of each chunk in chunked training
     chunk_sigma_reset: bool = True
+    # Number of times to cycle through all chunks (None/1 = single pass)
+    chunk_cycles: int | None = None
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
     plot_interval: int | None = None

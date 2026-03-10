@@ -12,7 +12,7 @@ from data import (collect, split, pad_and_stack, filter_by_species,
                   assign_type_indices, prepare_eval_data_raw,
                   component_labels, print_score_summary,
                   estimate_padded_bytes, get_available_memory,
-                  compute_max_padded_size, chunk_raw_data)
+                  compute_max_padded_size, check_raw_data_ram, chunk_raw_data)
 from plotting import plot_snes_history, plot_log_val_fitness, plot_sigma_history, plot_timing, plot_correlation
 from model_io import save_model, load_model, convert_z_to_type_indices
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
@@ -154,8 +154,8 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     print("Number of structures in raw dataset: " + str(len(dataset)))
 
     # Filter by species if configured
-    if cfg.allowed_species is not None:
-        dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species)
+    if cfg.species_filter is not None:
+        dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.species_filter)
         print("After species filter: " + str(len(dataset)) + " structures")
 
     # Recompute type list and indices (needed after filtering, and to normalise
@@ -183,7 +183,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     cfg.dim_q = train_data["descriptors"][0].shape[-1]
     print("Dimension of q: " + str(cfg.dim_q))
 
-    # Memory budget: compute max structures that fit in padded tensors
+    # Memory budget: compute max structures that fit in VRAM as padded tensors
     combined_raw = _concat_raw(_concat_raw(train_data, val_data), test_data)
     max_structures = compute_max_padded_size(combined_raw, cfg)
     S_train = len(train_data["descriptors"])
@@ -194,14 +194,15 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     per_struct = estimate_padded_bytes(combined_raw, 1)
     ram_bytes, vram_bytes = get_available_memory(cfg)
     print(f"\n=== Memory Budget ===")
-    print(f"  Per-structure estimate: {per_struct / 1024 / 1024:.1f} MB")
-    print(f"  Available RAM: {ram_bytes / 1024**3:.1f} GB  "
+    print(f"  Per-structure padded estimate: {per_struct / 1024 / 1024:.1f} MB")
+    print(f"  RAM: {ram_bytes / 1024**3:.1f} GB  "
           f"(budget: {ram_bytes * cfg.ram_threshold / 1024**3:.1f} GB)")
     if vram_bytes != float('inf'):
-        print(f"  GPU VRAM: {vram_bytes / 1024**3:.1f} GB  "
+        print(f"  VRAM: {vram_bytes / 1024**3:.1f} GB  "
               f"(budget: {vram_bytes * cfg.vram_threshold / 1024**3:.1f} GB)")
-    print(f"  Max padded structures: {max_structures}")
+    print(f"  Max padded chunk size: {max_structures} structures (VRAM-limited)")
     print(f"  Train+Val: {S_total_fit}  Test: {S_test}")
+    check_raw_data_ram(combined_raw, cfg)
 
     needs_chunking = max_structures < S_total_fit
 
@@ -247,43 +248,51 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         train_chunks = chunk_raw_data(train_data, train_chunk_size)
         val_chunks = chunk_raw_data(val_data, val_chunk_size)
         n_chunks = len(train_chunks)
-        chunk_gens = cfg.num_generations // n_chunks
-        remainder = cfg.num_generations % n_chunks
+        n_cycles = cfg.chunk_cycles if cfg.chunk_cycles is not None else 1
+        total_steps = n_chunks * n_cycles
+        chunk_gens = cfg.num_generations // total_steps
+        remainder = cfg.num_generations % total_steps
 
-        print(f"\nChunked training: {n_chunks} chunks "
-              f"(train: {train_chunk_size}, val: {val_chunk_size} structures/chunk)")
-        print(f"  Generations per chunk: {chunk_gens}"
-              + (f" (+{remainder} for first chunk)" if remainder else ""))
+        print(f"\nChunked training: {n_chunks} chunks x {n_cycles} cycle(s) "
+              f"= {total_steps} steps")
+        print(f"  Train: {train_chunk_size}, Val: {val_chunk_size} structures/chunk")
+        print(f"  Generations per step: {chunk_gens}"
+              + (f" (+{remainder} for first step)" if remainder else ""))
 
         if train_chunk_size < 10:
             print(f"  WARNING: Very small train chunks ({train_chunk_size}) — "
                   f"training may be noisy. Consider reducing dataset or increasing memory.")
 
         all_histories = []
-        for i in range(n_chunks):
-            gens_this_chunk = chunk_gens + (remainder if i == 0 else 0)
-            if gens_this_chunk == 0:
-                continue
-            auto_patience = min(cfg.patience, gens_this_chunk // 2) if cfg.patience is not None else None
+        step = 0
+        for cycle in range(n_cycles):
+            for i in range(n_chunks):
+                gens_this_step = chunk_gens + (remainder if step == 0 else 0)
+                if gens_this_step == 0:
+                    step += 1
+                    continue
+                auto_patience = min(cfg.patience, gens_this_step // 2) if cfg.patience is not None else None
 
-            print(f"\n--- Chunk {i + 1}/{n_chunks} "
-                  f"({len(train_chunks[i]['descriptors'])} train, "
-                  f"{len(val_chunks[i % len(val_chunks)]['descriptors'])} val, "
-                  f"{gens_this_chunk} generations, patience={auto_patience}) ---")
+                print(f"\n--- Cycle {cycle + 1}/{n_cycles}, "
+                      f"Chunk {i + 1}/{n_chunks} (step {step + 1}/{total_steps}) "
+                      f"({len(train_chunks[i]['descriptors'])} train, "
+                      f"{len(val_chunks[i % len(val_chunks)]['descriptors'])} val, "
+                      f"{gens_this_step} generations, patience={auto_patience}) ---")
 
-            if cfg.chunk_sigma_reset and i > 0:
-                model.optimizer.sigma.assign(
-                    tf.fill([model.optimizer.dim], cfg.init_sigma))
+                if cfg.chunk_sigma_reset and step > 0:
+                    model.optimizer.sigma.assign(
+                        tf.fill([model.optimizer.dim], cfg.init_sigma))
 
-            train_padded = pad_and_stack(train_chunks[i])
-            val_padded = pad_and_stack(val_chunks[i % len(val_chunks)])
+                train_padded = pad_and_stack(train_chunks[i])
+                val_padded = pad_and_stack(val_chunks[i % len(val_chunks)])
 
-            h = model.fit(train_padded, val_padded,
-                          plot_callback=None,
-                          num_generations=gens_this_chunk,
-                          patience=auto_patience)
-            all_histories.append(h)
-            del train_padded, val_padded  # free memory
+                h = model.fit(train_padded, val_padded,
+                              plot_callback=None,
+                              num_generations=gens_this_step,
+                              patience=auto_patience)
+                all_histories.append(h)
+                del train_padded, val_padded  # free memory
+                step += 1
 
         history = merge_histories(all_histories)
 

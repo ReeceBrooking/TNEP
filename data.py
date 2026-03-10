@@ -441,26 +441,64 @@ def get_available_memory(cfg: TNEPconfig) -> tuple[int, int]:
 
 
 def compute_max_padded_size(raw_data: dict, cfg: TNEPconfig) -> int:
-    """Compute max structures that fit in a single padded tensor within memory budget.
+    """Compute max structures that fit in one padded chunk on VRAM.
 
-    Uses the global max_atoms/max_neighbors from raw_data to estimate per-structure
-    bytes, then divides available memory budget to get chunk size.
+    Chunk size is determined by VRAM alone (padded tf.constant tensors live on GPU).
+    RAM holds the raw data permanently — this is checked separately via
+    check_raw_data_ram().
 
     Args:
         raw_data : dict from split() — should be the combined dataset (all splits
                    concatenated) to get global max_atoms/max_neighbors
-        cfg      : TNEPconfig with ram_threshold and vram_threshold
+        cfg      : TNEPconfig with vram_threshold
 
     Returns:
         max_structures : int >= 1
     """
     per_struct = estimate_padded_bytes(raw_data, 1)
-    ram_bytes, vram_bytes = get_available_memory(cfg)
+    _ram_bytes, vram_bytes = get_available_memory(cfg)
 
-    max_from_ram = int((ram_bytes * cfg.ram_threshold) / per_struct) if per_struct > 0 else 1
-    max_from_vram = int((vram_bytes * cfg.vram_threshold) / per_struct) if per_struct > 0 and vram_bytes != float('inf') else max_from_ram
+    if per_struct <= 0:
+        return 1
+    if vram_bytes == float('inf'):
+        # No VRAM info — fall back to RAM budget as safeguard
+        return max(int((_ram_bytes * cfg.ram_threshold) / per_struct), 1)
 
-    return max(min(max_from_ram, max_from_vram), 1)
+    return max(int((vram_bytes * cfg.vram_threshold) / per_struct), 1)
+
+
+def check_raw_data_ram(raw_data: dict, cfg: TNEPconfig) -> None:
+    """Warn if the raw (un-padded) dataset may not fit in available RAM.
+
+    Raw data is kept in RAM for the entire run. This estimates its size
+    and prints a warning if it exceeds the RAM budget.
+    """
+    ram_bytes, _vram_bytes = get_available_memory(cfg)
+    ram_budget = ram_bytes * cfg.ram_threshold
+
+    # Estimate raw data size: sum of actual tensor bytes (no padding overhead)
+    total_bytes = 0
+    S = len(raw_data["descriptors"])
+    for s in range(S):
+        N = raw_data["descriptors"][s].shape[0]
+        Q = raw_data["descriptors"][s].shape[-1]
+        total_bytes += N * Q * 4  # descriptors
+        total_bytes += N * 3 * 4  # positions
+        total_bytes += N * 4      # Z_int
+        total_bytes += 3 * 3 * 4  # boxes
+        # targets
+        t = raw_data["targets"][s]
+        total_bytes += (1 if t.shape == () else t.shape[0]) * 4
+        # gradients + grad_index (variable per atom)
+        for i in range(N):
+            M_i = raw_data["gradients"][s][i].shape[0]
+            total_bytes += M_i * 3 * Q * 4  # gradients
+            total_bytes += M_i * 4           # grad_index
+
+    if total_bytes > ram_budget:
+        print(f"  WARNING: Raw dataset ~{total_bytes / 1024**3:.1f} GB exceeds "
+              f"RAM budget {ram_budget / 1024**3:.1f} GB. "
+              f"Consider reducing total_N or increasing ram_threshold.")
 
 
 def chunk_raw_data(raw_data: dict, chunk_size: int) -> list[dict]:
