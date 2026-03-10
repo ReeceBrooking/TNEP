@@ -51,7 +51,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
                 cfg.types.append(z)
     cfg.num_types = len(cfg.types)
     dataset_types_int = assign_type_indices(dataset, cfg.types)
-    print("Species after filter: " + str(cfg.types) + " (" + str(cfg.num_types) + " types)")
+    print("Species: " + str(cfg.types) + " (" + str(cfg.num_types) + " types)")
 
     if cfg.target_mode == 1:
         print_dipole_statistics(dataset)
