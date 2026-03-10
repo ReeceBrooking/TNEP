@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import tensorflow as tf
 from TNEPconfig import TNEPconfig
@@ -21,13 +22,16 @@ def _set_model_params(model, *params):
 class SNES:
     """Separable Natural Evolution Strategy optimizer for TNEP.
 
-    Maintains a diagonal Gaussian search distribution N(μ, diag(σ²)) over
+    Maintains a diagonal Gaussian search distribution N(mu, diag(sigma^2)) over
     the flattened parameter vector of the TNEP model.  Each generation:
-      1. Sample pop_size candidates: z_p = μ + σ * s_p,  s_p ~ N(0,1)
+      1. Sample pop_size candidates: z_p = mu + sigma * s_p,  s_p ~ N(0,1)
       2. Evaluate fitness (RMSE) for each candidate on a random batch
       3. Rank candidates by fitness, pair with log-shaped utilities
-      4. Update:  μ  ← μ + σ * Σ_p u_p * s_p
-                  σ  ← σ * exp(η_σ * Σ_p u_p * (s_p² - 1))
+      4. Update:  mu    <- mu + sigma * sum_p u_p * s_p
+                  sigma <- sigma * exp(eta_sigma * sum_p u_p * (s_p^2 - 1))
+
+    All sampling, ranking, and update operations use TensorFlow ops to
+    stay on GPU.  Only scalar history values are transferred to CPU.
 
     Total parameter count = num_types * dim_q * num_neurons   (W0)
                           + num_types * num_neurons            (b0)
@@ -40,7 +44,12 @@ class SNES:
         self.cfg = model.cfg
         self.dim_q = self.cfg.dim_q
         self.batch_size = self.cfg.batch_size
-        self.rng = np.random.default_rng(self.cfg.seed)
+
+        # TF random generator for all stochastic ops in training loop
+        if self.cfg.seed is not None:
+            self.tf_rng = tf.random.Generator.from_seed(self.cfg.seed)
+        else:
+            self.tf_rng = tf.random.Generator.from_non_deterministic_state()
 
         # Total number of trainable parameters
         n_W0 = self.cfg.num_types * self.cfg.dim_q * self.cfg.num_neurons
@@ -54,14 +63,17 @@ class SNES:
         else:
             self.dim = self.n_primary
 
-        # Search distribution parameters: μ (mean) and σ (std dev)
+        # Search distribution parameters as tf.Variables (stay on GPU)
         # GPUMD initialises mu in [-1, 1] (see snes.cu line 6709)
-        self.mu = self.rng.uniform(-1.0, 1.0, size=self.dim)
-        self.sigma = np.full(self.dim, self.cfg.init_sigma, float)
+        rng = np.random.default_rng(self.cfg.seed)
+        mu_init = rng.uniform(-1.0, 1.0, size=self.dim).astype(np.float32)
+        self.mu = tf.Variable(mu_init, trainable=False, name="snes_mu")
+        self.sigma = tf.Variable(
+            tf.fill([self.dim], self.cfg.init_sigma),
+            trainable=False, name="snes_sigma")
 
         auto_pop = int(4 + (3 * np.log(self.dim)))
         self.pop_size = self.cfg.pop_size if self.cfg.pop_size is not None else auto_pop
-
 
         # Resolve auto-default regularization: sqrt(dim * 1e-6 / num_types)
         # GPUMD divides by num_types for type-specific ANN (version != 3)
@@ -70,54 +82,37 @@ class SNES:
         self.lambda_2 = self.cfg.lambda_2 if self.cfg.lambda_2 is not None else auto_lambda
 
         self.eta_sigma = self.compute_eta_sigma()
-        self.utilities = self.compute_utilities()
-
-    def calc_rmse(self, y_true, y_pred):
-        """Compute RMSE between prediction and target.
-
-        Args:
-            y_true : scalar or [3] tensor — target value
-            y_pred : same shape as y_true — predicted value
-
-        Returns:
-            float — root mean squared error over all elements
-        """
-        y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
-        y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
-
-        diff = y_pred - y_true
-        mse = tf.reduce_mean(tf.square(diff))
-        rmse_val = tf.sqrt(mse)
-
-        return float(rmse_val.numpy())
+        self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
     def compute_regularization(self, param_vector):
         """Compute L1 and L2 regularization penalties (GPUMD formula).
+
+        Works with both numpy arrays and TF tensors.
 
         L1 = lambda_1 * sum(|params|) / dim
         L2 = lambda_2 * sqrt(sum(params^2) / dim)
 
         Args:
-            param_vector : ndarray [dim] — flat parameter vector
+            param_vector : [dim] tensor or ndarray — flat parameter vector
 
         Returns:
             l1 : float — L1 penalty
             l2 : float — L2 penalty
         """
-        pv = np.asarray(param_vector)
-        l1 = self.lambda_1 * np.sum(np.abs(pv)) / self.dim
-        l2 = self.lambda_2 * np.sqrt(np.sum(pv ** 2) / self.dim)
+        pv = tf.cast(param_vector, tf.float32)
+        l1 = self.lambda_1 * tf.reduce_sum(tf.abs(pv)) / self.dim
+        l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(pv)) / self.dim)
         return float(l1), float(l2)
 
     def compute_eta_sigma(self) -> float:
-        """Compute the σ learning rate from per-type parameter dimensionality.
+        """Compute the sigma learning rate from per-type parameter dimensionality.
 
         GPUMD (version != 3) divides by num_types for type-specific ANNs,
         giving a larger step size that accounts for per-type independence.
 
         Returns:
-            η_σ : float — controls how fast σ adapts.
-                  η_σ = (3 + ln(num)) / (5 * sqrt(num)) / 2
+            eta_sigma : float — controls how fast sigma adapts.
+                  eta_sigma = (3 + ln(num)) / (5 * sqrt(num)) / 2
                   where num = dim / num_types
         """
         num = float(self.dim) / self.cfg.num_types
@@ -130,164 +125,183 @@ class SNES:
 
         Utilities are log-shaped and zero-centred so that top-ranked
         individuals contribute positive gradient and bottom-ranked
-        contribute negative.  Computed once at init.
+        contribute negative.  Computed once at init, stored as tf.constant.
 
         Returns:
             utilities : ndarray [pop_size] — weights indexed by rank (0 = best).
         """
 
-        λ = self.pop_size
+        lam = self.pop_size
 
-        ranks = np.arange(λ)
-        ranks += 1
+        ranks = np.arange(lam) + 1
 
-        raw = np.log((λ * 0.5) + 1.0) - np.log(ranks)
+        raw = np.log((lam * 0.5) + 1.0) - np.log(ranks)
         raw = np.maximum(0.0, raw)
 
         # Normalise to sum=1, then shift to zero-mean
-        total = tf.reduce_sum(raw).numpy()
+        total = np.sum(raw)
         if total > 0:
             raw /= total
         else:
             print("Utility calc failed due to negative total")
-        utilities = raw - 1.0 / λ
+        utilities = raw - 1.0 / lam
         print("utilities = ", utilities)
         return utilities
 
     def ask(self):
-        """Sample pop_size candidate parameter vectors from N(μ, diag(σ²)).
+        """Sample pop_size candidate parameter vectors from N(mu, diag(sigma^2)).
+
+        All operations run on GPU via TensorFlow.
 
         Returns:
-            samples : ndarray [pop_size, dim] — candidate parameter vectors
-            s       : ndarray [pop_size, dim] — standard normal noise used
+            samples : [pop_size, dim] float32 tensor — candidate parameter vectors
+            s       : [pop_size, dim] float32 tensor — standard normal noise used
         """
-        s = self.rng.standard_normal(size=(self.pop_size, self.dim))
+        s = self.tf_rng.normal(shape=(self.pop_size, self.dim))
         samples = self.mu + s * self.sigma
         return samples, s
 
     def update(self, utilities, s):
-        """Update μ and σ using fitness-ranked noise vectors.
+        """Update mu and sigma using fitness-ranked noise vectors.
+
+        All operations run on GPU via TensorFlow.
 
         Args:
-            utilities : ndarray [pop_size]     rank-based weights (best first)
-            s         : ndarray [pop_size, dim] noise vectors sorted by fitness
+            utilities : [pop_size] float32 tensor — rank-based weights (best first)
+            s         : [pop_size, dim] float32 tensor — noise vectors sorted by fitness
                         (s[0] = noise of best individual, s[-1] = worst)
 
-        Mutates self.mu and self.sigma in place.
+        Mutates self.mu and self.sigma tf.Variables in place.
         """
-        grad_mu = np.zeros(self.dim, dtype=float)
-        grad_sigma = np.zeros(self.dim, dtype=float)
+        grad_mu = tf.einsum('p,pd->d', utilities, s)
+        grad_sigma = tf.einsum('p,pd->d', utilities, s ** 2 - 1.0)
 
-        for i in range(self.pop_size):
-            grad_mu    += utilities[i] * s[i]
-            grad_sigma += utilities[i] * (s[i]**2 - 1.0)
+        self.mu.assign_add(self.sigma * grad_mu)
+        self.sigma.assign(self.sigma * tf.exp(self.eta_sigma * grad_sigma))
 
-        self.mu += self.sigma * grad_mu
-        self.sigma = self.sigma * np.exp(self.eta_sigma * grad_sigma)
+    def fit(self, train_data, val_data, plot_callback=None):
+        """Run the SNES training loop using GPU-batched population evaluation.
 
-    def fit(self, train_data, val_data):
-        """Run the SNES training loop for num_generations generations.
-
-        Each generation: sample pop_size candidates, evaluate each on a
-        random batch of batch_size structures, rank by RMSE, update μ/σ.
-        After updating, sets the model weights to the current μ.
+        All sampling, ranking, and update operations run on GPU.
+        Only scalar metrics are transferred to CPU for history/reporting.
 
         Args:
-            train_data : dict with keys descriptors, gradients, grad_index,
-                         positions, Z_int, targets, boxes (lists over structures)
-            val_data   : same structure, used for validation each generation
+            train_data    : dict with padded tensors from pad_and_stack()
+            val_data      : same structure
+            plot_callback : optional callable(history, gen) — called every
+                            cfg.plot_interval generations for periodic plotting
 
         Returns:
-            history : dict with keys generation, train_loss, val_loss (lists)
+            history : dict with training metrics per generation
         """
         print("Fitting model...")
-        train_descriptors = train_data["descriptors"]
-        train_gradients = train_data["gradients"]
-        train_grad_index = train_data["grad_index"]
-        train_positions = train_data["positions"]
-        train_z = train_data["Z_int"]
-        train_targets = train_data["targets"]
-        boxes = train_data["boxes"]
         cfg = self.cfg
+        S_train = train_data["descriptors"].shape[0]
+
         history = {
             "generation": [],
             "train_loss": [],
             "val_loss": [],
             "L1": [],
             "L2": [],
+            "best_rmse": [],
+            "worst_rmse": [],
+            "sigma_min": [],
+            "sigma_max": [],
+            "sigma_mean": [],
+            "sigma_median": [],
+            "sigma_resets": [],
+            "vram_mb": [],
+            "timing": {
+                "sample_batch": [],
+                "evaluate": [],
+                "rank_update": [],
+                "validate": [],
+                "overhead": [],
+            },
         }
 
-        # Early stopping state
         best_val_loss = float('inf')
-        best_mu = self.mu.copy()
-        best_sigma = self.sigma.copy()
+        best_mu = tf.identity(self.mu)
+        best_sigma = tf.identity(self.sigma)
         gens_without_improvement = 0
 
         for gen in range(cfg.num_generations):
+            t0 = time.perf_counter()
+
             samples, s = self.ask()
-            fitness_matrix = np.zeros(shape=self.pop_size, dtype=float)
 
-            # Select one random batch per generation — shared across all candidates
-            batch_indices = np.arange(len(train_positions))
-            self.rng.shuffle(batch_indices)
-            batch_indices = batch_indices[:cfg.batch_size]
+            # Select batch: None = full train set, int = random subset
+            if cfg.batch_size is None:
+                batch_data = train_data
+            else:
+                batch_idx_tf = tf.argsort(
+                    self.tf_rng.uniform(shape=[S_train]))[:cfg.batch_size]
+                batch_data = {
+                    key: tf.gather(train_data[key], batch_idx_tf)
+                    for key in ["descriptors", "gradients", "grad_index",
+                                "positions", "Z_int", "boxes", "targets",
+                                "atom_mask", "neighbor_mask"]
+                }
 
-            # Evaluate each candidate on the same batch
-            # Loss = RMSE + L1 + L2, matching GPUMD's total fitness (see snes.cu regularize)
-            for i in range(self.pop_size):
-                params = self.reconstruct_params(samples[i])
-                _set_model_params(self.model, *params)
+            t1 = time.perf_counter()
 
-                rmse = []
-                for j in batch_indices:
-                    y_pred = self.model.predict(
-                        train_descriptors[j], train_gradients[j],
-                        train_grad_index[j], train_positions[j],
-                        train_z[j], boxes[j])
-                    rmse.append(self.calc_rmse(train_targets[j], y_pred))
+            # Evaluate entire population on GPU
+            fitness = self.evaluate_population(samples, batch_data)
 
-                rmse_val = float(tf.reduce_mean(rmse))
-                if cfg.toggle_regularization:
-                    l1, l2 = self.compute_regularization(samples[i])
-                    fitness_matrix[i] = rmse_val + l1 + l2
-                else:
-                    fitness_matrix[i] = rmse_val
+            # GPU sync: extract scalar metrics
+            avg_fitness = float(tf.reduce_mean(fitness))
+            best_rmse = float(tf.reduce_min(fitness))
+            worst_rmse = float(tf.reduce_max(fitness))
 
-            avg_fitness = tf.reduce_mean(fitness_matrix)
-            # Compute regularization at current mean for reporting
+            # VRAM snapshot (peak after evaluate — the heaviest phase)
+            vram_info = tf.config.experimental.get_memory_info('GPU:0')
+            history["vram_mb"].append(vram_info["peak"] / 1024 / 1024)
+
+            t2 = time.perf_counter()
+
+            # Regularization at current mean for reporting
             if cfg.toggle_regularization:
                 gen_l1, gen_l2 = self.compute_regularization(self.mu)
             else:
                 gen_l1, gen_l2 = 0, 0
-            # Rank by fitness (ascending) and pair with utilities for update
-            ranks = np.argsort(fitness_matrix)
-            s_sorted = s[ranks]
 
-            # Update distribution parameters, then validate with current mean
+            # Rank and update (GPU)
+            ranks = tf.argsort(fitness)
+            s_sorted = tf.gather(s, ranks)
             self.update(self.utilities, s_sorted)
+            # GPU sync: read mu to ensure update completed before timing validate
+            self.mu.numpy()
 
-            # Set model weights to the updated mean for validation
-            params = self.reconstruct_params(self.mu)
-            _set_model_params(self.model, *params)
+            t3 = time.perf_counter()
 
-            val_fitness = self.validate(val_data)
+            # Validate with updated mean (GPU — mu is tf.Variable)
+            val_fitness = self.validate(val_data, self.mu)
+
+            t4 = time.perf_counter()
 
             history["generation"].append(gen)
             history["train_loss"].append(avg_fitness)
-            history["val_loss"].append(val_fitness)
+            history["val_loss"].append(float(val_fitness))
             history["L1"].append(gen_l1)
             history["L2"].append(gen_l2)
+            history["best_rmse"].append(best_rmse)
+            history["worst_rmse"].append(worst_rmse)
+            history["sigma_min"].append(float(tf.reduce_min(self.sigma)))
+            history["sigma_max"].append(float(tf.reduce_max(self.sigma)))
+            history["sigma_mean"].append(float(tf.reduce_mean(self.sigma)))
+            history["sigma_median"].append(float(np.median(self.sigma.numpy())))
 
             print(f"Generation {gen + 1}/{cfg.num_generations} complete, "
-                  f"train RMSE: {float(avg_fitness):.4f}, val RMSE: {float(val_fitness):.4f}, "
+                  f"train RMSE: {avg_fitness:.4f}, val RMSE: {float(val_fitness):.4f}, "
                   f"L1: {gen_l1:.6f}, L2: {gen_l2:.6f}")
 
-            # Early stopping check
+            # Early stopping
             val_loss_scalar = float(val_fitness)
             if val_loss_scalar < best_val_loss:
                 best_val_loss = val_loss_scalar
-                best_mu = self.mu.copy()
-                best_sigma = self.sigma.copy()
+                best_mu = tf.identity(self.mu)
+                best_sigma = tf.identity(self.sigma)
                 gens_without_improvement = 0
             else:
                 gens_without_improvement += 1
@@ -295,53 +309,106 @@ class SNES:
             if cfg.patience is not None and gens_without_improvement >= cfg.patience:
                 print(f"Early stopping at generation {gen + 1} "
                       f"(no improvement for {cfg.patience} generations)")
-                self.mu = best_mu
-                self.sigma = best_sigma
-                params = self.reconstruct_params(self.mu)
-                _set_model_params(self.model, *params)
+                self.mu.assign(best_mu)
+                self.sigma.assign(best_sigma)
                 break
 
-        # Restore best parameters even if early stopping didn't trigger
+            # Sigma reset on stagnation
+            if cfg.sigma_reset_patience is not None:
+                mean_sigma = float(tf.reduce_mean(self.sigma))
+                sigma_collapsed = mean_sigma < (cfg.sigma_reset_threshold * cfg.init_sigma)
+                if (gens_without_improvement >= cfg.sigma_reset_patience
+                        and sigma_collapsed):
+                    print(f"Sigma reset at generation {gen + 1}: "
+                          f"mean sigma {mean_sigma:.6f} < threshold, "
+                          f"stagnant for {gens_without_improvement} gens")
+                    self.sigma.assign(tf.fill([self.dim], cfg.init_sigma))
+                    gens_without_improvement = 0
+                    history["sigma_resets"].append(gen)
+
+            t5 = time.perf_counter()
+
+            history["timing"]["sample_batch"].append(t1 - t0)
+            history["timing"]["evaluate"].append(t2 - t1)
+            history["timing"]["rank_update"].append(t3 - t2)
+            history["timing"]["validate"].append(t4 - t3)
+            history["timing"]["overhead"].append(t5 - t4)
+
+            # Periodic plotting callback
+            if (plot_callback is not None
+                    and cfg.plot_interval is not None
+                    and (gen + 1) % cfg.plot_interval == 0)\
+                    and gen + 1 < cfg.num_generations:
+                # Temporarily restore best params for score()
+                params = self.reconstruct_params_tf(best_mu)
+                _set_model_params(self.model, *params)
+                plot_callback(history, gen + 1)
+                # Restore current mu back into model (training continues)
+                params = self.reconstruct_params_tf(self.mu)
+                _set_model_params(self.model, *params)
+
+        # Restore best parameters into model for downstream score() calls
         if cfg.patience is not None:
-            self.mu = best_mu
-            self.sigma = best_sigma
-            params = self.reconstruct_params(self.mu)
-            _set_model_params(self.model, *params)
+            self.mu.assign(best_mu)
+            self.sigma.assign(best_sigma)
+        params = self.reconstruct_params_tf(self.mu)
+        _set_model_params(self.model, *params)
 
         return history
 
-    def validate(self, val_data):
-        """Compute mean RMSE on a random subset of val_size validation structures.
+    def validate(self, val_data, mu_tf=None):
+        """Compute mean RMSE on a subset of validation structures using batched predict.
 
         Args:
-            val_data : dict, same structure as train_data
+            val_data : dict with padded tensors from pad_and_stack()
+            mu_tf    : optional [dim] float32 tensor/Variable — parameter vector.
+                       If provided, weights are reconstructed on GPU.
+                       If None, uses current model weights.
 
         Returns:
-            fitness : scalar tf.Tensor — mean RMSE across sampled structures
+            fitness : float — mean RMSE
         """
-        rmse = []
-        val_descriptors = val_data["descriptors"]
-        val_gradients = val_data["gradients"]
-        val_grad_index = val_data["grad_index"]
-        val_positions = val_data["positions"]
-        val_z = val_data["Z_int"]
-        val_targets = val_data["targets"]
-        boxes = val_data["boxes"]
+        if self.cfg.val_size is None:
+            batch_data = val_data
+        else:
+            S_val = val_data["descriptors"].shape[0]
+            val_idx_tf = tf.argsort(
+                self.tf_rng.uniform(shape=[S_val]))[:self.cfg.val_size]
 
-        indices = np.arange(len(val_positions))
-        self.rng.shuffle(indices)
+            batch_data = {
+                key: tf.gather(val_data[key], val_idx_tf)
+                for key in ["descriptors", "gradients", "grad_index",
+                            "positions", "Z_int", "boxes", "targets",
+                            "atom_mask", "neighbor_mask"]
+            }
 
-        for j in indices[:self.cfg.val_size]:
-            y_pred = self.model.predict(
-                val_descriptors[j], val_gradients[j], val_grad_index[j],
-                val_positions[j], val_z[j], boxes[j])
-            rmse.append(self.calc_rmse(val_targets[j], y_pred))
+        if mu_tf is not None:
+            params = self.reconstruct_params_tf(mu_tf)
+            if self.cfg.target_mode == 2:
+                W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
+            else:
+                W0, b0, W1, b1 = params
+                W0p = b0p = W1p = b1p = None
+        else:
+            W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
+            W0p = getattr(self.model, 'W0_pol', None)
+            b0p = getattr(self.model, 'b0_pol', None)
+            W1p = getattr(self.model, 'W1_pol', None)
+            b1p = getattr(self.model, 'b1_pol', None)
 
-        fitness = tf.reduce_mean(rmse)
-        return fitness
+        preds = self.model.predict_batch(
+            batch_data["descriptors"], batch_data["gradients"],
+            batch_data["grad_index"], batch_data["positions"],
+            batch_data["Z_int"], batch_data["boxes"],
+            batch_data["atom_mask"], batch_data["neighbor_mask"],
+            W0, b0, W1, b1, W0p, b0p, W1p, b1p,
+        )
+        diff = preds - batch_data["targets"]
+        rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
+        return float(rmse)
 
     def reconstruct_params(self, param_vector):
-        """Reconstruct TNEP parameters from a flat vector.
+        """Reconstruct TNEP parameters from a flat numpy vector.
 
         For modes 0/1: returns (W0, b0, W1, b1)
         For mode 2:    returns (W0, b0, W1, b1, W0_pol, b0_pol, W1_pol, b1_pol)
@@ -378,3 +445,181 @@ class SNES:
             return W0, b0, W1, b1, W0_pol, b0_pol, W1_pol, b1_pol
 
         return W0, b0, W1, b1
+
+    def reconstruct_params_tf(self, param_vectors):
+        """Reconstruct TNEP weight tensors from flat vectors using TF ops.
+
+        Works inside @tf.function. Handles single [dim] or batched [P, dim] vectors.
+
+        Args:
+            param_vectors : [P, dim] or [dim] float32 tensor
+
+        Returns:
+            tuple of (W0, b0, W1, b1) and optionally (W0_pol, b0_pol, W1_pol, b1_pol)
+            Each has shape [P, ...] for batched input or [...] for single.
+        """
+        T = self.cfg.num_types
+        Q = self.dim_q
+        H = self.cfg.num_neurons
+
+        n_W0 = T * Q * H
+        n_b0 = T * H
+        n_W1 = T * H
+        n_b1 = 1
+
+        is_batched = len(param_vectors.shape) == 2
+
+        def _extract(pv, offset):
+            W0 = tf.reshape(pv[..., offset:offset + n_W0],
+                            [-1, T, Q, H] if is_batched else [T, Q, H])
+            offset += n_W0
+            b0 = tf.reshape(pv[..., offset:offset + n_b0],
+                            [-1, T, H] if is_batched else [T, H])
+            offset += n_b0
+            W1 = tf.reshape(pv[..., offset:offset + n_W1],
+                            [-1, T, H] if is_batched else [T, H])
+            offset += n_W1
+            b1 = pv[..., offset]  # [P] or scalar
+            offset += n_b1
+            return W0, b0, W1, b1, offset
+
+        W0, b0, W1, b1, offset = _extract(param_vectors, 0)
+
+        if self.cfg.target_mode == 2:
+            W0p, b0p, W1p, b1p, _ = _extract(param_vectors, offset)
+            return W0, b0, W1, b1, W0p, b0p, W1p, b1p
+
+        return W0, b0, W1, b1
+
+    def compute_regularization_tf(self, param_vectors):
+        """Compute L1+L2 regularization for batched parameter vectors.
+
+        Args:
+            param_vectors : [P, dim] float32
+
+        Returns:
+            reg : [P] float32 — L1 + L2 penalty per candidate
+        """
+        l1 = self.lambda_1 * tf.reduce_sum(tf.abs(param_vectors), axis=1) / self.dim
+        l2 = self.lambda_2 * tf.sqrt(
+            tf.reduce_sum(tf.square(param_vectors), axis=1) / self.dim)
+        return l1 + l2
+
+    def evaluate_population(self, samples_tf, batch_data):
+        """Evaluate all SNES candidates on a batch of structures on GPU.
+
+        Chunks along both population (population_chunk_size) and structure
+        (batch_chunk_size) dimensions to limit VRAM usage. Accumulates sum
+        of squared errors across structure chunks for correct RMSE.
+
+        Args:
+            samples_tf : [P, dim] float32 — all candidate parameter vectors
+            batch_data : dict with padded batch tensors:
+                descriptors   : [B, A, Q]
+                gradients     : [B, A, M, 3, Q]
+                grad_index    : [B, A, M]
+                positions     : [B, A, 3]
+                Z_int         : [B, A]
+                boxes         : [B, 3, 3]
+                targets       : [B, T_dim]
+                atom_mask     : [B, A]
+                neighbor_mask : [B, A, M]
+
+        Returns:
+            fitness : [P] float32 — RMSE (+ regularization) per candidate
+        """
+        P = self.pop_size
+        B = batch_data["descriptors"].shape[0]
+        T_dim = batch_data["targets"].shape[1]
+        pop_chunk = self.cfg.population_chunk_size if self.cfg.population_chunk_size is not None else P
+        struct_chunk = self.cfg.batch_chunk_size if self.cfg.batch_chunk_size is not None else B
+
+        batch_keys = ["descriptors", "gradients", "grad_index",
+                      "positions", "Z_int", "boxes", "targets",
+                      "atom_mask", "neighbor_mask"]
+
+        all_fitness = []
+
+        for p_start in range(0, P, pop_chunk):
+            p_end = min(p_start + pop_chunk, P)
+            candidates = samples_tf[p_start:p_end]  # [C, dim]
+            C = p_end - p_start
+
+            # Accumulate SSE across structure chunks
+            total_sse = tf.zeros([C])
+            total_elements = 0
+
+            for s_start in range(0, B, struct_chunk):
+                s_end = min(s_start + struct_chunk, B)
+                struct_batch = {key: batch_data[key][s_start:s_end] for key in batch_keys}
+                chunk_sse = self._evaluate_chunk(candidates, struct_batch)  # [C]
+                total_sse = total_sse + chunk_sse
+                total_elements += (s_end - s_start) * T_dim
+
+            chunk_fitness = tf.sqrt(total_sse / tf.cast(total_elements, tf.float32))
+            all_fitness.append(chunk_fitness)
+
+        fitness = tf.concat(all_fitness, axis=0)  # [P]
+
+        if self.cfg.toggle_regularization:
+            reg = self.compute_regularization_tf(samples_tf)
+            fitness = fitness + reg
+
+        return fitness
+
+    @tf.function
+    def _evaluate_chunk(self, chunk_samples, batch_data):
+        """Evaluate a chunk of C candidates on B structures.
+
+        Returns sum of squared errors (not RMSE) so that structure chunks
+        can be aggregated correctly in evaluate_population.
+
+        Args:
+            chunk_samples : [C, dim]
+            batch_data    : dict of [B, ...] tensors
+
+        Returns:
+            sse : [C] — sum of squared errors per candidate
+        """
+        desc = batch_data["descriptors"]       # [B, A, Q]
+        grads = batch_data["gradients"]        # [B, A, M, 3, Q]
+        gidx = batch_data["grad_index"]        # [B, A, M]
+        pos = batch_data["positions"]          # [B, A, 3]
+        Z = batch_data["Z_int"]               # [B, A]
+        boxes = batch_data["boxes"]            # [B, 3, 3]
+        targets = batch_data["targets"]        # [B, T_dim]
+        amask = batch_data["atom_mask"]        # [B, A]
+        nmask = batch_data["neighbor_mask"]    # [B, A, M]
+
+        # Reconstruct weights for all candidates in chunk
+        params = self.reconstruct_params_tf(chunk_samples)
+
+        if self.cfg.target_mode == 2:
+            W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
+
+            def _forward_one_candidate(args):
+                w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
+                preds = self.model.predict_batch(
+                    desc, grads, gidx, pos, Z, boxes, amask, nmask,
+                    w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
+                )
+                diff = preds - targets
+                return tf.reduce_sum(tf.square(diff))
+
+            stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
+        else:
+            W0, b0, W1, b1 = params
+
+            def _forward_one_candidate(args):
+                w0, bb0, w1, bb1 = args
+                preds = self.model.predict_batch(
+                    desc, grads, gidx, pos, Z, boxes, amask, nmask,
+                    w0, bb0, w1, bb1, None, None, None, None,
+                )
+                diff = preds - targets
+                return tf.reduce_sum(tf.square(diff))
+
+            stacked = (W0, b0, W1, b1)
+
+        sse = tf.vectorized_map(_forward_one_candidate, stacked)  # [C]
+        return sse

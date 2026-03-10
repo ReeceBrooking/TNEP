@@ -8,28 +8,34 @@ class TNEPconfig:
     """
 
     data_path: str = "train.xyz"
-    num_neurons: int = 16
+    num_neurons: int = 30
     # Number of structures used in each train step
-    batch_size: int = 10
+    batch_size: int | None = None
     # Number of samples made in each train generation
-    pop_size: int | None = None
+    pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 100
+    num_generations: int = 5000
 
     # SOAP Turbo descriptor parameters
-    l_max: int = 3
-    alpha_max: int = 3
+    l_max: int = 4
+    alpha_max: int = 4
 
     # Cutoff radius value
     rc: float = 6.0
 
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
-    lambda_1: float | None = None
-    lambda_2: float | None = None
+    lambda_1: float | None = 0.001
+    lambda_2: float | None = 0.001
 
     # Early stopping patience (None = disabled)
-    patience: int | None = 20
+    patience: int | None = None
+
+    # Sigma reset: reinitialise sigma when it collapses and training stagnates
+    # None = disabled; int = generations stagnating + small sigma to trigger reset
+    sigma_reset_patience: int | None = None
+    # Fraction of init_sigma below which sigma is considered collapsed
+    sigma_reset_threshold: float = 0.01
 
     activation: str = 'tanh'
     # Initial distribution standard deviation
@@ -41,9 +47,16 @@ class TNEPconfig:
     # Test split ratio
     test_ratio : float = 0.2
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N : int = 1000
-    # Number of structures in each validation step
-    val_size : int = 10
+    total_N : int = None
+    # Number of structures in each validation step (None = use entire val set)
+    val_size : int | None = None
+    # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
+    population_chunk_size: int | None = 20
+    # Number of structures to process per GPU chunk during evaluation (None = all at once)
+    batch_chunk_size: int | None = 400
+
+    # Periodic plotting interval (None = disabled; int = plot every N generations)
+    plot_interval: int | None = 1000
 
     dim_q: int
     num_types: int

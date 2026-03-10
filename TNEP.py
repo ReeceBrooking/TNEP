@@ -27,8 +27,8 @@ class TNEP(layers.Layer):
 
     For mode 2 (polarizability), a second "scalar ANN" is added:
         W0_pol, b0_pol, W1_pol, b1_pol
-    The scalar ANN computes per-atom F_pol -> diagonal components.
-    The tensor ANN (primary W0/b0/W1/b1) computes forces -> off-diagonal + virial.
+    The scalar ANN computes per-atom F_pol -> isotropic diagonal.
+    The tensor ANN (primary W0/b0/W1/b1) computes forces -> anisotropic virial.
     Output: [xx, yy, zz, xy, yz, zx]
     """
 
@@ -103,185 +103,402 @@ class TNEP(layers.Layer):
                 trainable=True,
             )
 
-    def predict(self, descriptors, gradients, grad_index, positions, Z, box):
-        """Run the forward pass for a single structure.
+    def predict(self, descriptors, gradients, grad_index, positions, Z, box,
+                atom_mask, neighbor_mask):
+        """Run the forward pass for a single structure using padded tensors.
 
         Args:
-            descriptors : [N, dim_q]         per-atom SOAP descriptors
-            gradients   : list of N tensors, each [M_i, 3, dim_q]
-                          dq_i/dR_j for each neighbour j (M_i neighbours,
-                          3 Cartesian components, dim_q descriptor dims)
-            grad_index  : list of N lists, each [M_i] int
-                          neighbour atom indices corresponding to gradients
-            positions   : [N, 3]             Cartesian atom positions
-            Z           : [N]               integer type indices (0..num_types-1)
-            box         : [3, 3]             lattice vectors (rows)
+            descriptors    : [A, dim_q]     padded per-atom SOAP descriptors
+            gradients      : [A, M, 3, dim_q]  padded descriptor gradients
+            grad_index     : [A, M]         padded neighbor indices
+            positions      : [A, 3]         padded atom positions
+            Z              : [A]            padded integer type indices
+            box            : [3, 3]         lattice vectors
+            atom_mask      : [A]            1.0 for real atoms, 0.0 for padding
+            neighbor_mask  : [A, M]         1.0 for real neighbors, 0.0 for padding
 
         Returns:
-            target_mode 0: scalar total energy
-            target_mode 1: [3] dipole vector
-            target_mode 2: [6] polarizability tensor [xx, yy, zz, xy, yz, zx]
+            target_mode 0: [1]  total energy
+            target_mode 1: [3]  dipole vector
+            target_mode 2: [6]  polarizability tensor
         """
-        N = tf.shape(Z)[0]
-
         # Gather per-type weights for each atom
-        W0_t = tf.gather(self.W0, Z)   # [N, dim_q, num_neurons]
-        b0_t = tf.gather(self.b0, Z)   # [N, num_neurons]
-        W1_t = tf.gather(self.W1, Z)   # [N, num_neurons]
+        W0_t = tf.gather(self.W0, Z)   # [A, dim_q, H]
+        b0_t = tf.gather(self.b0, Z)   # [A, H]
+        W1_t = tf.gather(self.W1, Z)   # [A, H]
 
-        # Hidden layer: h_i = tanh(q_i @ W0[t_i] + b0[t_i])
-        q_exp = tf.expand_dims(descriptors, axis=1)  # [N, 1, dim_q]
-        h = tf.matmul(q_exp, W0_t)                   # [N, 1, num_neurons]
-        h = tf.squeeze(h, axis=1) + b0_t              # [N, num_neurons]
-        h = self.activation(h)                         # [N, num_neurons]
+        # Hidden layer: h_i = activation(q_i @ W0[t_i] + b0[t_i])
+        h = tf.einsum('nd,ndh->nh', descriptors, W0_t)  # [A, H]
+        h = h + b0_t                                      # [A, H]
+        h = self.activation(h)                             # [A, H]
+        # Mask out padded atoms
+        h = h * atom_mask[:, tf.newaxis]                   # [A, H]
 
         if self.cfg.target_mode == 0:
             # PES: E = -sum_i (h_i . W1[t_i] + b1)
-            E = tf.reduce_sum(h * W1_t, axis=1)  # [N] per-atom energies
-            E = E + self.b1
-            E = tf.reduce_sum(E)
-            return -E
-        elif self.cfg.target_mode == 1:
-            # Dipole: μ = -sum_i sum_{j!=i} |r_ij|^2 * (dU_i/dr_ij_vec)
-            dr, rij = self.builder.pairwise_displacements(
-                tf.convert_to_tensor(positions, dtype=tf.float32),
-                tf.convert_to_tensor(box, dtype=tf.float32))
-            mask = 1.0 - tf.eye(N, dtype=tf.float32)
-            rij2 = tf.square(rij) * mask  # [N, N] squared scalar distances, self-terms zeroed
+            E_per_atom = tf.reduce_sum(h * W1_t, axis=1) + self.b1  # [A]
+            E_per_atom = E_per_atom * atom_mask                       # zero padding
+            E = tf.reduce_sum(E_per_atom)
+            return tf.expand_dims(-E, axis=0)  # [1]
 
-            # dU_i/dr_ij_vec for all atoms and their neighbours
-            forces = self.calc_forces(h, gradients, W1_t, W0_t)
+        # Modes 1 and 2 need forces
+        forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask)  # [A, M, 3]
 
-            # Assemble dipole: weight each force by squared distance
-            dipole = []
-            for i in range(len(forces)):
-                dipole_i = tf.zeros(3, dtype=tf.float32)
-                for j in range(len(forces[i])):
-                    neighbor_idx = grad_index[i][j]
-                    rij2_val = rij2[i, neighbor_idx]       # scalar |r_ij|^2
-                    dipole_i += rij2_val * forces[i][j]    # scalar * [3]
-                dipole.append(dipole_i)
+        if self.cfg.target_mode == 1:
+            # Dipole: μ = -sum_i sum_j |r_ij|^2 * force_ij
+            # Gather displacement vectors for each (atom, neighbor) pair
+            dr, rij = self.builder.pairwise_displacements(positions, box)
+            # dr: [A, A, 3], rij: [A, A]
 
-            dipole = tf.convert_to_tensor(dipole, dtype=tf.float32)  # [N, 3]
-            dipole = -tf.reduce_sum(dipole, axis=0)                  # [3]
+            # Gather displacements for grad_index neighbors
+            A = tf.shape(Z)[0]
+            M = tf.shape(grad_index)[1]
+            atom_idx = tf.broadcast_to(tf.range(A)[:, tf.newaxis], [A, M])
+            # indices: [A, M, 2] — pairs of (atom_i, neighbor_j)
+            indices = tf.stack([atom_idx, grad_index], axis=-1)
+            dr_gathered = tf.gather_nd(dr, indices)     # [A, M, 3]
+            rij_gathered = tf.gather_nd(rij, indices)   # [A, M]
+
+            rij2 = tf.square(rij_gathered)                          # [A, M]
+            rij2 = rij2 * neighbor_mask                              # zero padding
+            dipole_contribs = rij2[:, :, tf.newaxis] * forces        # [A, M, 3]
+            dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])   # [3]
             return dipole
+
         elif self.cfg.target_mode == 2:
-            # Polarizability via dual ANN (GPUMD tnep.cu apply_ann_pol)
-            # Scalar ANN -> per-atom F_pol -> diagonal polarizability
-            # Tensor ANN -> forces via descriptor gradients -> off-diagonal
-            dr, rij = self.builder.pairwise_displacements(
-                tf.convert_to_tensor(positions, dtype=tf.float32),
-                tf.convert_to_tensor(box, dtype=tf.float32))
-            mask = 1.0 - tf.eye(N, dtype=tf.float32)
+            # Polarizability via dual ANN (GPUMD approach)
+            dr, rij = self.builder.pairwise_displacements(positions, box)
+            A = tf.shape(Z)[0]
+            M = tf.shape(grad_index)[1]
+            atom_idx = tf.broadcast_to(tf.range(A)[:, tf.newaxis], [A, M])
+            indices = tf.stack([atom_idx, grad_index], axis=-1)
+            dr_gathered = tf.gather_nd(dr, indices)  # [A, M, 3]
 
-            # --- Scalar ANN (polarizability-specific weights) ---
-            W0p_t = tf.gather(self.W0_pol, Z)  # [N, dim_q, H]
-            b0p_t = tf.gather(self.b0_pol, Z)  # [N, H]
-            W1p_t = tf.gather(self.W1_pol, Z)  # [N, H]
+            # --- Scalar ANN (isotropic) ---
+            W0p_t = tf.gather(self.W0_pol, Z)  # [A, dim_q, H]
+            b0p_t = tf.gather(self.b0_pol, Z)  # [A, H]
+            W1p_t = tf.gather(self.W1_pol, Z)  # [A, H]
 
-            h_pol = tf.matmul(q_exp, W0p_t)                    # [N, 1, H]
-            h_pol = tf.squeeze(h_pol, axis=1) + b0p_t           # [N, H]
-            h_pol = self.activation(h_pol)                       # [N, H]
-            F_pol = tf.reduce_sum(h_pol * W1p_t, axis=1) + self.b1_pol  # [N]
+            h_pol = tf.einsum('nd,ndh->nh', descriptors, W0p_t)  # [A, H]
+            h_pol = h_pol + b0p_t
+            h_pol = self.activation(h_pol)
+            h_pol = h_pol * atom_mask[:, tf.newaxis]
+            F_pol = tf.reduce_sum(h_pol * W1p_t, axis=1) + self.b1_pol  # [A]
+            F_pol = F_pol * atom_mask
+            scalar_sum = tf.reduce_sum(F_pol)
 
-            # Diagonal: alpha_aa = sum_i(F_pol_i) + sum_ij(-r_ij_a * f_ij_a)
-            scalar_sum = tf.reduce_sum(F_pol)  # scalar
+            # --- Tensor ANN (anisotropic virial) ---
+            pol_outer = -tf.einsum('nma,nmb->nmab', dr_gathered, forces)  # [A, M, 3, 3]
+            pol_outer = pol_outer * neighbor_mask[:, :, tf.newaxis, tf.newaxis]
+            pol_matrix = tf.reduce_sum(pol_outer, axis=[0, 1])  # [3, 3]
 
-            # --- Tensor ANN (primary weights) -> forces ---
-            forces = self.calc_forces(h, gradients, W1_t, W0_t)
+            # Extract 6 unique components: [xx, yy, zz, xy, yz, zx]
+            pol = tf.stack([
+                pol_matrix[0, 0],
+                pol_matrix[1, 1],
+                pol_matrix[2, 2],
+                pol_matrix[0, 1],
+                pol_matrix[1, 2],
+                pol_matrix[2, 0],
+            ])
 
-            # Assemble 6-component polarizability: [xx, yy, zz, xy, yz, zx]
-            # Component pairs: (0,0), (1,1), (2,2), (0,1), (1,2), (2,0)
-            comp_pairs = [(0, 0), (1, 1), (2, 2), (0, 1), (1, 2), (2, 0)]
-            pol = tf.zeros(6, dtype=tf.float32)
-
-            for i in range(len(forces)):
-                for j_idx in range(len(forces[i])):
-                    neighbor = grad_index[i][j_idx]
-                    r_vec = dr[i, neighbor]         # [3] displacement vector
-                    f_vec = forces[i][j_idx]        # [3] force vector
-
-                    for c, (a, b) in enumerate(comp_pairs):
-                        contrib = -r_vec[a] * f_vec[b]
-                        pol = pol + tf.one_hot(c, 6, dtype=tf.float32) * contrib
-
-            # Add scalar ANN contribution to diagonal components
-            for c in range(3):  # xx, yy, zz
-                pol = pol + tf.one_hot(c, 6, dtype=tf.float32) * scalar_sum
-
+            # Add scalar ANN to diagonal
+            pol = pol + tf.stack([scalar_sum, scalar_sum, scalar_sum,
+                                  0.0, 0.0, 0.0])
             return pol
-        else:
-            print("target mode not supported")
-            return
 
-    def calc_forces(self, h, gradients, W1_t, W0_t):
+    def calc_forces(self, h, gradients, W1_t, W0_t, neighbor_mask):
         """Compute dU_i/dR_j for every atom i and its neighbours j via chain rule.
 
-        Chain rule: dU_i/dR_j = sum_q (dU_i/dq_iq) * (dq_iq/dR_j)
+        Vectorized version — no Python loops. Uses padded gradient tensors.
 
         Args:
-            h         : [N, num_neurons]          hidden activations tanh(a)
-            gradients : list of N tensors, each [M_i, 3, dim_q]
-                        descriptor gradients dq_i/dR_j from quippy
-            W1_t      : [N, num_neurons]          per-atom output weights
-            W0_t      : [N, dim_q, num_neurons]   per-atom input weights
+            h              : [N, H]              hidden activations tanh(a)
+            gradients      : [N, M, 3, dim_q]   padded descriptor gradients
+            W1_t           : [N, H]              per-atom output weights
+            W0_t           : [N, dim_q, H]       per-atom input weights
+            neighbor_mask  : [N, M]              1.0 for real neighbors, 0.0 for padding
 
         Returns:
-            forces : list of N tensors, each [M_i, 3]
-                     dU_i/dR_j (3-vector per neighbour)
+            forces : [N, M, 3]  dU_i/dR_j per atom per neighbor
         """
         # dU/dh * dh/da = W1 * (1 - tanh^2(a))
         dtanh = 1.0 - tf.square(h)                               # [N, H]
         de_da = dtanh * W1_t                                      # [N, H]
-        # dU/dq = dU/da @ W0^T
-        de_da_exp = tf.expand_dims(de_da, axis=1)                 # [N, 1, H]
-        de_dq = tf.matmul(de_da_exp, W0_t, transpose_b=True)     # [N, 1, dim_q]
-        de_dq = tf.squeeze(de_dq, axis=1)                        # [N, dim_q]
-
-        # Contract dU/dq with dq/dR_j for each atom
-        forces = []
-        for i in range(len(gradients)):
-            # de_dq[i]: [dim_q] broadcasts with gradients[i]: [M_i, 3, dim_q]
-            # sum over dim_q (axis=-1) -> [M_i, 3]
-            force_i = tf.reduce_sum(de_dq[i] * gradients[i], axis=-1)
-            forces.append(force_i)
+        # dU/dq = dU/da @ W0^T  ->  [N, dim_q]
+        de_dq = tf.einsum('nh,nqh->nq', de_da, W0_t)             # [N, dim_q]
+        # Contract dU/dq with dq/dR_j: sum over dim_q
+        forces = tf.einsum('nq,nmcq->nmc', de_dq, gradients)     # [N, M, 3]
+        # Zero out padded neighbors
+        forces = forces * neighbor_mask[:, :, tf.newaxis]
         return forces
 
-    def fit(self, train_data, val_data):
+    def fit(self, train_data, val_data, plot_callback=None):
         """Train the model using the SNES evolutionary optimizer.
 
         Args:
-            train_data : dict with keys descriptors, gradients, grad_index,
-                         positions, Z_int, targets, boxes (lists over structures)
-            val_data   : same structure, used for validation each generation
+            train_data    : dict with keys descriptors, gradients, grad_index,
+                            positions, Z_int, targets, boxes (lists over structures)
+            val_data      : same structure, used for validation each generation
+            plot_callback : optional callable(history, gen) for periodic plotting
 
         Returns:
             history : dict with keys generation, train_loss, val_loss (lists)
         """
-        history = self.optimizer.fit(train_data, val_data)
+        history = self.optimizer.fit(train_data, val_data, plot_callback=plot_callback)
         return history
 
     def score(self, test_data):
-        """Evaluate RMSE over all structures in test_data.
+        """Evaluate RMSE, R², per-component R², and cosine similarity.
 
         Args:
-            test_data : dict, same structure as train_data
+            test_data : dict with padded tensors from pad_and_stack()
 
         Returns:
-            rmse : scalar tf.Tensor
-                   For PES: RMSE over scalar energies.
-                   For dipole: RMSE over all 3 components across structures.
+            metrics : dict with keys:
+                rmse          : scalar float — overall RMSE
+                r2            : scalar float — overall R²
+                r2_components : [T] tensor — per-component R²
+                cos_sim_mean  : scalar float — mean cosine similarity (modes 1,2 only)
+                cos_sim_all   : [S] tensor — per-structure cosine similarity (modes 1,2)
+            preds : [S, T] tensor of predictions
         """
-        test_descriptors = test_data["descriptors"]
-        test_gradients = test_data["gradients"]
-        test_grad_index = test_data["grad_index"]
-        test_positions = test_data["positions"]
-        test_targets = test_data["targets"]
-        test_z = test_data["Z_int"]
-        boxes = test_data["boxes"]
-        predictions = [self.predict(test_descriptors[i], test_gradients[i], test_grad_index[i], test_positions[i], test_z[i], boxes[i]) for i in range(len(test_descriptors))]
-        predictions_tf = tf.convert_to_tensor(predictions, dtype=tf.float32)
-        diff = predictions_tf - test_targets
+        preds = self.predict_batch(
+            test_data["descriptors"], test_data["gradients"],
+            test_data["grad_index"], test_data["positions"],
+            test_data["Z_int"], test_data["boxes"],
+            test_data["atom_mask"], test_data["neighbor_mask"],
+            self.W0, self.b0, self.W1, self.b1,
+            getattr(self, 'W0_pol', None),
+            getattr(self, 'b0_pol', None),
+            getattr(self, 'W1_pol', None),
+            getattr(self, 'b1_pol', None),
+        )
+        targets = test_data["targets"]
+        diff = preds - targets
         mse = tf.reduce_mean(tf.square(diff))
-        rmse_loss = tf.sqrt(mse)
-        return rmse_loss
+        rmse = tf.sqrt(mse)
+
+        # Overall R² = 1 - SS_res / SS_tot
+        ss_res = tf.reduce_sum(tf.square(diff))
+        ss_tot = tf.reduce_sum(tf.square(targets - tf.reduce_mean(targets, axis=0)))
+        r2 = 1.0 - ss_res / ss_tot
+
+        # Per-component R²
+        ss_res_comp = tf.reduce_sum(tf.square(diff), axis=0)       # [T]
+        ss_tot_comp = tf.reduce_sum(
+            tf.square(targets - tf.reduce_mean(targets, axis=0)), axis=0)  # [T]
+        r2_components = 1.0 - ss_res_comp / tf.maximum(ss_tot_comp, 1e-12)
+
+        metrics = {
+            "rmse": rmse,
+            "r2": r2,
+            "r2_components": r2_components,
+        }
+
+        # Cosine similarity for vector targets (modes 1 and 2)
+        if self.cfg.target_mode >= 1:
+            dot = tf.reduce_sum(preds * targets, axis=1)          # [S]
+            norm_p = tf.linalg.norm(preds, axis=1)                # [S]
+            norm_t = tf.linalg.norm(targets, axis=1)              # [S]
+            cos_sim = dot / tf.maximum(norm_p * norm_t, 1e-12)    # [S]
+            metrics["cos_sim_mean"] = tf.reduce_mean(cos_sim)
+            metrics["cos_sim_all"] = cos_sim
+
+        return metrics, preds
+
+    @tf.function
+    def predict_batch(self, descriptors, gradients, grad_index, positions, Z,
+                      boxes, atom_mask, neighbor_mask,
+                      W0, b0, W1, b1, W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None):
+        """Batched forward pass for B structures with explicit weight tensors.
+
+        Weights are passed explicitly (not read from self) so this method can
+        be used for SNES population evaluation with different candidate weights.
+
+        Args:
+            descriptors    : [B, A, Q]        padded descriptors
+            gradients      : [B, A, M, 3, Q]  padded descriptor gradients
+            grad_index     : [B, A, M]        padded neighbor indices
+            positions      : [B, A, 3]        padded positions
+            Z              : [B, A]           padded type indices
+            boxes          : [B, 3, 3]        lattice vectors
+            atom_mask      : [B, A]           atom mask
+            neighbor_mask  : [B, A, M]        neighbor mask
+            W0             : [T, Q, H]        input weights (shared across batch)
+            b0             : [T, H]           hidden bias
+            W1             : [T, H]           output weights
+            b1             : ()               scalar bias
+            W0_pol ... b1_pol : same shapes, for mode 2 only (None otherwise)
+
+        Returns:
+            predictions : [B, T_dim]  where T_dim = 1 (PES), 3 (dipole), 6 (pol)
+        """
+        # Gather per-type weights for each atom in each structure
+        W0_t = tf.gather(W0, Z)   # [B, A, Q, H]
+        b0_t = tf.gather(b0, Z)   # [B, A, H]
+        W1_t = tf.gather(W1, Z)   # [B, A, H]
+
+        # Hidden layer
+        h = tf.einsum('bnd,bndh->bnh', descriptors, W0_t)  # [B, A, H]
+        h = h + b0_t
+        h = self.activation(h)
+        h = h * atom_mask[:, :, tf.newaxis]
+
+        if self.cfg.target_mode == 0:
+            E = tf.reduce_sum(h * W1_t, axis=2) + b1  # [B, A]
+            E = E * atom_mask
+            E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
+            return -E
+
+        # Modes 1 and 2: compute forces
+        forces = self._calc_forces_batch(h, gradients, W1_t, W0_t, neighbor_mask)
+
+        if self.cfg.target_mode == 1:
+            return self._dipole_batch(forces, positions, boxes, grad_index,
+                                      atom_mask, neighbor_mask)
+
+        elif self.cfg.target_mode == 2:
+            return self._polarizability_batch(
+                descriptors, forces, positions, boxes, Z, grad_index,
+                atom_mask, neighbor_mask,
+                W0_pol, b0_pol, W1_pol, b1_pol)
+
+        else:
+            tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
+            return tf.zeros([tf.shape(descriptors)[0], 1])
+
+    def _calc_forces_batch(self, h, gradients, W1_t, W0_t, neighbor_mask):
+        """Batched calc_forces: [B,A,H] inputs -> [B,A,M,3] forces."""
+        dtanh = 1.0 - tf.square(h)                                    # [B, A, H]
+        de_da = dtanh * W1_t                                           # [B, A, H]
+        de_dq = tf.einsum('bnh,bnqh->bnq', de_da, W0_t)              # [B, A, Q]
+        forces = tf.einsum('bnq,bnmcq->bnmc', de_dq, gradients)      # [B, A, M, 3]
+        forces = forces * neighbor_mask[:, :, :, tf.newaxis]
+        return forces
+
+    def _pairwise_displacements_batch(self, positions, boxes):
+        """Batched pairwise displacements under minimum image convention.
+
+        Args:
+            positions : [B, A, 3]
+            boxes     : [B, 3, 3]
+
+        Returns:
+            dr  : [B, A, A, 3]  displacement vectors
+            rij : [B, A, A]     scalar distances
+        """
+        box_inv = tf.linalg.inv(boxes)                            # [B, 3, 3]
+        # Fractional coordinates
+        s = tf.einsum('bij,bnj->bni', box_inv, positions)         # [B, A, 3]
+        # Pairwise differences in fractional coords
+        ds = s[:, tf.newaxis, :, :] - s[:, :, tf.newaxis, :]      # [B, A, A, 3]
+        ds = ds - tf.round(ds)                                     # MIC wrap
+        # Back to Cartesian
+        dr = tf.einsum('bij,bnmj->bnmi', boxes, ds)               # [B, A, A, 3]
+        rij = tf.linalg.norm(dr, axis=-1)                          # [B, A, A]
+        return dr, rij
+
+    def _dipole_batch(self, forces, positions, boxes, grad_index,
+                      atom_mask, neighbor_mask):
+        """Batched dipole prediction.
+
+        Args:
+            forces        : [B, A, M, 3]
+            positions     : [B, A, 3]
+            boxes         : [B, 3, 3]
+            grad_index    : [B, A, M]
+            atom_mask     : [B, A]
+            neighbor_mask : [B, A, M]
+
+        Returns:
+            dipole : [B, 3]
+        """
+        dr, rij = self._pairwise_displacements_batch(positions, boxes)
+        B = tf.shape(positions)[0]
+        A = tf.shape(positions)[1]
+        M = tf.shape(grad_index)[2]
+
+        # Gather displacements for grad_index neighbors
+        batch_idx = tf.broadcast_to(
+            tf.range(B)[:, tf.newaxis, tf.newaxis], [B, A, M])
+        atom_idx = tf.broadcast_to(
+            tf.range(A)[tf.newaxis, :, tf.newaxis], [B, A, M])
+        indices = tf.stack([batch_idx, atom_idx, grad_index], axis=-1)  # [B,A,M,3]
+
+        rij_gathered = tf.gather_nd(rij, indices)                        # [B, A, M]
+        rij2 = tf.square(rij_gathered) * neighbor_mask                   # [B, A, M]
+
+        dipole_contribs = rij2[:, :, :, tf.newaxis] * forces             # [B, A, M, 3]
+        dipole = -tf.reduce_sum(dipole_contribs, axis=[1, 2])            # [B, 3]
+        return dipole
+
+    def _polarizability_batch(self, descriptors, forces, positions, boxes, Z,
+                              grad_index, atom_mask, neighbor_mask,
+                              W0_pol, b0_pol, W1_pol, b1_pol):
+        """Batched polarizability via dual ANN (GPUMD approach).
+
+        Scalar ANN (W0_pol..b1_pol) -> isotropic diagonal.
+        Tensor ANN (primary, via forces) -> anisotropic virial.
+
+        Args:
+            descriptors   : [B, A, Q]
+            forces        : [B, A, M, 3]
+            positions     : [B, A, 3]
+            boxes         : [B, 3, 3]
+            Z             : [B, A]
+            grad_index    : [B, A, M]
+            atom_mask     : [B, A]
+            neighbor_mask : [B, A, M]
+            W0_pol..b1_pol: scalar ANN weights [T,Q,H] etc.
+
+        Returns:
+            pol : [B, 6]  — [xx, yy, zz, xy, yz, zx]
+        """
+        dr, rij = self._pairwise_displacements_batch(positions, boxes)
+        B = tf.shape(positions)[0]
+        A = tf.shape(positions)[1]
+        M = tf.shape(grad_index)[2]
+
+        batch_idx = tf.broadcast_to(
+            tf.range(B)[:, tf.newaxis, tf.newaxis], [B, A, M])
+        atom_idx = tf.broadcast_to(
+            tf.range(A)[tf.newaxis, :, tf.newaxis], [B, A, M])
+        indices = tf.stack([batch_idx, atom_idx, grad_index], axis=-1)
+        dr_gathered = tf.gather_nd(dr, indices)  # [B, A, M, 3]
+
+        # Scalar ANN (isotropic)
+        W0p_t = tf.gather(W0_pol, Z)  # [B, A, Q, H]
+        b0p_t = tf.gather(b0_pol, Z)  # [B, A, H]
+        W1p_t = tf.gather(W1_pol, Z)  # [B, A, H]
+
+        h_pol = tf.einsum('bnd,bndh->bnh', descriptors, W0p_t)
+        h_pol = h_pol + b0p_t
+        h_pol = self.activation(h_pol)
+        h_pol = h_pol * atom_mask[:, :, tf.newaxis]
+        F_pol = tf.reduce_sum(h_pol * W1p_t, axis=2) + b1_pol  # [B, A]
+        F_pol = F_pol * atom_mask
+        scalar_sum = tf.reduce_sum(F_pol, axis=1)  # [B]
+
+        # Tensor part: outer product (anisotropic virial)
+        pol_outer = -tf.einsum('bnma,bnmb->bnmab', dr_gathered, forces)  # [B,A,M,3,3]
+        pol_outer = pol_outer * neighbor_mask[:, :, :, tf.newaxis, tf.newaxis]
+        pol_matrix = tf.reduce_sum(pol_outer, axis=[1, 2])  # [B, 3, 3]
+
+        # Extract 6 components
+        pol = tf.stack([
+            pol_matrix[:, 0, 0],
+            pol_matrix[:, 1, 1],
+            pol_matrix[:, 2, 2],
+            pol_matrix[:, 0, 1],
+            pol_matrix[:, 1, 2],
+            pol_matrix[:, 2, 0],
+        ], axis=1)  # [B, 6]
+
+        # Add scalar to diagonal
+        diag_add = tf.stack([scalar_sum, scalar_sum, scalar_sum,
+                             tf.zeros_like(scalar_sum),
+                             tf.zeros_like(scalar_sum),
+                             tf.zeros_like(scalar_sum)], axis=1)  # [B, 6]
+        pol = pol + diag_add
+        return pol
