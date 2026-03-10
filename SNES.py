@@ -335,17 +335,17 @@ class SNES:
             history["timing"]["overhead"].append(t5 - t4)
 
             # Periodic plotting callback
-            if (plot_callback is not None
-                    and cfg.plot_interval is not None
-                    and (gen + 1) % cfg.plot_interval == 0)\
-                    and gen + 1 < cfg.num_generations:
-                # Temporarily restore best params for score()
-                params = self.reconstruct_params_tf(best_mu)
-                _set_model_params(self.model, *params)
-                plot_callback(history, gen + 1)
-                # Restore current mu back into model (training continues)
-                params = self.reconstruct_params_tf(self.mu)
-                _set_model_params(self.model, *params)
+            if gen + 1 < cfg.num_generations:
+                if (plot_callback is not None
+                        and cfg.plot_interval is not None
+                        and (gen + 1) % cfg.plot_interval == 0):
+                    # Temporarily restore best params for score()
+                    params = self.reconstruct_params_tf(best_mu)
+                    _set_model_params(self.model, *params)
+                    plot_callback(history, gen + 1)
+                    # Restore current mu back into model (training continues)
+                    params = self.reconstruct_params_tf(self.mu)
+                    _set_model_params(self.model, *params)
 
         # Restore best parameters into model for downstream score() calls
         if cfg.patience is not None:

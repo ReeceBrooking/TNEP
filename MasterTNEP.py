@@ -230,11 +230,46 @@ def pad_and_stack(data):
         "num_atoms": tf.constant(num_atoms_np),
     }
 
-def plot_snes_history(history, logy=False):
+def _make_plot_filename(cfg, plot_name):
+    """Generate an automatic filename for a plot based on config and plot name.
+
+    Format: {plot_name}_mode{target_mode}_pop{pop_size}_n{num_neurons}_l{l_max}.png
+
+    Args:
+        cfg       : TNEPconfig
+        plot_name : str — short identifier for the plot type
+
+    Returns:
+        filename : str — e.g. "snes_fitness_mode1_pop80_n30_l4.png"
+    """
+    mode_names = {0: "pes", 1: "dipole", 2: "polar"}
+    mode = mode_names.get(cfg.target_mode, f"mode{cfg.target_mode}")
+    return (f"{plot_name}_{mode}_pop{cfg.pop_size}_n{cfg.num_neurons}"
+            f"_l{cfg.l_max}.png")
+
+
+def _save_fig(fig, cfg, plot_name):
+    """Save a figure if cfg.save_plots is set.
+
+    Args:
+        fig       : matplotlib Figure
+        cfg       : TNEPconfig
+        plot_name : str — short identifier for the plot type
+    """
+    if cfg.save_plots is None:
+        return
+    os.makedirs(cfg.save_plots, exist_ok=True)
+    filename = _make_plot_filename(cfg, plot_name)
+    path = os.path.join(cfg.save_plots, filename)
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    print(f"  Plot saved: {path}")
+
+
+def plot_snes_history(history, logy=False, cfg=None):
     """Plot train and validation RMSE vs generation with best/worst band."""
     g = np.asarray(history["generation"])
 
-    plt.figure()
+    fig = plt.figure()
     plt.plot(g, history["train_loss"], label="Train RMSE")
     plt.plot(g, history["val_loss"], label="Val RMSE")
 
@@ -248,29 +283,33 @@ def plot_snes_history(history, logy=False):
         plt.yscale("log")
     plt.legend()
     plt.title("SNES fitness vs generation")
+    if cfg:
+        _save_fig(fig, cfg, "snes_fitness")
     plt.show()
 
-def plot_log_val_fitness(history):
+def plot_log_val_fitness(history, cfg=None):
     """Plot natural log of validation fitness vs generation."""
     g = np.asarray(history["generation"])
     val = np.asarray(history["val_loss"])
     ln_val = np.log(val)
 
-    plt.figure()
+    fig = plt.figure()
     plt.plot(g, ln_val, label="ln(Val RMSE)")
     plt.xlabel("Generation")
     plt.ylabel("ln(Validation RMSE)")
     plt.legend()
     plt.title("Log validation fitness vs generation")
+    if cfg:
+        _save_fig(fig, cfg, "log_val_fitness")
     plt.show()
 
-def plot_sigma_history(history):
+def plot_sigma_history(history, cfg=None):
     """Plot sigma min/max/mean vs generation on log-y scale with reset markers."""
     g = np.asarray(history["generation"])
     if not history.get("sigma_mean"):
         return
 
-    plt.figure()
+    fig = plt.figure()
     plt.plot(g, history["sigma_mean"], label="Sigma mean")
     plt.plot(g, history["sigma_median"], label="Sigma median", linestyle="--")
     plt.plot(g, history["sigma_min"], label="Sigma min", alpha=0.6)
@@ -287,9 +326,11 @@ def plot_sigma_history(history):
     plt.yscale("log")
     plt.legend()
     plt.title("SNES sigma evolution")
+    if cfg:
+        _save_fig(fig, cfg, "sigma_evolution")
     plt.show()
 
-def plot_timing(history):
+def plot_timing(history, cfg=None):
     """Plot per-generation timing breakdown and aggregate summary."""
     timing = history.get("timing")
     if not timing or not timing.get("evaluate"):
@@ -321,6 +362,8 @@ def plot_timing(history):
                  f" {total:.3f}s ({pct:.1f}%)", va='center')
 
     plt.tight_layout()
+    if cfg:
+        _save_fig(fig, cfg, "timing")
     plt.show()
 
 def plot_correlation(targets, predictions, metrics, cfg):
@@ -408,7 +451,485 @@ def plot_correlation(targets, predictions, metrics, cfg):
     mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
     fig.suptitle(f"{mode} — RMSE: {rmse:.4f}, R²: {r2:.4f}", fontsize=14)
     plt.tight_layout()
+    _save_fig(fig, cfg, "correlation")
     plt.show()
+
+def compute_dipole_acf(dipoles):
+    """Compute the dipole autocorrelation function via the Wiener-Khinchin theorem.
+
+    Uses FFT for O(N log N) efficiency instead of direct O(N²) summation.
+    Averages over x, y, z components (isotropic).
+
+    Ref: Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284, Eq. 9
+
+    Args:
+        dipoles : [T, 3] ndarray — dipole moment trajectory (one per MD frame)
+
+    Returns:
+        acf : [T] ndarray — normalised dipole autocorrelation function C(τ)/C(0)
+    """
+    T = dipoles.shape[0]
+    # Zero-pad to avoid circular correlation artefacts
+    n_fft = 2 * T
+    acf = np.zeros(T)
+    for dim in range(3):
+        d = dipoles[:, dim]
+        # Wiener-Khinchin: ACF = IFFT(|FFT(d)|²)
+        fd = np.fft.rfft(d, n=n_fft)
+        power = np.real(fd * np.conj(fd))
+        full_acf = np.fft.irfft(power, n=n_fft)[:T]
+        acf += full_acf
+    # Normalise by number of overlapping pairs at each lag
+    counts = np.arange(T, 0, -1, dtype=np.float64)
+    acf /= counts
+    # Average over 3 spatial dimensions
+    acf /= 3.0
+    return acf
+
+
+def compute_ir_spectrum(dipoles, dt_fs=1.0, window='hann', max_freq_cm=4000.0):
+    """Compute IR absorption spectrum from a dipole moment trajectory.
+
+    Follows Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284:
+        1. Compute dipole autocorrelation function C(τ) = <μ(0)·μ(τ)>
+        2. Apply optional window function to reduce spectral leakage
+        3. Fourier transform: M(ω) = FT[C(τ)]
+        4. IR absorption: σ(ω) ∝ ω · M(ω)  (classical approximation, Eq. 8)
+
+    Args:
+        dipoles      : [T, 3] ndarray — dipole trajectory (e/Å or Debye, one per frame)
+        dt_fs        : float — timestep between frames in femtoseconds
+        window       : str or None — window function ('hann', 'blackman', or None)
+        max_freq_cm  : float — maximum frequency to return in cm⁻¹
+
+    Returns:
+        freq_cm : [N] ndarray — frequencies in cm⁻¹
+        intensity : [N] ndarray — IR absorption intensity (arb. units)
+        acf : [T] ndarray — dipole autocorrelation function
+    """
+    acf = compute_dipole_acf(dipoles)
+    T = len(acf)
+
+    # Apply window to reduce spectral leakage
+    if window == 'hann':
+        w = np.hanning(T)
+    elif window == 'blackman':
+        w = np.blackman(T)
+    else:
+        w = np.ones(T)
+    acf_windowed = acf * w
+
+    # Fourier transform of ACF -> line shape M(ω)
+    spectrum = np.fft.rfft(acf_windowed)
+    M_omega = np.real(spectrum)
+
+    # Frequency axis: convert from 1/fs to cm⁻¹
+    # ν (1/fs) -> ω (cm⁻¹): multiply by 1e15 / (c * 100)
+    # where c = 2.998e8 m/s, so c_cm = 2.998e10 cm/s
+    freq_per_fs = np.fft.rfftfreq(T, d=dt_fs)  # in 1/fs
+    c_cm_per_fs = 2.99792458e-5  # speed of light in cm/fs
+    freq_cm = freq_per_fs / c_cm_per_fs  # convert to cm⁻¹
+
+    # IR absorption: σ(ω) ∝ ω · M(ω)  (classical, Eq. 8 simplified)
+    intensity = freq_cm * M_omega
+
+    # Truncate to requested frequency range
+    mask = freq_cm <= max_freq_cm
+    freq_cm = freq_cm[mask]
+    intensity = intensity[mask]
+
+    # Normalise to peak = 1
+    peak = np.max(np.abs(intensity))
+    if peak > 0:
+        intensity /= peak
+
+    return freq_cm, intensity, acf
+
+
+def plot_ir_spectrum(freq_cm, intensity, title="IR Spectrum"):
+    """Plot IR absorption spectrum.
+
+    Args:
+        freq_cm   : [N] ndarray — frequencies in cm⁻¹
+        intensity : [N] ndarray — normalised IR intensity
+        title     : str — plot title
+    """
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(freq_cm, intensity, color='black', linewidth=0.8)
+    ax.set_xlabel("Wavenumber (cm⁻¹)")
+    ax.set_ylabel("IR Intensity (arb. units)")
+    ax.set_title(title)
+    ax.set_xlim(freq_cm[0], freq_cm[-1])
+    ax.invert_xaxis()  # IR convention: high to low wavenumber
+    plt.tight_layout()
+    plt.show()
+
+
+def predict_dipole_trajectory(model, trajectory, dataset_types_int, cfg):
+    """Predict dipole moments for each frame in an MD trajectory.
+
+    Args:
+        model             : trained TNEP model (target_mode = 1)
+        trajectory        : list of ase.Atoms — MD frames (ordered in time)
+        dataset_types_int : list of [N_i] int arrays — type indices per frame
+        cfg               : TNEPconfig
+
+    Returns:
+        dipoles : [T, 3] ndarray — predicted dipole moment per frame
+    """
+    builder = DescriptorBuilder(cfg)
+    descriptors, gradients, grad_index = builder.build_descriptors(trajectory)
+
+    dipoles = []
+    for s in range(len(trajectory)):
+        struct = trajectory[s]
+        N = len(struct)
+        pos = tf.constant(struct.positions, dtype=tf.float32)
+        Z = tf.constant(dataset_types_int[s], dtype=tf.int32)
+        box = tf.constant(struct.cell.array, dtype=tf.float32)
+        desc = descriptors[s]
+        atom_mask = tf.ones([N], dtype=tf.float32)
+
+        # Pad gradients/grad_index for this structure
+        max_nbrs = max(gradients[s][i].shape[0] for i in range(N))
+        grad_padded = np.zeros((N, max_nbrs, 3, cfg.dim_q), dtype=np.float32)
+        gidx_padded = np.zeros((N, max_nbrs), dtype=np.int32)
+        nbr_mask = np.zeros((N, max_nbrs), dtype=np.float32)
+        for i in range(N):
+            n_nbrs = gradients[s][i].shape[0]
+            grad_padded[i, :n_nbrs] = gradients[s][i].numpy()
+            gidx_padded[i, :n_nbrs] = grad_index[s][i]
+            nbr_mask[i, :n_nbrs] = 1.0
+
+        mu = model.predict(
+            desc, tf.constant(grad_padded), tf.constant(gidx_padded),
+            pos, Z, box, atom_mask, tf.constant(nbr_mask, dtype=tf.float32))
+        dipoles.append(mu.numpy())
+
+    return np.array(dipoles)
+
+
+def predict_polarizability_trajectory(model, trajectory, dataset_types_int, cfg):
+    """Predict polarizability tensors for each frame in an MD trajectory.
+
+    Args:
+        model             : trained TNEP model (target_mode = 2)
+        trajectory        : list of ase.Atoms — MD frames (ordered in time)
+        dataset_types_int : list of [N_i] int arrays — type indices per frame
+        cfg               : TNEPconfig
+
+    Returns:
+        pols : [T, 6] ndarray — predicted polarizability [xx, yy, zz, xy, yz, zx] per frame
+    """
+    builder = DescriptorBuilder(cfg)
+    descriptors, gradients, grad_index = builder.build_descriptors(trajectory)
+
+    pols = []
+    for s in range(len(trajectory)):
+        struct = trajectory[s]
+        N = len(struct)
+        pos = tf.constant(struct.positions, dtype=tf.float32)
+        Z = tf.constant(dataset_types_int[s], dtype=tf.int32)
+        box = tf.constant(struct.cell.array, dtype=tf.float32)
+        desc = descriptors[s]
+        atom_mask = tf.ones([N], dtype=tf.float32)
+
+        max_nbrs = max(gradients[s][i].shape[0] for i in range(N))
+        grad_padded = np.zeros((N, max_nbrs, 3, cfg.dim_q), dtype=np.float32)
+        gidx_padded = np.zeros((N, max_nbrs), dtype=np.int32)
+        nbr_mask = np.zeros((N, max_nbrs), dtype=np.float32)
+        for i in range(N):
+            n_nbrs = gradients[s][i].shape[0]
+            grad_padded[i, :n_nbrs] = gradients[s][i].numpy()
+            gidx_padded[i, :n_nbrs] = grad_index[s][i]
+            nbr_mask[i, :n_nbrs] = 1.0
+
+        pol = model.predict(
+            desc, tf.constant(grad_padded), tf.constant(gidx_padded),
+            pos, Z, box, atom_mask, tf.constant(nbr_mask, dtype=tf.float32))
+        pols.append(pol.numpy())
+
+    return np.array(pols)
+
+
+def _scalar_acf_fft(signal):
+    """Compute autocorrelation of a 1D signal via FFT (Wiener-Khinchin).
+
+    Args:
+        signal : [T] ndarray
+
+    Returns:
+        acf : [T] ndarray — unnormalised ACF (divided by overlap count)
+    """
+    T = len(signal)
+    n_fft = 2 * T
+    fd = np.fft.rfft(signal, n=n_fft)
+    power = np.real(fd * np.conj(fd))
+    acf = np.fft.irfft(power, n=n_fft)[:T]
+    counts = np.arange(T, 0, -1, dtype=np.float64)
+    acf /= counts
+    return acf
+
+
+def _cross_acf_fft(a, b):
+    """Compute cross-correlation <a(0)·b(t)> via FFT.
+
+    Args:
+        a, b : [T] ndarrays
+
+    Returns:
+        ccf : [T] ndarray — unnormalised cross-correlation
+    """
+    T = len(a)
+    n_fft = 2 * T
+    fa = np.fft.rfft(a, n=n_fft)
+    fb = np.fft.rfft(b, n=n_fft)
+    power = np.real(fa * np.conj(fb))
+    ccf = np.fft.irfft(power, n=n_fft)[:T]
+    counts = np.arange(T, 0, -1, dtype=np.float64)
+    ccf /= counts
+    return ccf
+
+
+def compute_raman_acfs(polarizabilities):
+    """Compute isotropic and anisotropic polarizability autocorrelation functions.
+
+    Decomposes the polarizability tensor into isotropic (γ) and anisotropic (β)
+    parts, then computes their respective ACFs.
+
+    Ref: Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284, Eq. 12
+
+    Decomposition:
+        γ(t) = (α_xx + α_yy + α_zz) / 3     (isotropic scalar)
+        β_ij = α_ij - γ·δ_ij                  (traceless anisotropic tensor)
+
+    ACFs:
+        C_iso(τ)   = <γ(0)·γ(τ)>
+        C_aniso(τ) = <β_ij(0)·β_ij(τ)>       (full tensor contraction)
+
+    Args:
+        polarizabilities : [T, 6] ndarray — [xx, yy, zz, xy, yz, zx] per frame
+
+    Returns:
+        acf_iso   : [T] ndarray — isotropic ACF
+        acf_aniso : [T] ndarray — anisotropic ACF
+    """
+    xx = polarizabilities[:, 0]
+    yy = polarizabilities[:, 1]
+    zz = polarizabilities[:, 2]
+    xy = polarizabilities[:, 3]
+    yz = polarizabilities[:, 4]
+    zx = polarizabilities[:, 5]
+
+    # Isotropic part: γ = Tr(α)/3
+    gamma = (xx + yy + zz) / 3.0
+    acf_iso = _scalar_acf_fft(gamma)
+
+    # Anisotropic (traceless) part: β_ij = α_ij - γ·δ_ij
+    beta_xx = xx - gamma
+    beta_yy = yy - gamma
+    beta_zz = zz - gamma
+    # Off-diagonal β components equal α (since δ_ij = 0 for i≠j)
+    beta_xy = xy
+    beta_yz = yz
+    beta_zx = zx
+
+    # C_aniso(τ) = <β_ij(0)·β_ij(τ)> summed over all i,j
+    # Diagonal: β_xx·β_xx + β_yy·β_yy + β_zz·β_zz
+    # Off-diagonal (×2 for symmetry): 2(β_xy·β_xy + β_yz·β_yz + β_zx·β_zx)
+    acf_aniso = (_scalar_acf_fft(beta_xx)
+                 + _scalar_acf_fft(beta_yy)
+                 + _scalar_acf_fft(beta_zz)
+                 + 2.0 * _scalar_acf_fft(beta_xy)
+                 + 2.0 * _scalar_acf_fft(beta_yz)
+                 + 2.0 * _scalar_acf_fft(beta_zx))
+
+    return acf_iso, acf_aniso
+
+
+def compute_raman_spectrum(polarizabilities, dt_fs=1.0, window='hann',
+                           max_freq_cm=4000.0, temperature=300.0):
+    """Compute Raman spectrum from a polarizability trajectory.
+
+    Follows Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284:
+        1. Decompose α(t) into isotropic γ(t) and anisotropic β(t)  (Eq. 12)
+        2. Compute ACFs: C_iso(τ), C_aniso(τ)
+        3. Fourier transform to get line shapes
+        4. Assemble parallel/perpendicular spectra  (Eq. 10-11)
+        5. Apply Bose-Einstein correction: (n(ω) + 1) / ω
+
+    Polarised (VV) and depolarised (VH) Raman intensities:
+        I_VV(ω) ∝ [45·L_iso(ω) + 4·L_aniso(ω)] · (n(ω)+1)/ω
+        I_VH(ω) ∝ 3·L_aniso(ω) · (n(ω)+1)/ω
+
+    Args:
+        polarizabilities : [T, 6] ndarray — [xx, yy, zz, xy, yz, zx] per frame
+        dt_fs            : float — timestep between frames in femtoseconds
+        window           : str or None — window function ('hann', 'blackman', None)
+        max_freq_cm      : float — maximum frequency in cm⁻¹
+        temperature      : float — temperature in Kelvin for Bose-Einstein factor
+
+    Returns:
+        freq_cm  : [N] ndarray — frequencies in cm⁻¹
+        I_VV     : [N] ndarray — parallel (polarised) Raman intensity
+        I_VH     : [N] ndarray — perpendicular (depolarised) Raman intensity
+        I_total  : [N] ndarray — total unpolarised Raman intensity
+        acf_iso  : [T] ndarray — isotropic ACF
+        acf_aniso: [T] ndarray — anisotropic ACF
+    """
+    acf_iso, acf_aniso = compute_raman_acfs(polarizabilities)
+    T = len(acf_iso)
+
+    # Apply window
+    if window == 'hann':
+        w = np.hanning(T)
+    elif window == 'blackman':
+        w = np.blackman(T)
+    else:
+        w = np.ones(T)
+
+    L_iso = np.real(np.fft.rfft(acf_iso * w))
+    L_aniso = np.real(np.fft.rfft(acf_aniso * w))
+
+    # Frequency axis: 1/fs -> cm⁻¹
+    freq_per_fs = np.fft.rfftfreq(T, d=dt_fs)
+    c_cm_per_fs = 2.99792458e-5  # speed of light in cm/fs
+    freq_cm = freq_per_fs / c_cm_per_fs
+
+    # Bose-Einstein correction: (n(ω) + 1) / ω
+    # n(ω) = 1 / (exp(ℏω/kT) - 1)
+    # ℏω in eV: ℏ·c·ν̃ where ν̃ in cm⁻¹
+    # ℏc = 1.23984e-4 eV·cm, kT at 300K = 0.02585 eV
+    hbar_c_eV_cm = 1.23984e-4  # eV·cm
+    kT = 8.617333e-5 * temperature  # eV (k_B in eV/K)
+
+    bose_factor = np.ones_like(freq_cm)
+    for i in range(1, len(freq_cm)):  # skip ω=0
+        hw = hbar_c_eV_cm * freq_cm[i]  # ℏω in eV
+        x = hw / kT
+        if x < 500:  # avoid overflow
+            n_bose = 1.0 / (np.exp(x) - 1.0)
+            bose_factor[i] = (n_bose + 1.0) / freq_cm[i]
+        else:
+            bose_factor[i] = 0.0
+    bose_factor[0] = 0.0  # DC component
+
+    # Raman intensities (Eq. 10-11)
+    I_VV = (45.0 * L_iso + 4.0 * L_aniso) * bose_factor
+    I_VH = 3.0 * L_aniso * bose_factor
+    I_total = I_VV + I_VH
+
+    # Truncate to frequency range
+    mask = freq_cm <= max_freq_cm
+    freq_cm = freq_cm[mask]
+    I_VV = I_VV[mask]
+    I_VH = I_VH[mask]
+    I_total = I_total[mask]
+
+    # Normalise to peak = 1
+    peak = np.max(np.abs(I_total))
+    if peak > 0:
+        I_VV /= peak
+        I_VH /= peak
+        I_total /= peak
+
+    return freq_cm, I_VV, I_VH, I_total, acf_iso, acf_aniso
+
+
+def plot_raman_spectrum(freq_cm, I_VV, I_VH, I_total, title="Raman Spectrum"):
+    """Plot Raman spectrum with parallel, perpendicular, and total components.
+
+    Args:
+        freq_cm : [N] ndarray — frequencies in cm⁻¹
+        I_VV    : [N] ndarray — parallel (polarised) intensity
+        I_VH    : [N] ndarray — perpendicular (depolarised) intensity
+        I_total : [N] ndarray — total intensity
+        title   : str — plot title
+    """
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(freq_cm, I_total, color='black', linewidth=0.8, label="Total")
+    ax.plot(freq_cm, I_VV, color='blue', linewidth=0.6, alpha=0.7, label="VV (polarised)")
+    ax.plot(freq_cm, I_VH, color='red', linewidth=0.6, alpha=0.7, label="VH (depolarised)")
+    ax.set_xlabel("Raman shift (cm⁻¹)")
+    ax.set_ylabel("Raman Intensity (arb. units)")
+    ax.set_title(title)
+    ax.set_xlim(freq_cm[0], freq_cm[-1])
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def save_model(model, cfg, path="tnep_model.npz"):
+    """Save trained TNEP model weights and config to a .npz file.
+
+    Args:
+        model : trained TNEP model
+        cfg   : TNEPconfig used for training
+        path  : str — output file path
+    """
+    data = {
+        "W0": model.W0.numpy(),
+        "b0": model.b0.numpy(),
+        "W1": model.W1.numpy(),
+        "b1": model.b1.numpy(),
+        "num_types": np.array(cfg.num_types),
+        "num_neurons": np.array(cfg.num_neurons),
+        "dim_q": np.array(cfg.dim_q),
+        "types": np.array(cfg.types),
+        "target_mode": np.array(cfg.target_mode),
+        "l_max": np.array(cfg.l_max),
+        "alpha_max": np.array(cfg.alpha_max),
+        "activation": np.array(cfg.activation),
+    }
+    if cfg.target_mode == 2:
+        data["W0_pol"] = model.W0_pol.numpy()
+        data["b0_pol"] = model.b0_pol.numpy()
+        data["W1_pol"] = model.W1_pol.numpy()
+        data["b1_pol"] = model.b1_pol.numpy()
+
+    np.savez(path, **data)
+    print(f"Model saved to {path}")
+
+
+def load_model(path="tnep_model.npz"):
+    """Load a trained TNEP model from a .npz file.
+
+    Reconstructs a TNEPconfig and TNEP model with the saved weights.
+
+    Args:
+        path : str — path to saved .npz file
+
+    Returns:
+        model : TNEP model with loaded weights
+        cfg   : TNEPconfig reconstructed from saved parameters
+    """
+    data = np.load(path, allow_pickle=True)
+    cfg = TNEPconfig()
+    cfg.num_types = int(data["num_types"])
+    cfg.num_neurons = int(data["num_neurons"])
+    cfg.dim_q = int(data["dim_q"])
+    cfg.types = data["types"].tolist()
+    cfg.target_mode = int(data["target_mode"])
+    cfg.l_max = int(data["l_max"])
+    cfg.alpha_max = int(data["alpha_max"])
+    cfg.activation = str(data["activation"])
+
+    model = TNEP(cfg)
+    model.W0.assign(data["W0"])
+    model.b0.assign(data["b0"])
+    model.W1.assign(data["W1"])
+    model.b1.assign(data["b1"])
+
+    if cfg.target_mode == 2:
+        model.W0_pol.assign(data["W0_pol"])
+        model.b0_pol.assign(data["b0_pol"])
+        model.W1_pol.assign(data["W1_pol"])
+        model.b1_pol.assign(data["b1_pol"])
+
+    print(f"Model loaded from {path} (target_mode={cfg.target_mode}, "
+          f"dim_q={cfg.dim_q}, num_types={cfg.num_types})")
+    return model, cfg
+
 
 def filter_by_species(dataset, dataset_types_int, allowed_Z):
     """Keep only structures whose atoms are all within allowed_Z.
@@ -565,6 +1086,9 @@ if "cos_sim_mean" in metrics:
           f"std={cos_all.std():.4f}")
 print("Run complete!")
 
+if cfg.save_path is not None:
+    save_model(model, cfg, cfg.save_path)
+
 timing = history.get("timing", {})
 if timing:
     phases = ["sample_batch", "evaluate", "rank_update", "validate", "overhead"]
@@ -583,8 +1107,8 @@ if vram:
     print(f"  Peak: {max(vram):.1f} MB / 12288 MB ({100*max(vram)/12288:.1f}%)")
     print(f"  Last: {vram[-1]:.1f} MB")
 
-plot_snes_history(history)
-plot_log_val_fitness(history)
-plot_sigma_history(history)
-plot_timing(history)
+plot_snes_history(history, cfg=cfg)
+plot_log_val_fitness(history, cfg=cfg)
+plot_sigma_history(history, cfg=cfg)
+plot_timing(history, cfg=cfg)
 plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg)

@@ -14,7 +14,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 5000
+    num_generations: int = 40000
 
     # SOAP Turbo descriptor parameters
     l_max: int = 4
@@ -56,7 +56,12 @@ class TNEPconfig:
     batch_chunk_size: int | None = 400
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
-    plot_interval: int | None = 1000
+    plot_interval: int | None = None
+
+    # Save model after training (None = disabled; str = file path)
+    save_path: str | None = "tnep_model.npz"
+    # Save final plots to directory (None = disabled; str = directory path)
+    save_plots: str | None = "plots"
 
     dim_q: int
     num_types: int
