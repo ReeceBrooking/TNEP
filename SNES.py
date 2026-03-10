@@ -186,23 +186,29 @@ class SNES:
         self.mu.assign_add(self.sigma * grad_mu)
         self.sigma.assign(self.sigma * tf.exp(self.eta_sigma * grad_sigma))
 
-    def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor], plot_callback: Callable | None = None) -> dict:
+    def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor],
+            plot_callback: Callable | None = None,
+            num_generations: int | None = None, patience: int | None = ...) -> dict:
         """Run the SNES training loop using GPU-batched population evaluation.
 
         All sampling, ranking, and update operations run on GPU.
         Only scalar metrics are transferred to CPU for history/reporting.
 
         Args:
-            train_data    : dict with padded tensors from pad_and_stack()
-            val_data      : same structure
-            plot_callback : optional callable(history, gen) — called every
-                            cfg.plot_interval generations for periodic plotting
+            train_data      : dict with padded tensors from pad_and_stack()
+            val_data        : same structure
+            plot_callback   : optional callable(history, gen) — called every
+                              cfg.plot_interval generations for periodic plotting
+            num_generations : override cfg.num_generations for this call (None = use cfg)
+            patience        : override cfg.patience for this call (... = use cfg)
 
         Returns:
             history : dict with training metrics per generation
         """
         print("Fitting model...")
         cfg = self.cfg
+        n_gens = num_generations if num_generations is not None else cfg.num_generations
+        effective_patience = patience if patience is not ... else cfg.patience
         S_train = train_data["descriptors"].shape[0]
 
         history = {
@@ -234,7 +240,7 @@ class SNES:
         gens_without_improvement = 0
         train_start = time.perf_counter()
 
-        for gen in range(cfg.num_generations):
+        for gen in range(n_gens):
             t0 = time.perf_counter()
 
             samples, s = self.ask()
@@ -301,7 +307,7 @@ class SNES:
             history["sigma_median"].append(float(np.median(self.sigma.numpy())))
 
             # Progress bar
-            frac = (gen + 1) / cfg.num_generations
+            frac = (gen + 1) / n_gens
             bar_len = 30
             filled = int(bar_len * frac)
             bar = "█" * filled + "░" * (bar_len - filled)
@@ -309,7 +315,7 @@ class SNES:
             eta = elapsed / frac * (1 - frac) if frac > 0 else 0
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
-            line = (f"\r{bar} {gen + 1}/{cfg.num_generations} "
+            line = (f"\r{bar} {gen + 1}/{n_gens} "
                     f"train RMSE: {avg_fitness:.4f}  "
                     f"val RMSE: {float(val_fitness):.4f}  "
                     f"best val RMSE: {best_val_loss:.4f}  "
@@ -329,9 +335,9 @@ class SNES:
             else:
                 gens_without_improvement += 1
 
-            if cfg.patience is not None and gens_without_improvement >= cfg.patience:
+            if effective_patience is not None and gens_without_improvement >= effective_patience:
                 print(f"\nEarly stopping at generation {gen + 1} "
-                      f"(no improvement for {cfg.patience} generations)")
+                      f"(no improvement for {effective_patience} generations)")
                 self.mu.assign(best_mu)
                 self.sigma.assign(best_sigma)
                 break
@@ -358,7 +364,7 @@ class SNES:
             history["timing"]["overhead"].append(t5 - t4)
 
             # Periodic plotting callback
-            if gen + 1 < cfg.num_generations:
+            if gen + 1 < n_gens:
                 if (plot_callback is not None
                         and cfg.plot_interval is not None
                         and (gen + 1) % cfg.plot_interval == 0):

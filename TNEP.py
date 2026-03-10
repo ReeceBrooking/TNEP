@@ -239,19 +239,23 @@ class TNEP(layers.Layer):
         return forces
 
     def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor],
-            plot_callback: Callable | None = None) -> dict:
+            plot_callback: Callable | None = None,
+            num_generations: int | None = None, patience: int | None = ...) -> dict:
         """Train the model using the SNES evolutionary optimizer.
 
         Args:
-            train_data    : dict with keys descriptors, gradients, grad_index,
-                            positions, Z_int, targets, boxes (lists over structures)
-            val_data      : same structure, used for validation each generation
-            plot_callback : optional callable(history, gen) for periodic plotting
+            train_data      : dict with keys descriptors, gradients, grad_index,
+                              positions, Z_int, targets, boxes (lists over structures)
+            val_data        : same structure, used for validation each generation
+            plot_callback   : optional callable(history, gen) for periodic plotting
+            num_generations : override cfg.num_generations for this call (None = use cfg)
+            patience        : override cfg.patience for this call (... = use cfg)
 
         Returns:
             history : dict with keys generation, train_loss, val_loss (lists)
         """
-        history = self.optimizer.fit(train_data, val_data, plot_callback=plot_callback)
+        history = self.optimizer.fit(train_data, val_data, plot_callback=plot_callback,
+                                     num_generations=num_generations, patience=patience)
         return history
 
     def score(self, test_data: dict[str, tf.Tensor]) -> tuple[dict[str, tf.Tensor], tf.Tensor]:

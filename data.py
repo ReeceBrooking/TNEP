@@ -154,6 +154,24 @@ def assemble_data_dict(
     }
 
 
+def prepare_eval_data_raw(dataset: list[Atoms], cfg: TNEPconfig) -> dict:
+    """Build type indices, descriptors, and raw (un-padded) data dict for evaluation.
+
+    Like prepare_eval_data() but stops before pad_and_stack().
+
+    Args:
+        dataset : list of ase.Atoms
+        cfg     : TNEPconfig from training
+
+    Returns:
+        raw data dict (un-padded) suitable for chunk_raw_data() then pad_and_stack()
+    """
+    types_int = assign_type_indices(dataset, cfg.types)
+    builder = DescriptorBuilder(cfg)
+    descriptors, gradients, grad_index = builder.build_descriptors(dataset)
+    return assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
+
+
 def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Tensor]:
     """Build type indices, descriptors, and padded data dict for evaluation.
 
@@ -338,6 +356,134 @@ def pad_and_stack(data: dict) -> dict[str, tf.Tensor]:
         "neighbor_mask": tf.constant(nbr_mask_np),
         "num_atoms": tf.constant(num_atoms_np),
     }
+
+
+def estimate_padded_bytes(raw_data: dict, num_structures: int | None = None) -> int:
+    """Estimate total bytes for padded tensors from raw (un-padded) data.
+
+    Scans raw data for global max_atoms and max_neighbors, then estimates
+    total bytes for num_structures (default: all). Applies 2x safety factor
+    (numpy + tf.constant coexist briefly during pad_and_stack()).
+
+    Args:
+        raw_data       : dict from split() or assemble_data_dict() (un-padded)
+        num_structures : int or None — how many structures to estimate for
+                         (None = all structures in raw_data)
+
+    Returns:
+        estimated bytes as int
+    """
+    S = num_structures if num_structures is not None else len(raw_data["descriptors"])
+    dim_q = raw_data["descriptors"][0].shape[-1]
+
+    total_S = len(raw_data["descriptors"])
+    atom_counts = [raw_data["descriptors"][i].shape[0] for i in range(total_S)]
+    max_atoms = max(atom_counts)
+
+    max_neighbors = 0
+    for s in range(total_S):
+        for i in range(atom_counts[s]):
+            n_nbrs = raw_data["gradients"][s][i].shape[0]
+            if n_nbrs > max_neighbors:
+                max_neighbors = n_nbrs
+
+    target_sample = raw_data["targets"][0]
+    target_dim = 1 if target_sample.shape == () else target_sample.shape[0]
+
+    A, M, Q, T = max_atoms, max_neighbors, dim_q, target_dim
+    bytes_per_structure = (
+        A * Q * 4              # descriptors [A, Q] float32
+        + A * M * 3 * Q * 4   # gradients [A, M, 3, Q] float32  (dominant)
+        + A * M * 4           # grad_index [A, M] int32
+        + A * 3 * 4           # positions [A, 3] float32
+        + A * 4               # Z_int [A] int32
+        + T * 4               # targets [T] float32
+        + 3 * 3 * 4           # boxes [3, 3] float32
+        + A * 4               # atom_mask [A] float32
+        + A * M * 4           # neighbor_mask [A, M] float32
+        + 4                   # num_atoms int32
+    )
+
+    # 2x safety: numpy array + tf.constant coexist during pad_and_stack()
+    return S * bytes_per_structure * 2
+
+
+def get_available_memory(cfg: TNEPconfig) -> tuple[int, int]:
+    """Return (ram_bytes, vram_bytes).
+
+    If cfg.ram_mb or cfg.gpu_memory_mb is set, those values are used directly
+    and auto-detection is skipped entirely. Otherwise:
+    RAM: psutil (fallback 8 GB). VRAM: TF experimental (fallback inf).
+    """
+    if cfg.ram_mb is not None or cfg.gpu_memory_mb is not None:
+        ram_bytes = cfg.ram_mb * 1024 * 1024 if cfg.ram_mb is not None else 8 * 1024 ** 3
+        vram_bytes = cfg.gpu_memory_mb * 1024 * 1024 if cfg.gpu_memory_mb is not None else float('inf')
+        return ram_bytes, vram_bytes
+
+    # Auto-detect RAM
+    try:
+        import psutil
+        ram_bytes = psutil.virtual_memory().available
+    except ImportError:
+        ram_bytes = 8 * 1024 ** 3
+
+    # Auto-detect VRAM
+    try:
+        info = tf.config.experimental.get_memory_info('GPU:0')
+        if 'limit' in info:
+            vram_bytes = info['limit']
+        else:
+            vram_bytes = float('inf')
+    except (RuntimeError, ValueError):
+        vram_bytes = float('inf')
+
+    return ram_bytes, vram_bytes
+
+
+def compute_max_padded_size(raw_data: dict, cfg: TNEPconfig) -> int:
+    """Compute max structures that fit in a single padded tensor within memory budget.
+
+    Uses the global max_atoms/max_neighbors from raw_data to estimate per-structure
+    bytes, then divides available memory budget to get chunk size.
+
+    Args:
+        raw_data : dict from split() — should be the combined dataset (all splits
+                   concatenated) to get global max_atoms/max_neighbors
+        cfg      : TNEPconfig with ram_threshold and vram_threshold
+
+    Returns:
+        max_structures : int >= 1
+    """
+    per_struct = estimate_padded_bytes(raw_data, 1)
+    ram_bytes, vram_bytes = get_available_memory(cfg)
+
+    max_from_ram = int((ram_bytes * cfg.ram_threshold) / per_struct) if per_struct > 0 else 1
+    max_from_vram = int((vram_bytes * cfg.vram_threshold) / per_struct) if per_struct > 0 and vram_bytes != float('inf') else max_from_ram
+
+    return max(min(max_from_ram, max_from_vram), 1)
+
+
+def chunk_raw_data(raw_data: dict, chunk_size: int) -> list[dict]:
+    """Split raw (un-padded) data dict into sub-dicts of at most chunk_size structures.
+
+    Each chunk has the same keys, with contiguous slices of the structure lists.
+
+    Args:
+        raw_data   : dict from split() with list-valued keys
+        chunk_size : max structures per chunk
+
+    Returns:
+        list of raw data dicts
+    """
+    S = len(raw_data["descriptors"])
+    chunks = []
+    for start in range(0, S, chunk_size):
+        end = min(start + chunk_size, S)
+        chunk = {}
+        for key in raw_data:
+            chunk[key] = raw_data[key][start:end]
+        chunks.append(chunk)
+    return chunks
 
 
 def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray], allowed_Z: list[int | str]) -> tuple[list[Atoms], list[np.ndarray]]:

@@ -66,15 +66,25 @@ class TNEPconfig:
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
-    population_chunk_size: int | None = 20
+    population_chunk_size: int | None = 10
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
-    batch_chunk_size: int | None = 400
+    batch_chunk_size: int | None = None
+    # Fraction of available RAM to budget for padded tensors (0.0-1.0)
+    ram_threshold: float = 0.5
+    # Fraction of available VRAM to budget for padded tensors (0.0-1.0)
+    vram_threshold: float = 0.8
+    # Total RAM in MB (None = auto-detect via psutil; set manually to override)
+    ram_mb: int | None = None
+    # Total GPU memory in MB (None = auto-detect via TF; set manually if detection fails)
+    gpu_memory_mb: int | None = None
+    # Reset sigma to init_sigma at the start of each chunk in chunked training
+    chunk_sigma_reset: bool = True
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
     plot_interval: int | None = None
 
     # Save model after training (None = disabled; "auto" = auto-generate name; str = explicit path)
-    save_path: str | None = "auto"
+    save_path: str | None = None #"auto"
     # Save final plots to directory (None = disabled; str = directory path)
     save_plots: str | None = None #"plots"
     # Show plots interactively (True = plt.show(), False = close after saving)
