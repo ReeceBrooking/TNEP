@@ -50,7 +50,6 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
             if z not in cfg.types:
                 cfg.types.append(z)
     cfg.num_types = len(cfg.types)
-
     dataset_types_int = assign_type_indices(dataset, cfg.types)
     print("Species after filter: " + str(cfg.types) + " (" + str(cfg.num_types) + " types)")
 
