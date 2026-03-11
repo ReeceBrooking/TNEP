@@ -265,8 +265,16 @@ class SNES:
             worst_rmse = float(tf.reduce_max(fitness))
 
             # VRAM snapshot (peak after evaluate — the heaviest phase)
-            vram_info = tf.config.experimental.get_memory_info('GPU:0')
-            history["vram_mb"].append(vram_info["peak"] / 1024 / 1024)
+            if tf.config.list_physical_devices('GPU'):
+                vram_info = tf.config.experimental.get_memory_info('GPU:0')
+                history["vram_mb"].append(vram_info["peak"] / 1024 / 1024)
+            else:
+                history["vram_mb"].append(0.0)
+
+            # RAM and CPU usage
+            ram_peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            history["ram_mb"].append(ram_peak_kb / 1024)
+            history["cpu_load"].append(os.getloadavg()[0])
 
             t2 = time.perf_counter()
 
