@@ -496,7 +496,7 @@ class TNEP(layers.Layer):
         scalar_sum = tf.reduce_sum(F_pol, axis=1)  # [B]
 
         # Tensor part: outer product (anisotropic virial)
-        pol_outer = -tf.einsum('bnma,bnmb->bnmab', dr_gathered, forces)  # [B,A,M,3,3]
+        pol_outer = -tf.einsum('bnmi,bnmj->bnmij', dr_gathered, forces)  # [B,A,M,3,3]
         pol_outer = pol_outer * neighbor_mask[:, :, :, tf.newaxis, tf.newaxis]
         pol_matrix = tf.reduce_sum(pol_outer, axis=[1, 2])  # [B, 3, 3]
 
