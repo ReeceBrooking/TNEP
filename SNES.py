@@ -219,6 +219,8 @@ class SNES:
             "sigma_median": [],
             "sigma_resets": [],
             "vram_mb": [],
+            "ram_mb": [],
+            "cpu_load": [],
             "timing": {
                 "sample_batch": [],
                 "evaluate": [],
