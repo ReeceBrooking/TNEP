@@ -72,6 +72,56 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     cfg.dim_q = train_data["descriptors"][0].shape[-1]
     print("Dimension of q: " + str(cfg.dim_q))
 
+    # Memory check: estimate padded tensor sizes vs available RAM/VRAM
+    def _estimate_tensor_mb(data: dict) -> float:
+        total_bytes = 0
+        for key, val in data.items():
+            if isinstance(val, tf.Tensor):
+                total_bytes += val.dtype.size * int(tf.size(val))
+        return total_bytes / (1024 * 1024)
+
+    tensor_mb = max(_estimate_tensor_mb(train_data),
+                    _estimate_tensor_mb(test_data),
+                    _estimate_tensor_mb(val_data))
+
+    use_gpu = bool(tf.config.list_physical_devices('GPU'))
+    if use_gpu:
+        # Assume 12 GB VRAM (common GPU); adjust if your GPU differs
+        total_vram_mb = 12288
+        usage_pct = 100 * tensor_mb / total_vram_mb
+        print(f"\n=== Memory Check (GPU) ===")
+        print(f"  Largest padded tensor set: {tensor_mb:.1f} MB")
+        print(f"  Assumed VRAM:              {total_vram_mb:.0f} MB")
+        print(f"  Estimated usage:           {usage_pct:.1f}%")
+        if usage_pct > 90:
+            print(f"  WARNING: Tensor data alone uses >{usage_pct:.0f}% of VRAM! "
+                  f"Risk of OOM. Reduce batch_chunk_size or population_chunk_size.")
+        elif usage_pct > 70:
+            print(f"  WARNING: Tensor data uses {usage_pct:.0f}% of VRAM. "
+                  f"May run tight during training.")
+    else:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    total_ram_mb = int(line.split()[1]) / 1024
+                    break
+            else:
+                total_ram_mb = None
+        print(f"\n=== Memory Check (CPU-only — no GPU detected) ===")
+        print(f"  Largest padded tensor set: {tensor_mb:.1f} MB")
+        if total_ram_mb is not None:
+            usage_pct = 100 * tensor_mb / total_ram_mb
+            print(f"  Total system RAM:          {total_ram_mb:.0f} MB")
+            print(f"  Estimated usage:           {usage_pct:.1f}%")
+            if usage_pct > 70:
+                print(f"  WARNING: Tensor data uses {usage_pct:.0f}% of RAM! "
+                      f"Risk of OOM. Reduce dataset size or total_N.")
+            elif usage_pct > 50:
+                print(f"  WARNING: Tensor data uses {usage_pct:.0f}% of RAM. "
+                      f"May run tight during training.")
+        else:
+            print(f"  WARNING: Could not determine total system RAM.")
+
     model = TNEP(cfg)
     print("Model Parameters: " + str(model.optimizer.dim))
     print("Population Size: " + str(model.optimizer.pop_size))
