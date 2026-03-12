@@ -93,8 +93,8 @@ def plot_log_val_fitness(history: dict, cfg: TNEPconfig,
     ln_val = np.log(val)
 
     fig = plt.figure()
-    plt.plot(g, ln_val, label="ln(Val RMSE)")
-    plt.xlabel("Generation")
+    plt.plot(ln_g, ln_val, label="ln(Val RMSE)")
+    plt.xlabel("Ln(Generation)")
     plt.ylabel("ln(Validation RMSE)")
     plt.legend()
     plt.title("Log validation fitness vs generation")
