@@ -91,6 +91,7 @@ def plot_log_val_fitness(history: dict, cfg: TNEPconfig,
     g = np.asarray(history["generation"])
     val = np.asarray(history["val_loss"])
     ln_val = np.log(val)
+    ln_g = np.log(g)
 
     fig = plt.figure()
     plt.plot(ln_g, ln_val, label="ln(Val RMSE)")
