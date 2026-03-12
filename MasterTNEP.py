@@ -2,7 +2,25 @@ from __future__ import annotations
 
 import numpy as np
 import os
-os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+import resource
+
+# CPU parallelisation: detect GPU vs CPU-only and set thread counts accordingly
+# Physical cores = logical cores / 2 (excludes hyperthreads)
+_logical = os.cpu_count() or 1
+_physical = max(_logical // 2, 1)
+_has_gpu = os.path.isdir('/proc/driver/nvidia') or os.environ.get('CUDA_VISIBLE_DEVICES', '') != ''
+
+if _has_gpu:
+    os.environ['OMP_NUM_THREADS'] = '2'
+    os.environ['MKL_NUM_THREADS'] = '2'
+    os.environ['TF_NUM_INTRAOP_THREADS'] = '4'
+    os.environ['TF_NUM_INTEROP_THREADS'] = '2'
+    os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+else:
+    os.environ['OMP_NUM_THREADS'] = str(_physical)
+    os.environ['MKL_NUM_THREADS'] = str(_physical)
+    os.environ['TF_NUM_INTRAOP_THREADS'] = str(_physical)
+    os.environ['TF_NUM_INTEROP_THREADS'] = '4'
 import tensorflow as tf
 
 from TNEP import TNEP
