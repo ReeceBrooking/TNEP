@@ -27,7 +27,8 @@ class TNEPconfig:
     alpha_max: int = 4
     rcut_hard: float = 3.7
     rcut_soft: float = 3.2
-    basis: str = "poly3gauss"
+    #basis: str = "poly3gauss"
+    basis: str = "poly3" #poly3tab
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 1
     compress_mode: str = "trivial"
