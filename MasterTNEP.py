@@ -50,26 +50,8 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     if cfg is None:
         cfg = TNEPconfig()
 
-    # Load raw dataset and assign initial type indices
+    # Load dataset, filter by species, then filter bad data
     dataset, dataset_types_int = collect(cfg)
-    print("Number of species in raw dataset: " + str(cfg.num_types))
-    print("Number of structures in raw dataset: " + str(len(dataset)))
-
-    # Filter by species if configured
-    if cfg.allowed_species is not None:
-        dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species)
-        print("After species filter: " + str(len(dataset)) + " structures")
-
-    # Recompute type list and indices (needed after filtering, and to normalise
-    # the inconsistent indexing from collect())
-    cfg.types = []
-    for struct in dataset:
-        for z in struct.numbers:
-            if z not in cfg.types:
-                cfg.types.append(z)
-    cfg.num_types = len(cfg.types)
-    dataset_types_int = assign_type_indices(dataset, cfg.types)
-    print("Species: " + str(cfg.types) + " (" + str(cfg.num_types) + " types)")
 
     if cfg.target_mode == 1:
         print_dipole_statistics(dataset)

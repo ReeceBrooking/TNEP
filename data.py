@@ -37,6 +37,27 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
 
     cfg.num_types = len(types)
     cfg.types = types
+    print("Number of species in raw dataset: " + str(cfg.num_types))
+    print("Number of structures in raw dataset: " + str(len(dataset)))
+
+    # Filter by species if configured
+    if cfg.allowed_species is not None:
+        dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species)
+        print("After species filter: " + str(len(dataset)) + " structures")
+
+    # Recompute type list and indices after species filtering
+    cfg.types = []
+    for struct in dataset:
+        for z in struct.numbers:
+            if z not in cfg.types:
+                cfg.types.append(z)
+    cfg.num_types = len(cfg.types)
+    dataset_types_int = assign_type_indices(dataset, cfg.types)
+    print("Species: " + str(cfg.types) + " (" + str(cfg.num_types) + " types)")
+
+    # Filter bad data based on config flags
+    dataset, dataset_types_int = filter_bad_data(dataset, dataset_types_int, cfg)
+
     return dataset, dataset_types_int
 
 
@@ -64,11 +85,173 @@ def assign_type_indices(dataset: list[Atoms], types: list[int]) -> list[np.ndarr
 
 def _extract_target(structure: Atoms, target_key: str) -> tf.Tensor:
     """Extract target, converting 9-component polarizability to 6-component if needed."""
-    raw = np.asarray(structure.info[target_key], dtype=np.float32)
+    if target_key in structure.info:
+        raw = np.asarray(structure.info[target_key], dtype=np.float32)
+    elif structure.calc is not None and target_key in structure.calc.results:
+        raw = np.asarray(structure.calc.results[target_key], dtype=np.float32)
+    else:
+        raise KeyError(f"'{target_key}' not found in structure.info or calc.results")
     if raw.size == 9:
         # Flattened 3x3 row-major -> unique [xx, yy, zz, xy, yz, zx]
         raw = raw[[0, 4, 8, 1, 5, 6]]
     return tf.convert_to_tensor(raw, dtype=tf.float32)
+
+
+def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]:
+    """Find structures with NaN values or zero-vector targets.
+
+    Args:
+        dataset    : list of ase.Atoms
+        target_key : key for the target property (e.g. 'dipole', 'pol')
+
+    Returns:
+        dict with keys 'nan_positions', 'nan_targets', 'zero_targets',
+        each mapping to a list of structure indices.
+    """
+    nan_positions = []
+    nan_targets = []
+    zero_targets = []
+    missing_targets = []
+    for i, structure in enumerate(dataset):
+        if np.any(np.isnan(structure.positions)):
+            nan_positions.append(i)
+        try:
+            target = _extract_target(structure, target_key).numpy()
+        except KeyError:
+            missing_targets.append(i)
+            continue
+        if np.any(np.isnan(target)):
+            nan_targets.append(i)
+        if np.allclose(target, 0.0):
+            zero_targets.append(i)
+    return {'nan_positions': nan_positions,
+            'nan_targets': nan_targets,
+            'zero_targets': zero_targets,
+            'missing_targets': missing_targets}
+
+
+def _gpaw_dipole_worker(args):
+    """Compute GPAW dipole for a single structure in a worker process."""
+    import os
+    os.environ['OMP_NUM_THREADS'] = str(args['omp_threads'])
+    os.environ['MKL_NUM_THREADS'] = str(args['omp_threads'])
+    from gpaw import GPAW
+    mol = args['mol']
+    calc = GPAW(mode='lcao', xc='LDA', basis='dzp', h=0.4, txt=None,
+                convergence={'energy': 0.01, 'density': 0.01},
+                occupations={'name': 'fermi-dirac', 'width': 0.2},
+                maxiter=50)
+    mol.center(vacuum=4.0)
+    return calc.get_dipole_moment(mol)
+
+
+def find_rigorous_bad_data(
+    dataset: list[Atoms],
+    target_key: str,
+    threshold: float,
+) -> list[int]:
+    """Recompute targets with GPAW and find structures with low cosine similarity.
+
+    Runs parallel GPAW dipole calculations, compares against dataset targets
+    using cosine similarity, and returns indices below the threshold.
+
+    Args:
+        dataset    : list of ase.Atoms
+        target_key : key for the target property
+        threshold  : cosine similarity threshold — structures below this are flagged
+
+    Returns:
+        list of structure indices with cosine similarity < threshold
+    """
+    import os
+    from multiprocessing import Pool
+    from tqdm import tqdm
+
+    logical = os.cpu_count() or 1
+    n_workers = max(logical // 2, 1)
+    omp_per_worker = 1
+
+    worker_args = [{'mol': s.copy(), 'omp_threads': omp_per_worker} for s in dataset]
+    print(f"  Rigorous filter: running {len(dataset)} GPAW calculations with "
+          f"{n_workers} workers ({omp_per_worker} OMP threads each)")
+
+    with Pool(n_workers) as pool:
+        target_calcs = list(tqdm(pool.imap(_gpaw_dipole_worker, worker_args),
+                                 total=len(worker_args), desc="  GPAW dipoles"))
+
+    target_actuals = [_extract_target(s, target_key) for s in dataset]
+    target_calcs = tf.convert_to_tensor(target_calcs, dtype=tf.float32)
+    target_actuals = tf.stack(target_actuals)
+
+    dot = tf.reduce_sum(target_calcs * target_actuals, axis=-1)
+    norm = tf.norm(target_calcs, axis=-1) * tf.norm(target_actuals, axis=-1)
+    similarity = dot / norm
+
+    print(f"  Cosine similarity: mean={float(tf.reduce_mean(similarity)):.4f}  "
+          f"min={float(tf.reduce_min(similarity)):.4f}")
+
+    bad_indices = [i for i in range(len(dataset)) if float(similarity[i]) < threshold]
+    return bad_indices
+
+
+def filter_bad_data(
+    dataset: list[Atoms],
+    dataset_types_int: list[np.ndarray],
+    cfg: TNEPconfig,
+) -> tuple[list[Atoms], list[np.ndarray]]:
+    """Remove structures with bad data based on config flags.
+
+    Structures with missing targets are always removed regardless of config,
+    since they cannot be used for training.
+
+    Args:
+        dataset           : list of ase.Atoms
+        dataset_types_int : list of ndarray [N_i] — integer type index per atom
+        cfg               : TNEPconfig with filter_nan_positions, filter_nan_targets,
+                            filter_zero_targets, filter_rigorous flags
+
+    Returns:
+        filtered_dataset, filtered_types_int : filtered parallel lists
+    """
+    target_key = _target_key_for_mode(cfg.target_mode)
+    bad = find_bad_data(dataset, target_key)
+
+    bad_indices: set[int] = set()
+
+    # Always remove structures missing the target key
+    if bad['missing_targets']:
+        bad_indices.update(bad['missing_targets'])
+        print(f"  Filtering {len(bad['missing_targets'])} structures with missing '{target_key}' key")
+
+    if not (cfg.filter_nan_positions or cfg.filter_nan_targets or cfg.filter_zero_targets
+            or cfg.filter_rigorous) and not bad_indices:
+        return dataset, dataset_types_int
+
+    if cfg.filter_nan_positions:
+        bad_indices.update(bad['nan_positions'])
+        if bad['nan_positions']:
+            print(f"  Filtering {len(bad['nan_positions'])} structures with NaN positions")
+    if cfg.filter_nan_targets:
+        bad_indices.update(bad['nan_targets'])
+        if bad['nan_targets']:
+            print(f"  Filtering {len(bad['nan_targets'])} structures with NaN targets")
+    if cfg.filter_zero_targets:
+        bad_indices.update(bad['zero_targets'])
+        if bad['zero_targets']:
+            print(f"  Filtering {len(bad['zero_targets'])} structures with zero targets")
+
+    if cfg.filter_rigorous:
+        rigorous_bad = find_rigorous_bad_data(dataset, target_key, cfg.rigorous_threshold)
+        bad_indices.update(rigorous_bad)
+        if rigorous_bad:
+            print(f"  Filtering {len(rigorous_bad)} structures with cosine similarity < {cfg.rigorous_threshold}")
+
+    if bad_indices:
+        dataset = [s for i, s in enumerate(dataset) if i not in bad_indices]
+        dataset_types_int = [t for i, t in enumerate(dataset_types_int) if i not in bad_indices]
+        print(f"  Removed {len(bad_indices)} bad structures, {len(dataset)} remaining")
+
+    return dataset, dataset_types_int
 
 
 def _target_key_for_mode(target_mode: int) -> str:
@@ -370,7 +553,7 @@ def print_dipole_statistics(dataset: list[Atoms], target_key: str = "dipole") ->
         dataset    : list of ase.Atoms with info[target_key] = [3] array
         target_key : str key in Atoms.info holding the dipole vector
     """
-    dipoles = np.array([s.info[target_key] for s in dataset])
+    dipoles = np.array([_extract_target(s, target_key).numpy() for s in dataset])
     norms = np.linalg.norm(dipoles, axis=1)
     print("=== Dipole Target Statistics ===")
     print(f"  N structures: {len(dipoles)}")
@@ -390,13 +573,7 @@ def print_polarizability_statistics(dataset: list[Atoms], target_key: str = "pol
         dataset    : list of ase.Atoms with info[target_key] = [6] or [9] array
         target_key : str key in Atoms.info holding the polarizability tensor
     """
-    pols = []
-    for s in dataset:
-        raw = np.asarray(s.info[target_key], dtype=np.float32)
-        if raw.size == 9:
-            raw = raw[[0, 4, 8, 1, 5, 6]]
-        pols.append(raw)
-    pols = np.array(pols)
+    pols = np.array([_extract_target(s, target_key).numpy() for s in dataset])
     labels = ["xx", "yy", "zz", "xy", "yz", "zx"]
     print("=== Polarizability Target Statistics ===")
     print(f"  N structures: {len(pols)}")

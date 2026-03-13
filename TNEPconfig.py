@@ -14,13 +14,20 @@ class TNEPconfig:
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = ["C", "H", "O"]
+    # Bad data filtering options
+    filter_nan_positions: bool = False
+    filter_nan_targets: bool = False
+    filter_zero_targets: bool = True
+    # Rigorous filtering: recompute targets with GPAW and filter by cosine similarity
+    filter_rigorous: bool = False
+    rigorous_threshold: float = 0.5
     num_neurons: int = 10
     # Number of structures used in each train step
     batch_size: int | None = 50
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 10000
+    num_generations: int = 1000
 
     # SOAP Turbo descriptor parameters
     l_max: int = 4
@@ -45,7 +52,7 @@ class TNEPconfig:
     lambda_2: float | None = 0.001
 
     # Early stopping patience (None = disabled)
-    patience: int | None = 5000
+    patience: int | None = None
 
     # Sigma reset: reinitialise sigma when it collapses and training stagnates
     # None = disabled; int = generations stagnating + small sigma to trigger reset
@@ -67,15 +74,15 @@ class TNEPconfig:
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
-    population_chunk_size: int | None = 20
+    population_chunk_size: int | None = 10
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
-    batch_chunk_size: int | None = 400
+    batch_chunk_size: int | None = None
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
     plot_interval: int | None = None
 
     # Save model after training (None = disabled; "auto" = auto-generate name; str = explicit path)
-    save_path: str | None = "auto"
+    save_path: str | None = None #"test_model" #"auto"
     # Save final plots to directory (None = disabled; str = directory path)
     save_plots: str | None = None #"plots"
     # Show plots interactively (True = plt.show(), False = close after saving)
