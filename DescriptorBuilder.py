@@ -237,6 +237,3 @@ class DescriptorBuilder(layers.Layer):
         dr = tf.reshape(dr_flat, [N, N, 3])
         rij = tf.linalg.norm(dr, axis=-1)
         return dr, rij
-
-    # TODO: cutoff, radial_basis, and angular_basis were removed — descriptors
-    # are now computed entirely by quippy SOAP-turbo via build_descriptors().

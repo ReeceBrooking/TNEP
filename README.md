@@ -31,6 +31,10 @@ TNEP/
 ├── TNEPconfig.py        # Configuration dataclass — all hyperparameters in one place
 ├── DescriptorBuilder.py # SOAP-turbo descriptor and gradient computation via quippy-ase
 ├── SNES.py              # Separable Natural Evolution Strategy optimiser
+├── data.py              # Data loading, filtering, preprocessing, train/val/test splitting
+├── spectroscopy.py      # IR/Raman spectrum computation from MD trajectories
+├── plotting.py          # Visualization (fitness curves, correlation plots, spectra)
+├── model_io.py          # Model saving/loading (.npz format)
 ├── train.xyz            # Example training dataset (extxyz format, dipole targets)
 └── PEStrain.xyz         # Example training dataset (extxyz format, PES targets — Te bulk)
 ```
@@ -42,13 +46,15 @@ TNEP/
 | Package | Purpose |
 |---|---|
 | `tensorflow` | Neural network, tensor operations, autograd |
+| `numpy` | Numerical computing |
 | `ase` | Reading extxyz datasets |
 | `quippy-ase` | Interface to SOAP-turbo for descriptors and descriptor gradients |
+| `matplotlib` | Plotting and visualization |
 
 Install Python dependencies:
 
 ```bash
-pip install tensorflow ase quippy-ase
+pip install tensorflow numpy ase quippy-ase matplotlib
 ```
 
 > **Note:** `quippy-ase` requires a working installation of [QUIP/GAP](https://github.com/libAtoms/QUIP). See the [quippy documentation](https://quippy.readthedocs.io) for platform-specific build instructions.
@@ -63,17 +69,18 @@ All hyperparameters are defined in `TNEPconfig.py`. Key settings:
 data_path       = "train.xyz"   # Path to training data
 target_mode     = 1             # 0 = PES, 1 = Dipole, 2 = Polarizability (WIP)
 
-num_neurons     = 64            # Hidden layer size
-num_generations = 20            # Number of SNES training generations
-batch_size      = 10            # Structures per training step
-pop_size        = 16            # SNES population size per generation
-total_N         = 100           # Max structures to use (None = all)
+num_neurons     = 10            # Hidden layer size
+num_generations = 1000          # Number of SNES training generations
+batch_size      = 50            # Structures per training step
+pop_size        = 80            # SNES population size per generation
+total_N         = None          # Max structures to use (None = all)
 test_ratio      = 0.2           # Train/test split
 
-n_radial        = 3             # Radial SOAP components
-n_radial_ang    = 3             # Angular SOAP radial components
-Lmax            = 2             # Maximum angular momentum
-rc              = 6.0           # Cutoff radius (Å)
+l_max           = 4             # Maximum angular momentum for SOAP-turbo
+alpha_max       = 4             # Maximum radial expansion order
+rcut_hard       = 3.7           # Hard cutoff radius (Å)
+rcut_soft       = 3.2           # Soft cutoff radius (Å)
+basis           = "poly3"       # Radial basis type
 
 activation      = 'tanh'
 init_sigma      = 0.1           # Initial SNES distribution std
@@ -166,8 +173,3 @@ If you use this code, please cite the original TNEP paper:
 }
 ```
 
----
-
-## License
-
-See [LICENSE](LICENSE) for details.

@@ -34,8 +34,7 @@ class TNEPconfig:
     alpha_max: int = 4
     rcut_hard: float = 3.7
     rcut_soft: float = 3.2
-    #basis: str = "poly3gauss"
-    basis: str = "poly3" #poly3tab
+    basis: str = "poly3"
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 1
     compress_mode: str = "trivial"
@@ -82,9 +81,9 @@ class TNEPconfig:
     plot_interval: int | None = None
 
     # Save model after training (None = disabled; "auto" = auto-generate name; str = explicit path)
-    save_path: str | None = None #"test_model" #"auto"
+    save_path: str | None = None
     # Save final plots to directory (None = disabled; str = directory path)
-    save_plots: str | None = None #"plots"
+    save_plots: str | None = None
     # Show plots interactively (True = plt.show(), False = close after saving)
     show_plots: bool = True
     # Show extra info in progress bar (L1, L2 regularisation)

@@ -375,7 +375,6 @@ class TNEP(layers.Layer):
 
         else:
             tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
-            return tf.zeros([tf.shape(descriptors)[0], 1])
 
     def _calc_forces_batch(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
                            W0_t: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:

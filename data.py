@@ -402,17 +402,6 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     val_descriptors, val_gradients, val_grad_index = builder.build_descriptors(val_dataset)
     test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(test_dataset)
 
-    """
-    # Scale descriptors by inverse range (GPUMD q_scaler convention)
-    q_scaler = DescriptorBuilder.compute_q_scaler(train_descriptors)
-    train_descriptors, train_gradients = DescriptorBuilder.apply_scaling(
-        train_descriptors, train_gradients, q_scaler)
-    val_descriptors, val_gradients = DescriptorBuilder.apply_scaling(
-        val_descriptors, val_gradients, q_scaler)
-    test_descriptors, test_gradients = DescriptorBuilder.apply_scaling(
-        test_descriptors, test_gradients, q_scaler)
-    """
-
     train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
     test_data = assemble_data_dict(test_dataset, test_types_int, test_descriptors, test_gradients, test_grad_index, cfg)
     val_data = assemble_data_dict(val_dataset, val_types_int, val_descriptors, val_gradients, val_grad_index, cfg)

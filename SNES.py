@@ -152,9 +152,11 @@ class SNES:
         if total > 0:
             raw /= total
         else:
-            print("Utility calc failed due to negative total")
+            if self.cfg.debug:
+                print("Utility calc failed due to negative total")
         utilities = raw - 1.0 / lam
-        print("utilities = ", utilities)
+        if self.cfg.debug:
+            print("utilities = ", utilities)
         return utilities
 
     def ask(self) -> tuple[tf.Tensor, tf.Tensor]:
