@@ -130,61 +130,6 @@ class DescriptorBuilder(layers.Layer):
             dataset_grad_index.append(grad_indexes)
         return dataset_descriptors, dataset_gradients, dataset_grad_index
 
-    @staticmethod
-    def compute_q_scaler(descriptors: list[tf.Tensor]) -> tf.Tensor:
-        """Compute per-component scaling factors from descriptor range.
-
-        Matches GPUMD's find_max_min kernel:
-            q_scaler[d] = 1.0 / (q_max[d] - q_min[d])
-
-        Should be called on the training set only. The returned q_scaler
-        is then used to scale train, val, and test sets identically.
-
-        Args:
-            descriptors : list of [N_i, dim_q] tensors (one per structure)
-
-        Returns:
-            q_scaler : [dim_q] tensor — per-component inverse range
-        """
-        all_q = tf.concat(descriptors, axis=0)  # [total_atoms, dim_q]
-        q_min = tf.reduce_min(all_q, axis=0)    # [dim_q]
-        q_max = tf.reduce_max(all_q, axis=0)    # [dim_q]
-        q_range = q_max - q_min
-        # Avoid division by zero for constant components (leave scaler at 0)
-        q_scaler = tf.where(q_range > 0, 1.0 / q_range, tf.zeros_like(q_range))
-        return q_scaler
-
-    @staticmethod
-    def apply_scaling(descriptors: list[tf.Tensor], gradients: list[list[tf.Tensor]], q_scaler: tf.Tensor) -> tuple[list[tf.Tensor], list[list[tf.Tensor]]]:
-        """Scale descriptors and gradients by q_scaler (GPUMD convention).
-
-        Matches GPUMD's apply_ann kernel:
-            q_scaled[d] = q[d] * q_scaler[d]     (no offset)
-            Fp_scaled[d] = Fp[d] * q_scaler[d]   (chain rule)
-
-        Args:
-            descriptors : list of [N_i, dim_q] tensors
-            gradients   : list of (list of N_i tensors each [M_i, 3, dim_q])
-            q_scaler    : [dim_q] tensor from compute_q_scaler
-
-        Returns:
-            scaled_descriptors : same structure, scaled by q_scaler
-            scaled_gradients   : same structure, scaled by q_scaler
-        """
-        scaled_descriptors = []
-        for q in descriptors:
-            scaled_descriptors.append(q * q_scaler)
-
-        scaled_gradients = []
-        for struct_grads in gradients:
-            scaled_struct = []
-            for g in struct_grads:
-                # g: [M_i, 3, dim_q] — scale along the dim_q axis
-                scaled_struct.append(g * q_scaler)
-            scaled_gradients.append(scaled_struct)
-
-        return scaled_descriptors, scaled_gradients
-
     @tf.function(
     input_signature=[
         tf.TensorSpec(shape=[None, 3], dtype=tf.float32),
