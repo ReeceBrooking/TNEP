@@ -7,7 +7,6 @@ import time
 import numpy as np
 import tensorflow as tf
 from typing import TYPE_CHECKING, Callable
-from TNEPconfig import TNEPconfig
 
 if TYPE_CHECKING:
     from TNEP import TNEP
@@ -90,7 +89,7 @@ class SNES:
         self.lambda_1 = self.cfg.lambda_1 if self.cfg.lambda_1 is not None else auto_lambda
         self.lambda_2 = self.cfg.lambda_2 if self.cfg.lambda_2 is not None else auto_lambda
 
-        self.eta_sigma = self.compute_eta_sigma()
+        self.eta_sigma = self.cfg.eta_sigma if self.cfg.eta_sigma is not None else self.compute_eta_sigma()
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray) -> tuple[float, float]:
@@ -440,6 +439,9 @@ class SNES:
             batch_data["atom_mask"], batch_data["neighbor_mask"],
             W0, b0, W1, b1, W0p, b0p, W1p, b1p,
         )
+        if self.cfg.scale_targets and self.cfg.target_mode == 1:
+            num_atoms = tf.reduce_sum(batch_data["atom_mask"], axis=1)  # [B]
+            preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]
         diff = preds - batch_data["targets"]
         rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
         return float(rmse)
@@ -631,6 +633,13 @@ class SNES:
         # Reconstruct weights for all candidates in chunk
         params = self.reconstruct_params_tf(chunk_samples)
 
+        # Per-atom normalization: divide model output by N_atoms so the
+        # loss is computed in per-atom space (matching scale_targets)
+        _scale_preds = self.cfg.scale_targets and self.cfg.target_mode == 1
+        if _scale_preds:
+            num_atoms = tf.reduce_sum(amask, axis=1)  # [B]
+            num_atoms = tf.maximum(num_atoms, 1.0)[:, tf.newaxis]  # [B, 1]
+
         if self.cfg.target_mode == 2:
             W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
 
@@ -653,6 +662,8 @@ class SNES:
                     desc, grads, gidx, pos, Z, boxes, amask, nmask,
                     w0, bb0, w1, bb1, None, None, None, None,
                 )
+                if _scale_preds:
+                    preds = preds / num_atoms
                 diff = preds - targets
                 return tf.reduce_sum(tf.square(diff))
 

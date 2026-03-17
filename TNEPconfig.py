@@ -11,13 +11,15 @@ class TNEPconfig:
     """
 
     data_path: str = "train.xyz"
+    # Separate test dataset (None = split from data_path; str = path to external .xyz)
+    test_data_path: str | None = "test.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = ["C", "H", "O"]
     # Bad data filtering options
     filter_nan_positions: bool = False
     filter_nan_targets: bool = False
-    filter_zero_targets: bool = True
+    filter_zero_targets: bool = False
     # Rigorous filtering: recompute targets with GPAW and filter by cosine similarity
     filter_rigorous: bool = False
     rigorous_threshold: float = 0.5
@@ -28,6 +30,8 @@ class TNEPconfig:
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
     num_generations: int = 1000
+    # Learning rate (None = auto)
+    eta_sigma: float | None = None
 
     # SOAP Turbo descriptor parameters
     l_max: int = 4
@@ -88,11 +92,22 @@ class TNEPconfig:
     show_plots: bool = True
     # Show extra info in progress bar (L1, L2 regularisation)
     debug: bool = False
+    # Negate predictions for structures detected as sign-flipped (cos_sim < -0.9)
+    fix_sign_flips: bool = False
+    # Scale input descriptors by their training-set statistics (per component)
+    scale_descriptors: bool = True
+    # Descriptor scaling method: "range" (GPUMD-style 1/(max-min)) or "mean" (mean(|x|)*sqrt(dim_q))
+    descriptor_scale_mode: str = "range"
+    # Floor for mean scaling: fraction of max component mean (None = no floor; ignored for range mode)
+    descriptor_scale_floor: float | None = 0.001
+    # Scale dipole targets by atom count (per-atom dipole training)
+    scale_targets: bool = False
 
     dim_q: int
     num_types: int
     types: list[int] = []
     indices: np.ndarray
+    descriptor_mean: np.ndarray | None = None
 
     def randomise(self, dataset: list) -> None:
         """Shuffle dataset indices and truncate to total_N.

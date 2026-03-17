@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import tensorflow as tf
-import numpy as np
 from tensorflow.keras import layers
 from typing import Callable
 
@@ -79,6 +78,14 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
+        # Descriptor scaling
+        if hasattr(cfg, 'descriptor_mean') and cfg.descriptor_mean is not None:
+            self._descriptor_mean = tf.Variable(
+                cfg.descriptor_mean, dtype=tf.float32, trainable=False)
+            self._scale_descriptors = True
+        else:
+            self._scale_descriptors = False
+
         # Scalar ANN for polarizability mode (target_mode == 2)
         if cfg.target_mode == 2:
             self.W0_pol = self.add_weight(
@@ -126,6 +133,12 @@ class TNEP(layers.Layer):
             target_mode 1: [3]  dipole vector
             target_mode 2: [6]  polarizability tensor
         """
+        # Scale descriptors and gradients by the same factor (chain rule)
+        if self._scale_descriptors:
+            scale = self._descriptor_mean
+            descriptors = descriptors / scale
+            gradients = gradients / scale
+
         # Gather per-type weights for each atom
         W0_t = tf.gather(self.W0, Z)   # [A, dim_q, H]
         b0_t = tf.gather(self.b0, Z)   # [A, H]
@@ -269,7 +282,7 @@ class TNEP(layers.Layer):
                 cos_sim_all   : [S] tensor — per-structure cosine similarity (modes 1,2)
             preds : [S, T] tensor of predictions
         """
-        preds = self.predict_batch(
+        raw_preds = self.predict_batch(
             test_data["descriptors"], test_data["gradients"],
             test_data["grad_index"], test_data["positions"],
             test_data["Z_int"], test_data["boxes"],
@@ -281,6 +294,15 @@ class TNEP(layers.Layer):
             getattr(self, 'b1_pol', None),
         )
         targets = test_data["targets"]
+
+        # Normalize predictions to per-atom space when target scaling is active
+        if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
+            num_atoms = tf.cast(test_data["num_atoms"], tf.float32)  # [S]
+            num_atoms_col = tf.maximum(num_atoms, 1.0)[:, tf.newaxis]  # [S, 1]
+            preds = raw_preds / num_atoms_col
+        else:
+            preds = raw_preds
+
         diff = preds - targets
         mse = tf.reduce_mean(tf.square(diff))
         rmse = tf.sqrt(mse)
@@ -301,6 +323,23 @@ class TNEP(layers.Layer):
             "r2": r2,
             "r2_components": r2_components,
         }
+
+        # Total (un-scaled) metrics when target scaling is active
+        if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
+            total_targets = targets * num_atoms_col
+            total_diff = raw_preds - total_targets
+            total_rmse = tf.sqrt(tf.reduce_mean(tf.square(total_diff)))
+            total_ss_res = tf.reduce_sum(tf.square(total_diff))
+            total_ss_tot = tf.reduce_sum(tf.square(
+                total_targets - tf.reduce_mean(total_targets, axis=0)))
+            total_r2 = 1.0 - total_ss_res / total_ss_tot
+            total_ss_res_comp = tf.reduce_sum(tf.square(total_diff), axis=0)
+            total_ss_tot_comp = tf.reduce_sum(tf.square(
+                total_targets - tf.reduce_mean(total_targets, axis=0)), axis=0)
+            total_r2_comp = 1.0 - total_ss_res_comp / tf.maximum(total_ss_tot_comp, 1e-12)
+            metrics["total_rmse"] = total_rmse
+            metrics["total_r2"] = total_r2
+            metrics["total_r2_components"] = total_r2_comp
 
         # Cosine similarity for vector targets (modes 1 and 2)
         if self.cfg.target_mode >= 1:
@@ -343,6 +382,12 @@ class TNEP(layers.Layer):
         Returns:
             predictions : [B, T_dim]  where T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
+        # Scale descriptors and gradients by the same factor (chain rule)
+        if self._scale_descriptors:
+            scale = self._descriptor_mean
+            descriptors = descriptors / scale
+            gradients = gradients / scale
+
         # Gather per-type weights for each atom in each structure
         W0_t = tf.gather(W0, Z)   # [B, A, Q, H]
         b0_t = tf.gather(b0, Z)   # [B, A, H]

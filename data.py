@@ -291,10 +291,24 @@ def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> Non
     r2_comp = metrics["r2_components"].numpy()
     labels = component_labels(cfg.target_mode, len(r2_comp))
 
-    print(f"\n{prefix} RMSE: {rmse:.4f}")
-    print(f"{prefix} R²:   {r2:.4f}")
-    print("Per-component R²:  " + "  ".join(
-        f"{lbl}={r2_comp[i]:.4f}" for i, lbl in enumerate(labels)))
+    if "total_rmse" in metrics:
+        print(f"\n{prefix} (per-atom) RMSE: {rmse:.4f}")
+        print(f"{prefix} (per-atom) R²:   {r2:.4f}")
+        print("Per-atom per-component R²:  " + "  ".join(
+            f"{lbl}={r2_comp[i]:.4f}" for i, lbl in enumerate(labels)))
+
+        total_rmse = float(metrics["total_rmse"])
+        total_r2 = float(metrics["total_r2"])
+        total_r2_comp = metrics["total_r2_components"].numpy()
+        print(f"{prefix} (total)    RMSE: {total_rmse:.4f}")
+        print(f"{prefix} (total)    R²:   {total_r2:.4f}")
+        print("Total per-component R²:     " + "  ".join(
+            f"{lbl}={total_r2_comp[i]:.4f}" for i, lbl in enumerate(labels)))
+    else:
+        print(f"\n{prefix} RMSE: {rmse:.4f}")
+        print(f"{prefix} R²:   {r2:.4f}")
+        print("Per-component R²:  " + "  ".join(
+            f"{lbl}={r2_comp[i]:.4f}" for i, lbl in enumerate(labels)))
 
     if "cos_sim_mean" in metrics:
         cos_mean = float(metrics["cos_sim_mean"])
@@ -326,10 +340,13 @@ def assemble_data_dict(
         dict with keys: positions, Z_int, targets, boxes, descriptors, gradients, grad_index
     """
     target_key = _target_key_for_mode(cfg.target_mode)
+    targets = [_extract_target(s, target_key) for s in dataset]
+    if cfg.scale_targets and cfg.target_mode == 1:
+        targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
     return {
         "positions": [tf.convert_to_tensor(s.positions, dtype=tf.float32) for s in dataset],
         "Z_int": [tf.convert_to_tensor(t, dtype=tf.int32) for t in types_int],
-        "targets": [_extract_target(s, target_key) for s in dataset],
+        "targets": targets,
         "boxes": [tf.convert_to_tensor(s.cell.array, dtype=tf.float32) for s in dataset],
         "descriptors": descriptors,
         "gradients": gradients,
@@ -382,33 +399,129 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     indices = cfg.indices
     n_structures = len(indices)
 
-    n_test = int(cfg.test_ratio * n_structures)
-
-    test_idx = indices[:n_test]
-    val_idx = indices[n_test:(2*n_test)]
-    train_idx = indices[(2*n_test):n_structures]
-
     builder = DescriptorBuilder(cfg)
 
-    test_dataset = [dataset[i] for i in test_idx]
-    val_dataset = [dataset[i] for i in val_idx]
-    train_dataset = [dataset[i] for i in train_idx]
+    if cfg.test_data_path is not None:
+        # External test set: split data_path into train + val only
+        n_val = int(cfg.test_ratio * n_structures)
+        val_idx = indices[:n_val]
+        train_idx = indices[n_val:]
 
-    test_types_int = [dataset_types_int[i] for i in test_idx]
-    val_types_int = [dataset_types_int[i] for i in val_idx]
-    train_types_int = [dataset_types_int[i] for i in train_idx]
+        val_dataset = [dataset[i] for i in val_idx]
+        train_dataset = [dataset[i] for i in train_idx]
+        val_types_int = [dataset_types_int[i] for i in val_idx]
+        train_types_int = [dataset_types_int[i] for i in train_idx]
+
+        # Load and prepare external test set
+        from ase.io import read as ase_read
+        test_structures = ase_read(cfg.test_data_path, index=":")
+        if cfg.allowed_species is not None:
+            # Filter before type assignment — test file may contain unknown species
+            from ase.data import atomic_numbers
+            allowed = set(atomic_numbers[z] if isinstance(z, str) else z
+                          for z in cfg.allowed_species)
+            test_structures = [s for s in test_structures
+                               if set(s.numbers).issubset(allowed)]
+        test_dataset = test_structures
+        test_types_int = assign_type_indices(test_dataset, cfg.types)
+        print(f"External test set: {len(test_dataset)} structures from {cfg.test_data_path}")
+    else:
+        # Default: three-way split from data_path
+        n_test = int(cfg.test_ratio * n_structures)
+        test_idx = indices[:n_test]
+        val_idx = indices[n_test:(2*n_test)]
+        train_idx = indices[(2*n_test):n_structures]
+
+        test_dataset = [dataset[i] for i in test_idx]
+        val_dataset = [dataset[i] for i in val_idx]
+        train_dataset = [dataset[i] for i in train_idx]
+        test_types_int = [dataset_types_int[i] for i in test_idx]
+        val_types_int = [dataset_types_int[i] for i in val_idx]
+        train_types_int = [dataset_types_int[i] for i in train_idx]
 
     train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset)
     val_descriptors, val_gradients, val_grad_index = builder.build_descriptors(val_dataset)
     test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(test_dataset)
 
+    if cfg.scale_descriptors:
+        all_desc = tf.concat(train_descriptors, axis=0)  # [total_train_atoms, dim_q]
+        dim_q = int(all_desc.shape[-1])
+
+        if cfg.descriptor_scale_mode == "range":
+            # GPUMD-style: divide by per-component range (max - min)
+            desc_max = tf.reduce_max(all_desc, axis=0).numpy()   # [dim_q]
+            desc_min = tf.reduce_min(all_desc, axis=0).numpy()   # [dim_q]
+            desc_range = desc_max - desc_min
+            # Components with zero range are constant — leave unscaled
+            cfg.descriptor_mean = np.where(desc_range > 1e-30, desc_range, 1.0)
+            print(f"Descriptor scaling (range): component range = "
+                  f"[{desc_range.min():.6f}, {desc_range.max():.6f}], "
+                  f"active components = {np.sum(desc_range > 1e-30)}/{dim_q}")
+
+        elif cfg.descriptor_scale_mode == "mean":
+            # Mean-based: divide by mean(|x|) * sqrt(dim_q)
+            raw_mean = tf.reduce_mean(tf.abs(all_desc), axis=0).numpy()  # [dim_q]
+            if cfg.descriptor_scale_floor is not None:
+                floor = np.max(raw_mean) * cfg.descriptor_scale_floor
+                safe_mean = np.maximum(raw_mean, floor)
+            else:
+                safe_mean = np.maximum(raw_mean, 1e-30)
+            cfg.descriptor_mean = safe_mean * np.sqrt(dim_q)
+            floor_str = f"{floor:.6f}" if cfg.descriptor_scale_floor is not None else "None"
+            print(f"Descriptor scaling (mean): raw |mean| range = "
+                  f"[{raw_mean.min():.6f}, {raw_mean.max():.6f}], "
+                  f"floor = {floor_str}, effective scale norm = "
+                  f"{np.linalg.norm(cfg.descriptor_mean):.6f} (dim_q={dim_q})")
+
+        else:
+            raise ValueError(f"Unknown descriptor_scale_mode: {cfg.descriptor_scale_mode!r} "
+                             f"(expected 'range' or 'mean')")
+
+        # Roundtrip verification: q_scaled * s must recover original exactly
+        scale = tf.constant(cfg.descriptor_mean, dtype=tf.float32)
+        for split_name, split_descs, split_grads in [
+            ("train", train_descriptors, train_gradients),
+            ("val", val_descriptors, val_gradients),
+            ("test", test_descriptors, test_gradients),
+        ]:
+            for i in range(min(3, len(split_descs))):
+                q_orig = split_descs[i]                            # [N_i, dim_q]
+                q_scaled = q_orig / scale
+                q_recovered = q_scaled * scale
+                desc_err = float(tf.reduce_max(tf.abs(q_orig - q_recovered)))
+
+                g_orig = split_grads[i]                            # list of N_i tensors [M, 3, dim_q]
+                g_scaled = [g / scale for g in g_orig]
+                g_recovered = [g * scale for g in g_scaled]
+                grad_err = max(
+                    float(tf.reduce_max(tf.abs(go - gr)))
+                    for go, gr in zip(g_orig, g_recovered)
+                ) if g_orig else 0.0
+
+                if desc_err > 1e-5 or grad_err > 1e-5:
+                    print(f"  WARNING: {split_name}[{i}] roundtrip error: "
+                          f"desc={desc_err:.2e}, grad={grad_err:.2e}")
+            # Check feature order: verify scale[j] corresponds to descriptor column j
+            if split_descs:
+                col_means = tf.reduce_mean(tf.abs(split_descs[0]), axis=0)  # [dim_q]
+                ratio = col_means / scale
+                ratio_std = float(tf.math.reduce_std(ratio))
+                if ratio_std > 10.0:
+                    print(f"  WARNING: {split_name} feature-order suspect — "
+                          f"col_mean/scale ratio std={ratio_std:.2f} (expect <10)")
+        print("  Descriptor scaling roundtrip check passed.")
+
     train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
     test_data = assemble_data_dict(test_dataset, test_types_int, test_descriptors, test_gradients, test_grad_index, cfg)
     val_data = assemble_data_dict(val_dataset, val_types_int, val_descriptors, val_gradients, val_grad_index, cfg)
-    print(str(n_structures) + " structures have been split into sets of size:")
-    print("Train set: " + str(len(train_data["positions"])) + " structures")
-    print("Test set: " + str(len(test_data["positions"])) + " structures")
-    print("Validation set: " + str(len(val_data["positions"])) + " structures")
+    n_train = len(train_data["positions"])
+    n_test_actual = len(test_data["positions"])
+    n_val = len(val_data["positions"])
+    if cfg.test_data_path is not None:
+        print(f"{n_structures} structures split into train ({n_train}) + val ({n_val})")
+        print(f"External test set: {n_test_actual} structures from {cfg.test_data_path}")
+    else:
+        print(f"{n_structures} structures split into train ({n_train}) + test ({n_test_actual}) + val ({n_val})")
     return train_data, test_data, val_data
 
 

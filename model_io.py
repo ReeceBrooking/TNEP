@@ -82,6 +82,9 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None) -> None:
         data["W1_pol"] = model.W1_pol.numpy()
         data["b1_pol"] = model.b1_pol.numpy()
 
+    if cfg.descriptor_mean is not None:
+        data["descriptor_mean"] = np.asarray(cfg.descriptor_mean)
+
     np.savez(path, **data)
     print(f"Model saved to {path}")
 
@@ -107,6 +110,9 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
         # New format: restore full config from JSON
         config_dict = json.loads(str(data["config_json"]))
         for k, v in config_dict.items():
+            # descriptor_mean is serialized as list in JSON; convert back to ndarray
+            if k == "descriptor_mean" and v is not None:
+                v = np.array(v, dtype=np.float32)
             setattr(cfg, k, v)
     else:
         # Legacy fallback: load individual fields
@@ -124,6 +130,10 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
             rc = float(data["rc"])
             cfg.rcut_hard = rc
             cfg.rcut_soft = rc - 0.5
+
+    # Restore descriptor_mean from dedicated array key (takes precedence over JSON)
+    if "descriptor_mean" in data:
+        cfg.descriptor_mean = data["descriptor_mean"].astype(np.float32)
 
     # Reconstruct Z -> type index mapping
     type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}

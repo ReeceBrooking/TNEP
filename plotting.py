@@ -167,7 +167,7 @@ def plot_timing(history: dict, cfg: TNEPconfig,
 
 def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict,
                      cfg: TNEPconfig, save_plots: str | None = None,
-                     show_plots: bool = True) -> None:
+                     show_plots: bool = True, suffix: str | None = None) -> None:
     """Plot target vs prediction correlation with per-component R² and cosine similarity.
 
     For scalar targets (PES), plots a single correlation panel.
@@ -245,6 +245,8 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
 
     mode_names = {0: "PES", 1: "Dipole", 2: "Polarizability"}
     mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
-    fig.suptitle(f"{mode} — RMSE: {rmse:.4f}, R²: {r2:.4f}", fontsize=14)
+    label = f" ({suffix})" if suffix else ""
+    fig.suptitle(f"{mode}{label} — RMSE: {rmse:.4f}, R²: {r2:.4f}", fontsize=14)
     plt.tight_layout()
-    _finish_fig(fig, cfg, "correlation", save_plots, show_plots)
+    plot_name = f"correlation_{suffix}" if suffix else "correlation"
+    _finish_fig(fig, cfg, plot_name, save_plots, show_plots)

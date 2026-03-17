@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import os
-import resource
 
 # CPU parallelisation: detect GPU vs CPU-only and set thread counts accordingly
 # Physical cores = logical cores / 2 (excludes hyperthreads)
@@ -25,15 +24,16 @@ import tensorflow as tf
 
 from TNEP import TNEP
 from TNEPconfig import TNEPconfig
-from data import (collect, split, pad_and_stack, filter_by_species,
+from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
-                  assign_type_indices, prepare_eval_data,
-                  component_labels, print_score_summary)
+                  assign_type_indices, prepare_eval_data, print_score_summary)
 from plotting import plot_snes_history, plot_log_val_fitness, plot_sigma_history, plot_timing, plot_correlation
-from model_io import save_model, load_model, convert_z_to_type_indices
+from model_io import save_model
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
                            compute_ir_spectrum, plot_ir_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
+from debug_signs import (diagnose_sign_flips, correct_sign_flips, check_cells,
+                         characterize_flipped, test_target_negation)
 from ase.io import read
 
 
@@ -89,7 +89,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         # Assume 12 GB VRAM (common GPU); adjust if your GPU differs
         total_vram_mb = 12288
         usage_pct = 100 * tensor_mb / total_vram_mb
-        print(f"\n=== Memory Check (GPU) ===")
+        print("\n=== Memory Check (GPU) ===")
         print(f"  Largest padded tensor set: {tensor_mb:.1f} MB")
         print(f"  Assumed VRAM:              {total_vram_mb:.0f} MB")
         print(f"  Estimated usage:           {usage_pct:.1f}%")
@@ -107,7 +107,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
                     break
             else:
                 total_ram_mb = None
-        print(f"\n=== Memory Check (CPU-only — no GPU detected) ===")
+        print("\n=== Memory Check (CPU-only — no GPU detected) ===")
         print(f"  Largest padded tensor set: {tensor_mb:.1f} MB")
         if total_ram_mb is not None:
             usage_pct = 100 * tensor_mb / total_ram_mb
@@ -120,7 +120,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
                 print(f"  WARNING: Tensor data uses {usage_pct:.0f}% of RAM. "
                       f"May run tight during training.")
         else:
-            print(f"  WARNING: Could not determine total system RAM.")
+            print("  WARNING: Could not determine total system RAM.")
 
     model = TNEP(cfg)
     print("Model Parameters: " + str(model.optimizer.dim))
@@ -133,6 +133,9 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         print(f"\n--- Periodic plots at generation {gen} ---")
         m, preds = model.score(test_data)
         print(f"  Test RMSE: {float(m['rmse']):.4f}  R²: {float(m['r2']):.4f}")
+        if "total_rmse" in m:
+            print(f"  Test total RMSE: {float(m['total_rmse']):.4f}  "
+                  f"total R²: {float(m['total_r2']):.4f}")
         plot_snes_history(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_log_val_fitness(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
@@ -147,6 +150,45 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     # Test
     metrics, test_preds = model.score(test_data)
     print_score_summary(metrics, cfg, prefix="Model test set")
+
+    # Debug sign-flipped dipole predictions
+    if cfg.target_mode == 1:
+        diag = diagnose_sign_flips(model, test_data)
+        if cfg.test_data_path is not None:
+            test_structures = read(cfg.test_data_path, index=":")
+            if cfg.allowed_species:
+                from ase.data import atomic_numbers
+                allowed = set(atomic_numbers[z] if isinstance(z, str) else z
+                              for z in cfg.allowed_species)
+                test_structures = [s for s in test_structures
+                                   if set(s.numbers).issubset(allowed)]
+        else:
+            n_test = int(cfg.test_ratio * len(cfg.indices))
+            test_idx = cfg.indices[:n_test]
+            test_structures = [dataset[i] for i in test_idx]
+        check_cells(test_structures)
+        if diag["flipped_idx"]:
+            characterize_flipped(test_structures, diag["flipped_idx"], diag["good_idx"])
+            test_target_negation(diag["preds"], diag["targets"], diag["flipped_idx"])
+        # NOTE: verify_gradient_sign() is not called here because it invokes
+        # quippy's C descriptor code again, which can cause heap corruption
+        # (malloc_consolidate) after training. Run it standalone if needed:
+        #   verify_gradient_sign(model, structures, cfg, structure_idx=0)
+
+        # Correct flipped predictions and recompute metrics
+        if cfg.fix_sign_flips and diag["flipped_idx"]:
+            corrected_preds = correct_sign_flips(diag["preds"], diag["cos_sim"])
+            test_preds = tf.constant(corrected_preds, dtype=tf.float32)
+            targets_np = diag["targets"]
+            diff = corrected_preds - targets_np
+            rmse = np.sqrt(np.mean(diff ** 2))
+            dot = np.sum(corrected_preds * targets_np, axis=1)
+            norm_p = np.linalg.norm(corrected_preds, axis=1)
+            norm_t = np.linalg.norm(targets_np, axis=1)
+            cos_sim = dot / np.maximum(norm_p * norm_t, 1e-12)
+            print("\n=== After sign-flip correction ===")
+            print(f"  RMSE:          {rmse:.4f}")
+            print(f"  Mean cos_sim:  {cos_sim.mean():.4f}")
 
     # Save model
     if cfg.save_path is not None:
@@ -168,7 +210,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     # VRAM summary
     vram = history.get("vram_mb", [])
     if vram:
-        print(f"\n=== VRAM Usage ===")
+        print("\n=== VRAM Usage ===")
         print(f"  Peak: {max(vram):.1f} MB / 12288 MB ({100*max(vram)/12288:.1f}%)")
         print(f"  Last: {vram[-1]:.1f} MB")
 
@@ -179,6 +221,23 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg,
                      cfg.save_plots, cfg.show_plots)
+
+    # Additional total-dipole correlation plot when target scaling is active
+    if "total_rmse" in metrics:
+        num_atoms = test_data["num_atoms"].numpy().astype(np.float32)
+        scale = num_atoms[:, np.newaxis]
+        total_targets = test_data["targets"].numpy() * scale
+        total_preds = test_preds.numpy() * scale
+        total_metrics = {
+            "rmse": metrics["total_rmse"],
+            "r2": metrics["total_r2"],
+            "r2_components": metrics["total_r2_components"],
+        }
+        if "cos_sim_all" in metrics:
+            total_metrics["cos_sim_mean"] = metrics["cos_sim_mean"]
+            total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
+        plot_correlation(total_targets, total_preds, total_metrics, cfg,
+                         cfg.save_plots, cfg.show_plots, suffix="total")
 
     print("Run complete!")
     return model, cfg
@@ -218,6 +277,22 @@ def test_model(
     # Plot correlation
     plot_correlation(data["targets"].numpy(), predictions.numpy(), metrics, cfg,
                      save_plots, show_plots)
+
+    if "total_rmse" in metrics:
+        num_atoms = data["num_atoms"].numpy().astype(np.float32)
+        scale = num_atoms[:, np.newaxis]
+        total_targets = data["targets"].numpy() * scale
+        total_preds = predictions.numpy() * scale
+        total_metrics = {
+            "rmse": metrics["total_rmse"],
+            "r2": metrics["total_r2"],
+            "r2_components": metrics["total_r2_components"],
+        }
+        if "cos_sim_all" in metrics:
+            total_metrics["cos_sim_mean"] = metrics["cos_sim_mean"]
+            total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
+        plot_correlation(total_targets, total_preds, total_metrics, cfg,
+                         save_plots, show_plots, suffix="total")
 
     return metrics, predictions
 
