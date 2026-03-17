@@ -10,9 +10,9 @@ class TNEPconfig:
     data loading (num_types, types, dim_q, indices).
     """
 
-    data_path: str = "train.xyz"
+    data_path: str = "datasets/train.xyz"
     # Separate test dataset (None = split from data_path; str = path to external .xyz)
-    test_data_path: str | None = "test.xyz"
+    test_data_path: str | None = "datasets/test.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = ["C", "H", "O"]
@@ -85,9 +85,9 @@ class TNEPconfig:
     plot_interval: int | None = None
 
     # Save model after training (None = disabled; "auto" = auto-generate name; str = explicit path)
-    save_path: str | None = None
+    save_path: str | None = "models/auto"
     # Save final plots to directory (None = disabled; str = directory path)
-    save_plots: str | None = None
+    save_plots: str | None = "plots"
     # Show plots interactively (True = plt.show(), False = close after saving)
     show_plots: bool = True
     # Show extra info in progress bar (L1, L2 regularisation)
@@ -101,7 +101,7 @@ class TNEPconfig:
     # Floor for mean scaling: fraction of max component mean (None = no floor; ignored for range mode)
     descriptor_scale_floor: float | None = 0.001
     # Scale dipole targets by atom count (per-atom dipole training)
-    scale_targets: bool = False
+    scale_targets: bool = True
 
     dim_q: int
     num_types: int

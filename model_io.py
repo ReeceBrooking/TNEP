@@ -41,8 +41,10 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None) -> None:
         cfg   : TNEPconfig used for training
         path  : str or None — output file path. If None, auto-generates.
     """
-    if path is None or path == "auto":
-        path = _generate_model_filename(cfg)
+    if path is None or path.endswith("auto"):
+        directory = os.path.dirname(path) if path and os.path.dirname(path) else "."
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, _generate_model_filename(cfg))
 
     # Build Z -> type index mapping: {atomic_number: layer_index}
     z_to_type_index = np.array(
