@@ -29,7 +29,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 50000
+    num_generations: int = 15000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
@@ -62,14 +62,14 @@ class TNEPconfig:
     # Each type's params are regularized separately, creating per-type fitness
     # rankings that drive per-type natural gradient updates.
     # Only effective for multi-element systems (auto-disabled for single-element).
-    per_type_regularization: bool = False
+    per_type_regularization: bool = True
 
     # Early stopping patience (None = disabled)
     patience: int | None = None
 
     # Stagnation response: apply action after this many gens without val improvement
     # None = disabled; requires stagnation_response to also be set
-    sigma_reset_patience: int | None = 10000
+    sigma_reset_patience: int | None = None
     # 'interpolate' = blend toward init_sigma; 'noise' = additive Gaussian; None = disabled
     stagnation_response: str | None = 'noise'
     # Blending factor for interpolate mode: sigma += alpha * (init_sigma - sigma)
@@ -77,14 +77,12 @@ class TNEPconfig:
     # Log10 of noise std for noise mode: noise ~ N(0, 10^k)
     sigma_noise_scale: float = -3.0
 
-    # Composite loss: weight for directional (cosine similarity) term (modes 1,2 only)
-    # None = disabled (pure RMSE); float = fitness = RMSE_magnitude + weight * (1 - mean_cos_sim)
-    direction_loss_weight: float | None = None
-    # Minimum target norm to include structure in directional loss (avoids div-by-zero)
-    direction_loss_eps: float = 1e-6
-    # Magnitude loss type: "absolute" = RMSE(||pred|| - ||target||),
-    #                       "log" = RMSE(log||pred|| - log||target||) — penalizes % error equally at all scales
-    magnitude_loss_type: str = "absolute"
+    # Loss function: "mse" = root-mean-square error, "mae" = mean absolute error
+    loss_type: str = "mse"
+    # Inverse-magnitude weighting: upweight structures with small targets
+    # Each structure's error is scaled by 1 / max(||target||^2, eps).
+    # None = disabled (uniform weighting); float = epsilon floor (e.g. 0.01)
+    inverse_weight_eps: float | None = None
     # Polarizability off-diagonal weight: loss for components [xy, yz, zx] scaled by lambda_shear^2
     # (GPUMD default 1.0 — equal weighting; <1.0 downweights off-diagonal)
     lambda_shear: float = 1.0

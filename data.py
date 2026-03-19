@@ -539,7 +539,7 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     return train_data, test_data, val_data
 
 
-def pad_and_stack(data: dict) -> dict[str, tf.Tensor]:
+def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tensor]:
     """Convert variable-length list-of-tensors data into dense padded tensors.
 
     Transforms the output of split() into fixed-shape tensors suitable for
@@ -605,11 +605,19 @@ def pad_and_stack(data: dict) -> dict[str, tf.Tensor]:
     nbr_mask_np = np.zeros((S, max_atoms, max_neighbors), dtype=np.float32)
     num_atoms_np = np.array(atom_counts, dtype=np.int32)
 
+    if num_types is not None:
+        types_contained_np = np.zeros((S, num_types), dtype=np.float32)
+
     for s in range(S):
         N_s = atom_counts[s]
         desc_np[s, :N_s, :] = data["descriptors"][s].numpy()
         pos_np[s, :N_s, :] = data["positions"][s].numpy()
         z_np[s, :N_s] = data["Z_int"][s].numpy()
+        if num_types is not None:
+            z_vals = z_np[s, :N_s]
+            for t in range(num_types):
+                if np.any(z_vals == t):
+                    types_contained_np[s, t] = 1.0
         box_np[s] = data["boxes"][s].numpy()
         atom_mask_np[s, :N_s] = 1.0
 
@@ -625,7 +633,7 @@ def pad_and_stack(data: dict) -> dict[str, tf.Tensor]:
             gidx_np[s, i, :n_nbrs] = data["grad_index"][s][i]
             nbr_mask_np[s, i, :n_nbrs] = 1.0
 
-    return {
+    result = {
         "descriptors": tf.constant(desc_np),
         "gradients": tf.constant(grad_np),
         "grad_index": tf.constant(gidx_np),
@@ -637,6 +645,9 @@ def pad_and_stack(data: dict) -> dict[str, tf.Tensor]:
         "neighbor_mask": tf.constant(nbr_mask_np),
         "num_atoms": tf.constant(num_atoms_np),
     }
+    if num_types is not None:
+        result["types_contained"] = tf.constant(types_contained_np)
+    return result
 
 
 def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray], allowed_Z: list[int | str]) -> tuple[list[Atoms], list[np.ndarray]]:

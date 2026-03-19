@@ -65,9 +65,9 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     train_data, test_data, val_data = split(dataset, dataset_types_int, cfg)
 
     # Convert to padded dense tensors for GPU-batched evaluation
-    train_data = pad_and_stack(train_data)
-    test_data = pad_and_stack(test_data)
-    val_data = pad_and_stack(val_data)
+    train_data = pad_and_stack(train_data, num_types=cfg.num_types)
+    test_data = pad_and_stack(test_data, num_types=cfg.num_types)
+    val_data = pad_and_stack(val_data, num_types=cfg.num_types)
 
     # dim_q is determined by the SOAP descriptor size
     cfg.dim_q = train_data["descriptors"][0].shape[-1]
