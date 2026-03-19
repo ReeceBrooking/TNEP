@@ -38,6 +38,9 @@ def edge_displacements(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Minimum image convention displacements for edges only — O(E) not O(N²).
 
+    Inverts box matrices per-structure (S inversions) then gathers,
+    rather than per-edge (E inversions).
+
     Args:
         positions  : [total_atoms, 3] atom positions
         boxes      : [S, 3, 3] lattice vectors per structure
@@ -49,14 +52,15 @@ def edge_displacements(
         dr  : [E, 3] Cartesian displacement vectors (dst - src, nearest image)
         rij : [E] scalar distances
     """
-    Ri = positions[edge_src]           # [E, 3]
-    Rj = positions[edge_dst]           # [E, 3]
-    box = boxes[edge_batch]            # [E, 3, 3]
-    box_inv = torch.linalg.inv(box)    # [E, 3, 3]
-    si = torch.einsum('eij,ej->ei', box_inv, Ri)  # fractional coords
+    Ri = positions[edge_src]                    # [E, 3]
+    Rj = positions[edge_dst]                    # [E, 3]
+    boxes_inv = torch.linalg.inv(boxes)         # [S, 3, 3] — S inversions, not E
+    box = boxes[edge_batch]                     # [E, 3, 3]
+    box_inv = boxes_inv[edge_batch]             # [E, 3, 3]
+    si = torch.einsum('eij,ej->ei', box_inv, Ri)
     sj = torch.einsum('eij,ej->ei', box_inv, Rj)
     ds = sj - si
-    ds = ds - torch.round(ds)          # MIC wrap to [-0.5, 0.5)
-    dr = torch.einsum('eij,ej->ei', box, ds)       # back to Cartesian
-    rij = torch.linalg.norm(dr, dim=-1)             # [E]
+    ds = ds - torch.round(ds)                  # MIC wrap to [-0.5, 0.5)
+    dr = torch.einsum('eij,ej->ei', box, ds)   # back to Cartesian
+    rij = torch.linalg.norm(dr, dim=-1)         # [E]
     return dr, rij

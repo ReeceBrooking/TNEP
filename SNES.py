@@ -653,19 +653,54 @@ class SNES:
             l2 = self.lambda_2 * torch.sqrt(torch.sum(param_vectors ** 2, dim=1) / self.dim)
             return l1 + l2
 
+    def _precompute_shared(self, batch_data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Pre-compute quantities shared across all candidates.
+
+        1. Scale descriptors and gradients
+        2. Compute edge displacements
+        3. Pad to static shapes for torch.compile
+
+        Returns a new dict with padded tensors ready for predict_padded_batched.
+        """
+        from scatter_ops import edge_displacements
+        out = dict(batch_data)  # shallow copy
+
+        # Scale descriptors and gradients once
+        if self.model._scale_descriptors:
+            scale = self.model._descriptor_mean
+            out["desc_scaled"] = out["descriptors"] / scale
+            out["grads_scaled"] = out["gradients"] / scale
+        else:
+            out["desc_scaled"] = out["descriptors"]
+            out["grads_scaled"] = out["gradients"]
+
+        # Edge displacements (for modes 1 and 2)
+        if self.cfg.target_mode >= 1:
+            dr, rij = edge_displacements(
+                out["positions"], out["boxes"],
+                out["edge_src"], out["edge_dst"], out["edge_batch"])
+            out["dr"] = dr
+            out["rij2"] = rij ** 2
+
+        # Pad to static shapes for compiled batched evaluation
+        out = self.model.pad_batch(out)
+
+        return out
+
     def evaluate_population(self, samples: torch.Tensor, batch_data: dict[str, torch.Tensor],
                             include_regularization: bool = True,
                             return_per_type: bool = False) -> torch.Tensor:
         """Evaluate all SNES candidates on a batch of structures.
 
-        Uses explicit loop over candidates (vmap fallback for scatter compatibility).
-        Chunks along population dimension to limit VRAM.
+        Uses torch.vmap to vectorise the forward pass over the population
+        dimension. Chunks along both population and structure dimensions
+        to limit VRAM.
         """
         P = self.pop_size
         S = int(batch_data["targets"].shape[0])
         T_dim = int(batch_data["targets"].shape[1])
-        pop_chunk = self.cfg.population_chunk_size if self.cfg.population_chunk_size is not None else P
         struct_chunk = self.cfg.batch_chunk_size if self.cfg.batch_chunk_size is not None else S
+        pop_chunk = self.cfg.population_chunk_size if self.cfg.population_chunk_size is not None else P
         T = self.cfg.num_types
 
         # Precompute per-type structure indices
@@ -686,6 +721,15 @@ class SNES:
                 if all_types_present_check:
                     all_types_present = True
 
+        # Pre-compute struct batches with shared quantities (scaled desc, edge displacements)
+        # so they are reused across population chunks instead of recomputed each time
+        struct_batches = []
+        for s_start in range(0, S, struct_chunk):
+            s_end = min(s_start + struct_chunk, S)
+            sb = select_structure_range(batch_data, s_start, s_end)
+            sb = self._precompute_shared(sb)
+            struct_batches.append((sb, (s_end - s_start) * T_dim))
+
         all_fitness = []
 
         for p_start in range(0, P, pop_chunk):
@@ -698,12 +742,10 @@ class SNES:
                     # Fast path: evaluate once, broadcast
                     total_sse = torch.zeros(C, device=self.device)
                     total_elements = 0
-                    for s_start in range(0, S, struct_chunk):
-                        s_end = min(s_start + struct_chunk, S)
-                        struct_batch = select_structure_range(batch_data, s_start, s_end)
-                        chunk_sse = self._evaluate_chunk(candidates, struct_batch)
+                    for sb, n_elem in struct_batches:
+                        chunk_sse = self._evaluate_chunk(candidates, sb)
                         total_sse += chunk_sse
-                        total_elements += (s_end - s_start) * T_dim
+                        total_elements += n_elem
                     global_rmse = torch.sqrt(total_sse / total_elements)
                     all_fitness.append(global_rmse.unsqueeze(1).expand(-1, T + 1).clone())
                 else:
@@ -715,12 +757,10 @@ class SNES:
                         if B_t == 0:
                             per_type_rmse.append(torch.zeros(C, device=self.device))
                             continue
-                        # Build sub-batch for structures with this type
                         type_sse = torch.zeros(C, device=self.device)
                         type_elements = 0
                         for s_i in range(0, B_t, struct_chunk):
                             s_j = min(s_i + struct_chunk, B_t)
-                            # Select individual structures
                             sub_indices = indices[s_i:s_j]
                             struct_batch = self._select_batch(
                                 batch_data, torch.tensor(sub_indices, device=self.device))
@@ -733,12 +773,10 @@ class SNES:
             else:
                 total_sse = torch.zeros(C, device=self.device)
                 total_elements = 0
-                for s_start in range(0, S, struct_chunk):
-                    s_end = min(s_start + struct_chunk, S)
-                    struct_batch = select_structure_range(batch_data, s_start, s_end)
-                    chunk_sse = self._evaluate_chunk(candidates, struct_batch)
+                for sb, n_elem in struct_batches:
+                    chunk_sse = self._evaluate_chunk(candidates, sb)
                     total_sse += chunk_sse
-                    total_elements += (s_end - s_start) * T_dim
+                    total_elements += n_elem
                 chunk_fitness = torch.sqrt(total_sse / total_elements)
                 all_fitness.append(chunk_fitness)
 
@@ -756,37 +794,46 @@ class SNES:
     @torch.no_grad()
     def _evaluate_chunk(self, chunk_samples: torch.Tensor,
                         batch_data: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Evaluate C candidates on a batch using explicit loop.
+        """Evaluate C candidates in parallel via padded batched forward pass.
+
+        Uses padded tensors with torch.compile for fused GPU execution,
+        matching TF's @tf.function + padded tensor performance.
 
         Returns:
             sse : [C] sum of squared errors per candidate
         """
-        C = chunk_samples.shape[0]
-        sse = torch.zeros(C, device=self.device)
+        if "desc_pad" not in batch_data:
+            batch_data = self._precompute_shared(batch_data)
 
-        scale_preds = self.cfg.scale_targets and self.cfg.target_mode == 1
-        if scale_preds:
-            num_atoms = batch_data["num_atoms"].float().clamp(min=1.0).unsqueeze(1)
+        params = self.reconstruct_params_torch(chunk_samples)  # batched [C, ...]
+        if self.cfg.target_mode == 2:
+            W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
+            # Mode 2 padded path not yet implemented — fall back to sequential
+            C = chunk_samples.shape[0]
+            sse = torch.zeros(C, device=self.device)
+            targets = batch_data["targets"]
+            for c in range(C):
+                preds = self.model.predict_flat(
+                    batch_data, W0[c], b0[c], W1[c], b1[c], W0p[c], b0p[c], W1p[c], b1p[c])
+                diff = preds - targets
+                sse[c] = torch.sum(diff ** 2 * self._pol_weights) if self._pol_weights is not None else torch.sum(diff ** 2)
+            return sse
 
-        targets = batch_data["targets"]
+        W0, b0, W1, b1 = params
 
-        for c in range(C):
-            params = self.reconstruct_params_torch(chunk_samples[c])
-            if self.cfg.target_mode == 2:
-                W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
-            else:
-                W0, b0, W1, b1 = params
-                W0p = b0p = W1p = b1p = None
+        preds = self.model.predict_padded_batched(
+            batch_data, W0, b0, W1, b1)  # [C, S, T_dim]
 
-            preds = self.model.predict_flat(batch_data, W0, b0, W1, b1, W0p, b0p, W1p, b1p)
+        if self.cfg.scale_targets and self.cfg.target_mode == 1:
+            num_atoms = batch_data["num_atoms"].float().clamp(min=1.0)
+            preds = preds / num_atoms.unsqueeze(0).unsqueeze(2)
 
-            if scale_preds:
-                preds = preds / num_atoms
+        targets = batch_data["targets"]          # [S, T_dim]
+        diff = preds - targets.unsqueeze(0)      # [C, S, T_dim]
 
-            diff = preds - targets
-            if self._pol_weights is not None:
-                sse[c] = torch.sum(diff ** 2 * self._pol_weights)
-            else:
-                sse[c] = torch.sum(diff ** 2)
+        if self._pol_weights is not None:
+            sse = torch.sum(diff ** 2 * self._pol_weights, dim=(1, 2))
+        else:
+            sse = torch.sum(diff ** 2, dim=(1, 2))
 
         return sse

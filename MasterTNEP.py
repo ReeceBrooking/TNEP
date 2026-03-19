@@ -38,6 +38,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')  # TF32 tensor cores — ~3× matmul speedup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Load dataset, filter by species, then filter bad data
@@ -82,7 +83,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     use_gpu = torch.cuda.is_available()
     if use_gpu:
         props = torch.cuda.get_device_properties(0)
-        total_vram_mb = props.total_mem / (1024 * 1024)
+        total_vram_mb = props.total_memory / (1024 * 1024)
         usage_pct = 100 * tensor_mb / total_vram_mb
         print("\n=== Memory Check (GPU) ===")
         print(f"  Largest tensor set: {tensor_mb:.1f} MB")

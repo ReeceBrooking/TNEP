@@ -562,6 +562,16 @@ def collate_flat(data: dict) -> dict[str, torch.Tensor]:
             edge_batch_list.append(np.full(M_i, s, dtype=np.int64))
         atom_offset += N_s
 
+    # Concatenate all arrays
+    desc_cat = np.concatenate(all_desc)
+    Z_cat = np.concatenate(all_Z)
+    pos_cat = np.concatenate(all_pos)
+    ab_cat = np.concatenate(atom_batch_list)
+    grads_cat = np.concatenate(all_grads)
+    es_cat = np.concatenate(edge_src_list)
+    ed_cat = np.concatenate(edge_dst_list)
+    eb_cat = np.concatenate(edge_batch_list)
+
     # Compute offset arrays for O(1) structure chunking
     atom_counts = [np.asarray(data["descriptors"][s]).shape[0] for s in range(S)]
     edge_counts = [sum(np.asarray(data["gradients"][s][i]).shape[0]
@@ -579,14 +589,14 @@ def collate_flat(data: dict) -> dict[str, torch.Tensor]:
         targets_np = np.stack(target_list)
 
     return {
-        "descriptors": torch.tensor(np.concatenate(all_desc), dtype=torch.float32),
-        "Z_int": torch.tensor(np.concatenate(all_Z), dtype=torch.int64),
-        "positions": torch.tensor(np.concatenate(all_pos), dtype=torch.float32),
-        "atom_batch": torch.tensor(np.concatenate(atom_batch_list), dtype=torch.int64),
-        "gradients": torch.tensor(np.concatenate(all_grads), dtype=torch.float32),
-        "edge_src": torch.tensor(np.concatenate(edge_src_list), dtype=torch.int64),
-        "edge_dst": torch.tensor(np.concatenate(edge_dst_list), dtype=torch.int64),
-        "edge_batch": torch.tensor(np.concatenate(edge_batch_list), dtype=torch.int64),
+        "descriptors": torch.tensor(desc_cat, dtype=torch.float32),
+        "Z_int": torch.tensor(Z_cat, dtype=torch.int64),
+        "positions": torch.tensor(pos_cat, dtype=torch.float32),
+        "atom_batch": torch.tensor(ab_cat, dtype=torch.int64),
+        "gradients": torch.tensor(grads_cat, dtype=torch.float32),
+        "edge_src": torch.tensor(es_cat, dtype=torch.int64),
+        "edge_dst": torch.tensor(ed_cat, dtype=torch.int64),
+        "edge_batch": torch.tensor(eb_cat, dtype=torch.int64),
         "targets": torch.tensor(targets_np, dtype=torch.float32),
         "boxes": torch.tensor(np.stack([np.asarray(b, dtype=np.float32) for b in data["boxes"]]), dtype=torch.float32),
         "num_atoms": torch.tensor(atom_counts, dtype=torch.int64),
@@ -611,10 +621,9 @@ def select_structure_range(batch: dict[str, torch.Tensor], s_start: int, s_end: 
     e0 = int(batch["edge_offsets"][s_start])
     e1 = int(batch["edge_offsets"][s_end])
     sub_num_atoms = batch["num_atoms"][s_start:s_end]
-    # Recompute offsets for the sub-batch so it can be sliced again
-    n_sub = s_end - s_start
     sub_atom_offsets = batch["atom_offsets"][s_start:s_end + 1] - a0
     sub_edge_offsets = batch["edge_offsets"][s_start:s_end + 1] - e0
+
     return {
         "descriptors": batch["descriptors"][a0:a1],
         "Z_int": batch["Z_int"][a0:a1],

@@ -99,10 +99,12 @@ class TNEPconfig:
     # Test split ratio
     test_ratio: float = 0.3
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N: int | None = 1000
+    total_N: int | None = None
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
+    # Dominant memory: P_chunk × N_atoms × dim_q × num_neurons × 4 bytes
+    # Rule of thumb for 12 GB GPU: 10; for 24 GB: 20-40
     population_chunk_size: int | None = 10
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
     batch_chunk_size: int | None = None

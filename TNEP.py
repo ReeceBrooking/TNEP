@@ -58,6 +58,13 @@ class TNEP:
 
         self.optimizer: SNES | None = None
 
+        # Compiled padded forward pass — built on first use
+        self._compiled_padded_fwd: Callable | None = None
+
+    # ------------------------------------------------------------------
+    # Flat forward pass (used for validation, scoring, spectroscopy)
+    # ------------------------------------------------------------------
+
     def predict_flat(
         self,
         batch: dict[str, torch.Tensor],
@@ -72,182 +79,296 @@ class TNEP:
     ) -> torch.Tensor:
         """Forward pass on flat (concatenated) batch data.
 
-        Args:
-            batch : dict from collate_flat() with keys:
-                descriptors [total_atoms, Q], Z_int [total_atoms],
-                positions [total_atoms, 3], atom_batch [total_atoms],
-                gradients [total_edges, 3, Q], edge_src [total_edges],
-                edge_dst [total_edges], edge_batch [total_edges],
-                targets [S, T_dim], boxes [S, 3, 3], num_atoms [S]
-            W0..b1 : weight tensors [T,Q,H], [T,H], [T,H], scalar
-            W0_pol..b1_pol : mode 2 only
-
         Returns:
             predictions : [S, T_dim]
         """
-        desc = batch["descriptors"]       # [total_atoms, Q]
-        Z = batch["Z_int"]                # [total_atoms]
-        atom_batch = batch["atom_batch"]   # [total_atoms]
-        grads = batch["gradients"]         # [total_edges, 3, Q]
-        edge_src = batch["edge_src"]       # [total_edges]
+        if "desc_scaled" in batch:
+            desc = batch["desc_scaled"]
+            grads = batch["grads_scaled"]
+        else:
+            desc = batch["descriptors"]
+            grads = batch["gradients"]
+            if self._scale_descriptors:
+                scale = self._descriptor_mean
+                desc = desc / scale
+                grads = grads / scale
+
+        Z = batch["Z_int"]
+        atom_batch = batch["atom_batch"]
+        edge_src = batch["edge_src"]
         S = int(batch["num_atoms"].shape[0])
 
-        # Scale descriptors and gradients
-        if self._scale_descriptors:
-            scale = self._descriptor_mean  # [Q]
-            desc = desc / scale
-            grads = grads / scale
-
-        # Gather per-type weights for each atom
-        W0_t = W0[Z]     # [total_atoms, Q, H]
-        b0_t = b0[Z]     # [total_atoms, H]
-        W1_t = W1[Z]     # [total_atoms, H]
+        # Gather per-type weights
+        W0_t = W0[Z]     # [N, Q, H]
+        b0_t = b0[Z]     # [N, H]
+        W1_t = W1[Z]     # [N, H]
 
         # Hidden layer
-        h = torch.einsum('nq,nqh->nh', desc, W0_t) + b0_t  # [total_atoms, H]
+        h = torch.einsum('nq,nqh->nh', desc, W0_t) + b0_t
         h = torch.tanh(h)
 
         if self.cfg.target_mode == 0:
-            # PES: E = -sum_i (h_i . W1[t_i] + b1)
-            E_per_atom = torch.sum(h * W1_t, dim=1) + b1    # [total_atoms]
-            E = scatter_sum(E_per_atom, atom_batch, dim_size=S)  # [S]
-            return -E.unsqueeze(1)  # [S, 1]
+            E_per_atom = (h * W1_t).sum(dim=1) + b1
+            E = scatter_sum(E_per_atom, atom_batch, dim_size=S)
+            return -E.unsqueeze(1)
 
-        # Modes 1 and 2 need forces
-        forces = self._calc_forces_flat(h, grads, W1_t, W0_t, edge_src)  # [total_edges, 3]
+        # Forces
+        dtanh = 1.0 - h ** 2
+        de_da = dtanh * W1_t
+        de_dq = torch.einsum('nh,nqh->nq', de_da, W0_t)
+        de_dq_edge = de_dq[edge_src]
+        forces = torch.einsum('eq,ecq->ec', de_dq_edge, grads)
 
         if self.cfg.target_mode == 1:
-            return self._dipole_flat(forces, batch, S)
+            rij2 = batch.get("rij2")
+            if rij2 is None:
+                _, rij = edge_displacements(
+                    batch["positions"], batch["boxes"],
+                    batch["edge_src"], batch["edge_dst"], batch["edge_batch"])
+                rij2 = rij ** 2
+            contribs = rij2.unsqueeze(1) * forces
+            return -scatter_sum(contribs, batch["edge_batch"], dim_size=S)
 
         elif self.cfg.target_mode == 2:
-            return self._polarizability_flat(
-                desc, forces, batch, S, Z, atom_batch,
-                W0_pol, b0_pol, W1_pol, b1_pol)
+            edge_batch = batch["edge_batch"]
+            dr = batch.get("dr")
+            if dr is None:
+                dr, _ = edge_displacements(
+                    batch["positions"], batch["boxes"],
+                    batch["edge_src"], batch["edge_dst"], edge_batch)
+            # Scalar ANN
+            W0p_t = W0_pol[Z]
+            b0p_t = b0_pol[Z]
+            W1p_t = W1_pol[Z]
+            h_pol = torch.einsum('nq,nqh->nh', desc, W0p_t) + b0p_t
+            h_pol = torch.tanh(h_pol)
+            F_pol = (h_pol * W1p_t).sum(dim=1) + b1_pol
+            scalar_sum = scatter_sum(F_pol, atom_batch, dim_size=S)
+            # Tensor ANN
+            pol_outer = -(dr.unsqueeze(2) * forces.unsqueeze(1))
+            pol_matrix = scatter_sum(pol_outer, edge_batch, dim_size=S)
+            pol = torch.stack([
+                pol_matrix[:, 0, 0], pol_matrix[:, 1, 1], pol_matrix[:, 2, 2],
+                pol_matrix[:, 0, 1], pol_matrix[:, 1, 2], pol_matrix[:, 2, 0],
+            ], dim=1)
+            pol[:, 0] += scalar_sum
+            pol[:, 1] += scalar_sum
+            pol[:, 2] += scalar_sum
+            return pol
 
-    def _calc_forces_flat(
+    # ------------------------------------------------------------------
+    # Padded forward pass (used for SNES population evaluation)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def pad_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Convert a flat batch into padded tensors with static shapes.
+
+        Fully vectorized — no Python loops over atoms or edges.
+        This enables torch.compile(fullgraph=True) and efficient batched matmul
+        over the population dimension — the same approach that made TF fast.
+        """
+        S = int(batch["num_atoms"].shape[0])
+        desc = batch.get("desc_scaled", batch["descriptors"])
+        grads = batch.get("grads_scaled", batch["gradients"])
+        Z = batch["Z_int"]
+        atom_batch_idx = batch["atom_batch"]
+        edge_src = batch["edge_src"]
+        Q = desc.shape[1]
+        N = desc.shape[0]
+        E = edge_src.shape[0]
+        device = desc.device
+
+        atom_offsets = batch["atom_offsets"]
+        num_atoms = batch["num_atoms"]
+        A_max = int(num_atoms.max())
+
+        # Compute local atom index within each structure: local_idx = global - offset[structure]
+        atom_local = torch.arange(N, device=device) - atom_offsets[atom_batch_idx]
+
+        # Padded descriptors [S, A_max, Q] and types [S, A_max]
+        desc_pad = desc.new_zeros(S, A_max, Q)
+        desc_pad[atom_batch_idx, atom_local] = desc
+        Z_pad = Z.new_zeros(S, A_max)
+        Z_pad[atom_batch_idx, atom_local] = Z
+        atom_mask = torch.zeros(S, A_max, dtype=torch.bool, device=device)
+        atom_mask[atom_batch_idx, atom_local] = True
+
+        # Count edges per global atom to find M_max and compute local edge index
+        edges_per_atom = torch.zeros(N, dtype=torch.int64, device=device)
+        edges_per_atom.scatter_add_(0, edge_src, torch.ones(E, dtype=torch.int64, device=device))
+        M_max = int(edges_per_atom.max())
+
+        # Local neighbor index within each atom's edge list
+        # For each edge, its position among edges sharing the same src atom
+        edge_order = torch.zeros(E, dtype=torch.int64, device=device)
+        # Cumulative count per src atom via sorting
+        sorted_idx = torch.argsort(edge_src, stable=True)
+        counts = edges_per_atom[edge_src[sorted_idx]]  # not needed directly
+        # Compute position within each group: for edges sorted by src, the position
+        # is the index minus the first occurrence of that src
+        src_sorted = edge_src[sorted_idx]
+        # Use cumsum trick: mark group starts, then cumsum within groups
+        group_start = torch.ones(E, dtype=torch.int64, device=device)
+        if E > 0:
+            same_as_prev = (src_sorted[1:] == src_sorted[:-1])
+            group_start[1:] = (~same_as_prev).long()
+        cum_pos = torch.cumsum(torch.ones(E, dtype=torch.int64, device=device), dim=0)
+        group_cum = torch.cumsum(group_start, dim=0)
+        # First edge in each group gets position 0
+        # group_offset[i] = cum_pos of the first edge in this group
+        group_first_pos = torch.zeros(E, dtype=torch.int64, device=device)
+        group_first_pos[0] = 0
+        if E > 1:
+            new_group = (group_start[1:] == 1).nonzero(as_tuple=True)[0] + 1
+            # Simpler approach: scatter to get start position per group
+            # and gather back
+        # Actually, simplest correct approach for local edge index:
+        inv_sorted = torch.empty_like(sorted_idx)
+        inv_sorted[sorted_idx] = torch.arange(E, device=device)
+        # edges_before[i] = number of edges with same src that come before i in sorted order
+        # = position_in_sorted - first_position_of_this_src_in_sorted
+        first_pos = torch.zeros(N, dtype=torch.int64, device=device)
+        # For each atom, first_pos = min index in sorted_idx where src == atom
+        # edges_per_atom is known, so prefix sum gives first_pos
+        first_pos[1:] = torch.cumsum(edges_per_atom[:-1], dim=0)
+        edge_local = inv_sorted - first_pos[edge_src]
+
+        # Map each edge to (structure, local_atom, local_neighbor)
+        edge_struct = batch["edge_batch"]
+        edge_src_local = edge_src - atom_offsets[edge_struct]
+
+        # Padded gradients [S, A_max, M_max, 3, Q]
+        grads_pad = grads.new_zeros(S, A_max, M_max, 3, Q)
+        grads_pad[edge_struct, edge_src_local, edge_local] = grads
+        edge_mask = torch.zeros(S, A_max, M_max, dtype=torch.bool, device=device)
+        edge_mask[edge_struct, edge_src_local, edge_local] = True
+
+        # rij2 padded [S, A_max, M_max] for dipole mode
+        rij2_pad = None
+        if "rij2" in batch:
+            rij2_pad = batch["rij2"].new_zeros(S, A_max, M_max)
+            rij2_pad[edge_struct, edge_src_local, edge_local] = batch["rij2"]
+
+        out = dict(batch)
+        out["desc_pad"] = desc_pad
+        out["Z_pad"] = Z_pad
+        out["atom_mask"] = atom_mask
+        out["grads_pad"] = grads_pad
+        out["edge_mask"] = edge_mask
+        out["A_max"] = A_max
+        out["M_max"] = M_max
+        if rij2_pad is not None:
+            out["rij2_pad"] = rij2_pad
+        return out
+
+    def predict_padded_batched(
         self,
-        h: torch.Tensor,
-        gradients: torch.Tensor,
-        W1_t: torch.Tensor,
-        W0_t: torch.Tensor,
-        edge_src: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        W0: torch.Tensor,
+        b0: torch.Tensor,
+        W1: torch.Tensor,
+        b1: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute dU_i/dR_j for every edge via chain rule.
+        """Evaluate P candidates on padded data using dense matmul.
+
+        All shapes are static → torch.compile can fuse everything.
+        Currently supports modes 0 (PES) and 1 (dipole).
 
         Args:
-            h         : [total_atoms, H] hidden activations
-            gradients : [total_edges, 3, Q] descriptor gradients
-            W1_t      : [total_atoms, H] per-atom output weights
-            W0_t      : [total_atoms, Q, H] per-atom input weights
-            edge_src  : [total_edges] center atom index
+            W0 [P, T, Q, H], b0 [P, T, H], W1 [P, T, H], b1 [P]
 
         Returns:
-            forces : [total_edges, 3]
+            predictions : [P, S, T_dim]
         """
-        dtanh = 1.0 - h ** 2                                    # [total_atoms, H]
-        de_da = dtanh * W1_t                                     # [total_atoms, H]
-        de_dq = torch.einsum('nh,nqh->nq', de_da, W0_t)        # [total_atoms, Q]
-        de_dq_edge = de_dq[edge_src]                             # [total_edges, Q]
-        forces = torch.einsum('eq,ecq->ec', de_dq_edge, gradients)  # [total_edges, 3]
-        return forces
+        desc_pad = batch["desc_pad"]          # [S, A, Q]
+        Z_pad = batch["Z_pad"]                # [S, A]
+        atom_mask = batch["atom_mask"]         # [S, A]
+        grads_pad = batch["grads_pad"]         # [S, A, M, 3, Q]
+        edge_mask = batch["edge_mask"]         # [S, A, M]
 
-    def _dipole_flat(
+        if self._compiled_padded_fwd is None:
+            self._compiled_padded_fwd = torch.compile(
+                self._padded_forward_impl,
+                fullgraph=True, mode="max-autotune")
+
+        rij2_pad = batch.get("rij2_pad")
+        if rij2_pad is None:
+            rij2_pad = torch.zeros(1, device=self.device)  # dummy
+
+        return self._compiled_padded_fwd(
+            desc_pad, Z_pad, atom_mask, grads_pad, edge_mask,
+            rij2_pad, W0, b0, W1, b1)
+
+    def _padded_forward_impl(
         self,
-        forces: torch.Tensor,
-        batch: dict[str, torch.Tensor],
-        S: int,
+        desc_pad: torch.Tensor,     # [S, A, Q]
+        Z_pad: torch.Tensor,        # [S, A]
+        atom_mask: torch.Tensor,     # [S, A]
+        grads_pad: torch.Tensor,     # [S, A, M, 3, Q]
+        edge_mask: torch.Tensor,     # [S, A, M]
+        rij2_pad: torch.Tensor,      # [S, A, M] or dummy
+        W0: torch.Tensor,            # [P, T, Q, H]
+        b0: torch.Tensor,            # [P, T, H]
+        W1: torch.Tensor,            # [P, T, H]
+        b1: torch.Tensor,            # [P]
     ) -> torch.Tensor:
-        """Dipole prediction from flat data.
+        """Padded dense forward pass — pure tensor function for torch.compile.
 
-        mu = -sum_edges |r_ij|^2 * force_ij
-
-        Returns:
-            dipole : [S, 3]
+        No scatter, no gather-by-index. All ops are regular dense matmul/einsum
+        on static-shape tensors. Masks applied after each step.
         """
-        positions = batch["positions"]
-        boxes = batch["boxes"]
-        edge_src = batch["edge_src"]
-        edge_dst = batch["edge_dst"]
-        edge_batch = batch["edge_batch"]
+        P = W0.shape[0]
+        S, A, Q = desc_pad.shape
+        H = W0.shape[3]
+        target_mode = self.cfg.target_mode
 
-        dr, rij = edge_displacements(positions, boxes, edge_src, edge_dst, edge_batch)
-        rij2 = rij ** 2                                          # [E]
-        dipole_contribs = rij2.unsqueeze(1) * forces             # [E, 3]
-        dipole = -scatter_sum(dipole_contribs, edge_batch, dim_size=S)  # [S, 3]
-        return dipole
+        # Gather per-type weights for each atom position: [P, S, A, ...]
+        # W0[p, Z[s,a]] -> [P, S, A, Q, H]
+        W0_t = W0[:, Z_pad]       # [P, S, A, Q, H]
+        b0_t = b0[:, Z_pad]       # [P, S, A, H]
+        W1_t = W1[:, Z_pad]       # [P, S, A, H]
 
-    def _polarizability_flat(
-        self,
-        desc: torch.Tensor,
-        forces: torch.Tensor,
-        batch: dict[str, torch.Tensor],
-        S: int,
-        Z: torch.Tensor,
-        atom_batch: torch.Tensor,
-        W0_pol: torch.Tensor,
-        b0_pol: torch.Tensor,
-        W1_pol: torch.Tensor,
-        b1_pol: torch.Tensor,
-    ) -> torch.Tensor:
-        """Polarizability via dual ANN (GPUMD approach).
+        # Hidden layer: [S, A, Q] @ [P, S, A, Q, H] -> [P, S, A, H]
+        h = torch.einsum('saq,psaqh->psah', desc_pad, W0_t) + b0_t
+        h = torch.tanh(h)
 
-        Scalar ANN → isotropic diagonal.
-        Tensor ANN (forces) → anisotropic virial.
+        if target_mode == 0:
+            # PES: sum per-atom energies masked
+            E_per_atom = (h * W1_t).sum(dim=3) + b1[:, None, None]  # [P, S, A]
+            E_per_atom = E_per_atom * atom_mask.float()              # mask padding
+            E = E_per_atom.sum(dim=2)                                # [P, S]
+            return -E.unsqueeze(2)                                   # [P, S, 1]
 
-        Returns:
-            pol : [S, 6] — [xx, yy, zz, xy, yz, zx]
-        """
-        positions = batch["positions"]
-        boxes = batch["boxes"]
-        edge_src = batch["edge_src"]
-        edge_dst = batch["edge_dst"]
-        edge_batch = batch["edge_batch"]
+        # Forces via chain rule
+        dtanh = 1.0 - h ** 2                                        # [P, S, A, H]
+        de_da = dtanh * W1_t                                         # [P, S, A, H]
+        # de_dq: [P, S, A, H] @ [P, S, A, H, Q] -> [P, S, A, Q]
+        de_dq = torch.einsum('psah,psaqh->psaq', de_da, W0_t)
 
-        dr, rij = edge_displacements(positions, boxes, edge_src, edge_dst, edge_batch)
+        # Forces per edge: de_dq[center] . grads[center, nbr]
+        # de_dq is [P, S, A, Q], grads_pad is [S, A, M, 3, Q]
+        # For each (s, a, m): force = de_dq[p, s, a, :] @ grads[s, a, m, :, :]^T
+        # = einsum over Q: [P, S, A, Q] * [S, A, M, 3, Q] -> [P, S, A, M, 3]
+        forces = torch.einsum('psaq,samcq->psamc', de_dq, grads_pad)
 
-        # --- Scalar ANN (isotropic) ---
-        W0p_t = W0_pol[Z]     # [total_atoms, Q, H]
-        b0p_t = b0_pol[Z]     # [total_atoms, H]
-        W1p_t = W1_pol[Z]     # [total_atoms, H]
+        if target_mode == 1:
+            # Dipole: -sum_edges rij^2 * force, masked
+            # rij2_pad [S, A, M], forces [P, S, A, M, 3]
+            contribs = rij2_pad[None, :, :, :, None] * forces        # [P, S, A, M, 3]
+            contribs = contribs * edge_mask[None, :, :, :, None].float()
+            dipole = -contribs.sum(dim=(2, 3))                       # [P, S, 3]
+            return dipole
 
-        h_pol = torch.einsum('nq,nqh->nh', desc, W0p_t) + b0p_t
-        h_pol = torch.tanh(h_pol)
-        F_pol = torch.sum(h_pol * W1p_t, dim=1) + b1_pol        # [total_atoms]
-        scalar_sum = scatter_sum(F_pol, atom_batch, dim_size=S)  # [S]
+        # Mode 2 not yet implemented in padded path — fall back handled in _evaluate_chunk
 
-        # --- Tensor ANN (anisotropic virial) ---
-        # pol_outer = -dr_a * force_b for each edge → [E, 3, 3]
-        pol_outer = -torch.einsum('ea,eb->eab', dr, forces)      # [E, 3, 3]
-        pol_matrix = scatter_sum(pol_outer, edge_batch, dim_size=S)  # [S, 3, 3]
-
-        # Extract 6 unique components: [xx, yy, zz, xy, yz, zx]
-        pol = torch.stack([
-            pol_matrix[:, 0, 0],
-            pol_matrix[:, 1, 1],
-            pol_matrix[:, 2, 2],
-            pol_matrix[:, 0, 1],
-            pol_matrix[:, 1, 2],
-            pol_matrix[:, 2, 0],
-        ], dim=1)  # [S, 6]
-
-        # Add scalar to diagonal
-        pol[:, 0] += scalar_sum
-        pol[:, 1] += scalar_sum
-        pol[:, 2] += scalar_sum
-        return pol
+    # ------------------------------------------------------------------
+    # Training and scoring
+    # ------------------------------------------------------------------
 
     def fit(self, train_data: dict[str, torch.Tensor], val_data: dict[str, torch.Tensor],
             plot_callback: Callable | None = None) -> dict:
-        """Train the model using the SNES evolutionary optimizer.
-
-        Args:
-            train_data    : dict from collate_flat()
-            val_data      : same structure
-            plot_callback : optional callable(history, gen) for periodic plotting
-
-        Returns:
-            history : dict with keys generation, train_loss, val_loss (lists)
-        """
+        """Train the model using the SNES evolutionary optimizer."""
         from SNES import SNES
         if self.optimizer is None:
             self.optimizer = SNES(self)
@@ -255,15 +376,7 @@ class TNEP:
         return history
 
     def score(self, test_data: dict[str, torch.Tensor]) -> tuple[dict[str, np.ndarray], np.ndarray]:
-        """Evaluate RMSE, R², per-component R², and cosine similarity.
-
-        Args:
-            test_data : dict from collate_flat()
-
-        Returns:
-            metrics : dict with numpy values
-            preds   : [S, T] numpy array
-        """
+        """Evaluate RMSE, R², per-component R², and cosine similarity."""
         with torch.no_grad():
             raw_preds = self.predict_flat(
                 test_data, self.W0, self.b0, self.W1, self.b1,
@@ -274,10 +387,9 @@ class TNEP:
             )
         targets = test_data["targets"]
 
-        # Per-atom normalization
         if self.cfg.scale_targets and self.cfg.target_mode == 1:
-            num_atoms = test_data["num_atoms"].float()         # [S]
-            num_atoms_col = num_atoms.clamp(min=1.0).unsqueeze(1)  # [S, 1]
+            num_atoms = test_data["num_atoms"].float()
+            num_atoms_col = num_atoms.clamp(min=1.0).unsqueeze(1)
             preds = raw_preds / num_atoms_col
         else:
             preds = raw_preds
@@ -286,12 +398,10 @@ class TNEP:
         mse = torch.mean(diff ** 2)
         rmse = torch.sqrt(mse)
 
-        # Overall R²
         ss_res = torch.sum(diff ** 2)
         ss_tot = torch.sum((targets - targets.mean(dim=0)) ** 2)
         r2 = 1.0 - ss_res / ss_tot
 
-        # Per-component R²
         ss_res_comp = torch.sum(diff ** 2, dim=0)
         ss_tot_comp = torch.sum((targets - targets.mean(dim=0)) ** 2, dim=0)
         r2_components = 1.0 - ss_res_comp / ss_tot_comp.clamp(min=1e-12)
@@ -302,7 +412,6 @@ class TNEP:
             "r2_components": r2_components.cpu().numpy(),
         }
 
-        # Total (un-scaled) metrics when target scaling is active
         if self.cfg.scale_targets and self.cfg.target_mode == 1:
             total_targets = targets * num_atoms_col
             total_diff = raw_preds - total_targets
@@ -317,7 +426,6 @@ class TNEP:
             metrics["total_r2"] = float(total_r2)
             metrics["total_r2_components"] = total_r2_comp.cpu().numpy()
 
-        # Cosine similarity for vector targets
         if self.cfg.target_mode >= 1:
             dot = torch.sum(preds * targets, dim=1)
             norm_p = torch.linalg.norm(preds, dim=1)
