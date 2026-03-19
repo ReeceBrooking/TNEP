@@ -23,25 +23,30 @@ class TNEPconfig:
     # Rigorous filtering: recompute targets with GPAW and filter by cosine similarity
     filter_rigorous: bool = False
     rigorous_threshold: float = 0.5
-    num_neurons: int = 10
+    num_neurons: int = 15
     # Number of structures used in each train step
-    batch_size: int | None = 50
+    batch_size: int | None = None
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 1000
+    num_generations: int = 100000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
     # SOAP Turbo descriptor parameters
     l_max: int = 4
     alpha_max: int = 4
-    rcut_hard: float = 3.7
-    rcut_soft: float = 3.2
+    rcut_hard: float = 6.0
+    rcut_soft: float = 5.5
     basis: str = "poly3"
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 1
     compress_mode: str = "trivial"
+    # Number of compressed radial channels (only used when compress_mode="linear"; None = quippy default)
+    compress_P: int | None = None
+    # PCA compression of descriptors (applied after SOAP computation, before scaling)
+    # Uses compress_P for number of components. Independent of quippy's compress_mode.
+    compress_pca: bool = False
     atom_sigma_r: float = 0.5
     atom_sigma_t: float = 0.5
     atom_sigma_r_scaling: float = 0.0
@@ -53,15 +58,36 @@ class TNEPconfig:
     toggle_regularization: bool = True
     lambda_1: float | None = 0.001
     lambda_2: float | None = 0.001
+    # Per-type regularization and ranking (GPUMD NEP4 style)
+    # Each type's params are regularized separately, creating per-type fitness
+    # rankings that drive per-type natural gradient updates.
+    # Only effective for multi-element systems (auto-disabled for single-element).
+    per_type_regularization: bool = True
 
     # Early stopping patience (None = disabled)
     patience: int | None = None
 
-    # Sigma reset: reinitialise sigma when it collapses and training stagnates
-    # None = disabled; int = generations stagnating + small sigma to trigger reset
-    sigma_reset_patience: int | None = None
-    # Fraction of init_sigma below which sigma is considered collapsed
-    sigma_reset_threshold: float = 0.01
+    # Stagnation response: apply action after this many gens without val improvement
+    # None = disabled; requires stagnation_response to also be set
+    sigma_reset_patience: int | None = 10000
+    # 'interpolate' = blend toward init_sigma; 'noise' = additive Gaussian; None = disabled
+    stagnation_response: str | None = 'noise'
+    # Blending factor for interpolate mode: sigma += alpha * (init_sigma - sigma)
+    sigma_interpolate_alpha: float = 0.5
+    # Log10 of noise std for noise mode: noise ~ N(0, 10^k)
+    sigma_noise_scale: float = -3.0
+
+    # Composite loss: weight for directional (cosine similarity) term (modes 1,2 only)
+    # None = disabled (pure RMSE); float = fitness = RMSE_magnitude + weight * (1 - mean_cos_sim)
+    direction_loss_weight: float | None = None
+    # Minimum target norm to include structure in directional loss (avoids div-by-zero)
+    direction_loss_eps: float = 1e-6
+    # Magnitude loss type: "absolute" = RMSE(||pred|| - ||target||),
+    #                       "log" = RMSE(log||pred|| - log||target||) — penalizes % error equally at all scales
+    magnitude_loss_type: str = "absolute"
+    # Polarizability off-diagonal weight: loss for components [xy, yz, zx] scaled by lambda_shear^2
+    # (GPUMD default 1.0 — equal weighting; <1.0 downweights off-diagonal)
+    lambda_shear: float = 1.0
 
     activation: str = 'tanh'
     # Initial distribution standard deviation
@@ -71,9 +97,9 @@ class TNEPconfig:
     # 0 : PES, 1 : Dipole, 2 : Polarizability
     target_mode: int = 1
     # Test split ratio
-    test_ratio: float = 0.2
+    test_ratio: float = 0.3
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N: int | None = None
+    total_N: int | None = 1000
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
@@ -82,7 +108,7 @@ class TNEPconfig:
     batch_chunk_size: int | None = None
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
-    plot_interval: int | None = None
+    plot_interval: int | None = 10000
 
     # Save model after training (None = disabled; "auto" = auto-generate name; str = explicit path)
     save_path: str | None = "models/auto"
@@ -91,7 +117,7 @@ class TNEPconfig:
     # Show plots interactively (True = plt.show(), False = close after saving)
     show_plots: bool = True
     # Show extra info in progress bar (L1, L2 regularisation)
-    debug: bool = False
+    debug: bool = True
     # Negate predictions for structures detected as sign-flipped (cos_sim < -0.9)
     fix_sign_flips: bool = False
     # Scale input descriptors by their training-set statistics (per component)

@@ -49,7 +49,8 @@ class SNES:
 
     def __init__(self, model: TNEP) -> None:
         self.model = model
-        self.cfg = model.cfg
+        cfg = model.cfg
+        self.cfg = cfg
         self.dim_q = self.cfg.dim_q
         self.batch_size = self.cfg.batch_size
 
@@ -64,6 +65,7 @@ class SNES:
         n_b0 = self.cfg.num_types * self.cfg.num_neurons
         n_W1 = self.cfg.num_types * self.cfg.num_neurons
         n_b1 = 1
+        self.n_typed = n_W0 + n_b0 + n_W1  # per-type params (excludes b1)
         self.n_primary = n_W0 + n_b0 + n_W1 + n_b1
         # Mode 2 (polarizability) adds a second ANN with identical shape
         if self.cfg.target_mode == 2:
@@ -89,16 +91,45 @@ class SNES:
         self.lambda_1 = self.cfg.lambda_1 if self.cfg.lambda_1 is not None else auto_lambda
         self.lambda_2 = self.cfg.lambda_2 if self.cfg.lambda_2 is not None else auto_lambda
 
+        if self.cfg.stagnation_response is not None:
+            assert self.cfg.stagnation_response in ('interpolate', 'noise'), (
+                f"stagnation_response must be 'interpolate', 'noise', or None, "
+                f"got {self.cfg.stagnation_response!r}")
+
+        # Composite loss flags (Python bools so tf.function traces correct branch)
+        self._use_dir_loss = (cfg.direction_loss_weight is not None and cfg.target_mode >= 1)
+        self._dir_eps = cfg.direction_loss_eps if self._use_dir_loss else 1e-6
+        self._log_magnitude = (self._use_dir_loss and cfg.magnitude_loss_type == "log")
+
+        # Polarizability shear weight: scale off-diagonal components [xy, yz, zx]
+        # Targets are [xx, yy, zz, xy, yz, zx] — indices 3,4,5 are off-diagonal
+        if cfg.target_mode == 2:
+            shear_sq = cfg.lambda_shear ** 2
+            self._pol_weights = tf.constant(
+                [1.0, 1.0, 1.0, shear_sq, shear_sq, shear_sq], dtype=tf.float32)
+        else:
+            self._pol_weights = None
+
+        # Per-type ranking: build type_of_variable map [dim] -> type index
+        # type 0..T-1 for typed params (W0, b0, W1), type T for b1 (global)
+        self._per_type = (cfg.per_type_regularization
+                          and cfg.toggle_regularization
+                          and cfg.num_types > 1)
+        if self._per_type:
+            self._type_of_variable = self._build_type_of_variable()
+
         self.eta_sigma = self.cfg.eta_sigma if self.cfg.eta_sigma is not None else self.compute_eta_sigma()
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray) -> tuple[float, float]:
-        """Compute L1 and L2 regularization penalties (GPUMD formula).
+        """Compute L1 and L2 regularization penalties (GPUMD NEP4 formula).
+
+        For multi-element systems, computes per-type regularization: each
+        atom type's parameters are penalized separately using
+        num_vars/num_types as the denominator, then averaged across types
+        and added to a global regularization term over all parameters.
 
         Works with both numpy arrays and TF tensors.
-
-        L1 = lambda_1 * sum(|params|) / dim
-        L2 = lambda_2 * sqrt(sum(params^2) / dim)
 
         Args:
             param_vector : [dim] tensor or ndarray — flat parameter vector
@@ -108,9 +139,171 @@ class SNES:
             l2 : float — L2 penalty
         """
         pv = tf.cast(param_vector, tf.float32)
-        l1 = self.lambda_1 * tf.reduce_sum(tf.abs(pv)) / self.dim
-        l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(pv)) / self.dim)
+        T = self.cfg.num_types
+        n_per_type = self.n_primary // T  # params per type (W0_t + b0_t + W1_t)
+
+        if T > 1:
+            # Per-type regularization: average L1/L2 across types + global term
+            total_l1 = tf.constant(0.0)
+            total_l2 = tf.constant(0.0)
+
+            for t in range(T):
+                type_params = self._extract_type_params(pv, t)
+                total_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(type_params)) / n_per_type
+                total_l2 += self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(type_params)) / n_per_type)
+
+            # Average per-type + global term over typed params only (excludes b1)
+            typed = tf.concat([pv[:self.n_typed]], axis=0)
+            n_typed_total = self.n_typed
+            if self.cfg.target_mode == 2:
+                # Second ANN's typed params (skip b1 of primary ANN)
+                typed = tf.concat([typed, pv[self.n_primary:self.n_primary + self.n_typed]], axis=0)
+                n_typed_total = 2 * self.n_typed
+            l1 = total_l1 / T + self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / n_typed_total
+            l2 = total_l2 / T + self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed)) / n_typed_total)
+        else:
+            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(pv)) / self.dim
+            l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(pv)) / self.dim)
+
         return float(l1), float(l2)
+
+    def _extract_type_params(self, pv: tf.Tensor, t: int) -> tf.Tensor:
+        """Extract parameters belonging to atom type t from flat vector.
+
+        Parameter layout: [W0(T,Q,H) | b0(T,H) | W1(T,H) | b1(1)]
+        Per-type slice: W0[t,:,:] + b0[t,:] + W1[t,:]
+
+        Args:
+            pv : [dim] flat parameter vector
+            t  : type index (0 to num_types-1)
+
+        Returns:
+            [Q*H + H + H] tensor — concatenated type-t parameters
+        """
+        T = self.cfg.num_types
+        Q = self.dim_q
+        H = self.cfg.num_neurons
+
+        # W0 block: [T, Q, H] flattened → stride T*Q*H, type t starts at t*Q*H
+        w0_start = t * Q * H
+        w0_end = w0_start + Q * H
+
+        # b0 block: after all W0, [T, H] → type t at offset T*Q*H + t*H
+        b0_offset = T * Q * H
+        b0_start = b0_offset + t * H
+        b0_end = b0_start + H
+
+        # W1 block: after b0, [T, H] → type t at offset T*Q*H + T*H + t*H
+        w1_offset = b0_offset + T * H
+        w1_start = w1_offset + t * H
+        w1_end = w1_start + H
+
+        return tf.concat([pv[w0_start:w0_end], pv[b0_start:b0_end], pv[w1_start:w1_end]], axis=0)
+
+    def _build_type_of_variable(self) -> np.ndarray:
+        """Build array mapping each parameter index to its atom type.
+
+        Layout per ANN: [W0(T,Q,H) | b0(T,H) | W1(T,H) | b1(1)]
+        W0/b0/W1 params for type t get label t. b1 gets label T (global).
+
+        Returns:
+            [dim] int array — type label per variable
+        """
+        T = self.cfg.num_types
+        Q = self.dim_q
+        H = self.cfg.num_neurons
+
+        def _ann_types() -> np.ndarray:
+            tov = np.empty(self.n_primary, dtype=np.int32)
+            offset = 0
+            # W0: [T, Q, H] — type t owns contiguous block of Q*H
+            for t in range(T):
+                tov[offset:offset + Q * H] = t
+                offset += Q * H
+            # b0: [T, H]
+            for t in range(T):
+                tov[offset:offset + H] = t
+                offset += H
+            # W1: [T, H]
+            for t in range(T):
+                tov[offset:offset + H] = t
+                offset += H
+            # b1: global (label = T)
+            tov[offset] = T
+            return tov
+
+        if self.cfg.target_mode == 2:
+            return np.concatenate([_ann_types(), _ann_types()])
+        return _ann_types()
+
+    def _build_per_type_gradients(
+        self,
+        s: tf.Tensor,
+        fitness_per_type_rmse: tf.Tensor,
+        samples: tf.Tensor,
+    ) -> tf.Tensor:
+        """Build composite noise matrix with per-type rankings.
+
+        For each variable v, permutes the P noise vectors according to the
+        ranking of type_of_variable[v]'s fitness. The result can be passed
+        directly to update() with the standard utilities.
+
+        Args:
+            s                    : [P, dim] noise vectors from ask()
+            fitness_per_type_rmse: [P, T+1] per-type RMSE (type 0..T-1 from
+                                   structures containing that type, type T = global)
+            samples              : [P, dim] candidate parameter vectors
+
+        Returns:
+            s_sorted : [P, dim] composite noise — each column permuted by
+                       its type's ranking
+        """
+        T = self.cfg.num_types
+        P = self.pop_size
+        Q = self.dim_q
+        H = self.cfg.num_neurons
+        n_per_type = Q * H + H + H
+
+        # Add per-type regularization to per-type RMSE → [T+1] fitness values
+        fitness_per_type = []
+        for t in range(T):
+            type_params = self._extract_type_params_batched(samples, t)  # [P, n_per_type]
+            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(type_params), axis=1) / n_per_type
+            l2 = self.lambda_2 * tf.sqrt(
+                tf.reduce_sum(tf.square(type_params), axis=1) / n_per_type)
+            fitness_per_type.append(fitness_per_type_rmse[:, t] + l1 + l2)
+
+        # Global ranking (type T): regularize over all typed params, excluding b1
+        typed = samples[:, :self.n_typed]
+        n_typed_total = self.n_typed
+        if self.cfg.target_mode == 2:
+            typed = tf.concat([typed, samples[:, self.n_primary:self.n_primary + self.n_typed]], axis=1)
+            n_typed_total = 2 * self.n_typed
+        global_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed), axis=1) / n_typed_total
+        global_l2 = self.lambda_2 * tf.sqrt(
+            tf.reduce_sum(tf.square(typed), axis=1) / n_typed_total)
+        fitness_per_type.append(fitness_per_type_rmse[:, T] + global_l1 + global_l2)
+
+        # Sort each type's fitness independently → [T+1, P] rank indices
+        # ranks_per_type[t] = indices that sort type t's fitness ascending
+        ranks_per_type = [tf.argsort(f) for f in fitness_per_type]  # list of [P]
+
+        # Build composite s_sorted: for each variable, permute by its type's ranking
+        # Gather all T+1 sorted versions of s, then select per-variable
+        # s_sorted_all[t] = s permuted by type t's ranking: [P, dim]
+        s_sorted_all = tf.stack([tf.gather(s, r) for r in ranks_per_type])  # [T+1, P, dim]
+
+        # type_of_variable[v] tells us which row of s_sorted_all to use for column v
+        tov = tf.constant(self._type_of_variable, dtype=tf.int32)  # [dim]
+        # We want s_sorted[:, v] = s_sorted_all[tov[v], :, v]
+        # Transpose to [dim, T+1, P] so we can index [v, tov[v]] -> [P]
+        s_by_var = tf.transpose(s_sorted_all, [2, 0, 1])  # [dim, T+1, P]
+        v_indices = tf.range(self.dim)  # [dim]
+        gather_idx = tf.stack([v_indices, tov], axis=1)  # [dim, 2] — [v, tov[v]]
+        s_selected = tf.gather_nd(s_by_var, gather_idx)  # [dim, P]
+        s_sorted = tf.transpose(s_selected)  # [P, dim]
+
+        return s_sorted
 
     def compute_eta_sigma(self) -> float:
         """Compute the sigma learning rate from per-type parameter dimensionality.
@@ -239,6 +432,20 @@ class SNES:
         gens_without_improvement = 0
         train_start = time.perf_counter()
 
+        # Precompute whether all training structures contain all types.
+        # If so, per-type RMSE = global RMSE and we can skip redundant evals.
+        if self._per_type:
+            Z_int_full = train_data["Z_int"].numpy()
+            amask_full = train_data["atom_mask"].numpy()
+            self._train_all_types_present = True
+            for t in range(cfg.num_types):
+                has_t = ((Z_int_full == t) * amask_full).sum(axis=1) > 0
+                if has_t.sum() < S_train:
+                    self._train_all_types_present = False
+                    break
+            if self._train_all_types_present:
+                print("Per-type RMSE: all types present in all structures — using fast path")
+
         for gen in range(cfg.num_generations):
             t0 = time.perf_counter()
 
@@ -260,7 +467,13 @@ class SNES:
             t1 = time.perf_counter()
 
             # Evaluate entire population on GPU
-            fitness = self.evaluate_population(samples, batch_data)
+            if self._per_type:
+                # Per-type mode: get per-type RMSE [P, T+1], then build composite gradients
+                fitness_per_type_rmse = self.evaluate_population(
+                    samples, batch_data, return_per_type=True)
+                fitness = fitness_per_type_rmse[:, -1]  # global RMSE for reporting
+            else:
+                fitness = self.evaluate_population(samples, batch_data)
 
             # GPU sync: extract scalar metrics
             avg_fitness = float(tf.reduce_mean(fitness))
@@ -288,8 +501,11 @@ class SNES:
                 gen_l1, gen_l2 = 0, 0
 
             # Rank and update (GPU)
-            ranks = tf.argsort(fitness)
-            s_sorted = tf.gather(s, ranks)
+            if self._per_type:
+                s_sorted = self._build_per_type_gradients(s, fitness_per_type_rmse, samples)
+            else:
+                ranks = tf.argsort(fitness)
+                s_sorted = tf.gather(s, ranks)
             self.update(self.utilities, s_sorted)
             # GPU sync: read mu to ensure update completed before timing validate
             self.mu.numpy()
@@ -323,9 +539,9 @@ class SNES:
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
             line = (f"\r{bar} {gen + 1}/{cfg.num_generations} "
-                    f"train RMSE: {avg_fitness:.4f}  "
-                    f"val RMSE: {float(val_fitness):.4f}  "
-                    f"best val RMSE: {best_val_loss:.4f}  "
+                    f"train RMSE: {avg_fitness:.6f}  "
+                    f"val RMSE: {float(val_fitness):.6f}  "
+                    f"best val RMSE: {best_val_loss:.6f}  "
                     f"elapsed: {elapsed_str}  ETA: {eta_str}")
             if cfg.debug:
                 line += f"  L1: {gen_l1:.6f}  L2: {gen_l2:.6f}"
@@ -349,18 +565,33 @@ class SNES:
                 self.sigma.assign(best_sigma)
                 break
 
-            # Sigma reset on stagnation
-            if cfg.sigma_reset_patience is not None:
-                mean_sigma = float(tf.reduce_mean(self.sigma))
-                sigma_collapsed = mean_sigma < (cfg.sigma_reset_threshold * cfg.init_sigma)
-                if (gens_without_improvement >= cfg.sigma_reset_patience
-                        and sigma_collapsed):
-                    print(f"\nSigma reset at generation {gen + 1}: "
-                          f"mean sigma {mean_sigma:.6f} < threshold, "
+            # Stagnation response: interpolate or noise injection
+            if (cfg.sigma_reset_patience is not None
+                    and cfg.stagnation_response is not None
+                    and gens_without_improvement >= cfg.sigma_reset_patience):
+                if cfg.stagnation_response == 'interpolate':
+                    alpha = cfg.sigma_interpolate_alpha
+                    init_vec = tf.fill([self.dim], cfg.init_sigma)
+                    self.sigma.assign(self.sigma + alpha * (init_vec - self.sigma))
+                    print(f"\nSigma interpolation at generation {gen + 1}: "
+                          f"alpha={alpha}, stagnant for "
+                          f"{gens_without_improvement} gens")
+                elif cfg.stagnation_response == 'noise':
+                    # Inject positive noise inversely proportional to current sigma:
+                    # small components get a large boost, large ones nearly unchanged.
+                    # noise_i = base_std * (init_sigma / sigma_i) * |z_i|
+                    # Using |z| ensures noise is always positive (sigma can only grow).
+                    noise_std = 10.0 ** cfg.sigma_noise_scale
+                    scale = cfg.init_sigma / tf.maximum(self.sigma, 1e-12)
+                    noise = noise_std * scale * tf.abs(self.tf_rng.normal(shape=[self.dim]))
+                    self.sigma.assign(self.sigma + noise)
+                    print(f"\nSigma noise injection at generation {gen + 1}: "
+                          f"base_std=10^{cfg.sigma_noise_scale}={noise_std:.2e}, "
+                          f"scale range=[{float(tf.reduce_min(scale)):.2f}, "
+                          f"{float(tf.reduce_max(scale)):.2f}], "
                           f"stagnant for {gens_without_improvement} gens")
-                    self.sigma.assign(tf.fill([self.dim], cfg.init_sigma))
-                    gens_without_improvement = 0
-                    history["sigma_resets"].append(gen)
+                gens_without_improvement = 0
+                history["sigma_resets"].append(gen)
 
             t5 = time.perf_counter()
 
@@ -442,9 +673,36 @@ class SNES:
         if self.cfg.scale_targets and self.cfg.target_mode == 1:
             num_atoms = tf.reduce_sum(batch_data["atom_mask"], axis=1)  # [B]
             preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]
-        diff = preds - batch_data["targets"]
-        rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
-        return float(rmse)
+
+        if self._use_dir_loss:
+            targets = batch_data["targets"]
+            pred_norm = tf.linalg.norm(preds, axis=1)      # [B]
+            tgt_norm = tf.linalg.norm(targets, axis=1)     # [B]
+            if self._log_magnitude:
+                eps = self._dir_eps
+                mag_rmse = tf.sqrt(tf.reduce_mean(tf.square(
+                    tf.math.log(tf.maximum(pred_norm, eps))
+                    - tf.math.log(tf.maximum(tgt_norm, eps)))))
+            else:
+                mag_rmse = tf.sqrt(tf.reduce_mean(tf.square(pred_norm - tgt_norm)))
+
+            eps = self._dir_eps
+            dot = tf.reduce_sum(preds * targets, axis=1)
+            denom = tf.maximum(pred_norm * tgt_norm, eps)
+            cos_sim = dot / denom
+            mask = tf.cast(tgt_norm > eps, tf.float32)
+            n_valid = tf.maximum(tf.reduce_sum(mask), 1.0)
+            dir_loss = 1.0 - tf.reduce_sum(cos_sim * mask) / n_valid
+
+            return float(mag_rmse + self.cfg.direction_loss_weight * dir_loss)
+        else:
+            diff = preds - batch_data["targets"]
+            # Apply shear weighting for polarizability off-diagonal components
+            if self._pol_weights is not None:
+                rmse = tf.sqrt(tf.reduce_mean(tf.square(diff) * self._pol_weights))
+            else:
+                rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
+            return float(rmse)
 
     def reconstruct_params(self, param_vector: np.ndarray) -> tuple:
         """Reconstruct TNEP parameters from a flat numpy vector.
@@ -533,18 +791,82 @@ class SNES:
     def compute_regularization_tf(self, param_vectors: tf.Tensor) -> tf.Tensor:
         """Compute L1+L2 regularization for batched parameter vectors.
 
+        For multi-element systems, computes per-type regularization (GPUMD NEP4):
+        each type's parameters are penalized separately, averaged across types,
+        then added to a global regularization term.
+
         Args:
             param_vectors : [P, dim] float32
 
         Returns:
             reg : [P] float32 — L1 + L2 penalty per candidate
         """
-        l1 = self.lambda_1 * tf.reduce_sum(tf.abs(param_vectors), axis=1) / self.dim
-        l2 = self.lambda_2 * tf.sqrt(
-            tf.reduce_sum(tf.square(param_vectors), axis=1) / self.dim)
-        return l1 + l2
+        T = self.cfg.num_types
+        Q = self.dim_q
+        H = self.cfg.num_neurons
 
-    def evaluate_population(self, samples_tf: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
+        if T > 1:
+            n_per_type = Q * H + H + H  # W0_t + b0_t + W1_t
+
+            total_l1 = tf.zeros([tf.shape(param_vectors)[0]])
+            total_l2 = tf.zeros([tf.shape(param_vectors)[0]])
+
+            for t in range(T):
+                type_params = self._extract_type_params_batched(param_vectors, t)  # [P, n_per_type]
+                total_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(type_params), axis=1) / n_per_type
+                total_l2 += self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(type_params), axis=1) / n_per_type)
+
+            # Average per-type + global over typed params only (excludes b1)
+            typed = param_vectors[:, :self.n_typed]  # [P, n_typed]
+            n_typed_total = self.n_typed
+            if self.cfg.target_mode == 2:
+                typed2 = param_vectors[:, self.n_primary:self.n_primary + self.n_typed]
+                typed = tf.concat([typed, typed2], axis=1)
+                n_typed_total = 2 * self.n_typed
+            global_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed), axis=1) / n_typed_total
+            global_l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed), axis=1) / n_typed_total)
+
+            return total_l1 / T + global_l1 + total_l2 / T + global_l2
+        else:
+            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(param_vectors), axis=1) / self.dim
+            l2 = self.lambda_2 * tf.sqrt(
+                tf.reduce_sum(tf.square(param_vectors), axis=1) / self.dim)
+            return l1 + l2
+
+    def _extract_type_params_batched(self, param_vectors: tf.Tensor, t: int) -> tf.Tensor:
+        """Extract type-t parameters from batched flat vectors.
+
+        Args:
+            param_vectors : [P, dim] float32
+            t             : type index
+
+        Returns:
+            [P, Q*H + H + H] float32 — type-t params for each candidate
+        """
+        T = self.cfg.num_types
+        Q = self.dim_q
+        H = self.cfg.num_neurons
+
+        w0_start = t * Q * H
+        w0_end = w0_start + Q * H
+
+        b0_offset = T * Q * H
+        b0_start = b0_offset + t * H
+        b0_end = b0_start + H
+
+        w1_offset = b0_offset + T * H
+        w1_start = w1_offset + t * H
+        w1_end = w1_start + H
+
+        return tf.concat([
+            param_vectors[:, w0_start:w0_end],
+            param_vectors[:, b0_start:b0_end],
+            param_vectors[:, w1_start:w1_end],
+        ], axis=1)
+
+    def evaluate_population(self, samples_tf: tf.Tensor, batch_data: dict[str, tf.Tensor],
+                            include_regularization: bool = True,
+                            return_per_type: bool = False) -> tf.Tensor:
         """Evaluate all SNES candidates on a batch of structures on GPU.
 
         Chunks along both population (population_chunk_size) and structure
@@ -563,9 +885,15 @@ class SNES:
                 targets       : [B, T_dim]
                 atom_mask     : [B, A]
                 neighbor_mask : [B, A, M]
+            include_regularization : bool — if False, return raw RMSE without
+                regularization (used by per-type ranking which applies reg separately)
+            return_per_type : bool — if True, return [P, T+1] per-type RMSE
+                (GPUMD-style: each type's RMSE from structures containing that type,
+                 plus global RMSE at index T). Implies include_regularization=False.
 
         Returns:
-            fitness : [P] float32 — RMSE (+ regularization) per candidate
+            fitness : [P] float32 — RMSE (+ regularization if enabled) per candidate
+                      OR [P, T+1] if return_per_type=True
         """
         P = self.pop_size
         B = batch_data["descriptors"].shape[0]
@@ -577,6 +905,29 @@ class SNES:
                       "positions", "Z_int", "boxes", "targets",
                       "atom_mask", "neighbor_mask"]
 
+        use_dir_loss = self._use_dir_loss
+
+        # Precompute per-type structure indices for per-type RMSE (GPUMD-style)
+        T = self.cfg.num_types
+        if return_per_type:
+            # Use precomputed flag when available (full training set always has
+            # the same composition; random batches inherit it if every structure
+            # in the dataset contains all types).
+            all_types_present = getattr(self, '_train_all_types_present', False)
+            if not all_types_present:
+                Z_int_np = batch_data["Z_int"].numpy()     # [B, A]
+                amask_np = batch_data["atom_mask"].numpy()  # [B, A]
+                type_struct_indices = []
+                all_types_present = True
+                for t in range(T):
+                    type_match = (Z_int_np == t) * amask_np  # [B, A]
+                    has_t = type_match.sum(axis=1) > 0       # [B] bool
+                    type_struct_indices.append(np.where(has_t)[0])
+                    if has_t.sum() < B:
+                        all_types_present = False
+                # Global = all structures
+                type_struct_indices.append(np.arange(B))
+
         all_fitness = []
 
         for p_start in range(0, P, pop_chunk):
@@ -584,41 +935,102 @@ class SNES:
             candidates = samples_tf[p_start:p_end]  # [C, dim]
             C = p_end - p_start
 
-            # Accumulate SSE across structure chunks
-            total_sse = tf.zeros([C])
-            total_elements = 0
+            if return_per_type:
+                if all_types_present:
+                    # Fast path: every structure contains all types, so per-type
+                    # RMSE equals global RMSE — evaluate once and broadcast
+                    total_sse = tf.zeros([C])
+                    total_elements = 0
+                    for s_start in range(0, B, struct_chunk):
+                        s_end = min(s_start + struct_chunk, B)
+                        struct_batch = {key: batch_data[key][s_start:s_end]
+                                        for key in batch_keys}
+                        chunk_sse, _ = self._evaluate_chunk(candidates, struct_batch)
+                        total_sse = total_sse + chunk_sse
+                        total_elements += (s_end - s_start) * T_dim
+                    global_rmse = tf.sqrt(total_sse / tf.cast(total_elements, tf.float32))
+                    # Broadcast to [C, T+1] — all types get same RMSE
+                    all_fitness.append(tf.tile(global_rmse[:, tf.newaxis], [1, T + 1]))
+                else:
+                    # Slow path: evaluate per type using only structures with that type
+                    per_type_rmse_parts = []
+                    for t_idx in range(T + 1):
+                        indices = type_struct_indices[t_idx]
+                        B_t = len(indices)
+                        if B_t == 0:
+                            per_type_rmse_parts.append(tf.zeros([C]))
+                            continue
+                        type_batch = {key: tf.gather(batch_data[key], indices)
+                                      for key in batch_keys}
 
-            for s_start in range(0, B, struct_chunk):
-                s_end = min(s_start + struct_chunk, B)
-                struct_batch = {key: batch_data[key][s_start:s_end] for key in batch_keys}
-                chunk_sse = self._evaluate_chunk(candidates, struct_batch)  # [C]
-                total_sse = total_sse + chunk_sse
-                total_elements += (s_end - s_start) * T_dim
+                        # Evaluate with structure chunking
+                        type_total_sse = tf.zeros([C])
+                        type_total_elements = 0
+                        for s_start in range(0, B_t, struct_chunk):
+                            s_end = min(s_start + struct_chunk, B_t)
+                            struct_batch = {key: type_batch[key][s_start:s_end]
+                                            for key in batch_keys}
+                            chunk_sse, _ = self._evaluate_chunk(candidates, struct_batch)
+                            type_total_sse = type_total_sse + chunk_sse
+                            type_total_elements += (s_end - s_start) * T_dim
 
-            chunk_fitness = tf.sqrt(total_sse / tf.cast(total_elements, tf.float32))
-            all_fitness.append(chunk_fitness)
+                        type_rmse = tf.sqrt(type_total_sse / tf.cast(
+                            tf.maximum(type_total_elements, 1), tf.float32))
+                        per_type_rmse_parts.append(type_rmse)
 
-        fitness = tf.concat(all_fitness, axis=0)  # [P]
+                    # Stack to [C, T+1]
+                    all_fitness.append(tf.stack(per_type_rmse_parts, axis=1))
+            else:
+                # Standard global evaluation
+                total_sse = tf.zeros([C])
+                total_dir_loss = tf.zeros([C])
+                total_elements = 0
+                total_structures = 0
+                n_struct_chunks = 0
 
-        if self.cfg.toggle_regularization:
+                for s_start in range(0, B, struct_chunk):
+                    s_end = min(s_start + struct_chunk, B)
+                    struct_batch = {key: batch_data[key][s_start:s_end] for key in batch_keys}
+                    chunk_sse, chunk_dir = self._evaluate_chunk(candidates, struct_batch)
+                    total_sse = total_sse + chunk_sse
+                    total_dir_loss = total_dir_loss + chunk_dir
+                    total_elements += (s_end - s_start) * T_dim
+                    total_structures += (s_end - s_start)
+                    n_struct_chunks += 1
+
+                if use_dir_loss:
+                    chunk_fitness = tf.sqrt(total_sse / tf.cast(total_structures, tf.float32))
+                    avg_dir_loss = total_dir_loss / tf.cast(n_struct_chunks, tf.float32)
+                    chunk_fitness = chunk_fitness + self.cfg.direction_loss_weight * avg_dir_loss
+                else:
+                    chunk_fitness = tf.sqrt(total_sse / tf.cast(total_elements, tf.float32))
+                all_fitness.append(chunk_fitness)
+
+        if return_per_type:
+            fitness = tf.concat(all_fitness, axis=0)  # [P, T+1]
+        else:
+            fitness = tf.concat(all_fitness, axis=0)  # [P]
+
+        if not return_per_type and include_regularization and self.cfg.toggle_regularization:
             reg = self.compute_regularization_tf(samples_tf)
             fitness = fitness + reg
 
         return fitness
 
     @tf.function
-    def _evaluate_chunk(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
+    def _evaluate_chunk(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tuple[tf.Tensor, tf.Tensor]:
         """Evaluate a chunk of C candidates on B structures.
 
-        Returns sum of squared errors (not RMSE) so that structure chunks
-        can be aggregated correctly in evaluate_population.
+        Returns sum of squared errors (not RMSE) and directional loss so that
+        structure chunks can be aggregated correctly in evaluate_population.
 
         Args:
             chunk_samples : [C, dim]
             batch_data    : dict of [B, ...] tensors
 
         Returns:
-            sse : [C] — sum of squared errors per candidate
+            sse      : [C] — sum of squared errors per candidate
+            dir_loss : [C] — mean (1 - cos_sim) per candidate (0 if disabled)
         """
         desc = batch_data["descriptors"]       # [B, A, Q]
         grads = batch_data["gradients"]        # [B, A, M, 3, Q]
@@ -640,8 +1052,13 @@ class SNES:
             num_atoms = tf.reduce_sum(amask, axis=1)  # [B]
             num_atoms = tf.maximum(num_atoms, 1.0)[:, tf.newaxis]  # [B, 1]
 
+        _use_dir_loss = self._use_dir_loss
+        _eps = self._dir_eps
+        _log_mag = self._log_magnitude
+
         if self.cfg.target_mode == 2:
             W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
+            pol_weights = self._pol_weights  # [6] component weights
 
             def _forward_one_candidate(args):
                 w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
@@ -649,8 +1066,10 @@ class SNES:
                     desc, grads, gidx, pos, Z, boxes, amask, nmask,
                     w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
                 )
-                diff = preds - targets
-                return tf.reduce_sum(tf.square(diff))
+                diff = preds - targets  # [B, 6]
+                # Weight off-diagonal components by lambda_shear^2
+                sse = tf.reduce_sum(tf.square(diff) * pol_weights)
+                return sse, tf.constant(0.0)
 
             stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
         else:
@@ -664,10 +1083,35 @@ class SNES:
                 )
                 if _scale_preds:
                     preds = preds / num_atoms
-                diff = preds - targets
-                return tf.reduce_sum(tf.square(diff))
+
+                if _use_dir_loss:
+                    pred_norm = tf.linalg.norm(preds, axis=1)      # [B]
+                    tgt_norm = tf.linalg.norm(targets, axis=1)     # [B]
+                    if _log_mag:
+                        # Log magnitude SSE: (log||pred|| - log||target||)²
+                        # Guards near-zero norms with eps
+                        mag_sse = tf.reduce_sum(tf.square(
+                            tf.math.log(tf.maximum(pred_norm, _eps))
+                            - tf.math.log(tf.maximum(tgt_norm, _eps))))
+                    else:
+                        # Absolute magnitude SSE: (||pred|| - ||target||)²
+                        mag_sse = tf.reduce_sum(tf.square(pred_norm - tgt_norm))
+
+                    # Cosine similarity, masked for near-zero targets
+                    dot = tf.reduce_sum(preds * targets, axis=1)   # [B]
+                    denom = tf.maximum(pred_norm * tgt_norm, _eps)
+                    cos_sim = dot / denom                           # [B]
+                    mask = tf.cast(tgt_norm > _eps, tf.float32)     # [B]
+                    n_valid = tf.maximum(tf.reduce_sum(mask), 1.0)
+                    dir_loss = 1.0 - tf.reduce_sum(cos_sim * mask) / n_valid
+
+                    return mag_sse, dir_loss
+                else:
+                    diff = preds - targets
+                    sse = tf.reduce_sum(tf.square(diff))
+                    return sse, tf.constant(0.0)
 
             stacked = (W0, b0, W1, b1)
 
-        sse = tf.vectorized_map(_forward_one_candidate, stacked)  # [C]
-        return sse
+        results = tf.vectorized_map(_forward_one_candidate, stacked)  # (sse [C], dir [C])
+        return results[0], results[1]

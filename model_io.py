@@ -87,6 +87,10 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None) -> None:
     if cfg.descriptor_mean is not None:
         data["descriptor_mean"] = np.asarray(cfg.descriptor_mean)
 
+    # Save PCA projection if used
+    if hasattr(cfg, '_descriptor_pca') and cfg._descriptor_pca is not None:
+        data.update(cfg._descriptor_pca.to_dict())
+
     np.savez(path, **data)
     print(f"Model saved to {path}")
 
@@ -136,6 +140,16 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
     # Restore descriptor_mean from dedicated array key (takes precedence over JSON)
     if "descriptor_mean" in data:
         cfg.descriptor_mean = data["descriptor_mean"].astype(np.float32)
+
+    # Restore PCA projection if saved
+    if "pca_components" in data:
+        from descriptor_pca import DescriptorPCA
+        cfg._descriptor_pca = DescriptorPCA.from_dict({
+            "pca_components": data["pca_components"],
+            "pca_mean": data["pca_mean"],
+            "pca_explained_variance_ratio": data["pca_explained_variance_ratio"],
+            "pca_n_components": data["pca_n_components"],
+        })
 
     # Reconstruct Z -> type index mapping
     type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}

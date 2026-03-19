@@ -88,7 +88,7 @@ def plot_snes_history(history: dict, cfg: TNEPconfig,
 def plot_log_val_fitness(history: dict, cfg: TNEPconfig,
                          save_plots: str | None = None, show_plots: bool = True) -> None:
     """Plot natural log of validation fitness vs generation."""
-    g = np.asarray(history["generation"])
+    g = np.asarray(history["generation"]) + 1  # shift so gen 0 → 1 (avoids log(0))
     val = np.asarray(history["val_loss"])
     ln_val = np.log(val)
     ln_g = np.log(g)
@@ -119,7 +119,7 @@ def plot_sigma_history(history: dict, cfg: TNEPconfig,
 
     for reset_gen in history.get("sigma_resets", []):
         plt.axvline(x=reset_gen, color="red", linestyle="--", alpha=0.7,
-                    label="Sigma reset" if reset_gen == history["sigma_resets"][0] else None)
+                    label="Sigma intervention" if reset_gen == history["sigma_resets"][0] else None)
 
     plt.xlabel("generation")
     plt.ylabel("sigma")
@@ -127,6 +127,34 @@ def plot_sigma_history(history: dict, cfg: TNEPconfig,
     plt.legend()
     plt.title("SNES sigma evolution")
     _finish_fig(fig, cfg, "sigma_evolution", save_plots, show_plots)
+
+
+def plot_loss_breakdown(history: dict, cfg: TNEPconfig,
+                        save_plots: str | None = None,
+                        show_plots: bool = True) -> None:
+    """Plot total loss with L1, L2 regularization and mean train RMSE on log-x scale."""
+    g = np.asarray(history["generation"], dtype=np.float64) + 1  # shift so gen 0 → 1 (avoids log(0))
+    train = np.asarray(history["train_loss"])
+    val = np.asarray(history["val_loss"])
+    l1 = np.maximum(np.asarray(history["L1"]), 0.0)
+    l2 = np.maximum(np.asarray(history["L2"]), 0.0)
+    total = train + l1 + l2
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(g, total, label="Total loss", color="#2c3e50", linewidth=1.5)
+    ax.plot(g, train, label="Train RMSE", color="#e74c3c", linewidth=1, alpha=0.8)
+    ax.plot(g, val, label="Val RMSE", color="#9b59b6", linewidth=1, alpha=0.8)
+    ax.plot(g, l1, label="L1", color="#3498db", linewidth=1, alpha=0.8)
+    ax.plot(g, l2, label="L2", color="#2ecc71", linewidth=1, alpha=0.8)
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Generation")
+    ax.set_ylabel("Loss")
+    ax.legend()
+    ax.set_title("Loss breakdown (train RMSE + L1 + L2)")
+    plt.tight_layout()
+    _finish_fig(fig, cfg, "loss_breakdown", save_plots, show_plots)
 
 
 def plot_timing(history: dict, cfg: TNEPconfig,
@@ -187,6 +215,15 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
     r2 = float(metrics["r2"])
     r2_comp = metrics["r2_components"].numpy()
 
+    # Relative RMSE per component: RMSE_i / mean(|target_i|)
+    rrmse_comp = np.array([
+        np.sqrt(np.mean((targets[:, i] - predictions[:, i]) ** 2))
+        / max(np.mean(np.abs(targets[:, i])), 1e-12)
+        for i in range(T)
+    ])
+    # Overall RRMSE
+    rrmse = rmse / max(np.mean(np.abs(targets)), 1e-12)
+
     labels = component_labels(cfg.target_mode, T)
 
     # Add extra column for cosine similarity histogram on vector targets
@@ -214,7 +251,7 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
 
         ax.set_xlabel(f"Target ({labels[i]})")
         ax.set_ylabel(f"Prediction ({labels[i]})")
-        ax.set_title(f"{labels[i]}  R²={r2_comp[i]:.4f}")
+        ax.set_title(f"{labels[i]}  R²={r2_comp[i]:.4f}  RRMSE={rrmse_comp[i]:.4f}")
         ax.set_aspect('equal', adjustable='box')
         ax.legend(loc='upper left')
 
@@ -246,7 +283,8 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
     mode_names = {0: "PES", 1: "Dipole", 2: "Polarizability"}
     mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
     label = f" ({suffix})" if suffix else ""
-    fig.suptitle(f"{mode}{label} — RMSE: {rmse:.4f}, R²: {r2:.4f}", fontsize=14)
+    fig.suptitle(f"{mode}{label} — RMSE: {rmse:.4f}, RRMSE: {rrmse:.4f}, R²: {r2:.4f}",
+                 fontsize=14)
     plt.tight_layout()
     plot_name = f"correlation_{suffix}" if suffix else "correlation"
     _finish_fig(fig, cfg, plot_name, save_plots, show_plots)

@@ -27,7 +27,8 @@ from TNEPconfig import TNEPconfig
 from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
                   assign_type_indices, prepare_eval_data, print_score_summary)
-from plotting import plot_snes_history, plot_log_val_fitness, plot_sigma_history, plot_timing, plot_correlation
+from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
+                      plot_timing, plot_correlation, plot_loss_breakdown)
 from model_io import save_model
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
                            compute_ir_spectrum, plot_ir_spectrum,
@@ -139,6 +140,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         plot_snes_history(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_log_val_fitness(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
+        plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
                          cfg.save_plots, cfg.show_plots)
@@ -218,6 +220,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     plot_snes_history(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_log_val_fitness(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
+    plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg,
                      cfg.save_plots, cfg.show_plots)

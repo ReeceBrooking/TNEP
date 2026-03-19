@@ -370,6 +370,8 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     types_int = assign_type_indices(dataset, cfg.types)
     builder = DescriptorBuilder(cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(dataset)
+    if hasattr(cfg, '_descriptor_pca') and cfg._descriptor_pca is not None:
+        descriptors, gradients = cfg._descriptor_pca.transform(descriptors, gradients)
     data = assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
     return pad_and_stack(data)
 
@@ -442,6 +444,18 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset)
     val_descriptors, val_gradients, val_grad_index = builder.build_descriptors(val_dataset)
     test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(test_dataset)
+
+    # PCA compression (after descriptor computation, before scaling)
+    if cfg.compress_pca and cfg.compress_P is not None:
+        from descriptor_pca import DescriptorPCA
+        pca = DescriptorPCA(n_components=cfg.compress_P)
+        pca.fit(train_descriptors)
+        train_descriptors, train_gradients = pca.transform(train_descriptors, train_gradients)
+        val_descriptors, val_gradients = pca.transform(val_descriptors, val_gradients)
+        test_descriptors, test_gradients = pca.transform(test_descriptors, test_gradients)
+        cfg._descriptor_pca = pca
+        print(f"PCA compression: {train_descriptors[0].shape[-1]} components "
+              f"({pca.explained_variance_ratio_.sum():.4f} variance explained)")
 
     if cfg.scale_descriptors:
         all_desc = tf.concat(train_descriptors, axis=0)  # [total_train_atoms, dim_q]
