@@ -29,7 +29,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 100000
+    num_generations: int = 50000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
@@ -62,7 +62,7 @@ class TNEPconfig:
     # Each type's params are regularized separately, creating per-type fitness
     # rankings that drive per-type natural gradient updates.
     # Only effective for multi-element systems (auto-disabled for single-element).
-    per_type_regularization: bool = True
+    per_type_regularization: bool = False
 
     # Early stopping patience (None = disabled)
     patience: int | None = None
@@ -102,8 +102,10 @@ class TNEPconfig:
     total_N: int | None = 1000
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
+    # Validate every N generations (1 = every gen, 10 = every 10th, etc.)
+    val_interval: int = 1
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
-    population_chunk_size: int | None = 10
+    population_chunk_size: int | None = 20
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
     batch_chunk_size: int | None = None
 
@@ -117,7 +119,7 @@ class TNEPconfig:
     # Show plots interactively (True = plt.show(), False = close after saving)
     show_plots: bool = True
     # Show extra info in progress bar (L1, L2 regularisation)
-    debug: bool = True
+    debug: bool = False
     # Negate predictions for structures detected as sign-flipped (cos_sim < -0.9)
     fix_sign_flips: bool = False
     # Scale input descriptors by their training-set statistics (per component)

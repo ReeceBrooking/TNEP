@@ -163,33 +163,16 @@ class TNEP(layers.Layer):
 
         if self.cfg.target_mode == 1:
             # Dipole: μ = -sum_i sum_j |r_ij|^2 * force_ij
-            # Gather displacement vectors for each (atom, neighbor) pair
-            dr, rij = self.builder.pairwise_displacements(positions, box)
-            # dr: [A, A, 3], rij: [A, A]
+            dr, rij = self._neighbor_displacements_single(positions, box, grad_index)
 
-            # Gather displacements for grad_index neighbors
-            A = tf.shape(Z)[0]
-            M = tf.shape(grad_index)[1]
-            atom_idx = tf.broadcast_to(tf.range(A)[:, tf.newaxis], [A, M])
-            # indices: [A, M, 2] — pairs of (atom_i, neighbor_j)
-            indices = tf.stack([atom_idx, grad_index], axis=-1)
-            dr_gathered = tf.gather_nd(dr, indices)     # [A, M, 3]
-            rij_gathered = tf.gather_nd(rij, indices)   # [A, M]
-
-            rij2 = tf.square(rij_gathered)                          # [A, M]
-            rij2 = rij2 * neighbor_mask                              # zero padding
-            dipole_contribs = rij2[:, :, tf.newaxis] * forces        # [A, M, 3]
-            dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])   # [3]
+            rij2 = tf.square(rij) * neighbor_mask                       # [A, M]
+            dipole_contribs = rij2[:, :, tf.newaxis] * forces            # [A, M, 3]
+            dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])       # [3]
             return dipole
 
         elif self.cfg.target_mode == 2:
             # Polarizability via dual ANN (GPUMD approach)
-            dr, rij = self.builder.pairwise_displacements(positions, box)
-            A = tf.shape(Z)[0]
-            M = tf.shape(grad_index)[1]
-            atom_idx = tf.broadcast_to(tf.range(A)[:, tf.newaxis], [A, M])
-            indices = tf.stack([atom_idx, grad_index], axis=-1)
-            dr_gathered = tf.gather_nd(dr, indices)  # [A, M, 3]
+            dr_gathered, _ = self._neighbor_displacements_single(positions, box, grad_index)
 
             # --- Scalar ANN (isotropic) ---
             W0p_t = tf.gather(self.W0_pol, Z)  # [A, dim_q, H]
@@ -358,7 +341,8 @@ class TNEP(layers.Layer):
                       boxes: tf.Tensor, atom_mask: tf.Tensor, neighbor_mask: tf.Tensor,
                       W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor, b1: tf.Tensor,
                       W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
-                      W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None) -> tf.Tensor:
+                      W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
+                      prescaled: bool = False) -> tf.Tensor:
         """Batched forward pass for B structures with explicit weight tensors.
 
         Weights are passed explicitly (not read from self) so this method can
@@ -378,15 +362,21 @@ class TNEP(layers.Layer):
             W1             : [T, H]           output weights
             b1             : ()               scalar bias
             W0_pol ... b1_pol : same shapes, for mode 2 only (None otherwise)
+            prescaled      : bool — if True, skip descriptor/gradient scaling
+                             (caller already applied it). Traces separately for
+                             True/False since it's a Python bool.
 
         Returns:
             predictions : [B, T_dim]  where T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
         # Scale descriptors and gradients by the same factor (chain rule)
-        if self._scale_descriptors:
+        if not prescaled and self._scale_descriptors:
             scale = self._descriptor_mean
             descriptors = descriptors / scale
             gradients = gradients / scale
+
+        # Precompute box inverse once (shared across all atoms and candidates)
+        box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
         # Gather per-type weights for each atom in each structure
         W0_t = tf.gather(W0, Z)   # [B, A, Q, H]
@@ -409,12 +399,12 @@ class TNEP(layers.Layer):
         forces = self._calc_forces_batch(h, gradients, W1_t, W0_t, neighbor_mask)
 
         if self.cfg.target_mode == 1:
-            return self._dipole_batch(forces, positions, boxes, grad_index,
-                                      atom_mask, neighbor_mask)
+            return self._dipole_batch(forces, positions, boxes, box_inv,
+                                      grad_index, atom_mask, neighbor_mask)
 
         elif self.cfg.target_mode == 2:
             return self._polarizability_batch(
-                descriptors, forces, positions, boxes, Z, grad_index,
+                descriptors, forces, positions, boxes, box_inv, Z, grad_index,
                 atom_mask, neighbor_mask,
                 W0_pol, b0_pol, W1_pol, b1_pol)
 
@@ -431,31 +421,65 @@ class TNEP(layers.Layer):
         forces = forces * neighbor_mask[:, :, :, tf.newaxis]
         return forces
 
-    def _pairwise_displacements_batch(self, positions: tf.Tensor,
-                                      boxes: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Batched pairwise displacements under minimum image convention.
+    def _neighbor_displacements_single(self, positions: tf.Tensor,
+                                       box: tf.Tensor,
+                                       grad_index: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        """Compute neighbor displacements for a single structure.
 
         Args:
-            positions : [B, A, 3]
-            boxes     : [B, 3, 3]
+            positions  : [A, 3]
+            box        : [3, 3]
+            grad_index : [A, M]
 
         Returns:
-            dr  : [B, A, A, 3]  displacement vectors
-            rij : [B, A, A]     scalar distances
+            dr  : [A, M, 3]  displacement vectors to neighbors
+            rij : [A, M]     scalar distances to neighbors
         """
-        box_inv = tf.linalg.inv(boxes)                            # [B, 3, 3]
-        # Fractional coordinates
-        s = tf.einsum('bij,bnj->bni', box_inv, positions)         # [B, A, 3]
-        # Pairwise differences in fractional coords
-        ds = s[:, tf.newaxis, :, :] - s[:, :, tf.newaxis, :]      # [B, A, A, 3]
-        ds = ds - tf.round(ds)                                     # MIC wrap
+        box_inv = tf.linalg.inv(box)                                      # [3, 3]
+        s = tf.einsum('ij,nj->ni', box_inv, positions)                    # [A, 3]
+        s_j = tf.gather(s, grad_index)                                     # [A, M, 3]
+        s_i = s[:, tf.newaxis, :]                                          # [A, 1, 3]
+        ds = s_j - s_i                                                     # [A, M, 3]
+        ds = ds - tf.round(ds)
+        dr = tf.einsum('ij,nmj->nmi', box, ds)                            # [A, M, 3]
+        rij = tf.linalg.norm(dr, axis=-1)                                  # [A, M]
+        return dr, rij
+
+    def _neighbor_displacements_batch(self, positions: tf.Tensor,
+                                      boxes: tf.Tensor,
+                                      box_inv: tf.Tensor,
+                                      grad_index: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        """Compute displacements only for actual neighbors (not full A×A matrix).
+
+        Uses grad_index to gather neighbor positions directly, avoiding O(A²)
+        memory and compute. Padded neighbors (grad_index=0) produce garbage
+        displacements that are zeroed out downstream by neighbor_mask.
+
+        Args:
+            positions  : [B, A, 3]
+            boxes      : [B, 3, 3]
+            box_inv    : [B, 3, 3]  pre-computed inverse of boxes
+            grad_index : [B, A, M]  neighbor indices
+
+        Returns:
+            dr  : [B, A, M, 3]  displacement vectors to neighbors
+            rij : [B, A, M]     scalar distances to neighbors
+        """
+        # Fractional coordinates for all atoms
+        s = tf.einsum('bij,bnj->bni', box_inv, positions)             # [B, A, 3]
+        # Gather neighbor fractional coords: s_j[b,a,m] = s[b, grad_index[b,a,m]]
+        s_j = tf.gather(s, grad_index, batch_dims=1)                  # [B, A, M, 3]
+        # Central atom fractional coords broadcast to [B, A, 1, 3]
+        s_i = s[:, :, tf.newaxis, :]                                   # [B, A, 1, 3]
+        ds = s_j - s_i                                                 # [B, A, M, 3]
+        ds = ds - tf.round(ds)                                         # MIC wrap
         # Back to Cartesian
-        dr = tf.einsum('bij,bnmj->bnmi', boxes, ds)               # [B, A, A, 3]
-        rij = tf.linalg.norm(dr, axis=-1)                          # [B, A, A]
+        dr = tf.einsum('bij,bnmj->bnmi', boxes, ds)                   # [B, A, M, 3]
+        rij = tf.linalg.norm(dr, axis=-1)                              # [B, A, M]
         return dr, rij
 
     def _dipole_batch(self, forces: tf.Tensor, positions: tf.Tensor, boxes: tf.Tensor,
-                      grad_index: tf.Tensor, atom_mask: tf.Tensor,
+                      box_inv: tf.Tensor, grad_index: tf.Tensor, atom_mask: tf.Tensor,
                       neighbor_mask: tf.Tensor) -> tf.Tensor:
         """Batched dipole prediction.
 
@@ -463,6 +487,7 @@ class TNEP(layers.Layer):
             forces        : [B, A, M, 3]
             positions     : [B, A, 3]
             boxes         : [B, 3, 3]
+            box_inv       : [B, 3, 3]
             grad_index    : [B, A, M]
             atom_mask     : [B, A]
             neighbor_mask : [B, A, M]
@@ -470,27 +495,17 @@ class TNEP(layers.Layer):
         Returns:
             dipole : [B, 3]
         """
-        dr, rij = self._pairwise_displacements_batch(positions, boxes)
-        B = tf.shape(positions)[0]
-        A = tf.shape(positions)[1]
-        M = tf.shape(grad_index)[2]
+        dr, rij = self._neighbor_displacements_batch(positions, boxes, box_inv, grad_index)
 
-        # Gather displacements for grad_index neighbors
-        batch_idx = tf.broadcast_to(
-            tf.range(B)[:, tf.newaxis, tf.newaxis], [B, A, M])
-        atom_idx = tf.broadcast_to(
-            tf.range(A)[tf.newaxis, :, tf.newaxis], [B, A, M])
-        indices = tf.stack([batch_idx, atom_idx, grad_index], axis=-1)  # [B,A,M,3]
-
-        rij_gathered = tf.gather_nd(rij, indices)                        # [B, A, M]
-        rij2 = tf.square(rij_gathered) * neighbor_mask                   # [B, A, M]
+        rij2 = tf.square(rij) * neighbor_mask                           # [B, A, M]
 
         dipole_contribs = rij2[:, :, :, tf.newaxis] * forces             # [B, A, M, 3]
         dipole = -tf.reduce_sum(dipole_contribs, axis=[1, 2])            # [B, 3]
         return dipole
 
     def _polarizability_batch(self, descriptors: tf.Tensor, forces: tf.Tensor,
-                              positions: tf.Tensor, boxes: tf.Tensor, Z: tf.Tensor,
+                              positions: tf.Tensor, boxes: tf.Tensor,
+                              box_inv: tf.Tensor, Z: tf.Tensor,
                               grad_index: tf.Tensor, atom_mask: tf.Tensor,
                               neighbor_mask: tf.Tensor, W0_pol: tf.Tensor,
                               b0_pol: tf.Tensor, W1_pol: tf.Tensor,
@@ -505,6 +520,7 @@ class TNEP(layers.Layer):
             forces        : [B, A, M, 3]
             positions     : [B, A, 3]
             boxes         : [B, 3, 3]
+            box_inv       : [B, 3, 3]
             Z             : [B, A]
             grad_index    : [B, A, M]
             atom_mask     : [B, A]
@@ -514,17 +530,7 @@ class TNEP(layers.Layer):
         Returns:
             pol : [B, 6]  — [xx, yy, zz, xy, yz, zx]
         """
-        dr, rij = self._pairwise_displacements_batch(positions, boxes)
-        B = tf.shape(positions)[0]
-        A = tf.shape(positions)[1]
-        M = tf.shape(grad_index)[2]
-
-        batch_idx = tf.broadcast_to(
-            tf.range(B)[:, tf.newaxis, tf.newaxis], [B, A, M])
-        atom_idx = tf.broadcast_to(
-            tf.range(A)[tf.newaxis, :, tf.newaxis], [B, A, M])
-        indices = tf.stack([batch_idx, atom_idx, grad_index], axis=-1)
-        dr_gathered = tf.gather_nd(dr, indices)  # [B, A, M, 3]
+        dr_gathered, _ = self._neighbor_displacements_batch(positions, boxes, box_inv, grad_index)
 
         # Scalar ANN (isotropic)
         W0p_t = tf.gather(W0_pol, Z)  # [B, A, Q, H]

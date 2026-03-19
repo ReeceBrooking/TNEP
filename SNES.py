@@ -117,6 +117,7 @@ class SNES:
                           and cfg.num_types > 1)
         if self._per_type:
             self._type_of_variable = self._build_type_of_variable()
+            self._type_of_variable_tf = tf.constant(self._type_of_variable, dtype=tf.int32)
 
         self.eta_sigma = self.cfg.eta_sigma if self.cfg.eta_sigma is not None else self.compute_eta_sigma()
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
@@ -294,7 +295,7 @@ class SNES:
         s_sorted_all = tf.stack([tf.gather(s, r) for r in ranks_per_type])  # [T+1, P, dim]
 
         # type_of_variable[v] tells us which row of s_sorted_all to use for column v
-        tov = tf.constant(self._type_of_variable, dtype=tf.int32)  # [dim]
+        tov = self._type_of_variable_tf  # [dim] — cached tf.constant
         # We want s_sorted[:, v] = s_sorted_all[tov[v], :, v]
         # Transpose to [dim, T+1, P] so we can index [v, tov[v]] -> [P]
         s_by_var = tf.transpose(s_sorted_all, [2, 0, 1])  # [dim, T+1, P]
@@ -430,21 +431,31 @@ class SNES:
         best_mu = tf.identity(self.mu)
         best_sigma = tf.identity(self.sigma)
         gens_without_improvement = 0
+        gen_l1, gen_l2 = 0.0, 0.0
+        val_fitness = float('inf')
+        sigma_min = sigma_max = sigma_mean = sigma_median = float(cfg.init_sigma)
         train_start = time.perf_counter()
 
-        # Precompute whether all training structures contain all types.
-        # If so, per-type RMSE = global RMSE and we can skip redundant evals.
+        # Precompute per-type structure membership for the training set.
+        # _train_type_has[t] is a bool array [S_train] — True if structure s
+        # contains at least one atom of type t.
         if self._per_type:
             Z_int_full = train_data["Z_int"].numpy()
             amask_full = train_data["atom_mask"].numpy()
+            self._train_type_has = []  # [T] list of bool arrays [S_train]
             self._train_all_types_present = True
             for t in range(cfg.num_types):
                 has_t = ((Z_int_full == t) * amask_full).sum(axis=1) > 0
+                self._train_type_has.append(has_t)
                 if has_t.sum() < S_train:
                     self._train_all_types_present = False
-                    break
             if self._train_all_types_present:
                 print("Per-type RMSE: all types present in all structures — using fast path")
+            else:
+                # Report per-type coverage
+                for t in range(cfg.num_types):
+                    n = int(self._train_type_has[t].sum())
+                    print(f"  Type {t}: {n}/{S_train} structures ({100*n/S_train:.0f}%)")
 
         for gen in range(cfg.num_generations):
             t0 = time.perf_counter()
@@ -480,24 +491,12 @@ class SNES:
             best_rmse = float(tf.reduce_min(fitness))
             worst_rmse = float(tf.reduce_max(fitness))
 
-            # VRAM snapshot (peak after evaluate — the heaviest phase)
-            if tf.config.list_physical_devices('GPU'):
-                vram_info = tf.config.experimental.get_memory_info('GPU:0')
-                history["vram_mb"].append(vram_info["peak"] / 1024 / 1024)
-            else:
-                history["vram_mb"].append(0.0)
-
-            # RAM and CPU usage
-            ram_peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            history["ram_mb"].append(ram_peak_kb / 1024)
-            history["cpu_load"].append(os.getloadavg()[0])
-
             t2 = time.perf_counter()
 
-            # Regularization at current mean for reporting
-            if cfg.toggle_regularization:
+            # Regularization at current mean for reporting (sample every 100 gens to avoid GPU sync)
+            if cfg.toggle_regularization and gen % 100 == 0:
                 gen_l1, gen_l2 = self.compute_regularization(self.mu)
-            else:
+            elif not cfg.toggle_regularization:
                 gen_l1, gen_l2 = 0, 0
 
             # Rank and update (GPU)
@@ -507,27 +506,52 @@ class SNES:
                 ranks = tf.argsort(fitness)
                 s_sorted = tf.gather(s, ranks)
             self.update(self.utilities, s_sorted)
-            # GPU sync: read mu to ensure update completed before timing validate
-            self.mu.numpy()
 
             t3 = time.perf_counter()
 
-            # Validate with updated mean (GPU — mu is tf.Variable)
-            val_fitness = self.validate(val_data, self.mu)
+            # Validate with updated mean (skip on non-val generations)
+            _do_val = (gen % cfg.val_interval == 0) or (gen == cfg.num_generations - 1)
+            if _do_val:
+                val_fitness = self.validate(val_data, self.mu)
 
             t4 = time.perf_counter()
 
             history["generation"].append(gen)
             history["train_loss"].append(avg_fitness)
-            history["val_loss"].append(float(val_fitness))
+            history["val_loss"].append(val_fitness)
             history["L1"].append(gen_l1)
             history["L2"].append(gen_l2)
             history["best_rmse"].append(best_rmse)
             history["worst_rmse"].append(worst_rmse)
-            history["sigma_min"].append(float(tf.reduce_min(self.sigma)))
-            history["sigma_max"].append(float(tf.reduce_max(self.sigma)))
-            history["sigma_mean"].append(float(tf.reduce_mean(self.sigma)))
-            history["sigma_median"].append(float(np.median(self.sigma.numpy())))
+
+            # Sigma stats: sample every 100 gens to avoid GPU→CPU transfer
+            if gen % 100 == 0:
+                sigma_np = self.sigma.numpy()
+                sigma_min = float(np.min(sigma_np))
+                sigma_max = float(np.max(sigma_np))
+                sigma_mean = float(np.mean(sigma_np))
+                sigma_median = float(np.median(sigma_np))
+            history["sigma_min"].append(sigma_min)
+            history["sigma_max"].append(sigma_max)
+            history["sigma_mean"].append(sigma_mean)
+            history["sigma_median"].append(sigma_median)
+
+            # VRAM/RAM/CPU monitoring: sample every 100 gens to avoid per-gen overhead
+            if gen % 100 == 0:
+                if tf.config.list_physical_devices('GPU'):
+                    vram_info = tf.config.experimental.get_memory_info('GPU:0')
+                    history["vram_mb"].append(vram_info["peak"] / 1024 / 1024)
+                else:
+                    history["vram_mb"].append(0.0)
+                try:
+                    ram_peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    history["ram_mb"].append(ram_peak_kb / 1024)
+                except Exception:
+                    history["ram_mb"].append(0.0)
+                try:
+                    history["cpu_load"].append(os.getloadavg()[0])
+                except (OSError, AttributeError):
+                    history["cpu_load"].append(0.0)
 
             # Progress bar
             frac = (gen + 1) / cfg.num_generations
@@ -540,7 +564,7 @@ class SNES:
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
             line = (f"\r{bar} {gen + 1}/{cfg.num_generations} "
                     f"train RMSE: {avg_fitness:.6f}  "
-                    f"val RMSE: {float(val_fitness):.6f}  "
+                    f"val RMSE: {val_fitness:.6f}  "
                     f"best val RMSE: {best_val_loss:.6f}  "
                     f"elapsed: {elapsed_str}  ETA: {eta_str}")
             if cfg.debug:
@@ -548,15 +572,15 @@ class SNES:
             sys.stdout.write(line)
             sys.stdout.flush()
 
-            # Early stopping
-            val_loss_scalar = float(val_fitness)
-            if val_loss_scalar < best_val_loss:
-                best_val_loss = val_loss_scalar
-                best_mu = tf.identity(self.mu)
-                best_sigma = tf.identity(self.sigma)
-                gens_without_improvement = 0
-            else:
-                gens_without_improvement += 1
+            # Early stopping (only update on val generations)
+            if _do_val:
+                if val_fitness < best_val_loss:
+                    best_val_loss = val_fitness
+                    best_mu = tf.identity(self.mu)
+                    best_sigma = tf.identity(self.sigma)
+                    gens_without_improvement = 0
+                else:
+                    gens_without_improvement += 1
 
             if cfg.patience is not None and gens_without_improvement >= cfg.patience:
                 print(f"\nEarly stopping at generation {gen + 1} "
@@ -910,23 +934,35 @@ class SNES:
         # Precompute per-type structure indices for per-type RMSE (GPUMD-style)
         T = self.cfg.num_types
         if return_per_type:
-            # Use precomputed flag when available (full training set always has
-            # the same composition; random batches inherit it if every structure
-            # in the dataset contains all types).
             all_types_present = getattr(self, '_train_all_types_present', False)
             if not all_types_present:
-                Z_int_np = batch_data["Z_int"].numpy()     # [B, A]
-                amask_np = batch_data["atom_mask"].numpy()  # [B, A]
-                type_struct_indices = []
-                all_types_present = True
-                for t in range(T):
-                    type_match = (Z_int_np == t) * amask_np  # [B, A]
-                    has_t = type_match.sum(axis=1) > 0       # [B] bool
-                    type_struct_indices.append(np.where(has_t)[0])
-                    if has_t.sum() < B:
-                        all_types_present = False
-                # Global = all structures
-                type_struct_indices.append(np.arange(B))
+                # Derive per-type indices from precomputed masks when using
+                # the full training set, or fall back to on-the-fly computation
+                # for random batches. Avoids GPU→CPU .numpy() transfer.
+                train_type_has = getattr(self, '_train_type_has', None)
+                if (self.cfg.batch_size is None
+                        and train_type_has is not None
+                        and batch_data["descriptors"].shape[0] == len(train_type_has[0])):
+                    # Full training set — use precomputed masks directly
+                    type_struct_indices = [np.where(h)[0] for h in train_type_has]
+                    type_struct_indices.append(np.arange(B))
+                else:
+                    # Random batch subset — need to check which types are present
+                    Z_int_np = batch_data["Z_int"].numpy()     # [B, A]
+                    amask_np = batch_data["atom_mask"].numpy()  # [B, A]
+                    type_struct_indices = []
+                    min_coverage = B
+                    for t in range(T):
+                        type_match = (Z_int_np == t) * amask_np  # [B, A]
+                        has_t = type_match.sum(axis=1) > 0       # [B] bool
+                        type_struct_indices.append(np.where(has_t)[0])
+                        min_coverage = min(min_coverage, int(has_t.sum()))
+                    type_struct_indices.append(np.arange(B))
+                    # If all types are present in >=95% of structures, the
+                    # per-type rankings will be nearly identical to global —
+                    # use the fast path to avoid T+1 redundant evaluations.
+                    if min_coverage >= int(0.95 * B):
+                        all_types_present = True
 
         all_fitness = []
 
@@ -1017,7 +1053,7 @@ class SNES:
 
         return fitness
 
-    @tf.function
+    @tf.function(reduce_retracing=True)
     def _evaluate_chunk(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tuple[tf.Tensor, tf.Tensor]:
         """Evaluate a chunk of C candidates on B structures.
 
@@ -1042,15 +1078,22 @@ class SNES:
         amask = batch_data["atom_mask"]        # [B, A]
         nmask = batch_data["neighbor_mask"]    # [B, A, M]
 
-        # Reconstruct weights for all candidates in chunk
-        params = self.reconstruct_params_tf(chunk_samples)
+        # Pre-scale descriptors and gradients once for all candidates
+        # (avoids redundant per-candidate scaling inside vectorized_map)
+        if self.model._scale_descriptors:
+            scale = self.model._descriptor_mean
+            desc = desc / scale
+            grads = grads / scale
 
-        # Per-atom normalization: divide model output by N_atoms so the
-        # loss is computed in per-atom space (matching scale_targets)
+        # Precompute per-atom normalization factor once (not per-candidate)
         _scale_preds = self.cfg.scale_targets and self.cfg.target_mode == 1
         if _scale_preds:
             num_atoms = tf.reduce_sum(amask, axis=1)  # [B]
-            num_atoms = tf.maximum(num_atoms, 1.0)[:, tf.newaxis]  # [B, 1]
+            inv_num_atoms = 1.0 / tf.maximum(num_atoms, 1.0)  # [B]
+            inv_num_atoms = inv_num_atoms[:, tf.newaxis]  # [B, 1]
+
+        # Reconstruct weights for all candidates in chunk
+        params = self.reconstruct_params_tf(chunk_samples)
 
         _use_dir_loss = self._use_dir_loss
         _eps = self._dir_eps
@@ -1065,6 +1108,7 @@ class SNES:
                 preds = self.model.predict_batch(
                     desc, grads, gidx, pos, Z, boxes, amask, nmask,
                     w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
+                    prescaled=True,
                 )
                 diff = preds - targets  # [B, 6]
                 # Weight off-diagonal components by lambda_shear^2
@@ -1080,24 +1124,21 @@ class SNES:
                 preds = self.model.predict_batch(
                     desc, grads, gidx, pos, Z, boxes, amask, nmask,
                     w0, bb0, w1, bb1, None, None, None, None,
+                    prescaled=True,
                 )
                 if _scale_preds:
-                    preds = preds / num_atoms
+                    preds = preds * inv_num_atoms
 
                 if _use_dir_loss:
                     pred_norm = tf.linalg.norm(preds, axis=1)      # [B]
                     tgt_norm = tf.linalg.norm(targets, axis=1)     # [B]
                     if _log_mag:
-                        # Log magnitude SSE: (log||pred|| - log||target||)²
-                        # Guards near-zero norms with eps
                         mag_sse = tf.reduce_sum(tf.square(
                             tf.math.log(tf.maximum(pred_norm, _eps))
                             - tf.math.log(tf.maximum(tgt_norm, _eps))))
                     else:
-                        # Absolute magnitude SSE: (||pred|| - ||target||)²
                         mag_sse = tf.reduce_sum(tf.square(pred_norm - tgt_norm))
 
-                    # Cosine similarity, masked for near-zero targets
                     dot = tf.reduce_sum(preds * targets, axis=1)   # [B]
                     denom = tf.maximum(pred_norm * tgt_norm, _eps)
                     cos_sim = dot / denom                           # [B]
