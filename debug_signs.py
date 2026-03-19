@@ -22,7 +22,7 @@ Usage:
 """
 
 import numpy as np
-import tensorflow as tf
+import torch
 from ase import Atoms
 from collections import Counter
 
@@ -31,20 +31,19 @@ from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
 
 
-def diagnose_sign_flips(model: TNEP, test_data: dict[str, tf.Tensor]) -> dict:
+def diagnose_sign_flips(model: TNEP, test_data: dict[str, torch.Tensor]) -> dict:
     """Identify structures with sign-flipped dipole predictions.
 
     Args:
         model     : trained TNEP model (target_mode=1)
-        test_data : padded data dict from prepare_eval_data()
+        test_data : flat data dict from prepare_eval_data()
 
     Returns:
         dict with keys: flipped_idx, good_idx, cos_sim, preds, targets
     """
     metrics, preds = model.score(test_data)
-    targets = test_data["targets"].numpy()
-    preds = preds.numpy()
-    cos_sim = metrics["cos_sim_all"].numpy()
+    targets = test_data["targets"].cpu().numpy()
+    cos_sim = metrics["cos_sim_all"]
 
     flipped_idx = list(np.where(cos_sim < -0.9)[0])
     good_idx = list(np.where(cos_sim > 0.9)[0])
@@ -268,7 +267,7 @@ def verify_gradient_sign(model: TNEP, test_structures: list[Atoms],
     cart_component = 0  # x-component
     desc_component = 0  # first descriptor component
 
-    analytical_val = analytical_grad[test_atom][neighbor_local_idx, cart_component, desc_component].numpy()
+    analytical_val = analytical_grad[test_atom][neighbor_local_idx, cart_component, desc_component]
 
     # Numerical gradient: d(descriptor of test_atom) / d(position of neighbor_atom, cart_component)
     positions = structure.get_positions().copy()
@@ -279,7 +278,7 @@ def verify_gradient_sign(model: TNEP, test_structures: list[Atoms],
     s_fwd = structure.copy()
     s_fwd.set_positions(pos_fwd)
     descs_fwd, _, _ = builder.build_descriptors([s_fwd])
-    q_fwd = descs_fwd[0][test_atom, desc_component].numpy()
+    q_fwd = descs_fwd[0][test_atom, desc_component]
 
     # Backward
     pos_bwd = positions.copy()
@@ -287,7 +286,7 @@ def verify_gradient_sign(model: TNEP, test_structures: list[Atoms],
     s_bwd = structure.copy()
     s_bwd.set_positions(pos_bwd)
     descs_bwd, _, _ = builder.build_descriptors([s_bwd])
-    q_bwd = descs_bwd[0][test_atom, desc_component].numpy()
+    q_bwd = descs_bwd[0][test_atom, desc_component]
 
     numerical_val = (q_fwd - q_bwd) / (2 * epsilon)
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import tensorflow as tf
 
 
 class DescriptorPCA:
@@ -18,7 +17,7 @@ class DescriptorPCA:
         self.mean_: np.ndarray | None = None          # [dim_q]
         self.explained_variance_ratio_: np.ndarray | None = None  # [n_components]
 
-    def fit(self, descriptors: list[tf.Tensor]) -> DescriptorPCA:
+    def fit(self, descriptors: list[np.ndarray]) -> DescriptorPCA:
         """Fit PCA on training descriptors.
 
         Args:
@@ -27,7 +26,7 @@ class DescriptorPCA:
         Returns:
             self
         """
-        all_desc = tf.concat(descriptors, axis=0).numpy()  # [total_atoms, dim_q]
+        all_desc = np.concatenate(descriptors, axis=0)  # [total_atoms, dim_q]
         self.mean_ = np.mean(all_desc, axis=0)              # [dim_q]
         centered = all_desc - self.mean_                     # [total_atoms, dim_q]
 
@@ -50,42 +49,42 @@ class DescriptorPCA:
         print(f"  Top-5 cumulative: {cumvar[:5]}")
         return self
 
-    def transform_descriptors(self, descriptors: list[tf.Tensor]) -> list[tf.Tensor]:
+    def transform_descriptors(self, descriptors: list[np.ndarray]) -> list[np.ndarray]:
         """Project descriptors to PCA space.
 
         Args:
-            descriptors: list of [N_i, dim_q] tensors
+            descriptors: list of [N_i, dim_q] arrays
 
         Returns:
-            list of [N_i, n_components] tensors
+            list of [N_i, n_components] arrays
         """
         P = self.components_.T.astype(np.float32)   # [dim_q, n_components]
         mean = self.mean_.astype(np.float32)          # [dim_q]
-        return [tf.constant((d.numpy() - mean) @ P) for d in descriptors]
+        return [(d - mean) @ P for d in descriptors]
 
-    def transform_gradients(self, gradients: list[list[tf.Tensor]]) -> list[list[tf.Tensor]]:
+    def transform_gradients(self, gradients: list[list[np.ndarray]]) -> list[list[np.ndarray]]:
         """Project descriptor gradients to PCA space.
 
         Gradients are dq/dR, so the chain rule for q_compressed = (q - mean) @ P
         gives d(q_compressed)/dR = dq/dR @ P (mean is constant).
 
         Args:
-            gradients: list of (list of [M_i, 3, dim_q] tensors)
+            gradients: list of (list of [M_i, 3, dim_q] arrays)
 
         Returns:
-            list of (list of [M_i, 3, n_components] tensors)
+            list of (list of [M_i, 3, n_components] arrays)
         """
-        P = tf.constant(self.components_.T, dtype=tf.float32)  # [dim_q, n_components]
+        P = self.components_.T.astype(np.float32)  # [dim_q, n_components]
         result = []
         for struct_grads in gradients:
-            result.append([tf.constant(tf.einsum('mdi,ip->mdp', g, P)) for g in struct_grads])
+            result.append([np.einsum('mdi,ip->mdp', g, P) for g in struct_grads])
         return result
 
     def transform(
         self,
-        descriptors: list[tf.Tensor],
-        gradients: list[list[tf.Tensor]],
-    ) -> tuple[list[tf.Tensor], list[list[tf.Tensor]]]:
+        descriptors: list[np.ndarray],
+        gradients: list[list[np.ndarray]],
+    ) -> tuple[list[np.ndarray], list[list[np.ndarray]]]:
         """Transform both descriptors and gradients."""
         return self.transform_descriptors(descriptors), self.transform_gradients(gradients)
 

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import tensorflow as tf
 import numpy as np
-from tensorflow.keras import layers
 from TNEPconfig import TNEPconfig
 from quippy.descriptors import Descriptor
 
@@ -10,21 +8,16 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ase import Atoms
 
-class DescriptorBuilder(layers.Layer):
+class DescriptorBuilder:
     """Builds SOAP-turbo descriptors and their gradients using quippy.
 
     Constructs one quippy Descriptor per atom type (central_index), then
     aggregates per-atom descriptors, descriptor gradients, and neighbour
     indices for each structure in a dataset.
-
-    Also provides geometry utilities (pairwise displacements under MIC)
-    needed by the dipole prediction branch.
     """
 
     def __init__(self,
-                 cfg: TNEPconfig,
-                 **kwargs) -> None:
-        super().__init__(**kwargs)
+                 cfg: TNEPconfig) -> None:
 
         self.cfg = cfg
         self.types = cfg.types
@@ -77,7 +70,7 @@ class DescriptorBuilder(layers.Layer):
 
         self.builders = [Descriptor(base + f" central_index={k}") for k in (np.arange(self.num_types, dtype=int) + 1)]
 
-    def build_descriptors(self, dataset: list[Atoms]) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
+    def build_descriptors(self, dataset: list[Atoms]) -> tuple[list[np.ndarray], list[list[np.ndarray]], list[list[list[int]]]]:
         """Compute SOAP descriptors and their gradients for every structure.
 
         Runs each per-type quippy Descriptor with grad=True, then collects
@@ -87,9 +80,9 @@ class DescriptorBuilder(layers.Layer):
             dataset : list of ase.Atoms structures
 
         Returns:
-            dataset_descriptors : list of tensors, one per structure
-                Each tensor has shape [N, dim_q].
-            dataset_gradients   : list of (list of N tensors), one per structure
+            dataset_descriptors : list of arrays, one per structure
+                Each array has shape [N, dim_q].
+            dataset_gradients   : list of (list of N arrays), one per structure
                 gradients[s][i] has shape [M_i, 3, dim_q] — the derivative of
                 atom i's descriptor w.r.t. each neighbour's position
                 (M_i neighbours, 3 Cartesian, dim_q descriptor components).
@@ -123,64 +116,11 @@ class DescriptorBuilder(layers.Layer):
                     grad_indexes[center].append(neighbour)
 
             for i in range(len(gradients)):
-                gradients[i] = tf.convert_to_tensor(gradients[i], dtype=tf.float32)
+                gradients[i] = np.array(gradients[i], dtype=np.float32)
 
-            descriptors = tf.convert_to_tensor(descriptors, dtype=tf.float32)
-            descriptors = tf.squeeze(descriptors, axis=1)
+            descriptors = np.array(descriptors, dtype=np.float32)
+            descriptors = np.squeeze(descriptors, axis=1)
             dataset_descriptors.append(descriptors)
             dataset_gradients.append(gradients)
             dataset_grad_index.append(grad_indexes)
         return dataset_descriptors, dataset_gradients, dataset_grad_index
-
-    @tf.function(
-    input_signature=[
-        tf.TensorSpec(shape=[None, 3], dtype=tf.float32),
-        tf.TensorSpec(shape=[None, 3], dtype=tf.float32),
-        tf.TensorSpec(shape=[3, 3], dtype=tf.float32),
-    ]
-)
-    def _minimum_image_displacement(self, Ri: tf.Tensor, Rj: tf.Tensor, box: tf.Tensor) -> tf.Tensor:
-        """Compute displacement vectors Rj - Ri under minimum image convention.
-
-        Args:
-            Ri  : [B, 3]  reference positions
-            Rj  : [B, 3]  target positions
-            box : [3, 3]  lattice vectors (rows)
-
-        Returns:
-            dr : [B, 3]  Cartesian displacement vectors wrapped to nearest image
-        """
-        box_inv = tf.linalg.inv(box)
-        si = tf.einsum('ij,bj->bi', box_inv, Ri)  # Cartesian -> fractional
-        sj = tf.einsum('ij,bj->bi', box_inv, Rj)
-        ds = sj - si
-        ds -= tf.round(ds)                         # wrap to [-0.5, 0.5)
-        dr = tf.einsum('ij,bj->bi', box, ds)       # fractional -> Cartesian
-        return dr
-
-    @tf.function(
-        input_signature=[
-            tf.TensorSpec(shape=[None, 3], dtype=tf.float32),
-            tf.TensorSpec(shape=[3, 3], dtype=tf.float32),
-        ]
-    )
-    def pairwise_displacements(self, R: tf.Tensor, box: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute all pairwise displacement vectors and scalar distances under MIC.
-
-        Args:
-            R   : [N, 3]  atom positions
-            box : [3, 3]  lattice vectors (rows)
-
-        Returns:
-            dr  : [N, N, 3]  displacement vectors dr[i,j] = R_j - R_i (nearest image)
-            rij : [N, N]     scalar distances |dr[i,j]|
-        """
-        N = tf.shape(R)[0]
-        Ri_t = tf.reshape(tf.tile(R, [N, 1]), [N, N, 3])
-        Rj_t = tf.transpose(Ri_t, perm=[1, 0, 2])
-        dr_flat = self._minimum_image_displacement(tf.reshape(Ri_t, [-1, 3]),
-                                              tf.reshape(Rj_t, [-1, 3]),
-                                              box)
-        dr = tf.reshape(dr_flat, [N, N, 3])
-        rij = tf.linalg.norm(dr, axis=-1)
-        return dr, rij

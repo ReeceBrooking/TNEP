@@ -1,30 +1,11 @@
 from __future__ import annotations
 
 import numpy as np
-import os
-
-# CPU parallelisation: detect GPU vs CPU-only and set thread counts accordingly
-# Physical cores = logical cores / 2 (excludes hyperthreads)
-_logical = os.cpu_count() or 1
-_physical = max(_logical // 2, 1)
-_has_gpu = os.path.isdir('/proc/driver/nvidia') or os.environ.get('CUDA_VISIBLE_DEVICES', '') != ''
-
-if _has_gpu:
-    os.environ['OMP_NUM_THREADS'] = '2'
-    os.environ['MKL_NUM_THREADS'] = '2'
-    os.environ['TF_NUM_INTRAOP_THREADS'] = '4'
-    os.environ['TF_NUM_INTEROP_THREADS'] = '2'
-    os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
-else:
-    os.environ['OMP_NUM_THREADS'] = str(_physical)
-    os.environ['MKL_NUM_THREADS'] = str(_physical)
-    os.environ['TF_NUM_INTRAOP_THREADS'] = str(_physical)
-    os.environ['TF_NUM_INTEROP_THREADS'] = '4'
-import tensorflow as tf
+import torch
 
 from TNEP import TNEP
 from TNEPconfig import TNEPconfig
-from data import (collect, split, pad_and_stack,
+from data import (collect, split, collate_flat,
                   print_dipole_statistics, print_polarizability_statistics,
                   assign_type_indices, prepare_eval_data, print_score_summary)
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
@@ -36,6 +17,10 @@ from spectroscopy import (predict_dipole_trajectory, predict_polarizability_traj
 from debug_signs import (diagnose_sign_flips, correct_sign_flips, check_cells,
                          characterize_flipped, test_target_negation)
 from ase.io import read
+
+
+def _to_device(d, dev):
+    return {k: v.to(dev) if isinstance(v, torch.Tensor) else v for k, v in d.items()}
 
 
 def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
@@ -51,6 +36,10 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     if cfg is None:
         cfg = TNEPconfig()
 
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     # Load dataset, filter by species, then filter bad data
     dataset, dataset_types_int = collect(cfg)
 
@@ -64,35 +53,40 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     # Split into train/test/val and build SOAP descriptors (slow)
     train_data, test_data, val_data = split(dataset, dataset_types_int, cfg)
 
-    # Convert to padded dense tensors for GPU-batched evaluation
-    train_data = pad_and_stack(train_data)
-    test_data = pad_and_stack(test_data)
-    val_data = pad_and_stack(val_data)
+    # Convert to collated flat tensors for GPU-batched evaluation
+    train_data = collate_flat(train_data)
+    test_data = collate_flat(test_data)
+    val_data = collate_flat(val_data)
+
+    # Move to device
+    train_data = _to_device(train_data, device)
+    test_data = _to_device(test_data, device)
+    val_data = _to_device(val_data, device)
 
     # dim_q is determined by the SOAP descriptor size
-    cfg.dim_q = train_data["descriptors"][0].shape[-1]
+    cfg.dim_q = int(train_data["descriptors"].shape[-1])
     print("Dimension of q: " + str(cfg.dim_q))
 
-    # Memory check: estimate padded tensor sizes vs available RAM/VRAM
-    def _estimate_tensor_mb(data: dict) -> float:
-        total_bytes = 0
-        for key, val in data.items():
-            if isinstance(val, tf.Tensor):
-                total_bytes += val.dtype.size * int(tf.size(val))
-        return total_bytes / (1024 * 1024)
+    # Memory check: estimate tensor sizes vs available RAM/VRAM
+    def _estimate_tensor_mb(data):
+        total = 0
+        for v in data.values():
+            if isinstance(v, torch.Tensor):
+                total += v.element_size() * v.nelement()
+        return total / (1024 * 1024)
 
     tensor_mb = max(_estimate_tensor_mb(train_data),
                     _estimate_tensor_mb(test_data),
                     _estimate_tensor_mb(val_data))
 
-    use_gpu = bool(tf.config.list_physical_devices('GPU'))
+    use_gpu = torch.cuda.is_available()
     if use_gpu:
-        # Assume 12 GB VRAM (common GPU); adjust if your GPU differs
-        total_vram_mb = 12288
+        props = torch.cuda.get_device_properties(0)
+        total_vram_mb = props.total_mem / (1024 * 1024)
         usage_pct = 100 * tensor_mb / total_vram_mb
         print("\n=== Memory Check (GPU) ===")
-        print(f"  Largest padded tensor set: {tensor_mb:.1f} MB")
-        print(f"  Assumed VRAM:              {total_vram_mb:.0f} MB")
+        print(f"  Largest tensor set: {tensor_mb:.1f} MB")
+        print(f"  Total VRAM:                {total_vram_mb:.0f} MB")
         print(f"  Estimated usage:           {usage_pct:.1f}%")
         if usage_pct > 90:
             print(f"  WARNING: Tensor data alone uses >{usage_pct:.0f}% of VRAM! "
@@ -101,15 +95,13 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
             print(f"  WARNING: Tensor data uses {usage_pct:.0f}% of VRAM. "
                   f"May run tight during training.")
     else:
-        with open('/proc/meminfo', 'r') as f:
-            for line in f:
-                if line.startswith('MemTotal:'):
-                    total_ram_mb = int(line.split()[1]) / 1024
-                    break
-            else:
-                total_ram_mb = None
+        try:
+            import psutil
+            total_ram_mb = psutil.virtual_memory().total / (1024 * 1024)
+        except ImportError:
+            total_ram_mb = None
         print("\n=== Memory Check (CPU-only — no GPU detected) ===")
-        print(f"  Largest padded tensor set: {tensor_mb:.1f} MB")
+        print(f"  Largest tensor set: {tensor_mb:.1f} MB")
         if total_ram_mb is not None:
             usage_pct = 100 * tensor_mb / total_ram_mb
             print(f"  Total system RAM:          {total_ram_mb:.0f} MB")
@@ -123,7 +115,9 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         else:
             print("  WARNING: Could not determine total system RAM.")
 
-    model = TNEP(cfg)
+    model = TNEP(cfg, device=device)
+    from SNES import SNES
+    model.optimizer = SNES(model)
     print("Model Parameters: " + str(model.optimizer.dim))
     print("Population Size: " + str(model.optimizer.pop_size))
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
@@ -142,7 +136,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
-        plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
+        plot_correlation(test_data["targets"].cpu().numpy(), preds, m, cfg,
                          cfg.save_plots, cfg.show_plots)
 
     # Train
@@ -172,15 +166,11 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         if diag["flipped_idx"]:
             characterize_flipped(test_structures, diag["flipped_idx"], diag["good_idx"])
             test_target_negation(diag["preds"], diag["targets"], diag["flipped_idx"])
-        # NOTE: verify_gradient_sign() is not called here because it invokes
-        # quippy's C descriptor code again, which can cause heap corruption
-        # (malloc_consolidate) after training. Run it standalone if needed:
-        #   verify_gradient_sign(model, structures, cfg, structure_idx=0)
 
         # Correct flipped predictions and recompute metrics
         if cfg.fix_sign_flips and diag["flipped_idx"]:
             corrected_preds = correct_sign_flips(diag["preds"], diag["cos_sim"])
-            test_preds = tf.constant(corrected_preds, dtype=tf.float32)
+            test_preds = corrected_preds
             targets_np = diag["targets"]
             diff = corrected_preds - targets_np
             rmse = np.sqrt(np.mean(diff ** 2))
@@ -213,7 +203,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     vram = history.get("vram_mb", [])
     if vram:
         print("\n=== VRAM Usage ===")
-        print(f"  Peak: {max(vram):.1f} MB / 12288 MB ({100*max(vram)/12288:.1f}%)")
+        print(f"  Peak: {max(vram):.1f} MB")
         print(f"  Last: {vram[-1]:.1f} MB")
 
     # Plots
@@ -222,15 +212,15 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
-    plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg,
+    plot_correlation(test_data["targets"].cpu().numpy(), test_preds, metrics, cfg,
                      cfg.save_plots, cfg.show_plots)
 
     # Additional total-dipole correlation plot when target scaling is active
     if "total_rmse" in metrics:
-        num_atoms = test_data["num_atoms"].numpy().astype(np.float32)
+        num_atoms = test_data["num_atoms"].cpu().numpy().astype(np.float32)
         scale = num_atoms[:, np.newaxis]
-        total_targets = test_data["targets"].numpy() * scale
-        total_preds = test_preds.numpy() * scale
+        total_targets = test_data["targets"].cpu().numpy() * scale
+        total_preds = test_preds * scale
         total_metrics = {
             "rmse": metrics["total_rmse"],
             "r2": metrics["total_r2"],
@@ -252,7 +242,7 @@ def test_model(
     data_path: str,
     save_plots: str | None = None,
     show_plots: bool = True,
-) -> tuple[dict, tf.Tensor]:
+) -> tuple[dict, np.ndarray]:
     """Test a trained model on an external dataset.
 
     Loads structures from data_path, builds descriptors, and scores.
@@ -266,26 +256,27 @@ def test_model(
 
     Returns:
         metrics    : dict with rmse, r2, r2_components, etc.
-        predictions : [S, T] tensor of predictions
+        predictions : [S, T] numpy array of predictions
     """
     dataset = read(data_path, index=":")
     print(f"Loaded {len(dataset)} structures from {data_path}")
 
     data = prepare_eval_data(dataset, cfg)
+    data = _to_device(data, model.device)
 
     # Score
     metrics, predictions = model.score(data)
     print_score_summary(metrics, cfg, prefix="External test")
 
     # Plot correlation
-    plot_correlation(data["targets"].numpy(), predictions.numpy(), metrics, cfg,
+    plot_correlation(data["targets"].cpu().numpy(), predictions, metrics, cfg,
                      save_plots, show_plots)
 
     if "total_rmse" in metrics:
-        num_atoms = data["num_atoms"].numpy().astype(np.float32)
+        num_atoms = data["num_atoms"].cpu().numpy().astype(np.float32)
         scale = num_atoms[:, np.newaxis]
-        total_targets = data["targets"].numpy() * scale
-        total_preds = predictions.numpy() * scale
+        total_targets = data["targets"].cpu().numpy() * scale
+        total_preds = predictions * scale
         total_metrics = {
             "rmse": metrics["total_rmse"],
             "r2": metrics["total_r2"],

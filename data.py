@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import tensorflow as tf
+import torch
 import numpy as np
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
@@ -31,7 +31,7 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
             z = structure.numbers[i]
             if z not in types:
                 types.append(z)
-            structure_types_int[i] = np.where(types == z)[0]
+            structure_types_int[i] = types.index(z)
 
         dataset_types_int.append(structure_types_int)
 
@@ -83,7 +83,7 @@ def assign_type_indices(dataset: list[Atoms], types: list[int]) -> list[np.ndarr
     return dataset_types_int
 
 
-def _extract_target(structure: Atoms, target_key: str) -> tf.Tensor:
+def _extract_target(structure: Atoms, target_key: str) -> np.ndarray:
     """Extract target, converting 9-component polarizability to 6-component if needed."""
     if target_key in structure.info:
         raw = np.asarray(structure.info[target_key], dtype=np.float32)
@@ -94,7 +94,7 @@ def _extract_target(structure: Atoms, target_key: str) -> tf.Tensor:
     if raw.size == 9:
         # Flattened 3x3 row-major -> unique [xx, yy, zz, xy, yz, zx]
         raw = raw[[0, 4, 8, 1, 5, 6]]
-    return tf.convert_to_tensor(raw, dtype=tf.float32)
+    return np.asarray(raw, dtype=np.float32)
 
 
 def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]:
@@ -116,7 +116,7 @@ def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]
         if np.any(np.isnan(structure.positions)):
             nan_positions.append(i)
         try:
-            target = _extract_target(structure, target_key).numpy()
+            target = _extract_target(structure, target_key)
         except KeyError:
             missing_targets.append(i)
             continue
@@ -180,15 +180,15 @@ def find_rigorous_bad_data(
                                  total=len(worker_args), desc="  GPAW dipoles"))
 
     target_actuals = [_extract_target(s, target_key) for s in dataset]
-    target_calcs = tf.convert_to_tensor(target_calcs, dtype=tf.float32)
-    target_actuals = tf.stack(target_actuals)
+    target_calcs = np.array(target_calcs, dtype=np.float32)
+    target_actuals = np.stack(target_actuals)
 
-    dot = tf.reduce_sum(target_calcs * target_actuals, axis=-1)
-    norm = tf.norm(target_calcs, axis=-1) * tf.norm(target_actuals, axis=-1)
+    dot = np.sum(target_calcs * target_actuals, axis=-1)
+    norm = np.linalg.norm(target_calcs, axis=-1) * np.linalg.norm(target_actuals, axis=-1)
     similarity = dot / norm
 
-    print(f"  Cosine similarity: mean={float(tf.reduce_mean(similarity)):.4f}  "
-          f"min={float(tf.reduce_min(similarity)):.4f}")
+    print(f"  Cosine similarity: mean={float(np.mean(similarity)):.4f}  "
+          f"min={float(np.min(similarity)):.4f}")
 
     bad_indices = [i for i in range(len(dataset)) if float(similarity[i]) < threshold]
     return bad_indices
@@ -288,7 +288,7 @@ def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> Non
     """
     rmse = float(metrics["rmse"])
     r2 = float(metrics["r2"])
-    r2_comp = metrics["r2_components"].numpy()
+    r2_comp = np.asarray(metrics["r2_components"])
     labels = component_labels(cfg.target_mode, len(r2_comp))
 
     if "total_rmse" in metrics:
@@ -299,7 +299,7 @@ def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> Non
 
         total_rmse = float(metrics["total_rmse"])
         total_r2 = float(metrics["total_r2"])
-        total_r2_comp = metrics["total_r2_components"].numpy()
+        total_r2_comp = np.asarray(metrics["total_r2_components"])
         print(f"{prefix} (total)    RMSE: {total_rmse:.4f}")
         print(f"{prefix} (total)    R²:   {total_r2:.4f}")
         print("Total per-component R²:     " + "  ".join(
@@ -312,7 +312,7 @@ def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> Non
 
     if "cos_sim_mean" in metrics:
         cos_mean = float(metrics["cos_sim_mean"])
-        cos_all = metrics["cos_sim_all"].numpy()
+        cos_all = np.asarray(metrics["cos_sim_all"])
         print(f"Cosine similarity:  mean={cos_mean:.4f}  "
               f"min={cos_all.min():.4f}  max={cos_all.max():.4f}  "
               f"std={cos_all.std():.4f}")
@@ -321,8 +321,8 @@ def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> Non
 def assemble_data_dict(
     dataset: list[Atoms],
     types_int: list[np.ndarray],
-    descriptors: list[tf.Tensor],
-    gradients: list[list[tf.Tensor]],
+    descriptors: list[np.ndarray],
+    gradients: list[list[np.ndarray]],
     grad_index: list[list[list[int]]],
     cfg: TNEPconfig,
 ) -> dict:
@@ -331,8 +331,8 @@ def assemble_data_dict(
     Args:
         dataset     : list of ase.Atoms
         types_int   : list of ndarray [N_i] integer type indices
-        descriptors : list of [N_i, dim_q] tensors
-        gradients   : list of (list of N_i tensors each [M, 3, dim_q])
+        descriptors : list of [N_i, dim_q] arrays
+        gradients   : list of (list of N_i arrays each [M, 3, dim_q])
         grad_index  : list of (list of N_i lists each [M] ints)
         cfg         : TNEPconfig (uses target_mode)
 
@@ -342,30 +342,30 @@ def assemble_data_dict(
     target_key = _target_key_for_mode(cfg.target_mode)
     targets = [_extract_target(s, target_key) for s in dataset]
     if cfg.scale_targets and cfg.target_mode == 1:
-        targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
+        targets = [t / float(len(s)) for t, s in zip(targets, dataset)]
     return {
-        "positions": [tf.convert_to_tensor(s.positions, dtype=tf.float32) for s in dataset],
-        "Z_int": [tf.convert_to_tensor(t, dtype=tf.int32) for t in types_int],
+        "positions": [np.asarray(s.positions, dtype=np.float32) for s in dataset],
+        "Z_int": [np.asarray(t, dtype=np.int64) for t in types_int],
         "targets": targets,
-        "boxes": [tf.convert_to_tensor(s.cell.array, dtype=tf.float32) for s in dataset],
+        "boxes": [np.asarray(s.cell.array, dtype=np.float32) for s in dataset],
         "descriptors": descriptors,
         "gradients": gradients,
         "grad_index": grad_index,
     }
 
 
-def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Tensor]:
-    """Build type indices, descriptors, and padded data dict for evaluation.
+def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, torch.Tensor]:
+    """Build type indices, descriptors, and collated data dict for evaluation.
 
     Convenience function that chains assign_type_indices → build_descriptors →
-    assemble_data_dict → pad_and_stack.
+    assemble_data_dict → collate_flat.
 
     Args:
         dataset : list of ase.Atoms — structures to evaluate
         cfg     : TNEPconfig from training (carries types, descriptor params, target_mode)
 
     Returns:
-        padded data dict ready for model.score() or model.predict_batch()
+        flat data dict ready for model.score()
     """
     types_int = assign_type_indices(dataset, cfg.types)
     builder = DescriptorBuilder(cfg)
@@ -373,7 +373,7 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     if hasattr(cfg, '_descriptor_pca') and cfg._descriptor_pca is not None:
         descriptors, gradients = cfg._descriptor_pca.transform(descriptors, gradients)
     data = assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
-    return pad_and_stack(data)
+    return collate_flat(data)
 
 
 def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> tuple[dict, dict, dict]:
@@ -389,12 +389,12 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
 
     Returns:
         train_data, test_data, val_data : dicts each containing:
-            positions   : list of [N_i, 3] tensors
-            Z_int       : list of [N_i] int tensors (type indices)
-            targets     : list of target tensors (scalar for PES, [3] for dipole)
-            boxes       : list of [3, 3] tensors (lattice vectors)
-            descriptors : list of [N_i, dim_q] tensors
-            gradients   : list of (list of N_i tensors each [M, 3, dim_q])
+            positions   : list of [N_i, 3] arrays
+            Z_int       : list of [N_i] int arrays (type indices)
+            targets     : list of target arrays (scalar for PES, [3] for dipole)
+            boxes       : list of [3, 3] arrays (lattice vectors)
+            descriptors : list of [N_i, dim_q] arrays
+            gradients   : list of (list of N_i arrays each [M, 3, dim_q])
             grad_index  : list of (list of N_i lists each [M] ints)
     """
 
@@ -458,13 +458,13 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
               f"({pca.explained_variance_ratio_.sum():.4f} variance explained)")
 
     if cfg.scale_descriptors:
-        all_desc = tf.concat(train_descriptors, axis=0)  # [total_train_atoms, dim_q]
+        all_desc = np.concatenate(train_descriptors, axis=0)  # [total_train_atoms, dim_q]
         dim_q = int(all_desc.shape[-1])
 
         if cfg.descriptor_scale_mode == "range":
             # GPUMD-style: divide by per-component range (max - min)
-            desc_max = tf.reduce_max(all_desc, axis=0).numpy()   # [dim_q]
-            desc_min = tf.reduce_min(all_desc, axis=0).numpy()   # [dim_q]
+            desc_max = np.max(all_desc, axis=0)   # [dim_q]
+            desc_min = np.min(all_desc, axis=0)   # [dim_q]
             desc_range = desc_max - desc_min
             # Components with zero range are constant — leave unscaled
             cfg.descriptor_mean = np.where(desc_range > 1e-30, desc_range, 1.0)
@@ -474,7 +474,7 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
 
         elif cfg.descriptor_scale_mode == "mean":
             # Mean-based: divide by mean(|x|) * sqrt(dim_q)
-            raw_mean = tf.reduce_mean(tf.abs(all_desc), axis=0).numpy()  # [dim_q]
+            raw_mean = np.mean(np.abs(all_desc), axis=0)  # [dim_q]
             if cfg.descriptor_scale_floor is not None:
                 floor = np.max(raw_mean) * cfg.descriptor_scale_floor
                 safe_mean = np.maximum(raw_mean, floor)
@@ -491,39 +491,7 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
             raise ValueError(f"Unknown descriptor_scale_mode: {cfg.descriptor_scale_mode!r} "
                              f"(expected 'range' or 'mean')")
 
-        # Roundtrip verification: q_scaled * s must recover original exactly
-        scale = tf.constant(cfg.descriptor_mean, dtype=tf.float32)
-        for split_name, split_descs, split_grads in [
-            ("train", train_descriptors, train_gradients),
-            ("val", val_descriptors, val_gradients),
-            ("test", test_descriptors, test_gradients),
-        ]:
-            for i in range(min(3, len(split_descs))):
-                q_orig = split_descs[i]                            # [N_i, dim_q]
-                q_scaled = q_orig / scale
-                q_recovered = q_scaled * scale
-                desc_err = float(tf.reduce_max(tf.abs(q_orig - q_recovered)))
-
-                g_orig = split_grads[i]                            # list of N_i tensors [M, 3, dim_q]
-                g_scaled = [g / scale for g in g_orig]
-                g_recovered = [g * scale for g in g_scaled]
-                grad_err = max(
-                    float(tf.reduce_max(tf.abs(go - gr)))
-                    for go, gr in zip(g_orig, g_recovered)
-                ) if g_orig else 0.0
-
-                if desc_err > 1e-5 or grad_err > 1e-5:
-                    print(f"  WARNING: {split_name}[{i}] roundtrip error: "
-                          f"desc={desc_err:.2e}, grad={grad_err:.2e}")
-            # Check feature order: verify scale[j] corresponds to descriptor column j
-            if split_descs:
-                col_means = tf.reduce_mean(tf.abs(split_descs[0]), axis=0)  # [dim_q]
-                ratio = col_means / scale
-                ratio_std = float(tf.math.reduce_std(ratio))
-                if ratio_std > 10.0:
-                    print(f"  WARNING: {split_name} feature-order suspect — "
-                          f"col_mean/scale ratio std={ratio_std:.2f} (expect <10)")
-        print("  Descriptor scaling roundtrip check passed.")
+        print("  Descriptor scaling applied.")
 
     train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
     test_data = assemble_data_dict(test_dataset, test_types_int, test_descriptors, test_gradients, test_grad_index, cfg)
@@ -539,103 +507,128 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     return train_data, test_data, val_data
 
 
-def pad_and_stack(data: dict) -> dict[str, tf.Tensor]:
-    """Convert variable-length list-of-tensors data into dense padded tensors.
+def collate_flat(data: dict) -> dict[str, torch.Tensor]:
+    """Convert variable-length list data to flat concatenated tensors.
 
-    Transforms the output of split() into fixed-shape tensors suitable for
-    batched GPU evaluation. Variable atom counts and neighbor counts are
-    padded to their maximums with zeros, and boolean masks track real vs
-    padded entries.
+    Convert variable-length list data to flat concatenated tensors.
+    All per-atom data is concatenated with batch index arrays for scatter ops.
 
     Args:
-        data : dict from split() with keys:
-            descriptors : list of [N_i, dim_q] tensors
-            gradients   : list of (list of N_i tensors each [M_ij, 3, dim_q])
+        data : dict from split() / assemble_data_dict() with keys:
+            descriptors : list of [N_i, dim_q] arrays
+            gradients   : list of (list of N_i arrays each [M_ij, 3, dim_q])
             grad_index  : list of (list of N_i lists each [M_ij] ints)
-            positions   : list of [N_i, 3] tensors
-            Z_int       : list of [N_i] int tensors
-            targets     : list of scalar/[3]/[6] tensors
-            boxes       : list of [3, 3] tensors
+            positions   : list of [N_i, 3] arrays
+            Z_int       : list of [N_i] int arrays (type indices)
+            targets     : list of scalar/[3]/[6] arrays
+            boxes       : list of [3, 3] arrays
 
     Returns:
-        padded : dict with keys:
-            descriptors    : [S, A, Q]        float32
-            gradients      : [S, A, M, 3, Q]  float32
-            grad_index     : [S, A, M]        int32
-            positions      : [S, A, 3]        float32
-            Z_int          : [S, A]           int32
-            targets        : [S, T]           float32  (T=1 for PES, 3 for dipole, 6 for pol)
-            boxes          : [S, 3, 3]        float32
-            atom_mask      : [S, A]           float32  (1.0 for real atoms, 0.0 for padding)
-            neighbor_mask  : [S, A, M]        float32  (1.0 for real neighbors, 0.0 for padding)
-            num_atoms      : [S]              int32    (actual atom count per structure)
-        where S = num_structures, A = max_atoms, M = max_neighbors, Q = dim_q
+        flat : dict with keys:
+            descriptors  : [total_atoms, Q]    float32
+            Z_int        : [total_atoms]       int64
+            positions    : [total_atoms, 3]    float32
+            atom_batch   : [total_atoms]       int64
+            gradients    : [total_edges, 3, Q] float32
+            edge_src     : [total_edges]       int64
+            edge_dst     : [total_edges]       int64
+            edge_batch   : [total_edges]       int64
+            targets      : [S, T]              float32
+            boxes        : [S, 3, 3]           float32
+            num_atoms    : [S]                 int64
+            atom_offsets : [S+1]               int64
+            edge_offsets : [S+1]               int64
     """
     S = len(data["descriptors"])
-    dim_q = data["descriptors"][0].shape[-1]
-
-    # Find max atom count across all structures
-    atom_counts = [data["descriptors"][i].shape[0] for i in range(S)]
-    max_atoms = max(atom_counts)
-
-    # Find max neighbor count across all atoms in all structures
-    max_neighbors = 0
-    for s in range(S):
-        for i in range(atom_counts[s]):
-            n_nbrs = data["gradients"][s][i].shape[0]
-            if n_nbrs > max_neighbors:
-                max_neighbors = n_nbrs
-
-    # Target dimensionality
-    target_sample = data["targets"][0]
-    if target_sample.shape == ():
-        target_dim = 1
-    else:
-        target_dim = target_sample.shape[0]
-
-    # Pre-allocate numpy arrays (faster than list comprehension for padding)
-    desc_np = np.zeros((S, max_atoms, dim_q), dtype=np.float32)
-    grad_np = np.zeros((S, max_atoms, max_neighbors, 3, dim_q), dtype=np.float32)
-    gidx_np = np.zeros((S, max_atoms, max_neighbors), dtype=np.int32)
-    pos_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
-    z_np = np.zeros((S, max_atoms), dtype=np.int32)
-    tgt_np = np.zeros((S, target_dim), dtype=np.float32)
-    box_np = np.zeros((S, 3, 3), dtype=np.float32)
-    atom_mask_np = np.zeros((S, max_atoms), dtype=np.float32)
-    nbr_mask_np = np.zeros((S, max_atoms, max_neighbors), dtype=np.float32)
-    num_atoms_np = np.array(atom_counts, dtype=np.int32)
+    all_desc, all_Z, all_pos, atom_batch_list = [], [], [], []
+    all_grads, edge_src_list, edge_dst_list, edge_batch_list = [], [], [], []
+    atom_offset = 0
 
     for s in range(S):
-        N_s = atom_counts[s]
-        desc_np[s, :N_s, :] = data["descriptors"][s].numpy()
-        pos_np[s, :N_s, :] = data["positions"][s].numpy()
-        z_np[s, :N_s] = data["Z_int"][s].numpy()
-        box_np[s] = data["boxes"][s].numpy()
-        atom_mask_np[s, :N_s] = 1.0
-
-        t = data["targets"][s]
-        if t.shape == ():
-            tgt_np[s, 0] = t.numpy()
-        else:
-            tgt_np[s, :] = t.numpy()
+        desc_s = np.asarray(data["descriptors"][s], dtype=np.float32)
+        N_s = desc_s.shape[0]
+        all_desc.append(desc_s)
+        all_Z.append(np.asarray(data["Z_int"][s], dtype=np.int64))
+        all_pos.append(np.asarray(data["positions"][s], dtype=np.float32))
+        atom_batch_list.append(np.full(N_s, s, dtype=np.int64))
 
         for i in range(N_s):
-            n_nbrs = data["gradients"][s][i].shape[0]
-            grad_np[s, i, :n_nbrs, :, :] = data["gradients"][s][i].numpy()
-            gidx_np[s, i, :n_nbrs] = data["grad_index"][s][i]
-            nbr_mask_np[s, i, :n_nbrs] = 1.0
+            g_i = np.asarray(data["gradients"][s][i], dtype=np.float32)  # [M_i, 3, Q]
+            nbrs_i = data["grad_index"][s][i]                             # [M_i]
+            M_i = g_i.shape[0]
+            all_grads.append(g_i)
+            edge_src_list.append(np.full(M_i, atom_offset + i, dtype=np.int64))
+            edge_dst_list.append(np.array(nbrs_i, dtype=np.int64) + atom_offset)
+            edge_batch_list.append(np.full(M_i, s, dtype=np.int64))
+        atom_offset += N_s
+
+    # Compute offset arrays for O(1) structure chunking
+    atom_counts = [np.asarray(data["descriptors"][s]).shape[0] for s in range(S)]
+    edge_counts = [sum(np.asarray(data["gradients"][s][i]).shape[0]
+                       for i in range(atom_counts[s])) for s in range(S)]
+    atom_offsets = np.zeros(S + 1, dtype=np.int64)
+    edge_offsets = np.zeros(S + 1, dtype=np.int64)
+    np.cumsum(atom_counts, out=atom_offsets[1:])
+    np.cumsum(edge_counts, out=edge_offsets[1:])
+
+    # Stack targets — handle scalar (mode 0) vs vector targets
+    target_list = [np.asarray(t, dtype=np.float32) for t in data["targets"]]
+    if target_list[0].ndim == 0:
+        targets_np = np.array(target_list, dtype=np.float32).reshape(-1, 1)
+    else:
+        targets_np = np.stack(target_list)
 
     return {
-        "descriptors": tf.constant(desc_np),
-        "gradients": tf.constant(grad_np),
-        "grad_index": tf.constant(gidx_np),
-        "positions": tf.constant(pos_np),
-        "Z_int": tf.constant(z_np),
-        "targets": tf.constant(tgt_np),
-        "boxes": tf.constant(box_np),
-        "atom_mask": tf.constant(atom_mask_np),
-        "neighbor_mask": tf.constant(nbr_mask_np),
-        "num_atoms": tf.constant(num_atoms_np),
+        "descriptors": torch.tensor(np.concatenate(all_desc), dtype=torch.float32),
+        "Z_int": torch.tensor(np.concatenate(all_Z), dtype=torch.int64),
+        "positions": torch.tensor(np.concatenate(all_pos), dtype=torch.float32),
+        "atom_batch": torch.tensor(np.concatenate(atom_batch_list), dtype=torch.int64),
+        "gradients": torch.tensor(np.concatenate(all_grads), dtype=torch.float32),
+        "edge_src": torch.tensor(np.concatenate(edge_src_list), dtype=torch.int64),
+        "edge_dst": torch.tensor(np.concatenate(edge_dst_list), dtype=torch.int64),
+        "edge_batch": torch.tensor(np.concatenate(edge_batch_list), dtype=torch.int64),
+        "targets": torch.tensor(targets_np, dtype=torch.float32),
+        "boxes": torch.tensor(np.stack([np.asarray(b, dtype=np.float32) for b in data["boxes"]]), dtype=torch.float32),
+        "num_atoms": torch.tensor(atom_counts, dtype=torch.int64),
+        "atom_offsets": torch.tensor(atom_offsets, dtype=torch.int64),
+        "edge_offsets": torch.tensor(edge_offsets, dtype=torch.int64),
+    }
+
+
+def select_structure_range(batch: dict[str, torch.Tensor], s_start: int, s_end: int) -> dict[str, torch.Tensor]:
+    """O(1) slicing of flat batch using precomputed offsets.
+
+    Args:
+        batch   : flat batch dict from collate_flat()
+        s_start : first structure index (inclusive)
+        s_end   : last structure index (exclusive)
+
+    Returns:
+        sub-batch dict with re-indexed atom_batch, edge_src, edge_dst, edge_batch
+    """
+    a0 = int(batch["atom_offsets"][s_start])
+    a1 = int(batch["atom_offsets"][s_end])
+    e0 = int(batch["edge_offsets"][s_start])
+    e1 = int(batch["edge_offsets"][s_end])
+    sub_num_atoms = batch["num_atoms"][s_start:s_end]
+    # Recompute offsets for the sub-batch so it can be sliced again
+    n_sub = s_end - s_start
+    sub_atom_offsets = batch["atom_offsets"][s_start:s_end + 1] - a0
+    sub_edge_offsets = batch["edge_offsets"][s_start:s_end + 1] - e0
+    return {
+        "descriptors": batch["descriptors"][a0:a1],
+        "Z_int": batch["Z_int"][a0:a1],
+        "positions": batch["positions"][a0:a1],
+        "atom_batch": batch["atom_batch"][a0:a1] - s_start,
+        "gradients": batch["gradients"][e0:e1],
+        "edge_src": batch["edge_src"][e0:e1] - a0,
+        "edge_dst": batch["edge_dst"][e0:e1] - a0,
+        "edge_batch": batch["edge_batch"][e0:e1] - s_start,
+        "targets": batch["targets"][s_start:s_end],
+        "boxes": batch["boxes"][s_start:s_end],
+        "num_atoms": sub_num_atoms,
+        "atom_offsets": sub_atom_offsets,
+        "edge_offsets": sub_edge_offsets,
     }
 
 
@@ -669,7 +662,7 @@ def print_dipole_statistics(dataset: list[Atoms], target_key: str = "dipole") ->
         dataset    : list of ase.Atoms with info[target_key] = [3] array
         target_key : str key in Atoms.info holding the dipole vector
     """
-    dipoles = np.array([_extract_target(s, target_key).numpy() for s in dataset])
+    dipoles = np.array([_extract_target(s, target_key) for s in dataset])
     norms = np.linalg.norm(dipoles, axis=1)
     print("=== Dipole Target Statistics ===")
     print(f"  N structures: {len(dipoles)}")
@@ -689,7 +682,7 @@ def print_polarizability_statistics(dataset: list[Atoms], target_key: str = "pol
         dataset    : list of ase.Atoms with info[target_key] = [6] or [9] array
         target_key : str key in Atoms.info holding the polarizability tensor
     """
-    pols = np.array([_extract_target(s, target_key).numpy() for s in dataset])
+    pols = np.array([_extract_target(s, target_key) for s in dataset])
     labels = ["xx", "yy", "zz", "xy", "yz", "zx"]
     print("=== Polarizability Target Statistics ===")
     print(f"  N structures: {len(pols)}")

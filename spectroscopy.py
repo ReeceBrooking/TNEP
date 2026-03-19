@@ -1,46 +1,16 @@
 from __future__ import annotations
 
-import tensorflow as tf
+import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import TYPE_CHECKING
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
+from data import collate_flat
 
 if TYPE_CHECKING:
     from ase import Atoms
     from TNEP import TNEP
-
-
-def _pad_gradients_for_structure(
-    gradients: list[tf.Tensor],
-    grad_index: list[list[int]],
-    N: int,
-    dim_q: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Pad per-atom gradients and neighbour indices to uniform shape for a single structure.
-
-    Args:
-        gradients  : list of N tensors each [M_i, 3, dim_q]
-        grad_index : list of N lists each [M_i] ints
-        N          : number of atoms
-        dim_q      : descriptor dimension
-
-    Returns:
-        grad_padded : [N, max_nbrs, 3, dim_q] float32
-        gidx_padded : [N, max_nbrs] int32
-        nbr_mask    : [N, max_nbrs] float32
-    """
-    max_nbrs = max(gradients[i].shape[0] for i in range(N))
-    grad_padded = np.zeros((N, max_nbrs, 3, dim_q), dtype=np.float32)
-    gidx_padded = np.zeros((N, max_nbrs), dtype=np.int32)
-    nbr_mask = np.zeros((N, max_nbrs), dtype=np.float32)
-    for i in range(N):
-        n_nbrs = gradients[i].shape[0]
-        grad_padded[i, :n_nbrs] = gradients[i].numpy()
-        gidx_padded[i, :n_nbrs] = grad_index[i]
-        nbr_mask[i, :n_nbrs] = 1.0
-    return grad_padded, gidx_padded, nbr_mask
 
 
 def compute_dipole_acf(dipoles: np.ndarray) -> np.ndarray:
@@ -160,74 +130,62 @@ def plot_ir_spectrum(freq_cm: np.ndarray, intensity: np.ndarray, cfg: TNEPconfig
     _finish_fig(fig, cfg, "ir_spectrum", save_plots, show_plots)
 
 
-def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> np.ndarray:
-    """Predict dipole moments for each frame in an MD trajectory.
-
-    Args:
-        model             : trained TNEP model (target_mode = 1)
-        trajectory        : list of ase.Atoms — MD frames (ordered in time)
-        dataset_types_int : list of [N_i] int arrays — type indices per frame
-        cfg               : TNEPconfig
-
-    Returns:
-        dipoles : [T, 3] ndarray — predicted dipole moment per frame
-    """
+def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms],
+                              dataset_types_int: list[np.ndarray],
+                              cfg: TNEPconfig) -> np.ndarray:
+    """Predict dipole moments for each frame in an MD trajectory."""
+    from data import assemble_data_dict, collate_flat
     builder = DescriptorBuilder(cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(trajectory)
 
     dipoles = []
     for s in range(len(trajectory)):
-        struct = trajectory[s]
-        N = len(struct)
-        pos = tf.constant(struct.positions, dtype=tf.float32)
-        Z = tf.constant(dataset_types_int[s], dtype=tf.int32)
-        box = tf.constant(struct.cell.array, dtype=tf.float32)
-        desc = descriptors[s]
-        atom_mask = tf.ones([N], dtype=tf.float32)
-
-        grad_padded, gidx_padded, nbr_mask = _pad_gradients_for_structure(
-            gradients[s], grad_index[s], N, cfg.dim_q)
-
-        mu = model.predict(
-            desc, tf.constant(grad_padded), tf.constant(gidx_padded),
-            pos, Z, box, atom_mask, tf.constant(nbr_mask, dtype=tf.float32))
-        dipoles.append(mu.numpy())
+        # Build single-structure data dict and collate
+        single_data = assemble_data_dict(
+            [trajectory[s]], [dataset_types_int[s]],
+            [descriptors[s]], [gradients[s]], [grad_index[s]], cfg)
+        batch = collate_flat(single_data)
+        # Move to model device
+        batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        with torch.no_grad():
+            mu = model.predict_flat(
+                batch, model.W0, model.b0, model.W1, model.b1,
+                getattr(model, 'W0_pol', None),
+                getattr(model, 'b0_pol', None),
+                getattr(model, 'W1_pol', None),
+                getattr(model, 'b1_pol', None),
+            )
+        dipoles.append(mu.cpu().numpy().squeeze(0))
 
     return np.array(dipoles)
 
 
-def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> np.ndarray:
-    """Predict polarizability tensors for each frame in an MD trajectory.
-
-    Args:
-        model             : trained TNEP model (target_mode = 2)
-        trajectory        : list of ase.Atoms — MD frames (ordered in time)
-        dataset_types_int : list of [N_i] int arrays — type indices per frame
-        cfg               : TNEPconfig
-
-    Returns:
-        pols : [T, 6] ndarray — predicted polarizability [xx, yy, zz, xy, yz, zx] per frame
-    """
+def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms],
+                                      dataset_types_int: list[np.ndarray],
+                                      cfg: TNEPconfig) -> np.ndarray:
+    """Predict polarizability tensors for each frame in an MD trajectory."""
+    from data import assemble_data_dict, collate_flat
     builder = DescriptorBuilder(cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(trajectory)
 
     pols = []
     for s in range(len(trajectory)):
-        struct = trajectory[s]
-        N = len(struct)
-        pos = tf.constant(struct.positions, dtype=tf.float32)
-        Z = tf.constant(dataset_types_int[s], dtype=tf.int32)
-        box = tf.constant(struct.cell.array, dtype=tf.float32)
-        desc = descriptors[s]
-        atom_mask = tf.ones([N], dtype=tf.float32)
-
-        grad_padded, gidx_padded, nbr_mask = _pad_gradients_for_structure(
-            gradients[s], grad_index[s], N, cfg.dim_q)
-
-        pol = model.predict(
-            desc, tf.constant(grad_padded), tf.constant(gidx_padded),
-            pos, Z, box, atom_mask, tf.constant(nbr_mask, dtype=tf.float32))
-        pols.append(pol.numpy())
+        single_data = assemble_data_dict(
+            [trajectory[s]], [dataset_types_int[s]],
+            [descriptors[s]], [gradients[s]], [grad_index[s]], cfg)
+        batch = collate_flat(single_data)
+        batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        with torch.no_grad():
+            pol = model.predict_flat(
+                batch, model.W0, model.b0, model.W1, model.b1,
+                getattr(model, 'W0_pol', None),
+                getattr(model, 'b0_pol', None),
+                getattr(model, 'W1_pol', None),
+                getattr(model, 'b1_pol', None),
+            )
+        pols.append(pol.cpu().numpy().squeeze(0))
 
     return np.array(pols)
 

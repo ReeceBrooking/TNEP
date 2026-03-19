@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import numpy as np
 import os
+import torch
 from TNEPconfig import TNEPconfig
-from TNEP import TNEP
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from TNEP import TNEP
 
 
 def _z_to_symbol(z: int) -> str:
@@ -14,21 +18,21 @@ def _z_to_symbol(z: int) -> str:
 
 
 def _generate_model_filename(cfg: TNEPconfig) -> str:
-    """Generate a model filename from config: {dataset}_{elements}_{mode}.npz
+    """Generate a model filename from config: {dataset}_{elements}_{mode}.pt
 
     Examples:
-        train_C_H_O_dipole.npz
-        water_O_H_pes.npz
+        train_C_H_O_dipole.pt
+        water_O_H_pes.pt
     """
     mode_names = {0: "pes", 1: "dipole", 2: "polar"}
     mode = mode_names.get(cfg.target_mode, f"mode{cfg.target_mode}")
     dataset_name = os.path.splitext(os.path.basename(cfg.data_path))[0]
     elements = "_".join(_z_to_symbol(z) for z in cfg.types)
-    return f"{dataset_name}_{elements}_{mode}.npz"
+    return f"{dataset_name}_{elements}_{mode}.pt"
 
 
 def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None) -> None:
-    """Save trained TNEP model weights and config to a .npz file.
+    """Save trained TNEP model weights and config to a .pt file.
 
     Saves all config attributes as a JSON string for full reproducibility.
     Also saves model weights and Z-to-type-index mapping.
@@ -69,20 +73,20 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None) -> None:
 
     data = {
         # --- Model weights ---
-        "W0": model.W0.numpy(),
-        "b0": model.b0.numpy(),
-        "W1": model.W1.numpy(),
-        "b1": model.b1.numpy(),
+        "W0": model.W0.cpu().numpy(),
+        "b0": model.b0.cpu().numpy(),
+        "W1": model.W1.cpu().numpy(),
+        "b1": model.b1.cpu().numpy(),
         # --- Species mapping ---
         "z_to_type_index": z_to_type_index,
         # --- Full config ---
-        "config_json": np.array(json.dumps(config_dict)),
+        "config_json": json.dumps(config_dict),
     }
     if cfg.target_mode == 2:
-        data["W0_pol"] = model.W0_pol.numpy()
-        data["b0_pol"] = model.b0_pol.numpy()
-        data["W1_pol"] = model.W1_pol.numpy()
-        data["b1_pol"] = model.b1_pol.numpy()
+        data["W0_pol"] = model.W0_pol.cpu().numpy()
+        data["b0_pol"] = model.b0_pol.cpu().numpy()
+        data["W1_pol"] = model.W1_pol.cpu().numpy()
+        data["b1_pol"] = model.b1_pol.cpu().numpy()
 
     if cfg.descriptor_mean is not None:
         data["descriptor_mean"] = np.asarray(cfg.descriptor_mean)
@@ -91,30 +95,41 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None) -> None:
     if hasattr(cfg, '_descriptor_pca') and cfg._descriptor_pca is not None:
         data.update(cfg._descriptor_pca.to_dict())
 
-    np.savez(path, **data)
+    torch.save(data, path)
     print(f"Model saved to {path}")
 
 
-def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int, int]]:
-    """Load a trained TNEP model from a .npz file.
+def load_model(path: str = "tnep_model.pt") -> tuple[TNEP, TNEPconfig, dict[int, int]]:
+    """Load a trained TNEP model from a .pt file (or legacy .npz file).
 
     Reconstructs a TNEPconfig and TNEP model with the saved weights.
-    Supports both new format (config_json) and legacy format (individual fields).
+    Supports both new .pt format (config_json as plain string),
+    legacy .npz format (config_json as np.array or individual fields).
 
     Args:
-        path : str — path to saved .npz file
+        path : str — path to saved .pt or .npz file
 
     Returns:
         model          : TNEP model with loaded weights
         cfg            : TNEPconfig reconstructed from saved parameters
         type_map       : dict {atomic_number: layer_index} for converting Z arrays
     """
-    data = np.load(path, allow_pickle=True)
+    from TNEP import TNEP
+
+    # Load data — detect legacy .npz vs new .pt format
+    if path.endswith(".npz"):
+        data = dict(np.load(path, allow_pickle=True))
+    else:
+        data = torch.load(path, weights_only=False)
+
     cfg = TNEPconfig()
 
     if "config_json" in data:
         # New format: restore full config from JSON
-        config_dict = json.loads(str(data["config_json"]))
+        raw = data["config_json"]
+        # Handle both np.array (legacy .npz) and plain string (.pt)
+        config_str = str(raw) if not isinstance(raw, str) else raw
+        config_dict = json.loads(config_str)
         for k, v in config_dict.items():
             # descriptor_mean is serialized as list in JSON; convert back to ndarray
             if k == "descriptor_mean" and v is not None:
@@ -129,7 +144,7 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
         cfg.target_mode = int(data["target_mode"])
         cfg.l_max = int(data["l_max"])
         cfg.alpha_max = int(data["alpha_max"])
-        cfg.activation = str(data["activation"])
+        # cfg.activation loaded but unused — tanh is hardcoded
         cfg.data_path = str(data["data_path"])
         # Map old rc -> rcut_hard/rcut_soft
         if "rc" in data:
@@ -139,7 +154,7 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
 
     # Restore descriptor_mean from dedicated array key (takes precedence over JSON)
     if "descriptor_mean" in data:
-        cfg.descriptor_mean = data["descriptor_mean"].astype(np.float32)
+        cfg.descriptor_mean = np.asarray(data["descriptor_mean"], dtype=np.float32)
 
     # Restore PCA projection if saved
     if "pca_components" in data:
@@ -155,16 +170,16 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
     type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}
 
     model = TNEP(cfg)
-    model.W0.assign(data["W0"])
-    model.b0.assign(data["b0"])
-    model.W1.assign(data["W1"])
-    model.b1.assign(data["b1"])
+    model.W0 = torch.tensor(np.asarray(data["W0"]), dtype=torch.float32, device=model.device)
+    model.b0 = torch.tensor(np.asarray(data["b0"]), dtype=torch.float32, device=model.device)
+    model.W1 = torch.tensor(np.asarray(data["W1"]), dtype=torch.float32, device=model.device)
+    model.b1 = torch.tensor(np.asarray(data["b1"]), dtype=torch.float32, device=model.device)
 
     if cfg.target_mode == 2:
-        model.W0_pol.assign(data["W0_pol"])
-        model.b0_pol.assign(data["b0_pol"])
-        model.W1_pol.assign(data["W1_pol"])
-        model.b1_pol.assign(data["b1_pol"])
+        model.W0_pol = torch.tensor(np.asarray(data["W0_pol"]), dtype=torch.float32, device=model.device)
+        model.b0_pol = torch.tensor(np.asarray(data["b0_pol"]), dtype=torch.float32, device=model.device)
+        model.W1_pol = torch.tensor(np.asarray(data["W1_pol"]), dtype=torch.float32, device=model.device)
+        model.b1_pol = torch.tensor(np.asarray(data["b1_pol"]), dtype=torch.float32, device=model.device)
 
     from ase.data import chemical_symbols
     type_str = ", ".join(f"{chemical_symbols[z]}(Z={z})→{idx}"

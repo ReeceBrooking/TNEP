@@ -29,7 +29,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 100000
+    num_generations: int = 10000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
@@ -89,7 +89,7 @@ class TNEPconfig:
     # (GPUMD default 1.0 — equal weighting; <1.0 downweights off-diagonal)
     lambda_shear: float = 1.0
 
-    activation: str = 'tanh'
+    # activation: str = 'tanh'  # unused — tanh is hardcoded in TNEP.predict_flat
     # Initial distribution standard deviation
     init_sigma: float = 0.1
     # Seed for randomisation
