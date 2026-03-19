@@ -288,3 +288,55 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
     plt.tight_layout()
     plot_name = f"correlation_{suffix}" if suffix else "correlation"
     _finish_fig(fig, cfg, plot_name, save_plots, show_plots)
+
+
+def plot_error_vs_magnitude(targets: np.ndarray, predictions: np.ndarray,
+                            cfg: TNEPconfig, save_plots: str | None = None,
+                            show_plots: bool = True, suffix: str | None = None) -> None:
+    """Plot per-structure absolute error vs target magnitude.
+
+    For vector targets (dipole/polarizability), uses the norm of the full vector.
+    Helps diagnose whether errors are proportional to target scale (capacity-limited)
+    or constant (accuracy floor from descriptors/data).
+
+    Args:
+        targets     : [S, T] numpy array of target values
+        predictions : [S, T] numpy array of predicted values
+        cfg         : TNEPconfig
+        save_plots  : str or None — directory to save into
+        show_plots  : bool — True to display interactively
+        suffix      : str or None — appended to filename
+    """
+    T = targets.shape[1]
+
+    if T == 1:
+        tgt_mag = np.abs(targets[:, 0])
+        abs_err = np.abs(targets[:, 0] - predictions[:, 0])
+    else:
+        tgt_mag = np.linalg.norm(targets, axis=1)
+        abs_err = np.linalg.norm(targets - predictions, axis=1)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+    ax.scatter(tgt_mag, abs_err, s=10, alpha=0.5)
+
+    # Fit a linear trend line for reference
+    if tgt_mag.max() > 0:
+        slope, intercept = np.polyfit(tgt_mag, abs_err, 1)
+        x_fit = np.linspace(0, tgt_mag.max(), 100)
+        ax.plot(x_fit, slope * x_fit + intercept, 'r--', linewidth=1.5,
+                label=f"fit: {slope:.4f}x + {intercept:.4f}")
+
+    ax.set_xlabel("Target magnitude")
+    ax.set_ylabel("Absolute error")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.legend()
+
+    mode_names = {0: "PES", 1: "Dipole", 2: "Polarizability"}
+    mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
+    label = f" ({suffix})" if suffix else ""
+    ax.set_title(f"{mode}{label} — Absolute error vs target magnitude")
+
+    plt.tight_layout()
+    plot_name = f"error_vs_mag_{suffix}" if suffix else "error_vs_mag"
+    _finish_fig(fig, cfg, plot_name, save_plots, show_plots)

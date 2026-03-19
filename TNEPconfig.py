@@ -23,7 +23,7 @@ class TNEPconfig:
     # Rigorous filtering: recompute targets with GPAW and filter by cosine similarity
     filter_rigorous: bool = False
     rigorous_threshold: float = 0.5
-    num_neurons: int = 15
+    num_neurons: int = 30
     # Number of structures used in each train step
     batch_size: int | None = None
     # Number of samples made in each train generation
@@ -35,7 +35,7 @@ class TNEPconfig:
 
     # SOAP Turbo descriptor parameters
     l_max: int = 4
-    alpha_max: int = 4
+    alpha_max: int = 6
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5
     basis: str = "poly3"
@@ -103,7 +103,7 @@ class TNEPconfig:
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)
     val_interval: int = 1
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
-    population_chunk_size: int | None = 20
+    population_chunk_size: int | None = 10
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
     batch_chunk_size: int | None = None
 
@@ -121,7 +121,7 @@ class TNEPconfig:
     # Negate predictions for structures detected as sign-flipped (cos_sim < -0.9)
     fix_sign_flips: bool = False
     # Scale input descriptors by their training-set statistics (per component)
-    scale_descriptors: bool = True
+    scale_descriptors: bool = False
     # Descriptor scaling method: "range" (GPUMD-style 1/(max-min)) or "mean" (mean(|x|)*sqrt(dim_q))
     descriptor_scale_mode: str = "range"
     # Floor for mean scaling: fraction of max component mean (None = no floor; ignored for range mode)

@@ -28,7 +28,8 @@ from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
                   assign_type_indices, prepare_eval_data, print_score_summary)
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
-                      plot_timing, plot_correlation, plot_loss_breakdown)
+                      plot_timing, plot_correlation, plot_loss_breakdown,
+                      plot_error_vs_magnitude)
 from model_io import save_model
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
                            compute_ir_spectrum, plot_ir_spectrum,
@@ -73,59 +74,8 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     cfg.dim_q = train_data["descriptors"][0].shape[-1]
     print("Dimension of q: " + str(cfg.dim_q))
 
-    # Memory check: estimate padded tensor sizes vs available RAM/VRAM
-    def _estimate_tensor_mb(data: dict) -> float:
-        total_bytes = 0
-        for key, val in data.items():
-            if isinstance(val, tf.Tensor):
-                total_bytes += val.dtype.size * int(tf.size(val))
-        return total_bytes / (1024 * 1024)
-
-    tensor_mb = max(_estimate_tensor_mb(train_data),
-                    _estimate_tensor_mb(test_data),
-                    _estimate_tensor_mb(val_data))
-
-    use_gpu = bool(tf.config.list_physical_devices('GPU'))
-    if use_gpu:
-        # Assume 12 GB VRAM (common GPU); adjust if your GPU differs
-        total_vram_mb = 12288
-        usage_pct = 100 * tensor_mb / total_vram_mb
-        print("\n=== Memory Check (GPU) ===")
-        print(f"  Largest padded tensor set: {tensor_mb:.1f} MB")
-        print(f"  Assumed VRAM:              {total_vram_mb:.0f} MB")
-        print(f"  Estimated usage:           {usage_pct:.1f}%")
-        if usage_pct > 90:
-            print(f"  WARNING: Tensor data alone uses >{usage_pct:.0f}% of VRAM! "
-                  f"Risk of OOM. Reduce batch_chunk_size or population_chunk_size.")
-        elif usage_pct > 70:
-            print(f"  WARNING: Tensor data uses {usage_pct:.0f}% of VRAM. "
-                  f"May run tight during training.")
-    else:
-        with open('/proc/meminfo', 'r') as f:
-            for line in f:
-                if line.startswith('MemTotal:'):
-                    total_ram_mb = int(line.split()[1]) / 1024
-                    break
-            else:
-                total_ram_mb = None
-        print("\n=== Memory Check (CPU-only — no GPU detected) ===")
-        print(f"  Largest padded tensor set: {tensor_mb:.1f} MB")
-        if total_ram_mb is not None:
-            usage_pct = 100 * tensor_mb / total_ram_mb
-            print(f"  Total system RAM:          {total_ram_mb:.0f} MB")
-            print(f"  Estimated usage:           {usage_pct:.1f}%")
-            if usage_pct > 70:
-                print(f"  WARNING: Tensor data uses {usage_pct:.0f}% of RAM! "
-                      f"Risk of OOM. Reduce dataset size or total_N.")
-            elif usage_pct > 50:
-                print(f"  WARNING: Tensor data uses {usage_pct:.0f}% of RAM. "
-                      f"May run tight during training.")
-        else:
-            print("  WARNING: Could not determine total system RAM.")
-
     model = TNEP(cfg)
-    print("Model Parameters: " + str(model.optimizer.dim))
-    print("Population Size: " + str(model.optimizer.pop_size))
+    print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
     print("Parameter Root: " + str(np.sqrt(model.optimizer.dim)))
 
@@ -142,8 +92,16 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
         plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
-        plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
-                         cfg.save_plots, cfg.show_plots)
+        if "total_rmse" in m:
+            na = test_data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
+            plot_correlation(test_data["targets"].numpy() * na, preds.numpy() * na,
+                             {"rmse": m["total_rmse"], "r2": m["total_r2"],
+                              "r2_components": m["total_r2_components"],
+                              **({k: m[k] for k in ("cos_sim_mean", "cos_sim_all") if k in m})},
+                             cfg, cfg.save_plots, cfg.show_plots, suffix="total_dipole")
+        else:
+            plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
+                             cfg.save_plots, cfg.show_plots)
 
     # Train
     history = model.fit(train_data, val_data,
@@ -209,23 +167,13 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
             pct = 100 * t / max(grand, 1e-9)
             print(f"  {p:15s}: {t:.3f}s total ({pct:5.1f}%) | {avg*1000:.1f}ms/gen")
 
-    # VRAM summary
-    vram = history.get("vram_mb", [])
-    if vram:
-        print("\n=== VRAM Usage ===")
-        print(f"  Peak: {max(vram):.1f} MB / 12288 MB ({100*max(vram)/12288:.1f}%)")
-        print(f"  Last: {vram[-1]:.1f} MB")
-
     # Plots
     plot_snes_history(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_log_val_fitness(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
-    plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg,
-                     cfg.save_plots, cfg.show_plots)
-
-    # Additional total-dipole correlation plot when target scaling is active
+    # Plot total (not per-atom) dipole correlations for test and val data
     if "total_rmse" in metrics:
         num_atoms = test_data["num_atoms"].numpy().astype(np.float32)
         scale = num_atoms[:, np.newaxis]
@@ -240,7 +188,39 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
             total_metrics["cos_sim_mean"] = metrics["cos_sim_mean"]
             total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
         plot_correlation(total_targets, total_preds, total_metrics, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix="total")
+                         cfg.save_plots, cfg.show_plots, suffix="total_dipole")
+        plot_error_vs_magnitude(total_targets, total_preds, cfg,
+                                cfg.save_plots, cfg.show_plots, suffix="total_dipole")
+    else:
+        plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg,
+                         cfg.save_plots, cfg.show_plots)
+        plot_error_vs_magnitude(test_data["targets"].numpy(), test_preds.numpy(), cfg,
+                                cfg.save_plots, cfg.show_plots)
+
+    # Validation set correlation plot
+    val_metrics, val_preds = model.score(val_data)
+    if "total_rmse" in val_metrics:
+        num_atoms_val = val_data["num_atoms"].numpy().astype(np.float32)
+        scale_val = num_atoms_val[:, np.newaxis]
+        val_total_targets = val_data["targets"].numpy() * scale_val
+        val_total_preds = val_preds.numpy() * scale_val
+        val_total_metrics = {
+            "rmse": val_metrics["total_rmse"],
+            "r2": val_metrics["total_r2"],
+            "r2_components": val_metrics["total_r2_components"],
+        }
+        if "cos_sim_all" in val_metrics:
+            val_total_metrics["cos_sim_mean"] = val_metrics["cos_sim_mean"]
+            val_total_metrics["cos_sim_all"] = val_metrics["cos_sim_all"]
+        plot_correlation(val_total_targets, val_total_preds, val_total_metrics, cfg,
+                         cfg.save_plots, cfg.show_plots, suffix="total_dipole_val")
+        plot_error_vs_magnitude(val_total_targets, val_total_preds, cfg,
+                                cfg.save_plots, cfg.show_plots, suffix="total_dipole_val")
+    else:
+        plot_correlation(val_data["targets"].numpy(), val_preds.numpy(), val_metrics, cfg,
+                         cfg.save_plots, cfg.show_plots, suffix="val")
+        plot_error_vs_magnitude(val_data["targets"].numpy(), val_preds.numpy(), cfg,
+                                cfg.save_plots, cfg.show_plots, suffix="val")
 
     print("Run complete!")
     return model, cfg
