@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(grep:*)",
+      "Bash(MSYS_NO_PATHCONV=1 wsl:*)",
+      "Bash(wsl ls:*)",
+      "WebSearch",
+      "mcp__plugin_claude-mem_mcp-search__search",
+      "mcp__plugin_claude-mem_mcp-search__get_observations",
+      "WebFetch(domain:doi.org)",
+      "WebFetch(domain:pubs.acs.org)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(wsl.exe bash:)",
+      "Bash(wsl.exe bash:*)",
+      "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
+      "Bash(cd:*)",
+      "Bash(ls:*)",
+      "Bash(python:*)",
+      "Bash(echo:*)",
+      "mcp__plugin_claude-mem_mcp-search__save_memory",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:libatoms.github.io)",
+      "WebFetch(domain:turbogap.fi)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Read(//mnt/c/Users/griff/PycharmProjects/**)",
+      "Bash(python3 -c \":*)",
+      "WebFetch(domain:pytorch-geometric.readthedocs.io)",
+      "WebFetch(domain:docs.pytorch.org)",
+      "WebFetch(domain:discuss.pytorch.org)",
+      "WebFetch(domain:docs.evotorch.ai)"
+    ]
+  }
+}

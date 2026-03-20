@@ -245,10 +245,13 @@ class TNEP(layers.Layer):
             plot_callback : optional callable(history, gen) for periodic plotting
 
         Returns:
-            history : dict with keys generation, train_loss, val_loss (lists)
+            history         : dict with keys generation, train_loss, val_loss (lists)
+            final_model     : TNEP model with weights from the last generation
+            best_val_model  : TNEP model with weights from the best validation generation
         """
-        history = self.optimizer.fit(train_data, val_data, plot_callback=plot_callback)
-        return history
+        history, final_model, best_val_model = self.optimizer.fit(
+            train_data, val_data, plot_callback=plot_callback)
+        return history, final_model, best_val_model
 
     def score(self, test_data: dict[str, tf.Tensor]) -> tuple[dict[str, tf.Tensor], tf.Tensor]:
         """Evaluate RMSE, R², per-component R², and cosine similarity.

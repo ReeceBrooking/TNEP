@@ -628,13 +628,24 @@ class SNES:
                     _set_model_params(self.model, *params)
 
         print()  # newline after progress bar
-        # Always restore best parameters into model for downstream score() calls
+
+        # Build final-gen model (current mu, before restoring best)
+        from TNEP import TNEP
+        final_model = TNEP(self.cfg)
+        final_params = self.reconstruct_params_tf(self.mu)
+        _set_model_params(final_model, *final_params)
+
+        # Build best-val model
+        best_val_model = TNEP(self.cfg)
+        best_val_params = self.reconstruct_params_tf(best_mu)
+        _set_model_params(best_val_model, *best_val_params)
+
+        # Restore best into self.model for backward compatibility
         self.mu.assign(best_mu)
         self.sigma.assign(best_sigma)
-        params = self.reconstruct_params_tf(self.mu)
-        _set_model_params(self.model, *params)
+        _set_model_params(self.model, *best_val_params)
 
-        return history
+        return history, final_model, best_val_model
 
     def validate(self, val_data: dict[str, tf.Tensor], mu_tf: tf.Tensor | None = None) -> float:
         """Compute mean RMSE on a subset of validation structures using batched predict.

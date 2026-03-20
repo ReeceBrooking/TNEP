@@ -29,13 +29,13 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 15000
+    num_generations: int = 40000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
     # SOAP Turbo descriptor parameters
     l_max: int = 4
-    alpha_max: int = 6
+    alpha_max: int = 4
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5
     basis: str = "poly3"
@@ -102,7 +102,9 @@ class TNEPconfig:
     val_size: int | None = None
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)
     val_interval: int = 1
-    # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage)
+    # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage).
+    # Peak VRAM ≈ C × total_edges × dim_q × 4 bytes (the de_dq_edge tensor).
+    # Reduce this if hitting OOM. E.g. with 200k edges, Q=100: C=10→800MB, C=5→400MB.
     population_chunk_size: int | None = 10
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
     batch_chunk_size: int | None = None
@@ -110,20 +112,20 @@ class TNEPconfig:
     # Periodic plotting interval (None = disabled; int = plot every N generations)
     plot_interval: int | None = 10000
 
-    # Save model after training (None = disabled; "auto" = auto-generate name; str = explicit path)
+    # Save model after training (None = disabled; "auto" = auto-generate run directory)
     save_path: str | None = "models/auto"
-    # Save final plots to directory (None = disabled; str = directory path)
-    save_plots: str | None = "plots"
+    # Save plots (None = disabled; set automatically by setup_run_directory)
+    save_plots: str | None = None
     # Show plots interactively (True = plt.show(), False = close after saving)
-    show_plots: bool = True
+    show_plots: bool = False
     # Show extra info in progress bar (L1, L2 regularisation)
     debug: bool = False
     # Negate predictions for structures detected as sign-flipped (cos_sim < -0.9)
     fix_sign_flips: bool = False
     # Scale input descriptors by their training-set statistics (per component)
-    scale_descriptors: bool = False
+    scale_descriptors: bool = True
     # Descriptor scaling method: "range" (GPUMD-style 1/(max-min)) or "mean" (mean(|x|)*sqrt(dim_q))
-    descriptor_scale_mode: str = "range"
+    descriptor_scale_mode: str = "mean"
     # Floor for mean scaling: fraction of max component mean (None = no floor; ignored for range mode)
     descriptor_scale_floor: float | None = 0.001
     # Scale dipole targets by atom count (per-atom dipole training)

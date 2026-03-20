@@ -30,7 +30,7 @@ from data import (collect, split, pad_and_stack,
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
                       plot_timing, plot_correlation, plot_loss_breakdown,
                       plot_error_vs_magnitude)
-from model_io import save_model
+from model_io import save_model, setup_run_directory
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
                            compute_ir_spectrum, plot_ir_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
@@ -74,6 +74,10 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
     cfg.dim_q = train_data["descriptors"][0].shape[-1]
     print("Dimension of q: " + str(cfg.dim_q))
 
+    # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/
+    if cfg.save_path is not None:
+        setup_run_directory(cfg)
+
     model = TNEP(cfg)
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
@@ -98,22 +102,37 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
                              {"rmse": m["total_rmse"], "r2": m["total_r2"],
                               "r2_components": m["total_r2_components"],
                               **({k: m[k] for k in ("cos_sim_mean", "cos_sim_all") if k in m})},
-                             cfg, cfg.save_plots, cfg.show_plots, suffix="total_dipole")
+                             cfg, cfg.save_plots, cfg.show_plots, suffix=f"total_dipole_gen{gen}")
         else:
             plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
-                             cfg.save_plots, cfg.show_plots)
+                             cfg.save_plots, cfg.show_plots, suffix=f"gen{gen}")
 
     # Train
-    history = model.fit(train_data, val_data,
-                        plot_callback=periodic_plot_callback if cfg.plot_interval else None)
+    history, final_model, best_val_model = model.fit(
+        train_data, val_data,
+        plot_callback=periodic_plot_callback if cfg.plot_interval else None)
 
-    # Test
-    metrics, test_preds = model.score(test_data)
-    print_score_summary(metrics, cfg, prefix="Model test set")
+    # Score final-generation model
+    final_metrics, final_preds = final_model.score(test_data)
+    print_score_summary(final_metrics, cfg, prefix="Final-gen test set")
+    if "total_rmse" in final_metrics:
+        na = test_data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
+        plot_correlation(test_data["targets"].numpy() * na, final_preds.numpy() * na,
+                         {"rmse": final_metrics["total_rmse"], "r2": final_metrics["total_r2"],
+                          "r2_components": final_metrics["total_r2_components"],
+                          **({k: final_metrics[k] for k in ("cos_sim_mean", "cos_sim_all") if k in final_metrics})},
+                         cfg, cfg.save_plots, cfg.show_plots, suffix="total_dipole_final_gen")
+    else:
+        plot_correlation(test_data["targets"].numpy(), final_preds.numpy(), final_metrics, cfg,
+                         cfg.save_plots, cfg.show_plots, suffix="final_gen")
+
+    # Score best-val model
+    metrics, test_preds = best_val_model.score(test_data)
+    print_score_summary(metrics, cfg, prefix="Best-val test set")
 
     # Debug sign-flipped dipole predictions
     if cfg.target_mode == 1:
-        diag = diagnose_sign_flips(model, test_data)
+        diag = diagnose_sign_flips(best_val_model, test_data)
         if cfg.test_data_path is not None:
             test_structures = read(cfg.test_data_path, index=":")
             if cfg.allowed_species:
@@ -152,7 +171,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
 
     # Save model
     if cfg.save_path is not None:
-        save_model(model, cfg, cfg.save_path)
+        save_model(best_val_model, cfg, cfg.save_path)
 
     # Timing summary
     timing = history.get("timing", {})
@@ -198,7 +217,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
                                 cfg.save_plots, cfg.show_plots)
 
     # Validation set correlation plot
-    val_metrics, val_preds = model.score(val_data)
+    val_metrics, val_preds = best_val_model.score(val_data)
     if "total_rmse" in val_metrics:
         num_atoms_val = val_data["num_atoms"].numpy().astype(np.float32)
         scale_val = num_atoms_val[:, np.newaxis]
@@ -223,7 +242,7 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
                                 cfg.save_plots, cfg.show_plots, suffix="val")
 
     print("Run complete!")
-    return model, cfg
+    return best_val_model, cfg
 
 
 def test_model(

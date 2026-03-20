@@ -282,7 +282,23 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
 
     mode_names = {0: "PES", 1: "Dipole", 2: "Polarizability"}
     mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
-    label = f" ({suffix})" if suffix else ""
+    # Build a readable label from the suffix
+    if suffix:
+        label_parts = []
+        if "total" in suffix:
+            label_parts.append("Total")
+        if "val" in suffix:
+            label_parts.append("Validation")
+        elif "test" in suffix:
+            label_parts.append("Test")
+        # Extract generation number if present
+        import re
+        gen_match = re.search(r'gen(\d+)', suffix)
+        if gen_match:
+            label_parts.append(f"Gen {gen_match.group(1)}")
+        label = f" ({' '.join(label_parts)})" if label_parts else f" ({suffix})"
+    else:
+        label = ""
     fig.suptitle(f"{mode}{label} — RMSE: {rmse:.4f}, RRMSE: {rrmse:.4f}, R²: {r2:.4f}",
                  fontsize=14)
     plt.tight_layout()

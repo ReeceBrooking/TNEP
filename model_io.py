@@ -7,6 +7,57 @@ from TNEPconfig import TNEPconfig
 from TNEP import TNEP
 
 
+def setup_run_directory(cfg: TNEPconfig) -> str:
+    """Create a run directory under models/ and configure cfg paths.
+
+    Directory structure:
+        models/
+            n{neurons}_q{dim_q}_pop{pop_size}_{YYYYMMDD_HHMMSS}/
+                plots/
+                config.txt
+                (model .npz saved here after training)
+
+    Requires cfg.dim_q to be set (call after descriptor building).
+    Updates cfg.save_path and cfg.save_plots in place.
+
+    Returns:
+        run_dir : str — path to the created run directory
+    """
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pop = cfg.pop_size if cfg.pop_size is not None else "auto"
+    dir_name = f"n{cfg.num_neurons}_q{cfg.dim_q}_pop{pop}_{timestamp}"
+    run_dir = os.path.join("models", dir_name)
+    plots_dir = os.path.join(run_dir, "plots")
+
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Write config as human-readable text
+    config_path = os.path.join(run_dir, "config.txt")
+    with open(config_path, "w") as f:
+        f.write(f"# TNEPconfig — {timestamp}\n")
+        f.write(f"# Run directory: {run_dir}\n\n")
+        for k in sorted(vars(TNEPconfig)):
+            if k.startswith('_'):
+                continue
+            default = getattr(TNEPconfig, k, None)
+            if callable(default):
+                continue
+            actual = getattr(cfg, k, default)
+            if isinstance(actual, np.ndarray):
+                f.write(f"{k} = ndarray shape={actual.shape} dtype={actual.dtype}\n")
+            else:
+                f.write(f"{k} = {actual!r}\n")
+
+    # Update cfg so save_model and plotting use this directory
+    cfg.save_path = os.path.join(run_dir, "auto")
+    cfg.save_plots = plots_dir
+
+    print(f"Run directory: {run_dir}")
+    return run_dir
+
+
 def _z_to_symbol(z: int) -> str:
     """Convert atomic number to element symbol."""
     from ase.data import chemical_symbols
