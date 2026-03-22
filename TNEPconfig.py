@@ -23,18 +23,18 @@ class TNEPconfig:
     # Rigorous filtering: recompute targets with GPAW and filter by cosine similarity
     filter_rigorous: bool = False
     rigorous_threshold: float = 0.5
-    num_neurons: int = 30
+    num_neurons: int = 15
     # Number of structures used in each train step
     batch_size: int | None = None
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 40000
+    num_generations: int = 60000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
     # SOAP Turbo descriptor parameters
-    l_max: int = 4
+    l_max: int = 6
     alpha_max: int = 4
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5
@@ -56,8 +56,8 @@ class TNEPconfig:
 
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
-    lambda_1: float | None = 0.001
-    lambda_2: float | None = 0.001
+    lambda_1: float | None = 0.005
+    lambda_2: float | None = 0.005
     # Per-type regularization and ranking (GPUMD NEP4 style)
     # Each type's params are regularized separately, creating per-type fitness
     # rankings that drive per-type natural gradient updates.
@@ -123,7 +123,7 @@ class TNEPconfig:
     # Negate predictions for structures detected as sign-flipped (cos_sim < -0.9)
     fix_sign_flips: bool = False
     # Scale input descriptors by their training-set statistics (per component)
-    scale_descriptors: bool = True
+    scale_descriptors: bool = False
     # Descriptor scaling method: "range" (GPUMD-style 1/(max-min)) or "mean" (mean(|x|)*sqrt(dim_q))
     descriptor_scale_mode: str = "mean"
     # Floor for mean scaling: fraction of max component mean (None = no floor; ignored for range mode)

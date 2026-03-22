@@ -78,7 +78,8 @@ def _generate_model_filename(cfg: TNEPconfig) -> str:
     return f"{dataset_name}_{elements}_{mode}.npz"
 
 
-def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None) -> None:
+def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
+               label: str | None = None) -> None:
     """Save trained TNEP model weights and config to a .npz file.
 
     Saves all config attributes as a JSON string for full reproducibility.
@@ -91,11 +92,16 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None) -> None:
         model : trained TNEP model
         cfg   : TNEPconfig used for training
         path  : str or None — output file path. If None, auto-generates.
+        label : optional suffix inserted before .npz (e.g. "best_val", "final_gen")
     """
     if path is None or path.endswith("auto"):
         directory = os.path.dirname(path) if path and os.path.dirname(path) else "."
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, _generate_model_filename(cfg))
+
+    if label:
+        base, ext = os.path.splitext(path)
+        path = f"{base}_{label}{ext}"
 
     # Build Z -> type index mapping: {atomic_number: layer_index}
     z_to_type_index = np.array(

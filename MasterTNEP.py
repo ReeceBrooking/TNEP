@@ -169,9 +169,10 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
             print(f"  RMSE:          {rmse:.4f}")
             print(f"  Mean cos_sim:  {cos_sim.mean():.4f}")
 
-    # Save model
+    # Save models
     if cfg.save_path is not None:
-        save_model(best_val_model, cfg, cfg.save_path)
+        save_model(best_val_model, cfg, cfg.save_path, label="best_val")
+        save_model(final_model, cfg, cfg.save_path, label="final_gen")
 
     # Timing summary
     timing = history.get("timing", {})
