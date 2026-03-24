@@ -37,6 +37,7 @@ from spectroscopy import (predict_dipole_trajectory, predict_polarizability_traj
 from debug_signs import (diagnose_sign_flips, correct_sign_flips, check_cells,
                          characterize_flipped, test_target_negation)
 from ase.io import read
+from tqdm import tqdm
 
 
 def train_model(cfg: TNEPconfig | None = None) -> TNEP:
@@ -305,6 +306,7 @@ def process_trajectory(
     dt_fs: float = 1.0,
     save_plots: str | None = None,
     show_plots: bool = True,
+    batch_size: int | None = None,
 ) -> dict:
     """Predict properties along an MD trajectory and compute spectra.
 
@@ -318,6 +320,9 @@ def process_trajectory(
         dt_fs           : float — MD timestep in femtoseconds
         save_plots      : str or None — directory to save plot into (None = don't save)
         show_plots      : bool — True to display plot interactively (default True)
+        batch_size      : int or None — if set, process the trajectory in batches of
+                          this many frames to avoid computing all descriptors at once.
+                          If None, process the entire trajectory in one go.
 
     Returns:
         For mode 1 (dipole):
@@ -333,13 +338,35 @@ def process_trajectory(
     dataset_types_int = assign_type_indices(trajectory, cfg.types)
 
     if cfg.target_mode == 1:
-        dipoles = predict_dipole_trajectory(model, trajectory, dataset_types_int)
+        if batch_size is None:
+            dipoles = predict_dipole_trajectory(model, trajectory, dataset_types_int)
+        else:
+            n_frames = len(trajectory)
+            batches = []
+            starts = list(range(0, n_frames, batch_size))
+            for start in tqdm(starts, desc="Dipole batches", unit="batch"):
+                end = min(start + batch_size, n_frames)
+                batch_dipoles = predict_dipole_trajectory(
+                    model, trajectory[start:end], dataset_types_int[start:end])
+                batches.append(batch_dipoles)
+            dipoles = np.concatenate(batches, axis=0)
         freq_cm, intensity, acf = compute_ir_spectrum(dipoles, dt_fs=dt_fs)
         plot_ir_spectrum(freq_cm, intensity, cfg, save_plots, show_plots)
         return {"dipoles": dipoles, "freq_cm": freq_cm, "intensity": intensity, "acf": acf}
 
     elif cfg.target_mode == 2:
-        pols = predict_polarizability_trajectory(model, trajectory, dataset_types_int)
+        if batch_size is None:
+            pols = predict_polarizability_trajectory(model, trajectory, dataset_types_int)
+        else:
+            n_frames = len(trajectory)
+            batches = []
+            starts = list(range(0, n_frames, batch_size))
+            for start in tqdm(starts, desc="Polarizability batches", unit="batch"):
+                end = min(start + batch_size, n_frames)
+                batch_pols = predict_polarizability_trajectory(
+                    model, trajectory[start:end], dataset_types_int[start:end])
+                batches.append(batch_pols)
+            pols = np.concatenate(batches, axis=0)
         freq_cm, I_VV, I_VH, I_total, acf_iso, acf_aniso = compute_raman_spectrum(
             pols, dt_fs=dt_fs)
         plot_raman_spectrum(freq_cm, I_VV, I_VH, I_total, cfg, save_plots, show_plots)
@@ -355,5 +382,5 @@ def process_trajectory(
 if __name__ == '__main__':
     #model = train_model()
     model = load_model("models/train_C_O_H_dipole.npz")
-    dipoles = process_trajectory(model, "datasets/CHO_2.xyz")
+    dipoles = process_trajectory(model, "datasets/CHO_final.xyz", batch_size=1000)
     
