@@ -9,16 +9,16 @@ Usage:
     from data import prepare_eval_data
     from ase.io import read
 
-    model, cfg, type_map = load_model("test_model.npz")
+    model = load_model("test_model.npz")
     test_structures = read("train.xyz", index=":")
-    test_data = prepare_eval_data(test_structures, cfg)
+    test_data = prepare_eval_data(test_structures, model.cfg)
 
     diag = diagnose_sign_flips(model, test_data)
     check_cells(test_structures)
     if diag["flipped_idx"]:
         characterize_flipped(test_structures, diag["flipped_idx"], diag["good_idx"])
         test_target_negation(diag["preds"], diag["targets"], diag["flipped_idx"])
-    verify_gradient_sign(model, test_structures, cfg, structure_idx=0)
+    verify_gradient_sign(model, test_structures, structure_idx=0)
 """
 
 import numpy as np
@@ -27,7 +27,6 @@ from ase import Atoms
 from collections import Counter
 
 from TNEP import TNEP
-from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
 
 
@@ -227,7 +226,7 @@ def test_target_negation(preds: np.ndarray, targets: np.ndarray,
 
 
 def verify_gradient_sign(model: TNEP, test_structures: list[Atoms],
-                         cfg: TNEPconfig, structure_idx: int = 0,
+                         structure_idx: int = 0,
                          epsilon: float = 1e-4) -> None:
     """Test hypothesis 3: does quippy's gradient sign match finite differences?
 
@@ -235,9 +234,8 @@ def verify_gradient_sign(model: TNEP, test_structures: list[Atoms],
     the analytical gradient from quippy's grad_data.
 
     Args:
-        model          : trained TNEP model
+        model          : trained TNEP model (config accessed via model.cfg)
         test_structures: list of structures
-        cfg            : TNEPconfig
         structure_idx  : which structure to test
         epsilon        : finite difference step size
     """
@@ -246,7 +244,7 @@ def verify_gradient_sign(model: TNEP, test_structures: list[Atoms],
     print(f"  Epsilon: {epsilon}")
 
     structure = test_structures[structure_idx].copy()
-    builder = DescriptorBuilder(cfg)
+    builder = DescriptorBuilder(model.cfg)
 
     # Analytical gradients from quippy
     descs, grads, grad_idx = builder.build_descriptors([structure])

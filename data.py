@@ -42,8 +42,8 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
 
     # Filter by species if configured
     if cfg.allowed_species is not None:
-        dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species)
-        print("After species filter: " + str(len(dataset)) + " structures")
+        dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species, mode=cfg.filter_mode)
+        print("After species filter (" + cfg.filter_mode + "): " + str(len(dataset)) + " structures")
 
     # Recompute type list and indices after species filtering
     cfg.types = []
@@ -422,8 +422,12 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
             from ase.data import atomic_numbers
             allowed = set(atomic_numbers[z] if isinstance(z, str) else z
                           for z in cfg.allowed_species)
-            test_structures = [s for s in test_structures
-                               if set(s.numbers).issubset(allowed)]
+            if cfg.filter_mode == "exact":
+                test_structures = [s for s in test_structures
+                                   if set(s.numbers) == allowed]
+            else:
+                test_structures = [s for s in test_structures
+                                   if set(s.numbers).issubset(allowed)]
         test_dataset = test_structures
         test_types_int = assign_type_indices(test_dataset, cfg.types)
         print(f"External test set: {len(test_dataset)} structures from {cfg.test_data_path}")
@@ -650,14 +654,16 @@ def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tens
     return result
 
 
-def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray], allowed_Z: list[int | str]) -> tuple[list[Atoms], list[np.ndarray]]:
-    """Keep only structures whose atoms are all within allowed_Z.
+def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray], allowed_Z: list[int | str], mode: str = "subset") -> tuple[list[Atoms], list[np.ndarray]]:
+    """Keep only structures whose atoms satisfy the species filter.
 
     Args:
         dataset           : list of ase.Atoms
         dataset_types_int : list of ndarray — parallel to dataset
         allowed_Z         : list of int or str — allowed atomic numbers (e.g. [6, 1, 8])
                             or element symbols (e.g. ["C", "H", "O"])
+        mode              : "subset" = keep structures with only allowed species
+                            "exact"  = keep structures containing exactly all allowed species
 
     Returns:
         filtered_dataset, filtered_types_int : filtered parallel lists
@@ -667,7 +673,12 @@ def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray],
     filtered_dataset = []
     filtered_types_int = []
     for struct, types_int in zip(dataset, dataset_types_int):
-        if set(struct.numbers).issubset(allowed):
+        species = set(struct.numbers)
+        if mode == "exact":
+            keep = species == allowed
+        else:
+            keep = species.issubset(allowed)
+        if keep:
             filtered_dataset.append(struct)
             filtered_types_int.append(types_int)
     return filtered_dataset, filtered_types_int

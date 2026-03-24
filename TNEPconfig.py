@@ -16,6 +16,9 @@ class TNEPconfig:
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = ["C", "H", "O"]
+    # Species filter mode: "subset" = keep structures with only allowed species,
+    # "exact" = keep structures containing exactly all allowed species
+    filter_mode: str = "subset"
     # Bad data filtering options
     filter_nan_positions: bool = False
     filter_nan_targets: bool = False
@@ -34,7 +37,7 @@ class TNEPconfig:
     eta_sigma: float | None = None
 
     # SOAP Turbo descriptor parameters
-    l_max: int = 6
+    l_max: int = 4
     alpha_max: int = 4
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5
@@ -134,6 +137,7 @@ class TNEPconfig:
     dim_q: int
     num_types: int
     types: list[int] = []
+    type_map: dict = {}
     indices: np.ndarray
     descriptor_mean: np.ndarray | None = None
 

@@ -208,8 +208,8 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
             "pca_n_components": data["pca_n_components"],
         })
 
-    # Reconstruct Z -> type index mapping
-    type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}
+    # Reconstruct Z -> type index mapping and store in cfg
+    cfg.type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}
 
     model = TNEP(cfg)
     model.W0.assign(data["W0"])
@@ -225,12 +225,12 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
 
     from ase.data import chemical_symbols
     type_str = ", ".join(f"{chemical_symbols[z]}(Z={z})→{idx}"
-                         for z, idx in type_map.items())
+                         for z, idx in cfg.type_map.items())
     print(f"Model loaded from {path}")
     print(f"  target_mode={cfg.target_mode}, dim_q={cfg.dim_q}, "
           f"num_types={cfg.num_types}")
     print(f"  Type mapping: {type_str}")
-    return model, cfg, type_map
+    return model
 
 
 def convert_z_to_type_indices(z_array: np.ndarray, type_map: dict[int, int]) -> np.ndarray:

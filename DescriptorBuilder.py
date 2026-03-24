@@ -6,9 +6,7 @@ from tensorflow.keras import layers
 from TNEPconfig import TNEPconfig
 from quippy.descriptors import Descriptor
 
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from ase import Atoms
+from ase import Atoms
 
 class DescriptorBuilder(layers.Layer):
     """Builds SOAP-turbo descriptors and their gradients using quippy.
@@ -102,6 +100,12 @@ class DescriptorBuilder(layers.Layer):
         dataset_grad_index = []
 
         for structure in dataset:
+            structure = Atoms(
+                numbers=structure.numbers,
+                positions=structure.positions,
+                cell=structure.cell,
+                pbc=structure.pbc,
+            )
             outs = [b.calc(structure, grad=True) for b in self.builders]
 
             descriptors = [[] for _ in range(len(structure))]

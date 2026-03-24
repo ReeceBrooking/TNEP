@@ -30,7 +30,7 @@ from data import (collect, split, pad_and_stack,
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
                       plot_timing, plot_correlation, plot_loss_breakdown,
                       plot_error_vs_magnitude)
-from model_io import save_model, setup_run_directory
+from model_io import save_model, setup_run_directory, load_model
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
                            compute_ir_spectrum, plot_ir_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
@@ -39,21 +39,21 @@ from debug_signs import (diagnose_sign_flips, correct_sign_flips, check_cells,
 from ase.io import read
 
 
-def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
+def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     """Run full TNEP training pipeline: load, split, train, test, plot, save.
 
     Args:
         cfg : TNEPconfig or None (uses defaults)
 
     Returns:
-        model  : trained TNEP model
-        cfg    : TNEPconfig (potentially modified with dim_q, types, etc.)
+        model  : trained TNEP model (access config via model.cfg)
     """
     if cfg is None:
         cfg = TNEPconfig()
 
     # Load dataset, filter by species, then filter bad data
     dataset, dataset_types_int = collect(cfg)
+    cfg.type_map = {z: idx for idx, z in enumerate(cfg.types)}
 
     if cfg.target_mode == 1:
         print_dipole_statistics(dataset)
@@ -243,12 +243,11 @@ def train_model(cfg: TNEPconfig | None = None) -> tuple[TNEP, TNEPconfig]:
                                 cfg.save_plots, cfg.show_plots, suffix="val")
 
     print("Run complete!")
-    return best_val_model, cfg
+    return best_val_model
 
 
 def test_model(
     model: TNEP,
-    cfg: TNEPconfig,
     data_path: str,
     save_plots: str | None = None,
     show_plots: bool = True,
@@ -258,8 +257,7 @@ def test_model(
     Loads structures from data_path, builds descriptors, and scores.
 
     Args:
-        model      : trained TNEP model
-        cfg        : TNEPconfig from training (carries types, descriptor params)
+        model      : trained TNEP model (config accessed via model.cfg)
         data_path  : str — path to .xyz file with test structures
         save_plots : str or None — directory to save plot into (None = don't save)
         show_plots : bool — True to display plot interactively (default True)
@@ -268,6 +266,7 @@ def test_model(
         metrics    : dict with rmse, r2, r2_components, etc.
         predictions : [S, T] tensor of predictions
     """
+    cfg = model.cfg
     dataset = read(data_path, index=":")
     print(f"Loaded {len(dataset)} structures from {data_path}")
 
@@ -302,7 +301,6 @@ def test_model(
 
 def process_trajectory(
     model: TNEP,
-    cfg: TNEPconfig,
     trajectory_path: str,
     dt_fs: float = 1.0,
     save_plots: str | None = None,
@@ -315,8 +313,7 @@ def process_trajectory(
     computes Raman spectrum.
 
     Args:
-        model           : trained TNEP model
-        cfg             : TNEPconfig from training
+        model           : trained TNEP model (config accessed via model.cfg)
         trajectory_path : str — path to .xyz trajectory file
         dt_fs           : float — MD timestep in femtoseconds
         save_plots      : str or None — directory to save plot into (None = don't save)
@@ -329,19 +326,20 @@ def process_trajectory(
             dict with keys: polarizabilities, freq_cm, I_VV, I_VH, I_total,
                             acf_iso, acf_aniso
     """
+    cfg = model.cfg
     trajectory = read(trajectory_path, index=":")
     print(f"Loaded {len(trajectory)} frames from {trajectory_path}")
 
     dataset_types_int = assign_type_indices(trajectory, cfg.types)
 
     if cfg.target_mode == 1:
-        dipoles = predict_dipole_trajectory(model, trajectory, dataset_types_int, cfg)
+        dipoles = predict_dipole_trajectory(model, trajectory, dataset_types_int)
         freq_cm, intensity, acf = compute_ir_spectrum(dipoles, dt_fs=dt_fs)
         plot_ir_spectrum(freq_cm, intensity, cfg, save_plots, show_plots)
         return {"dipoles": dipoles, "freq_cm": freq_cm, "intensity": intensity, "acf": acf}
 
     elif cfg.target_mode == 2:
-        pols = predict_polarizability_trajectory(model, trajectory, dataset_types_int, cfg)
+        pols = predict_polarizability_trajectory(model, trajectory, dataset_types_int)
         freq_cm, I_VV, I_VH, I_total, acf_iso, acf_aniso = compute_raman_spectrum(
             pols, dt_fs=dt_fs)
         plot_raman_spectrum(freq_cm, I_VV, I_VH, I_total, cfg, save_plots, show_plots)
@@ -355,4 +353,7 @@ def process_trajectory(
 
 
 if __name__ == '__main__':
-    model, cfg = train_model()
+    #model = train_model()
+    model = load_model("models/train_C_O_H_dipole.npz")
+    dipoles = process_trajectory(model, "datasets/CHO_2.xyz")
+    

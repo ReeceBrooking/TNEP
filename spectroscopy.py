@@ -80,10 +80,11 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     """Compute IR absorption spectrum from a dipole moment trajectory.
 
     Follows Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284:
-        1. Compute dipole autocorrelation function C(τ) = <μ(0)·μ(τ)>
-        2. Apply optional window function to reduce spectral leakage
-        3. Fourier transform: M(ω) = FT[C(τ)]
-        4. IR absorption: σ(ω) ∝ ω · M(ω)  (classical approximation, Eq. 8)
+        1. Subtract mean dipole to remove DC component
+        2. Compute dipole autocorrelation function C(τ) = <μ(0)·μ(τ)>
+        3. Apply optional window function to reduce spectral leakage
+        4. Fourier transform: M(ω) = FT[C(τ)]
+        5. IR absorption: σ(ω) ∝ ω² · M(ω)  (Eq. 1)
 
     Args:
         dipoles      : [T, 3] ndarray — dipole trajectory (e/Å or Debye, one per frame)
@@ -96,6 +97,8 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
         intensity : [N] ndarray — IR absorption intensity (arb. units)
         acf : [T] ndarray — dipole autocorrelation function
     """
+    # Subtract mean to remove DC component before computing ACF
+    dipoles = dipoles - dipoles.mean(axis=0)
     acf = compute_dipole_acf(dipoles)
     T = len(acf)
 
@@ -119,8 +122,8 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     c_cm_per_fs = 2.99792458e-5  # speed of light in cm/fs
     freq_cm = freq_per_fs / c_cm_per_fs  # convert to cm⁻¹
 
-    # IR absorption: σ(ω) ∝ ω · M(ω)  (classical, Eq. 8 simplified)
-    intensity = freq_cm * M_omega
+    # IR absorption: σ(ω) ∝ ω² · M(ω)  (Xu et al. JCTC 2024, Eq. 1)
+    intensity = freq_cm**2 * M_omega
 
     # Truncate to requested frequency range
     mask = freq_cm <= max_freq_cm
@@ -160,20 +163,20 @@ def plot_ir_spectrum(freq_cm: np.ndarray, intensity: np.ndarray, cfg: TNEPconfig
     _finish_fig(fig, cfg, "ir_spectrum", save_plots, show_plots)
 
 
-def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> np.ndarray:
+def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray]) -> np.ndarray:
     """Predict dipole moments for each frame in an MD trajectory.
 
     Args:
-        model             : trained TNEP model (target_mode = 1)
+        model             : trained TNEP model (target_mode = 1, config via model.cfg)
         trajectory        : list of ase.Atoms — MD frames (ordered in time)
         dataset_types_int : list of [N_i] int arrays — type indices per frame
-        cfg               : TNEPconfig
 
     Returns:
         dipoles : [T, 3] ndarray — predicted dipole moment per frame
     """
-    builder = DescriptorBuilder(cfg)
+    builder = DescriptorBuilder(model.cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(trajectory)
+    actual_dim_q = descriptors[0].shape[-1]
 
     dipoles = []
     for s in range(len(trajectory)):
@@ -186,7 +189,7 @@ def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_type
         atom_mask = tf.ones([N], dtype=tf.float32)
 
         grad_padded, gidx_padded, nbr_mask = _pad_gradients_for_structure(
-            gradients[s], grad_index[s], N, cfg.dim_q)
+            gradients[s], grad_index[s], N, actual_dim_q)
 
         mu = model.predict(
             desc, tf.constant(grad_padded), tf.constant(gidx_padded),
@@ -196,20 +199,20 @@ def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_type
     return np.array(dipoles)
 
 
-def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> np.ndarray:
+def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray]) -> np.ndarray:
     """Predict polarizability tensors for each frame in an MD trajectory.
 
     Args:
-        model             : trained TNEP model (target_mode = 2)
+        model             : trained TNEP model (target_mode = 2, config via model.cfg)
         trajectory        : list of ase.Atoms — MD frames (ordered in time)
         dataset_types_int : list of [N_i] int arrays — type indices per frame
-        cfg               : TNEPconfig
 
     Returns:
         pols : [T, 6] ndarray — predicted polarizability [xx, yy, zz, xy, yz, zx] per frame
     """
-    builder = DescriptorBuilder(cfg)
+    builder = DescriptorBuilder(model.cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(trajectory)
+    actual_dim_q = descriptors[0].shape[-1]
 
     pols = []
     for s in range(len(trajectory)):
@@ -222,7 +225,7 @@ def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms], data
         atom_mask = tf.ones([N], dtype=tf.float32)
 
         grad_padded, gidx_padded, nbr_mask = _pad_gradients_for_structure(
-            gradients[s], grad_index[s], N, cfg.dim_q)
+            gradients[s], grad_index[s], N, actual_dim_q)
 
         pol = model.predict(
             desc, tf.constant(grad_padded), tf.constant(gidx_padded),
