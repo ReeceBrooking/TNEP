@@ -380,7 +380,7 @@ def process_trajectory(
 
 
 if __name__ == '__main__':
-    #model = train_model()
-    model = load_model("models/train_C_O_H_dipole.npz")
-    dipoles = process_trajectory(model, "datasets/CHO_final.xyz", batch_size=1000)
+    model = train_model()
+    #model = load_model("models/train_C_O_H_dipole.npz")
+    #dipoles = process_trajectory(model, "datasets/CHO_final.xyz", batch_size=250)
     

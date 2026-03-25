@@ -76,51 +76,67 @@ def compute_dipole_acf(dipoles: np.ndarray) -> np.ndarray:
     return acf
 
 
-def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | None = 'hann', max_freq_cm: float = 4000.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | None = 'hann',
+                         max_freq_cm: float = 4000.0, acf_ratio: float = 0.1,
+                         smooth_k: int = 10) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute IR absorption spectrum from a dipole moment trajectory.
 
-    Follows Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284:
+    Follows the reference GPUMD/NEP notebook (Dr. Nan Xu) and
+    Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284:
         1. Subtract mean dipole to remove DC component
         2. Compute dipole autocorrelation function C(τ) = <μ(0)·μ(τ)>
-        3. Apply optional window function to reduce spectral leakage
-        4. Fourier transform: M(ω) = FT[C(τ)]
-        5. IR absorption: σ(ω) ∝ ω² · M(ω)  (Eq. 1)
+        3. Truncate ACF to first acf_ratio of the trajectory (default 10%)
+        4. Apply Hann window and Kronecker doubling factor
+        5. Cosine transform to obtain line shape M(ω) (guaranteed non-negative)
+        6. IR absorption: σ(ω) ∝ ω² · M(ω)  (Eq. 1)
+        7. Smooth with a moving average of width smooth_k
 
     Args:
         dipoles      : [T, 3] ndarray — dipole trajectory (e/Å or Debye, one per frame)
         dt_fs        : float — timestep between frames in femtoseconds
         window       : str or None — window function ('hann', 'blackman', or None)
         max_freq_cm  : float — maximum frequency to return in cm⁻¹
+        acf_ratio    : float — fraction of trajectory to use as max ACF lag (default 0.1)
+        smooth_k     : int — moving-average smoothing width (default 10, 0 to disable)
 
     Returns:
         freq_cm : [N] ndarray — frequencies in cm⁻¹
         intensity : [N] ndarray — IR absorption intensity (arb. units)
-        acf : [T] ndarray — dipole autocorrelation function
+        acf : [Nmax] ndarray — dipole autocorrelation function
     """
     # Subtract mean to remove DC component before computing ACF
     dipoles = dipoles - dipoles.mean(axis=0)
-    acf = compute_dipole_acf(dipoles)
-    T = len(acf)
+    acf_full = compute_dipole_acf(dipoles)
+
+    # Truncate ACF — only the first acf_ratio fraction has good statistics
+    Nmax = len(acf_full) // int(1.0 / acf_ratio)
+    acf = acf_full[:Nmax]
+
+    # Kronecker doubling: one-sided ACF -> two-sided via factor of 2 (except lag 0)
+    kronecker = np.ones(Nmax) * 2.0
+    kronecker[0] = 1.0
 
     # Apply window to reduce spectral leakage
     if window == 'hann':
-        w = np.hanning(T)
+        w = (np.cos(np.pi * np.arange(Nmax) / Nmax) + 1.0) * 0.5
     elif window == 'blackman':
-        w = np.blackman(T)
+        w = np.blackman(Nmax)
     else:
-        w = np.ones(T)
-    acf_windowed = acf * w
+        w = np.ones(Nmax)
 
-    # Fourier transform of ACF -> line shape M(ω)
-    spectrum = np.fft.rfft(acf_windowed)
-    M_omega = np.real(spectrum)
+    acf_prepared = acf * w * kronecker
 
-    # Frequency axis: convert from 1/fs to cm⁻¹
-    # ν (1/fs) -> ω (cm⁻¹): multiply by 1e15 / (c * 100)
-    # where c = 2.998e8 m/s, so c_cm = 2.998e10 cm/s
-    freq_per_fs = np.fft.rfftfreq(T, d=dt_fs)  # in 1/fs
+    # Cosine transform (DCT) to obtain line shape — guaranteed real & non-negative
+    # M(k) = Σ_t acf(t) · cos(2πkt / (2Nmax-1))
+    t_idx = np.arange(Nmax)
+    M_omega = np.zeros(Nmax)
+    for k in range(Nmax):
+        M_omega[k] = np.sum(acf_prepared * np.cos(2.0 * np.pi * k * t_idx / (2 * Nmax - 1)))
+
+    # Frequency axis: convert from DCT index to cm⁻¹
+    # k-th bin corresponds to frequency k / ((2*Nmax-1) * dt_fs) in 1/fs
     c_cm_per_fs = 2.99792458e-5  # speed of light in cm/fs
-    freq_cm = freq_per_fs / c_cm_per_fs  # convert to cm⁻¹
+    freq_cm = np.arange(Nmax) / ((2 * Nmax - 1) * dt_fs * c_cm_per_fs)
 
     # IR absorption: σ(ω) ∝ ω² · M(ω)  (Xu et al. JCTC 2024, Eq. 1)
     intensity = freq_cm**2 * M_omega
@@ -129,6 +145,13 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     mask = freq_cm <= max_freq_cm
     freq_cm = freq_cm[mask]
     intensity = intensity[mask]
+
+    # Smooth with moving average
+    if smooth_k > 1 and len(intensity) > smooth_k:
+        kernel = np.ones(smooth_k) / smooth_k
+        smoothed = np.convolve(intensity, kernel, mode='valid')
+        freq_cm = freq_cm[:len(smoothed)]
+        intensity = smoothed
 
     # Normalise to peak = 1
     peak = np.max(np.abs(intensity))

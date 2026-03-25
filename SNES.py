@@ -96,6 +96,10 @@ class SNES:
                 f"stagnation_response must be 'interpolate', 'noise', or None, "
                 f"got {self.cfg.stagnation_response!r}")
 
+        # PES force/virial flags (set by TNEP.fit() before training starts)
+        self._has_forces = False
+        self._has_virial = False
+
         # Loss function flags (Python bools so tf.function traces correct branch)
         self._use_mae = (cfg.loss_type == "mae")
         self._use_inv_weight = (cfg.inverse_weight_eps is not None)
@@ -457,6 +461,10 @@ class SNES:
                 gather_keys = ["descriptors", "gradients", "grad_index",
                                "positions", "Z_int", "boxes", "targets",
                                "atom_mask", "neighbor_mask"]
+                if self._has_forces:
+                    gather_keys.append("forces")
+                if self._has_virial:
+                    gather_keys.append("virials")
                 if "types_contained" in train_data:
                     gather_keys.append("types_contained")
                 batch_data = {
@@ -666,11 +674,16 @@ class SNES:
             val_idx_tf = tf.argsort(
                 self.tf_rng.uniform(shape=[S_val]))[:self.cfg.val_size]
 
+            val_keys = ["descriptors", "gradients", "grad_index",
+                        "positions", "Z_int", "boxes", "targets",
+                        "atom_mask", "neighbor_mask"]
+            if self._has_forces:
+                val_keys.append("forces")
+            if self._has_virial:
+                val_keys.append("virials")
             batch_data = {
                 key: tf.gather(val_data[key], val_idx_tf)
-                for key in ["descriptors", "gradients", "grad_index",
-                            "positions", "Z_int", "boxes", "targets",
-                            "atom_mask", "neighbor_mask"]
+                for key in val_keys
             }
 
         if mu_tf is not None:
@@ -704,7 +717,43 @@ class SNES:
             diff_sq = tf.square(diff) * self._pol_weights
         else:
             diff_sq = tf.square(diff)
-        rmse = tf.sqrt(tf.reduce_mean(diff_sq))
+
+        if self.cfg.target_mode == 0 and (self._has_forces or self._has_virial):
+            # Combined PES loss: energy + weighted force/virial terms
+            energy_err = tf.reduce_sum(tf.square(diff), axis=1)          # [B]
+
+            E, forces_pair = self.model.pes_forward_with_forces(
+                batch_data["descriptors"], batch_data["gradients"],
+                batch_data["grad_index"], batch_data["positions"],
+                batch_data["Z_int"], batch_data["boxes"],
+                batch_data["atom_mask"], batch_data["neighbor_mask"],
+                W0, b0, W1, b1)
+
+            combined_err = energy_err
+            amask = batch_data["atom_mask"]
+
+            if self._has_forces:
+                F_pred = self.model.scatter_forces_to_atoms(
+                    forces_pair, batch_data["grad_index"], amask)
+                f_diff = F_pred - batch_data["forces"]
+                n_atoms = tf.reduce_sum(amask, axis=1)
+                f_err = tf.reduce_sum(
+                    tf.square(f_diff) * amask[:, :, tf.newaxis], axis=[1, 2])
+                f_err = f_err / tf.maximum(n_atoms * 3.0, 1.0)
+                combined_err = combined_err + self.cfg.force_weight * f_err
+
+            if self._has_virial:
+                V_pred = self.model.compute_virial_batch(
+                    forces_pair, batch_data["positions"], batch_data["boxes"],
+                    batch_data["grad_index"], batch_data["neighbor_mask"])
+                v_diff = V_pred - batch_data["virials"]
+                v_err = tf.reduce_sum(tf.square(v_diff), axis=1) / 6.0
+                combined_err = combined_err + self.cfg.virial_weight * v_err
+
+            rmse = tf.sqrt(tf.reduce_mean(combined_err))
+        else:
+            rmse = tf.sqrt(tf.reduce_mean(diff_sq))
+
         return float(rmse)
 
     def reconstruct_params(self, param_vector: np.ndarray) -> tuple:
@@ -907,6 +956,10 @@ class SNES:
         batch_keys = ["descriptors", "gradients", "grad_index",
                       "positions", "Z_int", "boxes", "targets",
                       "atom_mask", "neighbor_mask"]
+        if self._has_forces:
+            batch_keys.append("forces")
+        if self._has_virial:
+            batch_keys.append("virials")
 
         T = self.cfg.num_types
         T_dim_f = tf.cast(T_dim, tf.float32)
@@ -1044,6 +1097,64 @@ class SNES:
                     return tf.reduce_sum(tf.square(diff) * pol_weights, axis=1)  # [B]
 
             stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
+
+        elif self.cfg.target_mode == 0 and (self._has_forces or self._has_virial):
+            # PES mode with force and/or virial loss
+            W0, b0, W1, b1 = params
+            _fw = tf.constant(self.cfg.force_weight, dtype=tf.float32)
+            _vw = tf.constant(self.cfg.virial_weight, dtype=tf.float32)
+            _has_f = self._has_forces
+            _has_v = self._has_virial
+            if _has_f:
+                target_forces = batch_data["forces"]   # [B, A, 3]
+            if _has_v:
+                target_virials = batch_data["virials"]  # [B, 6]
+
+            def _forward_one_candidate(args):
+                w0, bb0, w1, bb1 = args
+                E, forces_pair = self.model.pes_forward_with_forces(
+                    desc, grads, gidx, pos, Z, boxes, amask, nmask,
+                    w0, bb0, w1, bb1, prescaled=True)
+
+                # Energy error
+                diff_E = E - targets                                     # [B, 1]
+                if _use_mae:
+                    err = tf.reduce_sum(tf.abs(diff_E), axis=1)          # [B]
+                else:
+                    err = tf.reduce_sum(tf.square(diff_E), axis=1)       # [B]
+
+                if _has_f:
+                    F_pred = self.model.scatter_forces_to_atoms(
+                        forces_pair, gidx, amask)                        # [B, A, 3]
+                    diff_F = F_pred - target_forces                      # [B, A, 3]
+                    # Per-structure force error, averaged per component
+                    n_atoms = tf.reduce_sum(amask, axis=1)               # [B]
+                    if _use_mae:
+                        f_err = tf.reduce_sum(
+                            tf.abs(diff_F) * amask[:, :, tf.newaxis],
+                            axis=[1, 2])                                 # [B]
+                        f_err = f_err / tf.maximum(n_atoms * 3.0, 1.0)
+                    else:
+                        f_err = tf.reduce_sum(
+                            tf.square(diff_F) * amask[:, :, tf.newaxis],
+                            axis=[1, 2])                                 # [B]
+                        f_err = f_err / tf.maximum(n_atoms * 3.0, 1.0)
+                    err = err + _fw * f_err
+
+                if _has_v:
+                    V_pred = self.model.compute_virial_batch(
+                        forces_pair, pos, boxes, gidx, nmask)            # [B, 6]
+                    diff_V = V_pred - target_virials                     # [B, 6]
+                    if _use_mae:
+                        v_err = tf.reduce_sum(tf.abs(diff_V), axis=1) / 6.0
+                    else:
+                        v_err = tf.reduce_sum(tf.square(diff_V), axis=1) / 6.0
+                    err = err + _vw * v_err
+
+                return err                                               # [B]
+
+            stacked = (W0, b0, W1, b1)
+
         else:
             W0, b0, W1, b1 = params
 

@@ -318,6 +318,37 @@ def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> Non
               f"std={cos_all.std():.4f}")
 
 
+def _get_forces(s: Atoms) -> np.ndarray | None:
+    """Get per-atom forces [N, 3] from an Atoms object, or None."""
+    for key in ("force", "forces"):
+        if key in s.arrays:
+            return np.asarray(s.arrays[key], dtype=np.float32)
+    if s.calc is not None and "forces" in s.calc.results:
+        return np.asarray(s.calc.results["forces"], dtype=np.float32)
+    return None
+
+
+def _get_virial(s: Atoms) -> np.ndarray | None:
+    """Get virial as 6-component Voigt [xx,yy,zz,xy,yz,zx] from Atoms, or None."""
+    if "virial" in s.info:
+        v = np.asarray(s.info["virial"], dtype=np.float32)
+        if v.shape == (3, 3):
+            return np.array([v[0, 0], v[1, 1], v[2, 2],
+                             v[0, 1], v[1, 2], v[2, 0]], dtype=np.float32)
+        elif v.shape == (9,):
+            v = v.reshape(3, 3)
+            return np.array([v[0, 0], v[1, 1], v[2, 2],
+                             v[0, 1], v[1, 2], v[2, 0]], dtype=np.float32)
+        elif v.shape == (6,):
+            return v
+    return None
+
+
+def _dataset_has_key(dataset: list[Atoms], getter) -> bool:
+    """Check whether ALL structures in dataset have a given property."""
+    return all(getter(s) is not None for s in dataset)
+
+
 def assemble_data_dict(
     dataset: list[Atoms],
     types_int: list[np.ndarray],
@@ -343,7 +374,7 @@ def assemble_data_dict(
     targets = [_extract_target(s, target_key) for s in dataset]
     if cfg.scale_targets and cfg.target_mode == 1:
         targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
-    return {
+    data = {
         "positions": [tf.convert_to_tensor(s.positions, dtype=tf.float32) for s in dataset],
         "Z_int": [tf.convert_to_tensor(t, dtype=tf.int32) for t in types_int],
         "targets": targets,
@@ -352,6 +383,19 @@ def assemble_data_dict(
         "gradients": gradients,
         "grad_index": grad_index,
     }
+
+    # Auto-detect and include force/virial targets for PES mode
+    if cfg.target_mode == 0:
+        if _dataset_has_key(dataset, _get_forces):
+            data["forces"] = [tf.convert_to_tensor(_get_forces(s), dtype=tf.float32)
+                              for s in dataset]
+            print(f"  PES mode: forces detected in dataset (weight={cfg.force_weight})")
+        if _dataset_has_key(dataset, _get_virial):
+            data["virials"] = [tf.convert_to_tensor(_get_virial(s), dtype=tf.float32)
+                               for s in dataset]
+            print(f"  PES mode: virials detected in dataset (weight={cfg.virial_weight})")
+
+    return data
 
 
 def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Tensor]:
@@ -597,6 +641,10 @@ def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tens
     else:
         target_dim = target_sample.shape[0]
 
+    # Detect optional force/virial targets (PES mode)
+    has_forces = "forces" in data
+    has_virials = "virials" in data
+
     # Pre-allocate numpy arrays (faster than list comprehension for padding)
     desc_np = np.zeros((S, max_atoms, dim_q), dtype=np.float32)
     grad_np = np.zeros((S, max_atoms, max_neighbors, 3, dim_q), dtype=np.float32)
@@ -608,6 +656,10 @@ def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tens
     atom_mask_np = np.zeros((S, max_atoms), dtype=np.float32)
     nbr_mask_np = np.zeros((S, max_atoms, max_neighbors), dtype=np.float32)
     num_atoms_np = np.array(atom_counts, dtype=np.int32)
+    if has_forces:
+        force_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
+    if has_virials:
+        virial_np = np.zeros((S, 6), dtype=np.float32)
 
     if num_types is not None:
         types_contained_np = np.zeros((S, num_types), dtype=np.float32)
@@ -631,6 +683,11 @@ def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tens
         else:
             tgt_np[s, :] = t.numpy()
 
+        if has_forces:
+            force_np[s, :N_s, :] = data["forces"][s].numpy()
+        if has_virials:
+            virial_np[s, :] = data["virials"][s].numpy()
+
         for i in range(N_s):
             n_nbrs = data["gradients"][s][i].shape[0]
             grad_np[s, i, :n_nbrs, :, :] = data["gradients"][s][i].numpy()
@@ -649,6 +706,10 @@ def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tens
         "neighbor_mask": tf.constant(nbr_mask_np),
         "num_atoms": tf.constant(num_atoms_np),
     }
+    if has_forces:
+        result["forces"] = tf.constant(force_np)
+    if has_virials:
+        result["virials"] = tf.constant(virial_np)
     if num_types is not None:
         result["types_contained"] = tf.constant(types_contained_np)
     return result
