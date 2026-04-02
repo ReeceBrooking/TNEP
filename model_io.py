@@ -118,6 +118,11 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             v = int(v)
         elif isinstance(v, np.floating):
             v = float(v)
+        elif isinstance(v, dict):
+            v = {(int(dk) if isinstance(dk, np.integer) else dk):
+                 (int(dv) if isinstance(dv, np.integer) else
+                  float(dv) if isinstance(dv, np.floating) else dv)
+                 for dk, dv in v.items()}
         elif isinstance(v, list):
             v = [int(x) if isinstance(x, np.integer) else
                  float(x) if isinstance(x, np.floating) else x

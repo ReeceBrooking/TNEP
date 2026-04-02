@@ -32,7 +32,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 60000
+    num_generations: int = 100
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
@@ -137,7 +137,7 @@ class TNEPconfig:
     # "e*angstrom" = no conversion needed (already in e·Å)
     # "e*bohr"     = convert from e·bohr to e·Å (multiply by 0.5292)
     # "debye"      = convert from Debye to e·Å  (multiply by 0.2082)
-    dipole_units: str = "e*angstrom"
+    dipole_units: str = "e*bohr"
 
     dim_q: int
     num_types: int
