@@ -205,9 +205,9 @@ def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_type
     for s in range(len(trajectory)):
         struct = trajectory[s]
         N = len(struct)
-        pos = tf.constant(struct.positions, dtype=tf.float32)
-        Z = tf.constant(dataset_types_int[s], dtype=tf.int32)
-        box = tf.constant(struct.cell.array, dtype=tf.float32)
+        pos = tf.convert_to_tensor(struct.positions, dtype=tf.float32)
+        Z = tf.convert_to_tensor(dataset_types_int[s], dtype=tf.int32)
+        box = tf.convert_to_tensor(struct.cell.array, dtype=tf.float32)
         desc = descriptors[s]
         atom_mask = tf.ones([N], dtype=tf.float32)
 
@@ -215,8 +215,8 @@ def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_type
             gradients[s], grad_index[s], N, actual_dim_q)
 
         mu = model.predict(
-            desc, tf.constant(grad_padded), tf.constant(gidx_padded),
-            pos, Z, box, atom_mask, tf.constant(nbr_mask, dtype=tf.float32))
+            desc, tf.convert_to_tensor(grad_padded), tf.convert_to_tensor(gidx_padded),
+            pos, Z, box, atom_mask, tf.convert_to_tensor(nbr_mask, dtype=tf.float32))
         dipoles.append(mu.numpy())
 
     return np.array(dipoles)
@@ -241,9 +241,9 @@ def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms], data
     for s in range(len(trajectory)):
         struct = trajectory[s]
         N = len(struct)
-        pos = tf.constant(struct.positions, dtype=tf.float32)
-        Z = tf.constant(dataset_types_int[s], dtype=tf.int32)
-        box = tf.constant(struct.cell.array, dtype=tf.float32)
+        pos = tf.convert_to_tensor(struct.positions, dtype=tf.float32)
+        Z = tf.convert_to_tensor(dataset_types_int[s], dtype=tf.int32)
+        box = tf.convert_to_tensor(struct.cell.array, dtype=tf.float32)
         desc = descriptors[s]
         atom_mask = tf.ones([N], dtype=tf.float32)
 
@@ -251,8 +251,8 @@ def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms], data
             gradients[s], grad_index[s], N, actual_dim_q)
 
         pol = model.predict(
-            desc, tf.constant(grad_padded), tf.constant(gidx_padded),
-            pos, Z, box, atom_mask, tf.constant(nbr_mask, dtype=tf.float32))
+            desc, tf.convert_to_tensor(grad_padded), tf.convert_to_tensor(gidx_padded),
+            pos, Z, box, atom_mask, tf.convert_to_tensor(nbr_mask, dtype=tf.float32))
         pols.append(pol.numpy())
 
     return np.array(pols)

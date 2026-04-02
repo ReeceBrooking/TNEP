@@ -8,6 +8,30 @@ from ase.io import read
 from ase import Atoms
 
 
+BOHR_TO_ANGSTROM = 0.529177210903
+DEBYE_TO_EANGSTROM = 0.20819434
+
+
+def _dipole_conversion_factor(dipole_units: str) -> float:
+    """Return the multiplicative factor to convert dipole_units → e·Å.
+
+    Args:
+        dipole_units : "e*angstrom", "e*bohr", or "debye"
+
+    Returns:
+        float — conversion factor (1.0 if already in e·Å)
+    """
+    if dipole_units == "e*angstrom":
+        return 1.0
+    elif dipole_units == "e*bohr":
+        return BOHR_TO_ANGSTROM
+    elif dipole_units == "debye":
+        return DEBYE_TO_EANGSTROM
+    else:
+        raise ValueError(f"Unknown dipole_units: {dipole_units!r} "
+                         f"(expected 'e*angstrom', 'e*bohr', or 'debye')")
+
+
 def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
     """Load all structures from train.xyz and assign integer type indices.
 
@@ -372,6 +396,10 @@ def assemble_data_dict(
     """
     target_key = _target_key_for_mode(cfg.target_mode)
     targets = [_extract_target(s, target_key) for s in dataset]
+    if cfg.target_mode == 1:
+        factor = _dipole_conversion_factor(cfg.dipole_units)
+        if factor != 1.0:
+            targets = [t * factor for t in targets]
     if cfg.scale_targets and cfg.target_mode == 1:
         targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
     data = {
@@ -745,16 +773,22 @@ def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray],
     return filtered_dataset, filtered_types_int
 
 
-def print_dipole_statistics(dataset: list[Atoms], target_key: str = "dipole") -> None:
+def print_dipole_statistics(dataset: list[Atoms], cfg: TNEPconfig,
+                            target_key: str = "dipole") -> None:
     """Print min/max/mean/std of dipole targets across the dataset.
 
     Args:
         dataset    : list of ase.Atoms with info[target_key] = [3] array
+        cfg        : TNEPconfig — used to check unit conversion flag
         target_key : str key in Atoms.info holding the dipole vector
     """
     dipoles = np.array([_extract_target(s, target_key).numpy() for s in dataset])
+    factor = _dipole_conversion_factor(cfg.dipole_units)
+    if factor != 1.0:
+        dipoles = dipoles * factor
+    unit = f"e\u00b7\u00c5 (from {cfg.dipole_units})" if factor != 1.0 else "e\u00b7\u00c5"
     norms = np.linalg.norm(dipoles, axis=1)
-    print("=== Dipole Target Statistics ===")
+    print(f"=== Dipole Target Statistics ({unit}) ===")
     print(f"  N structures: {len(dipoles)}")
     print(f"  Component ranges: x=[{dipoles[:,0].min():.4f}, {dipoles[:,0].max():.4f}]  "
           f"y=[{dipoles[:,1].min():.4f}, {dipoles[:,1].max():.4f}]  "

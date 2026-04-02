@@ -1,11 +1,26 @@
 from __future__ import annotations
 
+import re
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 
 from TNEPconfig import TNEPconfig
 from data import component_labels
+
+
+def unit_label(cfg: TNEPconfig) -> str:
+    """Return the unit string for the current target mode.
+
+    Dipole targets are always in e·Å after conversion in the data pipeline.
+
+    Args:
+        cfg : TNEPconfig
+
+    Returns:
+        str — "eV", "e·Å", or "ų"
+    """
+    return {0: "eV", 1: "e\u00b7\u00c5", 2: "\u00c5\u00b3"}.get(cfg.target_mode, "")
 
 
 def _make_plot_filename(cfg: TNEPconfig, plot_name: str) -> str:
@@ -76,8 +91,9 @@ def plot_snes_history(history: dict, cfg: TNEPconfig,
         plt.fill_between(g, history["best_rmse"], history["worst_rmse"],
                          alpha=0.2, label="Best\u2013Worst range")
 
-    plt.xlabel("generation")
-    plt.ylabel("fitness (lower is better)")
+    units = unit_label(cfg)
+    plt.xlabel("Generation")
+    plt.ylabel(f"Fitness RMSE ({units})")
     if logy:
         plt.yscale("log")
     plt.legend()
@@ -95,8 +111,9 @@ def plot_log_val_fitness(history: dict, cfg: TNEPconfig,
 
     fig = plt.figure()
     plt.plot(ln_g, ln_val, label="ln(Val RMSE)")
-    plt.xlabel("Ln(Generation)")
-    plt.ylabel("ln(Validation RMSE)")
+    units = unit_label(cfg)
+    plt.xlabel("ln(Generation)")
+    plt.ylabel(f"ln(Validation RMSE / {units})")
     plt.legend()
     plt.title("Log validation fitness vs generation")
     _finish_fig(fig, cfg, "log_val_fitness", save_plots, show_plots)
@@ -121,8 +138,8 @@ def plot_sigma_history(history: dict, cfg: TNEPconfig,
         plt.axvline(x=reset_gen, color="red", linestyle="--", alpha=0.7,
                     label="Sigma intervention" if reset_gen == history["sigma_resets"][0] else None)
 
-    plt.xlabel("generation")
-    plt.ylabel("sigma")
+    plt.xlabel("Generation")
+    plt.ylabel("\u03c3")
     plt.yscale("log")
     plt.legend()
     plt.title("SNES sigma evolution")
@@ -140,19 +157,22 @@ def plot_loss_breakdown(history: dict, cfg: TNEPconfig,
     l2 = np.maximum(np.asarray(history["L2"]), 0.0)
     total = train + l1 + l2
 
+    units = unit_label(cfg)
+
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(g, total, label="Total loss", color="#2c3e50", linewidth=1.5)
-    ax.plot(g, train, label="Train RMSE", color="#e74c3c", linewidth=1, alpha=0.8)
-    ax.plot(g, val, label="Val RMSE", color="#9b59b6", linewidth=1, alpha=0.8)
-    ax.plot(g, l1, label="L1", color="#3498db", linewidth=1, alpha=0.8)
-    ax.plot(g, l2, label="L2", color="#2ecc71", linewidth=1, alpha=0.8)
+    ax.plot(g, train, label=f"Train RMSE ({units})", color="#e74c3c", linewidth=1, alpha=0.8)
+    ax.plot(g, val, label=f"Val RMSE ({units})", color="#9b59b6", linewidth=1, alpha=0.8)
+    ax.plot(g, total, label="Total loss (RMSE + L1 + L2)", color="#2c3e50", linewidth=1.5,
+            linestyle="--")
+    ax.plot(g, l1, label="L1 (dimensionless)", color="#3498db", linewidth=1, alpha=0.8)
+    ax.plot(g, l2, label="L2 (dimensionless)", color="#2ecc71", linewidth=1, alpha=0.8)
 
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("Generation")
     ax.set_ylabel("Loss")
     ax.legend()
-    ax.set_title("Loss breakdown (train RMSE + L1 + L2)")
+    ax.set_title("Loss breakdown")
     plt.tight_layout()
     _finish_fig(fig, cfg, "loss_breakdown", save_plots, show_plots)
 
@@ -193,19 +213,50 @@ def plot_timing(history: dict, cfg: TNEPconfig,
     _finish_fig(fig, cfg, "timing", save_plots, show_plots)
 
 
+def _build_suptitle(cfg: TNEPconfig, suffix: str | None,
+                    rmse: float, rrmse: float, r2: float) -> str:
+    """Build a suptitle string with mode, suffix label, and metrics."""
+    mode_names = {0: "PES", 1: "Dipole", 2: "Polarizability"}
+    mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
+    if suffix:
+        label_parts = []
+        if "best" in suffix:
+            label_parts.append("Best Val")
+        elif "final" in suffix:
+            label_parts.append("Final Gen")
+        if "per_atom" in suffix:
+            label_parts.append("Per Atom")
+        elif "total" in suffix:
+            label_parts.append("Total")
+        # Detect validation set: "_val_" or trailing "_val" beyond "best_val"
+        stripped = suffix.replace("best_val", "", 1)
+        if "val" in stripped:
+            label_parts.append("Validation")
+        elif "test" in stripped:
+            label_parts.append("Test")
+        gen_match = re.search(r'gen(\d+)', suffix)
+        if gen_match:
+            label_parts.append(f"Gen {gen_match.group(1)}")
+        label = f" ({' '.join(label_parts)})" if label_parts else f" ({suffix})"
+    else:
+        label = ""
+    units = unit_label(cfg)
+    return f"{mode}{label} \u2014 RMSE: {rmse:.4f} {units}, RRMSE: {rrmse:.4f}, R\u00b2: {r2:.4f}"
+
+
 def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict,
                      cfg: TNEPconfig, save_plots: str | None = None,
                      show_plots: bool = True, suffix: str | None = None) -> None:
-    """Plot target vs prediction correlation with per-component R² and cosine similarity.
+    """Plot target vs prediction correlation with per-component R².
 
     For scalar targets (PES), plots a single correlation panel.
     For vector targets (dipole [3] or polarizability [6]), plots one correlation
-    panel per component plus a cosine similarity histogram.
+    panel per component.
 
     Args:
         targets     : [S, T] numpy array of target values
         predictions : [S, T] numpy array of predicted values
-        metrics     : dict from TNEP.score() with r2, rmse, r2_components, cos_sim_all
+        metrics     : dict from TNEP.score() with r2, rmse, r2_components
         cfg         : TNEPconfig — used to determine target mode and labels
         save_plots  : str or None — directory to save into
         show_plots  : bool — True to display interactively
@@ -225,13 +276,10 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
     rrmse = rmse / max(np.mean(np.abs(targets)), 1e-12)
 
     labels = component_labels(cfg.target_mode, T)
+    units = unit_label(cfg)
 
-    # Add extra column for cosine similarity histogram on vector targets
-    has_cos = cfg.target_mode >= 1 and "cos_sim_all" in metrics
     ncols = min(T, 3)
     nrows = (T + ncols - 1) // ncols
-    if has_cos:
-        nrows += 1  # extra row for cosine similarity
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), squeeze=False)
 
@@ -249,60 +297,54 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
         ax.plot([lo - margin, hi + margin], [lo - margin, hi + margin],
                 'k--', linewidth=1, label="x = y")
 
-        ax.set_xlabel(f"Target ({labels[i]})")
-        ax.set_ylabel(f"Prediction ({labels[i]})")
+        ax.set_xlabel(f"Target {labels[i]} ({units})")
+        ax.set_ylabel(f"Prediction {labels[i]} ({units})")
         ax.set_title(f"{labels[i]}  R²={r2_comp[i]:.4f}  RRMSE={rrmse_comp[i]:.4f}")
         ax.set_aspect('equal', adjustable='box')
         ax.legend(loc='upper left')
 
-    # Hide unused correlation subplots
-    cos_row_start = (T + ncols - 1) // ncols  # first row used by cosine sim
-    for i in range(T, cos_row_start * ncols):
+    # Hide unused subplots
+    total_slots = nrows * ncols
+    for i in range(T, total_slots):
         axes[i // ncols, i % ncols].set_visible(False)
 
-    # Cosine similarity histogram
-    if has_cos:
-        cos_all = metrics["cos_sim_all"].numpy()
-        cos_mean = float(metrics["cos_sim_mean"])
-
-        # Span all columns in the bottom row
-        for c in range(ncols):
-            axes[nrows - 1, c].set_visible(False)
-        ax_cos = fig.add_subplot(nrows, 1, nrows)
-
-        ax_cos.hist(cos_all, bins=50, edgecolor='black', alpha=0.7, color='#3498db')
-        ax_cos.axvline(cos_mean, color='red', linestyle='--', linewidth=1.5,
-                       label=f"Mean = {cos_mean:.4f}")
-        ax_cos.set_xlabel("Cosine similarity")
-        ax_cos.set_ylabel("Count")
-        ax_cos.set_xlim(-1.05, 1.05)
-        ax_cos.set_title(f"Cosine similarity distribution  "
-                         f"(mean={cos_mean:.4f}, std={cos_all.std():.4f})")
-        ax_cos.legend()
-
-    mode_names = {0: "PES", 1: "Dipole", 2: "Polarizability"}
-    mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
-    # Build a readable label from the suffix
-    if suffix:
-        label_parts = []
-        if "total" in suffix:
-            label_parts.append("Total")
-        if "val" in suffix:
-            label_parts.append("Validation")
-        elif "test" in suffix:
-            label_parts.append("Test")
-        # Extract generation number if present
-        import re
-        gen_match = re.search(r'gen(\d+)', suffix)
-        if gen_match:
-            label_parts.append(f"Gen {gen_match.group(1)}")
-        label = f" ({' '.join(label_parts)})" if label_parts else f" ({suffix})"
-    else:
-        label = ""
-    fig.suptitle(f"{mode}{label} — RMSE: {rmse:.4f}, RRMSE: {rrmse:.4f}, R²: {r2:.4f}",
-                 fontsize=14)
+    fig.suptitle(_build_suptitle(cfg, suffix, rmse, rrmse, r2), fontsize=14)
     plt.tight_layout()
     plot_name = f"correlation_{suffix}" if suffix else "correlation"
+    _finish_fig(fig, cfg, plot_name, save_plots, show_plots)
+
+
+def plot_cosine_similarity(metrics: dict, cfg: TNEPconfig,
+                           save_plots: str | None = None,
+                           show_plots: bool = True,
+                           suffix: str | None = None) -> None:
+    """Plot cosine similarity histogram for vector targets.
+
+    Args:
+        metrics    : dict from TNEP.score() with cos_sim_all, cos_sim_mean
+        cfg        : TNEPconfig
+        save_plots : str or None — directory to save into
+        show_plots : bool — True to display interactively
+        suffix     : str or None — appended to filename
+    """
+    if "cos_sim_all" not in metrics:
+        return
+
+    cos_all = metrics["cos_sim_all"].numpy()
+    cos_mean = float(metrics["cos_sim_mean"])
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.hist(cos_all, bins=50, edgecolor='black', alpha=0.7, color='#3498db')
+    ax.axvline(cos_mean, color='red', linestyle='--', linewidth=1.5,
+               label=f"Mean = {cos_mean:.4f}")
+    ax.set_xlabel("Cosine similarity")
+    ax.set_ylabel("Count")
+    ax.set_xlim(-1.05, 1.05)
+    ax.set_title(f"Cosine similarity distribution  "
+                 f"(mean={cos_mean:.4f}, std={cos_all.std():.4f})")
+    ax.legend()
+    plt.tight_layout()
+    plot_name = f"cosine_similarity_{suffix}" if suffix else "cosine_similarity"
     _finish_fig(fig, cfg, plot_name, save_plots, show_plots)
 
 
@@ -342,8 +384,9 @@ def plot_error_vs_magnitude(targets: np.ndarray, predictions: np.ndarray,
         ax.plot(x_fit, slope * x_fit + intercept, 'r--', linewidth=1.5,
                 label=f"fit: {slope:.4f}x + {intercept:.4f}")
 
-    ax.set_xlabel("Target magnitude")
-    ax.set_ylabel("Absolute error")
+    units = unit_label(cfg)
+    ax.set_xlabel(f"Target magnitude ({units})")
+    ax.set_ylabel(f"Absolute error ({units})")
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
     ax.legend()

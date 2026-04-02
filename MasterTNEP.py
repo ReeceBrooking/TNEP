@@ -28,8 +28,8 @@ from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
                   assign_type_indices, prepare_eval_data, print_score_summary)
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
-                      plot_timing, plot_correlation, plot_loss_breakdown,
-                      plot_error_vs_magnitude)
+                      plot_timing, plot_correlation, plot_cosine_similarity,
+                      plot_loss_breakdown, plot_error_vs_magnitude)
 from model_io import save_model, setup_run_directory, load_model
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
                            compute_ir_spectrum, plot_ir_spectrum,
@@ -57,7 +57,7 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     cfg.type_map = {z: idx for idx, z in enumerate(cfg.types)}
 
     if cfg.target_mode == 1:
-        print_dipole_statistics(dataset)
+        print_dipole_statistics(dataset, cfg)
     elif cfg.target_mode == 2:
         print_polarizability_statistics(dataset)
 
@@ -97,16 +97,21 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
         plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
         plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
+        plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
+                         cfg.save_plots, cfg.show_plots, suffix=f"per_atom_gen{gen}")
+        plot_cosine_similarity(m, cfg, cfg.save_plots, cfg.show_plots,
+                               suffix=f"per_atom_gen{gen}")
+        plot_error_vs_magnitude(test_data["targets"].numpy(), preds.numpy(), cfg,
+                                cfg.save_plots, cfg.show_plots, suffix=f"per_atom_gen{gen}")
         if "total_rmse" in m:
             na = test_data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
             plot_correlation(test_data["targets"].numpy() * na, preds.numpy() * na,
                              {"rmse": m["total_rmse"], "r2": m["total_r2"],
                               "r2_components": m["total_r2_components"],
                               **({k: m[k] for k in ("cos_sim_mean", "cos_sim_all") if k in m})},
-                             cfg, cfg.save_plots, cfg.show_plots, suffix=f"total_dipole_gen{gen}")
-        else:
-            plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
-                             cfg.save_plots, cfg.show_plots, suffix=f"gen{gen}")
+                             cfg, cfg.save_plots, cfg.show_plots, suffix=f"total_gen{gen}")
+            plot_error_vs_magnitude(test_data["targets"].numpy() * na, preds.numpy() * na, cfg,
+                                    cfg.save_plots, cfg.show_plots, suffix=f"total_gen{gen}")
 
     # Train
     history, final_model, best_val_model = model.fit(
@@ -116,16 +121,6 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     # Score final-generation model
     final_metrics, final_preds = final_model.score(test_data)
     print_score_summary(final_metrics, cfg, prefix="Final-gen test set")
-    if "total_rmse" in final_metrics:
-        na = test_data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
-        plot_correlation(test_data["targets"].numpy() * na, final_preds.numpy() * na,
-                         {"rmse": final_metrics["total_rmse"], "r2": final_metrics["total_r2"],
-                          "r2_components": final_metrics["total_r2_components"],
-                          **({k: final_metrics[k] for k in ("cos_sim_mean", "cos_sim_all") if k in final_metrics})},
-                         cfg, cfg.save_plots, cfg.show_plots, suffix="total_dipole_final_gen")
-    else:
-        plot_correlation(test_data["targets"].numpy(), final_preds.numpy(), final_metrics, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix="final_gen")
 
     # Score best-val model
     metrics, test_preds = best_val_model.score(test_data)
@@ -159,16 +154,38 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
         if cfg.fix_sign_flips and diag["flipped_idx"]:
             corrected_preds = correct_sign_flips(diag["preds"], diag["cos_sim"])
             test_preds = tf.constant(corrected_preds, dtype=tf.float32)
-            targets_np = diag["targets"]
-            diff = corrected_preds - targets_np
-            rmse = np.sqrt(np.mean(diff ** 2))
-            dot = np.sum(corrected_preds * targets_np, axis=1)
-            norm_p = np.linalg.norm(corrected_preds, axis=1)
-            norm_t = np.linalg.norm(targets_np, axis=1)
-            cos_sim = dot / np.maximum(norm_p * norm_t, 1e-12)
+            targets_tf = test_data["targets"]
+            diff = test_preds - targets_tf
+            metrics["rmse"] = tf.sqrt(tf.reduce_mean(tf.square(diff)))
+            ss_res = tf.reduce_sum(tf.square(diff))
+            ss_tot = tf.reduce_sum(tf.square(targets_tf - tf.reduce_mean(targets_tf, axis=0)))
+            metrics["r2"] = 1.0 - ss_res / ss_tot
+            ss_res_comp = tf.reduce_sum(tf.square(diff), axis=0)
+            ss_tot_comp = tf.reduce_sum(
+                tf.square(targets_tf - tf.reduce_mean(targets_tf, axis=0)), axis=0)
+            metrics["r2_components"] = 1.0 - ss_res_comp / tf.maximum(ss_tot_comp, 1e-12)
+            dot = tf.reduce_sum(test_preds * targets_tf, axis=1)
+            norm_p = tf.linalg.norm(test_preds, axis=1)
+            norm_t = tf.linalg.norm(targets_tf, axis=1)
+            cos_sim = dot / tf.maximum(norm_p * norm_t, 1e-12)
+            metrics["cos_sim_mean"] = tf.reduce_mean(cos_sim)
+            metrics["cos_sim_all"] = cos_sim
+            if "total_rmse" in metrics:
+                na = tf.cast(test_data["num_atoms"], tf.float32)[:, tf.newaxis]
+                total_diff = test_preds * na - targets_tf * na
+                metrics["total_rmse"] = tf.sqrt(tf.reduce_mean(tf.square(total_diff)))
+                total_ss_res = tf.reduce_sum(tf.square(total_diff))
+                total_targets = targets_tf * na
+                total_ss_tot = tf.reduce_sum(tf.square(
+                    total_targets - tf.reduce_mean(total_targets, axis=0)))
+                metrics["total_r2"] = 1.0 - total_ss_res / total_ss_tot
+                total_ss_res_comp = tf.reduce_sum(tf.square(total_diff), axis=0)
+                total_ss_tot_comp = tf.reduce_sum(tf.square(
+                    total_targets - tf.reduce_mean(total_targets, axis=0)), axis=0)
+                metrics["total_r2_components"] = 1.0 - total_ss_res_comp / tf.maximum(total_ss_tot_comp, 1e-12)
             print("\n=== After sign-flip correction ===")
-            print(f"  RMSE:          {rmse:.4f}")
-            print(f"  Mean cos_sim:  {cos_sim.mean():.4f}")
+            print(f"  RMSE:          {float(metrics['rmse']):.4f}")
+            print(f"  Mean cos_sim:  {float(metrics['cos_sim_mean']):.4f}")
 
     # Save models
     if cfg.save_path is not None:
@@ -194,7 +211,15 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
-    # Plot total (not per-atom) dipole correlations for test and val data
+    # Best-val model: test set plots (per-atom)
+    plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg,
+                     cfg.save_plots, cfg.show_plots, suffix="best_val_per_atom")
+    plot_cosine_similarity(metrics, cfg, cfg.save_plots, cfg.show_plots,
+                           suffix="best_val_per_atom")
+    plot_error_vs_magnitude(test_data["targets"].numpy(), test_preds.numpy(), cfg,
+                            cfg.save_plots, cfg.show_plots, suffix="best_val_per_atom")
+    # Best-val model: test set plots (total) — only when target scaling is active
+    # Cosine similarity omitted for total: scale-invariant, already plotted at per-atom scale
     if "total_rmse" in metrics:
         num_atoms = test_data["num_atoms"].numpy().astype(np.float32)
         scale = num_atoms[:, np.newaxis]
@@ -209,17 +234,20 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
             total_metrics["cos_sim_mean"] = metrics["cos_sim_mean"]
             total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
         plot_correlation(total_targets, total_preds, total_metrics, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix="total_dipole")
+                         cfg.save_plots, cfg.show_plots, suffix="best_val_total")
         plot_error_vs_magnitude(total_targets, total_preds, cfg,
-                                cfg.save_plots, cfg.show_plots, suffix="total_dipole")
-    else:
-        plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg,
-                         cfg.save_plots, cfg.show_plots)
-        plot_error_vs_magnitude(test_data["targets"].numpy(), test_preds.numpy(), cfg,
-                                cfg.save_plots, cfg.show_plots)
+                                cfg.save_plots, cfg.show_plots, suffix="best_val_total")
 
-    # Validation set correlation plot
+    # Best-val model: validation set plots (per-atom)
     val_metrics, val_preds = best_val_model.score(val_data)
+    plot_correlation(val_data["targets"].numpy(), val_preds.numpy(), val_metrics, cfg,
+                     cfg.save_plots, cfg.show_plots, suffix="best_val_val_per_atom")
+    plot_cosine_similarity(val_metrics, cfg, cfg.save_plots, cfg.show_plots,
+                           suffix="best_val_val_per_atom")
+    plot_error_vs_magnitude(val_data["targets"].numpy(), val_preds.numpy(), cfg,
+                            cfg.save_plots, cfg.show_plots, suffix="best_val_val_per_atom")
+    # Best-val model: validation set plots (total)
+    # Cosine similarity omitted for total: scale-invariant, already plotted at per-atom scale
     if "total_rmse" in val_metrics:
         num_atoms_val = val_data["num_atoms"].numpy().astype(np.float32)
         scale_val = num_atoms_val[:, np.newaxis]
@@ -234,14 +262,35 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
             val_total_metrics["cos_sim_mean"] = val_metrics["cos_sim_mean"]
             val_total_metrics["cos_sim_all"] = val_metrics["cos_sim_all"]
         plot_correlation(val_total_targets, val_total_preds, val_total_metrics, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix="total_dipole_val")
+                         cfg.save_plots, cfg.show_plots, suffix="best_val_val_total")
         plot_error_vs_magnitude(val_total_targets, val_total_preds, cfg,
-                                cfg.save_plots, cfg.show_plots, suffix="total_dipole_val")
-    else:
-        plot_correlation(val_data["targets"].numpy(), val_preds.numpy(), val_metrics, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix="val")
-        plot_error_vs_magnitude(val_data["targets"].numpy(), val_preds.numpy(), cfg,
-                                cfg.save_plots, cfg.show_plots, suffix="val")
+                                cfg.save_plots, cfg.show_plots, suffix="best_val_val_total")
+
+    # Final-gen model: test set plots (per-atom)
+    plot_correlation(test_data["targets"].numpy(), final_preds.numpy(), final_metrics, cfg,
+                     cfg.save_plots, cfg.show_plots, suffix="final_gen_per_atom")
+    plot_cosine_similarity(final_metrics, cfg, cfg.save_plots, cfg.show_plots,
+                           suffix="final_gen_per_atom")
+    plot_error_vs_magnitude(test_data["targets"].numpy(), final_preds.numpy(), cfg,
+                            cfg.save_plots, cfg.show_plots, suffix="final_gen_per_atom")
+    # Final-gen model: test set plots (total)
+    # Cosine similarity omitted for total: scale-invariant, already plotted at per-atom scale
+    if "total_rmse" in final_metrics:
+        na = test_data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
+        fg_total_targets = test_data["targets"].numpy() * na
+        fg_total_preds = final_preds.numpy() * na
+        fg_total_metrics = {
+            "rmse": final_metrics["total_rmse"],
+            "r2": final_metrics["total_r2"],
+            "r2_components": final_metrics["total_r2_components"],
+        }
+        if "cos_sim_all" in final_metrics:
+            fg_total_metrics["cos_sim_mean"] = final_metrics["cos_sim_mean"]
+            fg_total_metrics["cos_sim_all"] = final_metrics["cos_sim_all"]
+        plot_correlation(fg_total_targets, fg_total_preds, fg_total_metrics, cfg,
+                         cfg.save_plots, cfg.show_plots, suffix="final_gen_total")
+        plot_error_vs_magnitude(fg_total_targets, fg_total_preds, cfg,
+                                cfg.save_plots, cfg.show_plots, suffix="final_gen_total")
 
     print("Run complete!")
     return best_val_model
@@ -277,10 +326,14 @@ def test_model(
     metrics, predictions = model.score(data)
     print_score_summary(metrics, cfg, prefix="External test")
 
-    # Plot correlation
+    # Plot per-atom
     plot_correlation(data["targets"].numpy(), predictions.numpy(), metrics, cfg,
-                     save_plots, show_plots)
+                     save_plots, show_plots, suffix="per_atom")
+    plot_cosine_similarity(metrics, cfg, save_plots, show_plots, suffix="per_atom")
+    plot_error_vs_magnitude(data["targets"].numpy(), predictions.numpy(), cfg,
+                            save_plots, show_plots, suffix="per_atom")
 
+    # Plot total
     if "total_rmse" in metrics:
         num_atoms = data["num_atoms"].numpy().astype(np.float32)
         scale = num_atoms[:, np.newaxis]
@@ -296,6 +349,8 @@ def test_model(
             total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
         plot_correlation(total_targets, total_preds, total_metrics, cfg,
                          save_plots, show_plots, suffix="total")
+        plot_error_vs_magnitude(total_targets, total_preds, cfg,
+                                save_plots, show_plots, suffix="total")
 
     return metrics, predictions
 
@@ -382,5 +437,5 @@ def process_trajectory(
 if __name__ == '__main__':
     model = train_model()
     #model = load_model("models/train_C_O_H_dipole.npz")
-    #dipoles = process_trajectory(model, "datasets/CHO_final.xyz", batch_size=250)
+    #dipoles = process_trajectory(model, "datasets/CHO_final.xyz", batch_size=1000)
     

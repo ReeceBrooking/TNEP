@@ -59,8 +59,8 @@ class TNEPconfig:
 
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
-    lambda_1: float | None = 0.005
-    lambda_2: float | None = 0.005
+    lambda_1: float | None = 0.001
+    lambda_2: float | None = 0.001
     # Per-type regularization and ranking (GPUMD NEP4 style)
     # Each type's params are regularized separately, creating per-type fitness
     # rankings that drive per-type natural gradient updates.
@@ -133,6 +133,11 @@ class TNEPconfig:
     descriptor_scale_floor: float | None = 0.001
     # Scale dipole targets by atom count (per-atom dipole training)
     scale_targets: bool = True
+    # Input units of dipole targets in the dataset.
+    # "e*angstrom" = no conversion needed (already in e·Å)
+    # "e*bohr"     = convert from e·bohr to e·Å (multiply by 0.5292)
+    # "debye"      = convert from Debye to e·Å  (multiply by 0.2082)
+    dipole_units: str = "e*angstrom"
 
     dim_q: int
     num_types: int
