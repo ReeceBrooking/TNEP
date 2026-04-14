@@ -11,6 +11,24 @@ from ase import Atoms
 BOHR_TO_ANGSTROM = 0.529177210903
 DEBYE_TO_EANGSTROM = 0.20819434
 
+# Box used for structures without periodic boundary conditions.
+# Large enough that MIC never wraps any pairwise displacement (1000 Å >> any
+# molecular extent or NEP cutoff radius).
+_NO_PBC_BOX = 1000.0 * np.eye(3, dtype=np.float32)
+
+
+def cell_to_box(atoms) -> np.ndarray:
+    """Return the cell matrix for *atoms*, or a large dummy box if unset.
+
+    ASE stores an unset cell as a zero 3×3 matrix (det = 0), which is not
+    invertible.  Replacing it with a 1000 Å cubic box ensures MIC never alters
+    any pairwise displacement while keeping GPU code unconditional.
+    """
+    cell = atoms.cell.array.astype(np.float32)
+    if abs(np.linalg.det(cell)) < 1e-6:
+        return _NO_PBC_BOX
+    return cell
+
 
 def _dipole_conversion_factor(dipole_units: str) -> float:
     """Return the multiplicative factor to convert dipole_units → e·Å.
@@ -406,7 +424,7 @@ def assemble_data_dict(
         "positions": [tf.convert_to_tensor(s.positions, dtype=tf.float32) for s in dataset],
         "Z_int": [tf.convert_to_tensor(t, dtype=tf.int32) for t in types_int],
         "targets": targets,
-        "boxes": [tf.convert_to_tensor(s.cell.array, dtype=tf.float32) for s in dataset],
+        "boxes": [tf.convert_to_tensor(cell_to_box(s), dtype=tf.float32) for s in dataset],
         "descriptors": descriptors,
         "gradients": gradients,
         "grad_index": grad_index,

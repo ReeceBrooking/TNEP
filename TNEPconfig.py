@@ -26,13 +26,13 @@ class TNEPconfig:
     # Rigorous filtering: recompute targets with GPAW and filter by cosine similarity
     filter_rigorous: bool = False
     rigorous_threshold: float = 0.5
-    num_neurons: int = 15
+    num_neurons: int = 30
     # Number of structures used in each train step
     batch_size: int | None = None
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 100
+    num_generations: int = 60000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 

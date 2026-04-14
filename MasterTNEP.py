@@ -32,7 +32,7 @@ from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_histor
                       plot_loss_breakdown, plot_error_vs_magnitude)
 from model_io import save_model, setup_run_directory, load_model
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
-                           compute_ir_spectrum, plot_ir_spectrum,
+                           compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
 from debug_signs import (diagnose_sign_flips, correct_sign_flips, check_cells,
                          characterize_flipped, test_target_negation)
@@ -92,26 +92,28 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
         if "total_rmse" in m:
             print(f"  Test total RMSE: {float(m['total_rmse']):.4f}  "
                   f"total R²: {float(m['total_r2']):.4f}")
-        plot_snes_history(history, cfg, cfg.save_plots, cfg.show_plots)
-        plot_log_val_fitness(history, cfg, cfg.save_plots, cfg.show_plots)
-        plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
-        plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
-        plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
+        # Save periodic plots into a generation-specific subfolder
+        gen_save = os.path.join(cfg.save_plots, f"{gen}_plots") if cfg.save_plots else None
+        plot_snes_history(history, cfg, gen_save, cfg.show_plots)
+        plot_log_val_fitness(history, cfg, gen_save, cfg.show_plots)
+        plot_sigma_history(history, cfg, gen_save, cfg.show_plots)
+        plot_loss_breakdown(history, cfg, gen_save, cfg.show_plots)
+        plot_timing(history, cfg, gen_save, cfg.show_plots)
         plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix=f"per_atom_gen{gen}")
-        plot_cosine_similarity(m, cfg, cfg.save_plots, cfg.show_plots,
-                               suffix=f"per_atom_gen{gen}")
+                         gen_save, cfg.show_plots, suffix="per_atom")
+        plot_cosine_similarity(m, cfg, gen_save, cfg.show_plots,
+                               suffix="per_atom")
         plot_error_vs_magnitude(test_data["targets"].numpy(), preds.numpy(), cfg,
-                                cfg.save_plots, cfg.show_plots, suffix=f"per_atom_gen{gen}")
+                                gen_save, cfg.show_plots, suffix="per_atom")
         if "total_rmse" in m:
             na = test_data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
             plot_correlation(test_data["targets"].numpy() * na, preds.numpy() * na,
                              {"rmse": m["total_rmse"], "r2": m["total_r2"],
                               "r2_components": m["total_r2_components"],
                               **({k: m[k] for k in ("cos_sim_mean", "cos_sim_all") if k in m})},
-                             cfg, cfg.save_plots, cfg.show_plots, suffix=f"total_gen{gen}")
+                             cfg, gen_save, cfg.show_plots, suffix="total")
             plot_error_vs_magnitude(test_data["targets"].numpy() * na, preds.numpy() * na, cfg,
-                                    cfg.save_plots, cfg.show_plots, suffix=f"total_gen{gen}")
+                                    gen_save, cfg.show_plots, suffix="total")
 
     # Train
     history, final_model, best_val_model = model.fit(
@@ -359,8 +361,8 @@ def process_trajectory(
     model: TNEP,
     trajectory_path: str,
     dt_fs: float = 1.0,
-    save_plots: str | None = None,
-    show_plots: bool = True,
+    save_plots: str | None = "plots",
+    show_plots: bool = False,
     batch_size: int | None = None,
 ) -> dict:
     """Predict properties along an MD trajectory and compute spectra.
@@ -373,8 +375,8 @@ def process_trajectory(
         model           : trained TNEP model (config accessed via model.cfg)
         trajectory_path : str — path to .xyz trajectory file
         dt_fs           : float — MD timestep in femtoseconds
-        save_plots      : str or None — directory to save plot into (None = don't save)
-        show_plots      : bool — True to display plot interactively (default True)
+        save_plots      : str or None — directory to save plot into (default "plots")
+        show_plots      : bool — True to display plot interactively (default False)
         batch_size      : int or None — if set, process the trajectory in batches of
                           this many frames to avoid computing all descriptors at once.
                           If None, process the entire trajectory in one go.
@@ -405,9 +407,10 @@ def process_trajectory(
                     model, trajectory[start:end], dataset_types_int[start:end])
                 batches.append(batch_dipoles)
             dipoles = np.concatenate(batches, axis=0)
-        freq_cm, intensity, acf = compute_ir_spectrum(dipoles, dt_fs=dt_fs)
+        freq_cm, intensity, power, acf = compute_ir_spectrum(dipoles, dt_fs=dt_fs)
         plot_ir_spectrum(freq_cm, intensity, cfg, save_plots, show_plots)
-        return {"dipoles": dipoles, "freq_cm": freq_cm, "intensity": intensity, "acf": acf}
+        plot_power_spectrum(freq_cm, power, cfg, save_plots, show_plots)
+        return {"dipoles": dipoles, "freq_cm": freq_cm, "intensity": intensity, "power": power, "acf": acf}
 
     elif cfg.target_mode == 2:
         if batch_size is None:
@@ -435,7 +438,7 @@ def process_trajectory(
 
 
 if __name__ == '__main__':
-    model = train_model()
-    #model = load_model("models/train_C_O_H_dipole.npz")
-    #dipoles = process_trajectory(model, "datasets/CHO_final.xyz", batch_size=1000)
+    #model = train_model()
+    model = load_model("models/n30_q165_pop80_20260405_122809/train_C_O_H_dipole_final_gen.npz")
+    dipoles = process_trajectory(model, "datasets/Ethanol_tj.xyz", batch_size=1000)
     

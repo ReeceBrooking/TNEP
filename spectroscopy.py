@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from typing import TYPE_CHECKING
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
+from data import cell_to_box
 
 if TYPE_CHECKING:
     from ase import Atoms
@@ -100,9 +101,10 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
         smooth_k     : int — moving-average smoothing width (default 10, 0 to disable)
 
     Returns:
-        freq_cm : [N] ndarray — frequencies in cm⁻¹
-        intensity : [N] ndarray — IR absorption intensity (arb. units)
-        acf : [Nmax] ndarray — dipole autocorrelation function
+        freq_cm   : [N] ndarray — frequencies in cm⁻¹
+        intensity : [N] ndarray — IR absorption intensity (arb. units, ω²·M(ω))
+        power     : [N] ndarray — power spectrum (arb. units, M(ω) before ω² weighting)
+        acf       : [Nmax] ndarray — dipole autocorrelation function
     """
     # Subtract mean to remove DC component before computing ACF
     dipoles = dipoles - dipoles.mean(axis=0)
@@ -140,25 +142,34 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
 
     # IR absorption: σ(ω) ∝ ω² · M(ω)  (Xu et al. JCTC 2024, Eq. 1)
     intensity = freq_cm**2 * M_omega
+    power = M_omega.copy()
 
     # Truncate to requested frequency range
     mask = freq_cm <= max_freq_cm
     freq_cm = freq_cm[mask]
     intensity = intensity[mask]
+    power = power[mask]
 
     # Smooth with moving average
     if smooth_k > 1 and len(intensity) > smooth_k:
         kernel = np.ones(smooth_k) / smooth_k
-        smoothed = np.convolve(intensity, kernel, mode='valid')
-        freq_cm = freq_cm[:len(smoothed)]
-        intensity = smoothed
+        intensity = np.convolve(intensity, kernel, mode='valid')
+        power = np.convolve(power, kernel, mode='valid')
+        # mode='valid' output[i] averages input[i:i+smooth_k], centred at i+(smooth_k-1)/2.
+        # freq_cm is linear, so compute exact fractional-centre frequencies directly.
+        d_freq = freq_cm[1] - freq_cm[0]
+        freq_start = freq_cm[0] + (smooth_k - 1) / 2.0 * d_freq
+        freq_cm = freq_start + np.arange(len(intensity)) * d_freq
 
-    # Normalise to peak = 1
+    # Normalise both to peak = 1
     peak = np.max(np.abs(intensity))
     if peak > 0:
         intensity /= peak
+    peak = np.max(np.abs(power))
+    if peak > 0:
+        power /= peak
 
-    return freq_cm, intensity, acf
+    return freq_cm, intensity, power, acf
 
 
 def plot_ir_spectrum(freq_cm: np.ndarray, intensity: np.ndarray, cfg: TNEPconfig,
@@ -182,8 +193,34 @@ def plot_ir_spectrum(freq_cm: np.ndarray, intensity: np.ndarray, cfg: TNEPconfig
     ax.set_title(title)
     ax.set_xlim(freq_cm[0], freq_cm[-1])
     ax.invert_xaxis()  # IR convention: high to low wavenumber
+    ax.set_ylim(1, 0)  # intensity descends from 1 at top to 0 at bottom
     plt.tight_layout()
     _finish_fig(fig, cfg, "ir_spectrum", save_plots, show_plots)
+
+
+def plot_power_spectrum(freq_cm: np.ndarray, power: np.ndarray, cfg: TNEPconfig,
+                        save_plots: str | None = "plots", show_plots: bool = False,
+                        title: str = "Power Spectrum") -> None:
+    """Plot the dipole power spectrum M(ω) (before ω² weighting).
+
+    Args:
+        freq_cm    : [N] ndarray — frequencies in cm⁻¹
+        power      : [N] ndarray — normalised power spectrum M(ω)
+        cfg        : TNEPconfig — used for filename generation
+        save_plots : str or None — directory to save into
+        show_plots : bool — True to display interactively
+        title      : str — plot title
+    """
+    from plotting import _finish_fig
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(freq_cm, power, color='black', linewidth=0.8)
+    ax.set_xlabel("Wavenumber (cm⁻¹)")
+    ax.set_ylabel("Power (arb. units)")
+    ax.set_title(title)
+    ax.set_xlim(freq_cm[0], freq_cm[-1])
+    ax.invert_xaxis()
+    plt.tight_layout()
+    _finish_fig(fig, cfg, "power_spectrum", save_plots, show_plots)
 
 
 def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray]) -> np.ndarray:
@@ -207,7 +244,7 @@ def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_type
         N = len(struct)
         pos = tf.convert_to_tensor(struct.positions, dtype=tf.float32)
         Z = tf.convert_to_tensor(dataset_types_int[s], dtype=tf.int32)
-        box = tf.convert_to_tensor(struct.cell.array, dtype=tf.float32)
+        box = tf.convert_to_tensor(cell_to_box(struct), dtype=tf.float32)
         desc = descriptors[s]
         atom_mask = tf.ones([N], dtype=tf.float32)
 
@@ -243,7 +280,7 @@ def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms], data
         N = len(struct)
         pos = tf.convert_to_tensor(struct.positions, dtype=tf.float32)
         Z = tf.convert_to_tensor(dataset_types_int[s], dtype=tf.int32)
-        box = tf.convert_to_tensor(struct.cell.array, dtype=tf.float32)
+        box = tf.convert_to_tensor(cell_to_box(struct), dtype=tf.float32)
         desc = descriptors[s]
         atom_mask = tf.ones([N], dtype=tf.float32)
 
@@ -467,6 +504,7 @@ def plot_raman_spectrum(freq_cm: np.ndarray, I_VV: np.ndarray, I_VH: np.ndarray,
     ax.set_ylabel("Raman Intensity (arb. units)")
     ax.set_title(title)
     ax.set_xlim(freq_cm[0], freq_cm[-1])
+    ax.set_ylim(1, 0)  # intensity descends from 1 at top to 0 at bottom
     ax.legend()
     plt.tight_layout()
     _finish_fig(fig, cfg, "raman_spectrum", save_plots, show_plots)
