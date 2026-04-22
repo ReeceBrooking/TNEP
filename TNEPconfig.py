@@ -10,9 +10,9 @@ class TNEPconfig:
     data loading (num_types, types, dim_q, indices).
     """
 
-    data_path: str = "datasets/train.xyz"
+    data_path: str = "datasets/water_monomer.xyz"
     # Separate test dataset (None = split from data_path; str = path to external .xyz)
-    test_data_path: str | None = "datasets/test.xyz"
+    test_data_path: str | None = None
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = ["C", "H", "O"]
@@ -97,6 +97,10 @@ class TNEPconfig:
     seed: int | None = None
     # 0 : PES, 1 : Dipole, 2 : Polarizability
     target_mode: int = 1
+    # Override the info/results key used to read targets from ASE structures.
+    # None = use the default for target_mode ("energy", "dipole", "pol").
+    # Set to a custom string to support non-standard dataset labels (e.g. "mu", "alpha").
+    target_key: str | None = "mu"
     # Test split ratio
     test_ratio: float = 0.3
     # None : uses entire dataset, int : defines maximum structures to use in training

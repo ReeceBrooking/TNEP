@@ -18,14 +18,16 @@ _NO_PBC_BOX = 1000.0 * np.eye(3, dtype=np.float32)
 
 
 def cell_to_box(atoms) -> np.ndarray:
-    """Return the cell matrix for *atoms*, or a large dummy box if unset.
+    """Return the cell matrix for *atoms*, or a large dummy box if unset/zero.
 
-    ASE stores an unset cell as a zero 3×3 matrix (det = 0), which is not
-    invertible.  Replacing it with a 1000 Å cubic box ensures MIC never alters
-    any pairwise displacement while keeping GPU code unconditional.
+    Two cases are treated as "no periodic boundary":
+      1. ASE stores an unset cell as a zero 3×3 matrix — det = 0, not invertible.
+      2. A Lattice is present in the file but all entries are zero (uniformly 0).
+    In both cases a 1000 Å cubic box is returned so MIC never alters any
+    pairwise displacement while keeping GPU code unconditional.
     """
     cell = atoms.cell.array.astype(np.float32)
-    if abs(np.linalg.det(cell)) < 1e-6:
+    if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
         return _NO_PBC_BOX
     return cell
 
@@ -73,7 +75,7 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
             z = structure.numbers[i]
             if z not in types:
                 types.append(z)
-            structure_types_int[i] = np.where(types == z)[0]
+            structure_types_int[i] = types.index(z)
 
         dataset_types_int.append(structure_types_int)
 
@@ -126,13 +128,25 @@ def assign_type_indices(dataset: list[Atoms], types: list[int]) -> list[np.ndarr
 
 
 def _extract_target(structure: Atoms, target_key: str) -> tf.Tensor:
-    """Extract target, converting 9-component polarizability to 6-component if needed."""
+    """Extract target, converting 9-component polarizability to 6-component if needed.
+
+    Handles datasets where values have a trailing space inside the quoted string
+    (e.g. mu="-0.734398 0.000000 -0.040971 ").  ASE's extxyz parser splits on
+    literal space and produces a spurious NaN at the end; trailing NaN elements
+    are stripped before the tensor is returned.
+    """
     if target_key in structure.info:
         raw = np.asarray(structure.info[target_key], dtype=np.float32)
     elif structure.calc is not None and target_key in structure.calc.results:
         raw = np.asarray(structure.calc.results[target_key], dtype=np.float32)
     else:
         raise KeyError(f"'{target_key}' not found in structure.info or calc.results")
+    # Strip trailing NaN artefacts produced by trailing whitespace in quoted values
+    if raw.ndim == 1:
+        n = raw.size
+        while n > 0 and np.isnan(raw[n - 1]):
+            n -= 1
+        raw = raw[:n]
     if raw.size == 9:
         # Flattened 3x3 row-major -> unique [xx, yy, zz, xy, yz, zx]
         raw = raw[[0, 4, 8, 1, 5, 6]]
@@ -255,7 +269,7 @@ def filter_bad_data(
     Returns:
         filtered_dataset, filtered_types_int : filtered parallel lists
     """
-    target_key = _target_key_for_mode(cfg.target_mode)
+    target_key = _resolve_target_key(cfg)
     bad = find_bad_data(dataset, target_key)
 
     bad_indices: set[int] = set()
@@ -297,8 +311,20 @@ def filter_bad_data(
 
 
 def _target_key_for_mode(target_mode: int) -> str:
-    """Return the Atoms.info key for the given target mode."""
+    """Return the default Atoms.info key for the given target mode."""
     return {0: "energy", 1: "dipole", 2: "pol"}[target_mode]
+
+
+def _resolve_target_key(cfg: TNEPconfig) -> str:
+    """Return the target key to use, honouring cfg.target_key if set.
+
+    If cfg.target_key is not None it is returned as-is, allowing non-standard
+    dataset labels (e.g. "mu", "alpha") to be used without changing target_mode.
+    Otherwise falls back to the mode default ("energy", "dipole", "pol").
+    """
+    if cfg.target_key is not None:
+        return cfg.target_key
+    return _target_key_for_mode(cfg.target_mode)
 
 
 def component_labels(target_mode: int, num_components: int) -> list[str]:
@@ -412,7 +438,7 @@ def assemble_data_dict(
     Returns:
         dict with keys: positions, Z_int, targets, boxes, descriptors, gradients, grad_index
     """
-    target_key = _target_key_for_mode(cfg.target_mode)
+    target_key = _resolve_target_key(cfg)
     targets = [_extract_target(s, target_key) for s in dataset]
     if cfg.target_mode == 1:
         factor = _dipole_conversion_factor(cfg.dipole_units)
@@ -570,10 +596,10 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
             # Mean-based: divide by mean(|x|) * sqrt(dim_q)
             raw_mean = tf.reduce_mean(tf.abs(all_desc), axis=0).numpy()  # [dim_q]
             if cfg.descriptor_scale_floor is not None:
-                floor = np.max(raw_mean) * cfg.descriptor_scale_floor
+                floor = max(np.max(raw_mean) * cfg.descriptor_scale_floor, 1e-6)
                 safe_mean = np.maximum(raw_mean, floor)
             else:
-                safe_mean = np.maximum(raw_mean, 1e-30)
+                safe_mean = np.maximum(raw_mean, 1e-6)
             cfg.descriptor_mean = safe_mean * np.sqrt(dim_q)
             floor_str = f"{floor:.6f}" if cfg.descriptor_scale_floor is not None else "None"
             print(f"Descriptor scaling (mean): raw |mean| range = "

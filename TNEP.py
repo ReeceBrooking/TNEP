@@ -291,7 +291,7 @@ class TNEP(layers.Layer):
 
         diff = preds - targets
         mse = tf.reduce_mean(tf.square(diff))
-        rmse = tf.sqrt(mse)
+        rmse = tf.sqrt(tf.maximum(mse, 0.0))
 
         # Overall R² = 1 - SS_res / SS_tot
         ss_res = tf.reduce_sum(tf.square(diff))

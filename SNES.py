@@ -582,6 +582,14 @@ class SNES:
             if cfg.patience is not None and gens_without_improvement >= cfg.patience:
                 print(f"\nEarly stopping at generation {gen + 1} "
                       f"(no improvement for {cfg.patience} generations)")
+                # Force a final validation if this generation wasn't a val generation,
+                # so best_val_loss is never left at its initial inf sentinel.
+                if not _do_val:
+                    val_fitness = self.validate(val_data, self.mu)
+                    if val_fitness < best_val_loss:
+                        best_val_loss = val_fitness
+                        best_mu = tf.identity(self.mu)
+                        best_sigma = tf.identity(self.sigma)
                 self.mu.assign(best_mu)
                 self.sigma.assign(best_sigma)
                 break
@@ -750,9 +758,9 @@ class SNES:
                 v_err = tf.reduce_sum(tf.square(v_diff), axis=1) / 6.0
                 combined_err = combined_err + self.cfg.virial_weight * v_err
 
-            rmse = tf.sqrt(tf.reduce_mean(combined_err))
+            rmse = tf.sqrt(tf.maximum(tf.reduce_mean(combined_err), 0.0))
         else:
-            rmse = tf.sqrt(tf.reduce_mean(diff_sq))
+            rmse = tf.sqrt(tf.maximum(tf.reduce_mean(diff_sq), 0.0))
 
         return float(rmse)
 
@@ -1007,14 +1015,14 @@ class SNES:
                     if use_mae:
                         type_fitness = type_err / (n_t * T_dim_f)
                     else:
-                        type_fitness = tf.sqrt(type_err / (n_t * T_dim_f))
+                        type_fitness = tf.sqrt(tf.maximum(type_err / (n_t * T_dim_f), 0.0))
                     per_type_parts.append(type_fitness)
                 # Global (index T)
                 global_err = tf.reduce_sum(per_struct_err, axis=1)     # [C]
                 if use_mae:
                     global_fitness = global_err / (B_f * T_dim_f)
                 else:
-                    global_fitness = tf.sqrt(global_err / (B_f * T_dim_f))
+                    global_fitness = tf.sqrt(tf.maximum(global_err / (B_f * T_dim_f), 0.0))
                 per_type_parts.append(global_fitness)
                 all_fitness.append(tf.stack(per_type_parts, axis=1))   # [C, T+1]
             else:
@@ -1022,7 +1030,7 @@ class SNES:
                 if use_mae:
                     chunk_fitness = total_err / (B_f * T_dim_f)
                 else:
-                    chunk_fitness = tf.sqrt(total_err / (B_f * T_dim_f))
+                    chunk_fitness = tf.sqrt(tf.maximum(total_err / (B_f * T_dim_f), 0.0))
                 all_fitness.append(chunk_fitness)
 
         if return_per_type:

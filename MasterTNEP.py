@@ -26,7 +26,8 @@ from TNEP import TNEP
 from TNEPconfig import TNEPconfig
 from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
-                  assign_type_indices, prepare_eval_data, print_score_summary)
+                  assign_type_indices, prepare_eval_data, print_score_summary,
+                  _resolve_target_key)
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
                       plot_timing, plot_correlation, plot_cosine_similarity,
                       plot_loss_breakdown, plot_error_vs_magnitude)
@@ -57,9 +58,9 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     cfg.type_map = {z: idx for idx, z in enumerate(cfg.types)}
 
     if cfg.target_mode == 1:
-        print_dipole_statistics(dataset, cfg)
+        print_dipole_statistics(dataset, cfg, target_key=_resolve_target_key(cfg))
     elif cfg.target_mode == 2:
-        print_polarizability_statistics(dataset)
+        print_polarizability_statistics(dataset, target_key=_resolve_target_key(cfg))
 
     cfg.randomise(dataset)
 
@@ -438,7 +439,7 @@ def process_trajectory(
 
 
 if __name__ == '__main__':
-    #model = train_model()
-    model = load_model("models/n30_q165_pop80_20260405_122809/train_C_O_H_dipole_final_gen.npz")
-    dipoles = process_trajectory(model, "datasets/Ethanol_tj.xyz", batch_size=1000)
+    model = train_model()
+    #model = load_model("models/n30_q165_pop80_20260405_122809/train_C_O_H_dipole_final_gen.npz")
+    #dipoles = process_trajectory(model, "datasets/Ethanol_tj.xyz", batch_size=1000)
     

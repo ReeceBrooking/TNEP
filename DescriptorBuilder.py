@@ -100,11 +100,20 @@ class DescriptorBuilder(layers.Layer):
         dataset_grad_index = []
 
         for structure in dataset:
+            cell = structure.cell.array
+            if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
+                # Zero or degenerate cell: quippy cannot build a valid PBC neighbour
+                # list and returns NaN descriptor gradients.  Replace with a large
+                # dummy box (same logic as cell_to_box in data.py) and disable PBC.
+                cell = 1000.0 * np.eye(3, dtype=np.float32)
+                pbc = False
+            else:
+                pbc = structure.pbc
             structure = Atoms(
                 numbers=structure.numbers,
                 positions=structure.positions,
-                cell=structure.cell,
-                pbc=structure.pbc,
+                cell=cell,
+                pbc=pbc,
             )
             outs = [b.calc(structure, grad=True) for b in self.builders]
 
