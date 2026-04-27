@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import multiprocessing
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras import layers
@@ -7,6 +9,74 @@ from TNEPconfig import TNEPconfig
 from quippy.descriptors import Descriptor
 
 from ase import Atoms
+
+
+def _worker_init(omp_threads: int) -> None:
+    """Set OMP/MKL thread counts in each worker process before any tasks run.
+
+    Called via Pool(initializer=...) so env vars are in place before the first
+    Descriptor.calc() call. Note: with forkserver, quippy is already imported
+    in the server process from which workers are forked; whether the OMP thread
+    pool resizes depends on the runtime (MKL re-reads per-call; OpenMP
+    thread pools may not resize after pool-init).
+    """
+    import os
+    os.environ['OMP_NUM_THREADS'] = str(omp_threads)
+    os.environ['MKL_NUM_THREADS'] = str(omp_threads)
+
+
+def _describe_structure_worker(
+    args: tuple[Atoms, list[str]],
+) -> tuple[np.ndarray, list[np.ndarray], list[list[int]]]:
+    """Compute SOAP descriptors for one structure inside a worker process.
+
+    Rebuilds quippy Descriptor objects from plain strings (C extensions cannot
+    cross process boundaries). OMP/MKL thread counts are set by the Pool
+    initializer (_worker_init) before this function runs.
+    """
+    structure, soap_strings = args
+
+    from ase import Atoms
+    import numpy as np
+    from quippy.descriptors import Descriptor
+
+    cell = structure.cell.array
+    if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
+        cell = 1000.0 * np.eye(3, dtype=np.float32)
+        pbc = False
+    else:
+        pbc = structure.pbc
+    structure = Atoms(
+        numbers=structure.numbers,
+        positions=structure.positions,
+        cell=cell,
+        pbc=pbc,
+    )
+
+    builders = [Descriptor(s) for s in soap_strings]
+    outs = [b.calc(structure, grad=True) for b in builders]
+
+    N = len(structure)
+    descriptors  = [[] for _ in range(N)]
+    gradients    = [[] for _ in range(N)]
+    grad_indexes = [[] for _ in range(N)]
+
+    for out in outs:
+        data = out.get("data")
+        if data is None or data.size == 0 or data.shape[1] == 0:
+            continue
+        for k in range(len(out["ci"])):
+            descriptors[out["ci"][k] - 1].append(out["data"][k])
+        for j in range(len(out["grad_index_0based"])):
+            center    = out["grad_index_0based"][j][0]
+            neighbour = out["grad_index_0based"][j][1]
+            gradients[center].append(out["grad_data"][j])
+            grad_indexes[center].append(neighbour)
+
+    descriptors_np = np.array(descriptors, dtype=np.float32).squeeze(axis=1)
+    gradients_np   = [np.array(g, dtype=np.float32) for g in gradients]
+    return descriptors_np, gradients_np, grad_indexes
+
 
 class DescriptorBuilder(layers.Layer):
     """Builds SOAP-turbo descriptors and their gradients using quippy.
@@ -73,7 +143,17 @@ class DescriptorBuilder(layers.Layer):
 
         base += species_Z + n_species + alpha_max + atom_sigma_r + atom_sigma_t + atom_sigma_r_scaling + atom_sigma_t_scaling + amplitude_scaling + central_weight
 
-        self.builders = [Descriptor(base + f" central_index={k}") for k in (np.arange(self.num_types, dtype=int) + 1)]
+        self._soap_strings = [
+            base + f" central_index={k}"
+            for k in (np.arange(self.num_types, dtype=int) + 1)
+        ]
+        self.builders = [Descriptor(s) for s in self._soap_strings]
+
+        if cfg.num_descriptor_workers is None:
+            _slurm = os.environ.get('SLURM_CPUS_PER_TASK')
+            self._num_workers = int(_slurm) if _slurm else 1
+        else:
+            self._num_workers = cfg.num_descriptor_workers
 
     def build_descriptors(self, dataset: list[Atoms]) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
         """Compute SOAP descriptors and their gradients for every structure.
@@ -96,52 +176,74 @@ class DescriptorBuilder(layers.Layer):
                 each neighbour in gradients[s][i].
         """
         dataset_descriptors = []
-        dataset_gradients = []
-        dataset_grad_index = []
+        dataset_gradients   = []
+        dataset_grad_index  = []
 
-        for structure in dataset:
-            cell = structure.cell.array
-            if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
-                # Zero or degenerate cell: quippy cannot build a valid PBC neighbour
-                # list and returns NaN descriptor gradients.  Replace with a large
-                # dummy box (same logic as cell_to_box in data.py) and disable PBC.
-                cell = 1000.0 * np.eye(3, dtype=np.float32)
-                pbc = False
-            else:
-                pbc = structure.pbc
-            structure = Atoms(
-                numbers=structure.numbers,
-                positions=structure.positions,
-                cell=cell,
-                pbc=pbc,
-            )
-            outs = [b.calc(structure, grad=True) for b in self.builders]
+        if self._num_workers <= 1:
+            # Serial path — unchanged from original
+            for structure in dataset:
+                cell = structure.cell.array
+                if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
+                    cell = 1000.0 * np.eye(3, dtype=np.float32)
+                    pbc = False
+                else:
+                    pbc = structure.pbc
+                structure = Atoms(
+                    numbers=structure.numbers,
+                    positions=structure.positions,
+                    cell=cell,
+                    pbc=pbc,
+                )
+                outs = [b.calc(structure, grad=True) for b in self.builders]
 
-            descriptors = [[] for _ in range(len(structure))]
-            gradients = [[] for _ in range(len(structure))]
-            grad_indexes = [[] for _ in range(len(structure))]
+                descriptors  = [[] for _ in range(len(structure))]
+                gradients    = [[] for _ in range(len(structure))]
+                grad_indexes = [[] for _ in range(len(structure))]
 
-            for out in outs:
-                data = out.get("data")
-                if data is None or data.size == 0 or data.shape[1] == 0:
-                    continue
-                # ci is 1-indexed centre atom index from quippy
-                for k in range(len(out["ci"])):
-                    descriptors[out["ci"][k] - 1].append(out["data"][k])
-                # grad_index_0based[j] = [centre, neighbour] (0-indexed)
-                for j in range(len(out["grad_index_0based"])):
-                    center = out["grad_index_0based"][j][0]
-                    neighbour = out["grad_index_0based"][j][1]
-                    gradients[center].append(out["grad_data"][j])
-                    grad_indexes[center].append(neighbour)
+                for out in outs:
+                    data = out.get("data")
+                    if data is None or data.size == 0 or data.shape[1] == 0:
+                        continue
+                    # ci is 1-indexed centre atom index from quippy
+                    for k in range(len(out["ci"])):
+                        descriptors[out["ci"][k] - 1].append(out["data"][k])
+                    # grad_index_0based[j] = [centre, neighbour] (0-indexed)
+                    for j in range(len(out["grad_index_0based"])):
+                        center    = out["grad_index_0based"][j][0]
+                        neighbour = out["grad_index_0based"][j][1]
+                        gradients[center].append(out["grad_data"][j])
+                        grad_indexes[center].append(neighbour)
 
-            for i in range(len(gradients)):
-                gradients[i] = tf.convert_to_tensor(gradients[i], dtype=tf.float32)
+                for i in range(len(gradients)):
+                    gradients[i] = tf.convert_to_tensor(gradients[i], dtype=tf.float32)
 
-            descriptors = tf.convert_to_tensor(descriptors, dtype=tf.float32)
-            descriptors = tf.squeeze(descriptors, axis=1)
-            dataset_descriptors.append(descriptors)
-            dataset_gradients.append(gradients)
-            dataset_grad_index.append(grad_indexes)
+                descriptors = tf.convert_to_tensor(descriptors, dtype=tf.float32)
+                descriptors = tf.squeeze(descriptors, axis=1)
+                dataset_descriptors.append(descriptors)
+                dataset_gradients.append(gradients)
+                dataset_grad_index.append(grad_indexes)
+
+        else:
+            # Outside SLURM, falls back to num_workers as total CPUs → omp_per_worker=1 (safe)
+            _slurm_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', self._num_workers))
+            omp_per_worker = max(1, _slurm_cpus // self._num_workers)
+
+            ctx = multiprocessing.get_context('forkserver')
+            args = [
+                (structure, self._soap_strings)
+                for structure in dataset
+            ]
+            with ctx.Pool(self._num_workers,
+                          initializer=_worker_init,
+                          initargs=(omp_per_worker,)) as pool:
+                results = pool.map(_describe_structure_worker, args)
+
+            for descriptors_np, gradients_np, grad_indexes in results:
+                dataset_descriptors.append(tf.convert_to_tensor(descriptors_np, dtype=tf.float32))
+                dataset_gradients.append(
+                    [tf.convert_to_tensor(g, dtype=tf.float32) for g in gradients_np]
+                )
+                dataset_grad_index.append(grad_indexes)
+
         return dataset_descriptors, dataset_gradients, dataset_grad_index
 

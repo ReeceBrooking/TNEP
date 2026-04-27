@@ -10,9 +10,9 @@ class TNEPconfig:
     data loading (num_types, types, dim_q, indices).
     """
 
-    data_path: str = "datasets/water_monomer.xyz"
+    data_path: str = "datasets/train_waterbulk.xyz"
     # Separate test dataset (None = split from data_path; str = path to external .xyz)
-    test_data_path: str | None = None
+    test_data_path: str | None = "datasets/test_waterbulk.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = ["C", "H", "O"]
@@ -87,7 +87,7 @@ class TNEPconfig:
     # Override the info/results key used to read targets from ASE structures.
     # None = use the default for target_mode ("energy", "dipole", "pol").
     # Set to a custom string to support non-standard dataset labels (e.g. "mu", "alpha").
-    target_key: str | None = "mu"
+    target_key: str | None = None
     # Test split ratio
     test_ratio: float = 0.3
     # None : uses entire dataset, int : defines maximum structures to use in training
@@ -97,11 +97,16 @@ class TNEPconfig:
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)
     val_interval: int = 1
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage).
-    # Peak VRAM ≈ C × total_edges × dim_q × 4 bytes (the de_dq_edge tensor).
-    # Reduce this if hitting OOM. E.g. with 200k edges, Q=100: C=10→800MB, C=5→400MB.
-    population_chunk_size: int | None = 10
+    # None = no chunking (recommended for A100 at typical molecular sizes).
+    # For very large systems (>50k edges per structure), start at 50 and reduce if OOM.
+    population_chunk_size: int | None = None
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
     batch_chunk_size: int | None = None
+    # Number of parallel workers for SOAP descriptor computation.
+    # None = auto (reads SLURM_CPUS_PER_TASK at DescriptorBuilder init time, falls back to 1)
+    # 1    = serial (current behaviour, default outside SLURM)
+    # N    = use N worker processes
+    num_descriptor_workers: int | None = None
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
     plot_interval: int | None = 10000

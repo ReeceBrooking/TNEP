@@ -190,6 +190,10 @@ def plot_timing(history: dict, cfg: TNEPconfig,
     ax1.set_ylabel("Time (s)")
     ax1.legend(loc="upper left")
     ax1.set_title("Per-generation timing breakdown")
+    # Cap y-axis at 99th percentile to prevent TF warmup outliers from hiding data
+    totals_per_gen = sum(data)
+    if len(totals_per_gen) > 1:
+        ax1.set_ylim(bottom=0, top=np.percentile(totals_per_gen, 99) * 1.1)
 
     # Right: horizontal bar chart of totals
     totals = [sum(timing[p]) for p in phases]

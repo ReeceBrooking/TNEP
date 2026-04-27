@@ -695,24 +695,25 @@ def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tens
             gidx_np[s, i, :n_nbrs] = data["grad_index"][s][i]
             nbr_mask_np[s, i, :n_nbrs] = 1.0
 
-    result = {
-        "descriptors": tf.constant(desc_np),
-        "gradients": tf.constant(grad_np),
-        "grad_index": tf.constant(gidx_np),
-        "positions": tf.constant(pos_np),
-        "Z_int": tf.constant(z_np),
-        "targets": tf.constant(tgt_np),
-        "boxes": tf.constant(box_np),
-        "atom_mask": tf.constant(atom_mask_np),
-        "neighbor_mask": tf.constant(nbr_mask_np),
-        "num_atoms": tf.constant(num_atoms_np),
-    }
-    if has_forces:
-        result["forces"] = tf.constant(force_np)
-    if has_virials:
-        result["virials"] = tf.constant(virial_np)
-    if num_types is not None:
-        result["types_contained"] = tf.constant(types_contained_np)
+    with tf.device('/CPU:0'):
+        result = {
+            "descriptors": tf.constant(desc_np),
+            "gradients": tf.constant(grad_np),
+            "grad_index": tf.constant(gidx_np),
+            "positions": tf.constant(pos_np),
+            "Z_int": tf.constant(z_np),
+            "targets": tf.constant(tgt_np),
+            "boxes": tf.constant(box_np),
+            "atom_mask": tf.constant(atom_mask_np),
+            "neighbor_mask": tf.constant(nbr_mask_np),
+            "num_atoms": tf.constant(num_atoms_np),
+        }
+        if has_forces:
+            result["forces"] = tf.constant(force_np)
+        if has_virials:
+            result["virials"] = tf.constant(virial_np)
+        if num_types is not None:
+            result["types_contained"] = tf.constant(types_contained_np)
     return result
 
 

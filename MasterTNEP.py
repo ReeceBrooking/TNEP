@@ -4,22 +4,26 @@ import numpy as np
 import os
 
 # CPU parallelisation: detect GPU vs CPU-only and set thread counts accordingly
-# Physical cores = logical cores / 2 (excludes hyperthreads)
-_logical = os.cpu_count() or 1
-_physical = max(_logical // 2, 1)
-_has_gpu = os.path.isdir('/proc/driver/nvidia') or os.environ.get('CUDA_VISIBLE_DEVICES', '') != ''
+_slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
+_cpu_threads = int(_slurm_cpus) if _slurm_cpus else max(os.cpu_count() // 2, 1)
+
+_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+_has_gpu = (_cuda_visible not in ('', '-1')) or os.path.exists('/dev/nvidiactl')
 
 if _has_gpu:
-    os.environ['OMP_NUM_THREADS'] = '2'
-    os.environ['MKL_NUM_THREADS'] = '2'
+    # OMP_NUM_THREADS=4 (was 2) — main process only governs TF CPU ops and the serial
+    # descriptor fallback; workers set their own omp_per_worker inside each process.
+    os.environ['OMP_NUM_THREADS'] = '4'
+    os.environ['MKL_NUM_THREADS'] = '4'
     os.environ['TF_NUM_INTRAOP_THREADS'] = '4'
     os.environ['TF_NUM_INTEROP_THREADS'] = '2'
     os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 else:
-    os.environ['OMP_NUM_THREADS'] = str(_physical)
-    os.environ['MKL_NUM_THREADS'] = str(_physical)
-    os.environ['TF_NUM_INTRAOP_THREADS'] = str(_physical)
-    os.environ['TF_NUM_INTEROP_THREADS'] = '4'
+    os.environ['OMP_NUM_THREADS'] = str(_cpu_threads)
+    os.environ['MKL_NUM_THREADS'] = str(_cpu_threads)
+    os.environ['TF_NUM_INTRAOP_THREADS'] = str(_cpu_threads)
+    os.environ['TF_NUM_INTEROP_THREADS'] = '4'  # interop governs graph-level parallelism; 4 is sufficient
+
 import tensorflow as tf
 
 from TNEP import TNEP
