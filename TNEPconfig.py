@@ -23,9 +23,6 @@ class TNEPconfig:
     filter_nan_positions: bool = False
     filter_nan_targets: bool = False
     filter_zero_targets: bool = False
-    # Rigorous filtering: recompute targets with GPAW and filter by cosine similarity
-    filter_rigorous: bool = False
-    rigorous_threshold: float = 0.5
     num_neurons: int = 30
     # Number of structures used in each train step
     batch_size: int | None = None
@@ -69,16 +66,6 @@ class TNEPconfig:
 
     # Early stopping patience (None = disabled)
     patience: int | None = None
-
-    # Stagnation response: apply action after this many gens without val improvement
-    # None = disabled; requires stagnation_response to also be set
-    sigma_reset_patience: int | None = None
-    # 'interpolate' = blend toward init_sigma; 'noise' = additive Gaussian; None = disabled
-    stagnation_response: str | None = 'noise'
-    # Blending factor for interpolate mode: sigma += alpha * (init_sigma - sigma)
-    sigma_interpolate_alpha: float = 0.5
-    # Log10 of noise std for noise mode: noise ~ N(0, 10^k)
-    sigma_noise_scale: float = -3.0
 
     # Loss function: "mse" = root-mean-square error, "mae" = mean absolute error
     loss_type: str = "mse"

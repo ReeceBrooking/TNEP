@@ -163,7 +163,7 @@ class TNEP(layers.Layer):
 
         if self.cfg.target_mode == 1:
             # Dipole: μ = -sum_i sum_j |r_ij|^2 * force_ij
-            dr, rij = self._neighbor_displacements_single(positions, box, grad_index)
+            _, rij = self._neighbor_displacements_single(positions, box, grad_index)
 
             rij2 = tf.square(rij) * neighbor_mask                       # [A, M]
             dipole_contribs = rij2[:, :, tf.newaxis] * forces            # [A, M, 3]

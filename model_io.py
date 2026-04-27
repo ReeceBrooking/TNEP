@@ -157,7 +157,7 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
     print(f"Model saved to {path}")
 
 
-def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int, int]]:
+def load_model(path: str = "tnep_model.npz") -> TNEP:
     """Load a trained TNEP model from a .npz file.
 
     Reconstructs a TNEPconfig and TNEP model with the saved weights.
@@ -167,9 +167,7 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
         path : str — path to saved .npz file
 
     Returns:
-        model          : TNEP model with loaded weights
-        cfg            : TNEPconfig reconstructed from saved parameters
-        type_map       : dict {atomic_number: layer_index} for converting Z arrays
+        model : TNEP model with loaded weights
     """
     data = np.load(path, allow_pickle=True)
     cfg = TNEPconfig()
@@ -236,16 +234,3 @@ def load_model(path: str = "tnep_model.npz") -> tuple[TNEP, TNEPconfig, dict[int
           f"num_types={cfg.num_types}")
     print(f"  Type mapping: {type_str}")
     return model
-
-
-def convert_z_to_type_indices(z_array: np.ndarray, type_map: dict[int, int]) -> np.ndarray:
-    """Convert an array of atomic numbers to model-compatible type indices.
-
-    Args:
-        z_array  : ndarray of atomic numbers (e.g. structure.numbers)
-        type_map : dict {atomic_number: layer_index} from load_model()
-
-    Returns:
-        type_indices : ndarray of int — model layer indices
-    """
-    return np.array([type_map[z] for z in z_array], dtype=np.int32)

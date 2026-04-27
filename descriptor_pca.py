@@ -50,7 +50,7 @@ class DescriptorPCA:
         print(f"  Top-5 cumulative: {cumvar[:5]}")
         return self
 
-    def transform_descriptors(self, descriptors: list[tf.Tensor]) -> list[tf.Tensor]:
+    def _transform_descriptors(self, descriptors: list[tf.Tensor]) -> list[tf.Tensor]:
         """Project descriptors to PCA space.
 
         Args:
@@ -63,7 +63,7 @@ class DescriptorPCA:
         mean = self.mean_.astype(np.float32)          # [dim_q]
         return [tf.constant((d.numpy() - mean) @ P) for d in descriptors]
 
-    def transform_gradients(self, gradients: list[list[tf.Tensor]]) -> list[list[tf.Tensor]]:
+    def _transform_gradients(self, gradients: list[list[tf.Tensor]]) -> list[list[tf.Tensor]]:
         """Project descriptor gradients to PCA space.
 
         Gradients are dq/dR, so the chain rule for q_compressed = (q - mean) @ P
@@ -87,7 +87,7 @@ class DescriptorPCA:
         gradients: list[list[tf.Tensor]],
     ) -> tuple[list[tf.Tensor], list[list[tf.Tensor]]]:
         """Transform both descriptors and gradients."""
-        return self.transform_descriptors(descriptors), self.transform_gradients(gradients)
+        return self._transform_descriptors(descriptors), self._transform_gradients(gradients)
 
     def to_dict(self) -> dict[str, np.ndarray]:
         """Serialize for model saving."""

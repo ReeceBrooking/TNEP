@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import resource
 import sys
 import time
 import numpy as np
@@ -91,15 +89,6 @@ class SNES:
         self.lambda_1 = self.cfg.lambda_1 if self.cfg.lambda_1 is not None else auto_lambda
         self.lambda_2 = self.cfg.lambda_2 if self.cfg.lambda_2 is not None else auto_lambda
 
-        if self.cfg.stagnation_response is not None:
-            assert self.cfg.stagnation_response in ('interpolate', 'noise'), (
-                f"stagnation_response must be 'interpolate', 'noise', or None, "
-                f"got {self.cfg.stagnation_response!r}")
-
-        # PES force/virial flags (set by TNEP.fit() before training starts)
-        self._has_forces = False
-        self._has_virial = False
-
         # Loss function flags (Python bools so tf.function traces correct branch)
         self._use_mae = (cfg.loss_type == "mae")
         self._use_inv_weight = (cfg.inverse_weight_eps is not None)
@@ -145,7 +134,9 @@ class SNES:
         """
         pv = tf.cast(param_vector, tf.float32)
         T = self.cfg.num_types
-        n_per_type = self.n_primary // T  # params per type (W0_t + b0_t + W1_t)
+        Q = self.dim_q
+        H = self.cfg.num_neurons
+        n_per_type = Q * H + H + H  # W0_t + b0_t + W1_t
 
         if T > 1:
             # Per-type regularization: average L1/L2 across types + global term
@@ -418,10 +409,6 @@ class SNES:
             "sigma_max": [],
             "sigma_mean": [],
             "sigma_median": [],
-            "sigma_resets": [],
-            "vram_mb": [],
-            "ram_mb": [],
-            "cpu_load": [],
             "timing": {
                 "sample_batch": [],
                 "evaluate": [],
@@ -461,10 +448,6 @@ class SNES:
                 gather_keys = ["descriptors", "gradients", "grad_index",
                                "positions", "Z_int", "boxes", "targets",
                                "atom_mask", "neighbor_mask"]
-                if self._has_forces:
-                    gather_keys.append("forces")
-                if self._has_virial:
-                    gather_keys.append("virials")
                 if "types_contained" in train_data:
                     gather_keys.append("types_contained")
                 batch_data = {
@@ -533,23 +516,6 @@ class SNES:
             history["sigma_mean"].append(sigma_mean)
             history["sigma_median"].append(sigma_median)
 
-            # VRAM/RAM/CPU monitoring: sample every 100 gens to avoid per-gen overhead
-            if gen % 100 == 0:
-                if tf.config.list_physical_devices('GPU'):
-                    vram_info = tf.config.experimental.get_memory_info('GPU:0')
-                    history["vram_mb"].append(vram_info["peak"] / 1024 / 1024)
-                else:
-                    history["vram_mb"].append(0.0)
-                try:
-                    ram_peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    history["ram_mb"].append(ram_peak_kb / 1024)
-                except Exception:
-                    history["ram_mb"].append(0.0)
-                try:
-                    history["cpu_load"].append(os.getloadavg()[0])
-                except (OSError, AttributeError):
-                    history["cpu_load"].append(0.0)
-
             # Progress bar
             frac = (gen + 1) / cfg.num_generations
             bar_len = 30
@@ -593,34 +559,6 @@ class SNES:
                 self.mu.assign(best_mu)
                 self.sigma.assign(best_sigma)
                 break
-
-            # Stagnation response: interpolate or noise injection
-            if (cfg.sigma_reset_patience is not None
-                    and cfg.stagnation_response is not None
-                    and gens_without_improvement >= cfg.sigma_reset_patience):
-                if cfg.stagnation_response == 'interpolate':
-                    alpha = cfg.sigma_interpolate_alpha
-                    init_vec = tf.fill([self.dim], cfg.init_sigma)
-                    self.sigma.assign(self.sigma + alpha * (init_vec - self.sigma))
-                    print(f"\nSigma interpolation at generation {gen + 1}: "
-                          f"alpha={alpha}, stagnant for "
-                          f"{gens_without_improvement} gens")
-                elif cfg.stagnation_response == 'noise':
-                    # Inject positive noise inversely proportional to current sigma:
-                    # small components get a large boost, large ones nearly unchanged.
-                    # noise_i = base_std * (init_sigma / sigma_i) * |z_i|
-                    # Using |z| ensures noise is always positive (sigma can only grow).
-                    noise_std = 10.0 ** cfg.sigma_noise_scale
-                    scale = cfg.init_sigma / tf.maximum(self.sigma, 1e-12)
-                    noise = noise_std * scale * tf.abs(self.tf_rng.normal(shape=[self.dim]))
-                    self.sigma.assign(self.sigma + noise)
-                    print(f"\nSigma noise injection at generation {gen + 1}: "
-                          f"base_std=10^{cfg.sigma_noise_scale}={noise_std:.2e}, "
-                          f"scale range=[{float(tf.reduce_min(scale)):.2f}, "
-                          f"{float(tf.reduce_max(scale)):.2f}], "
-                          f"stagnant for {gens_without_improvement} gens")
-                gens_without_improvement = 0
-                history["sigma_resets"].append(gen)
 
             t5 = time.perf_counter()
 
@@ -685,10 +623,6 @@ class SNES:
             val_keys = ["descriptors", "gradients", "grad_index",
                         "positions", "Z_int", "boxes", "targets",
                         "atom_mask", "neighbor_mask"]
-            if self._has_forces:
-                val_keys.append("forces")
-            if self._has_virial:
-                val_keys.append("virials")
             batch_data = {
                 key: tf.gather(val_data[key], val_idx_tf)
                 for key in val_keys
@@ -726,82 +660,9 @@ class SNES:
         else:
             diff_sq = tf.square(diff)
 
-        if self.cfg.target_mode == 0 and (self._has_forces or self._has_virial):
-            # Combined PES loss: energy + weighted force/virial terms
-            energy_err = tf.reduce_sum(tf.square(diff), axis=1)          # [B]
-
-            E, forces_pair = self.model.pes_forward_with_forces(
-                batch_data["descriptors"], batch_data["gradients"],
-                batch_data["grad_index"], batch_data["positions"],
-                batch_data["Z_int"], batch_data["boxes"],
-                batch_data["atom_mask"], batch_data["neighbor_mask"],
-                W0, b0, W1, b1)
-
-            combined_err = energy_err
-            amask = batch_data["atom_mask"]
-
-            if self._has_forces:
-                F_pred = self.model.scatter_forces_to_atoms(
-                    forces_pair, batch_data["grad_index"], amask)
-                f_diff = F_pred - batch_data["forces"]
-                n_atoms = tf.reduce_sum(amask, axis=1)
-                f_err = tf.reduce_sum(
-                    tf.square(f_diff) * amask[:, :, tf.newaxis], axis=[1, 2])
-                f_err = f_err / tf.maximum(n_atoms * 3.0, 1.0)
-                combined_err = combined_err + self.cfg.force_weight * f_err
-
-            if self._has_virial:
-                V_pred = self.model.compute_virial_batch(
-                    forces_pair, batch_data["positions"], batch_data["boxes"],
-                    batch_data["grad_index"], batch_data["neighbor_mask"])
-                v_diff = V_pred - batch_data["virials"]
-                v_err = tf.reduce_sum(tf.square(v_diff), axis=1) / 6.0
-                combined_err = combined_err + self.cfg.virial_weight * v_err
-
-            rmse = tf.sqrt(tf.maximum(tf.reduce_mean(combined_err), 0.0))
-        else:
-            rmse = tf.sqrt(tf.maximum(tf.reduce_mean(diff_sq), 0.0))
+        rmse = tf.sqrt(tf.maximum(tf.reduce_mean(diff_sq), 0.0))
 
         return float(rmse)
-
-    def reconstruct_params(self, param_vector: np.ndarray) -> tuple:
-        """Reconstruct TNEP parameters from a flat numpy vector.
-
-        For modes 0/1: returns (W0, b0, W1, b1)
-        For mode 2:    returns (W0, b0, W1, b1, W0_pol, b0_pol, W1_pol, b1_pol)
-        """
-        pv = np.asarray(param_vector, dtype=float)
-        assert pv.shape[0] == self.dim, (
-            f"param_vector has length {pv.shape[0]}, expected {self.dim}"
-        )
-
-        T = self.cfg.num_types
-        Q = self.dim_q
-        H = self.cfg.num_neurons
-
-        n_W0 = T * Q * H
-        n_b0 = T * H
-        n_W1 = T * H
-        n_b1 = 1
-
-        def _extract_ann(pv, offset):
-            W0 = pv[offset: offset + n_W0].reshape((T, Q, H))
-            offset += n_W0
-            b0 = pv[offset: offset + n_b0].reshape((T, H))
-            offset += n_b0
-            W1 = pv[offset: offset + n_W1].reshape((T, H))
-            offset += n_W1
-            b1 = float(pv[offset])
-            offset += n_b1
-            return W0, b0, W1, b1, offset
-
-        W0, b0, W1, b1, offset = _extract_ann(pv, 0)
-
-        if self.cfg.target_mode == 2:
-            W0_pol, b0_pol, W1_pol, b1_pol, _ = _extract_ann(pv, offset)
-            return W0, b0, W1, b1, W0_pol, b0_pol, W1_pol, b1_pol
-
-        return W0, b0, W1, b1
 
     def reconstruct_params_tf(self, param_vectors: tf.Tensor) -> tuple:
         """Reconstruct TNEP weight tensors from flat vectors using TF ops.
@@ -925,7 +786,6 @@ class SNES:
         ], axis=1)
 
     def evaluate_population(self, samples_tf: tf.Tensor, batch_data: dict[str, tf.Tensor],
-                            include_regularization: bool = True,
                             return_per_type: bool = False) -> tf.Tensor:
         """Evaluate all SNES candidates on a batch of structures on GPU.
 
@@ -945,11 +805,9 @@ class SNES:
                 targets       : [B, T_dim]
                 atom_mask     : [B, A]
                 neighbor_mask : [B, A, M]
-            include_regularization : bool — if False, return raw RMSE without
-                regularization (used by per-type ranking which applies reg separately)
             return_per_type : bool — if True, return [P, T+1] per-type RMSE
                 (GPUMD-style: each type's RMSE from structures containing that type,
-                 plus global RMSE at index T). Implies include_regularization=False.
+                 plus global RMSE at index T).
 
         Returns:
             fitness : [P] float32 — RMSE (+ regularization if enabled) per candidate
@@ -964,10 +822,6 @@ class SNES:
         batch_keys = ["descriptors", "gradients", "grad_index",
                       "positions", "Z_int", "boxes", "targets",
                       "atom_mask", "neighbor_mask"]
-        if self._has_forces:
-            batch_keys.append("forces")
-        if self._has_virial:
-            batch_keys.append("virials")
 
         T = self.cfg.num_types
         T_dim_f = tf.cast(T_dim, tf.float32)
@@ -1038,7 +892,7 @@ class SNES:
         else:
             fitness = tf.concat(all_fitness, axis=0)  # [P]
 
-        if not return_per_type and include_regularization and self.cfg.toggle_regularization:
+        if not return_per_type and self.cfg.toggle_regularization:
             reg = self.compute_regularization_tf(samples_tf)
             fitness = fitness + reg
 
@@ -1105,63 +959,6 @@ class SNES:
                     return tf.reduce_sum(tf.square(diff) * pol_weights, axis=1)  # [B]
 
             stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
-
-        elif self.cfg.target_mode == 0 and (self._has_forces or self._has_virial):
-            # PES mode with force and/or virial loss
-            W0, b0, W1, b1 = params
-            _fw = tf.constant(self.cfg.force_weight, dtype=tf.float32)
-            _vw = tf.constant(self.cfg.virial_weight, dtype=tf.float32)
-            _has_f = self._has_forces
-            _has_v = self._has_virial
-            if _has_f:
-                target_forces = batch_data["forces"]   # [B, A, 3]
-            if _has_v:
-                target_virials = batch_data["virials"]  # [B, 6]
-
-            def _forward_one_candidate(args):
-                w0, bb0, w1, bb1 = args
-                E, forces_pair = self.model.pes_forward_with_forces(
-                    desc, grads, gidx, pos, Z, boxes, amask, nmask,
-                    w0, bb0, w1, bb1, prescaled=True)
-
-                # Energy error
-                diff_E = E - targets                                     # [B, 1]
-                if _use_mae:
-                    err = tf.reduce_sum(tf.abs(diff_E), axis=1)          # [B]
-                else:
-                    err = tf.reduce_sum(tf.square(diff_E), axis=1)       # [B]
-
-                if _has_f:
-                    F_pred = self.model.scatter_forces_to_atoms(
-                        forces_pair, gidx, amask)                        # [B, A, 3]
-                    diff_F = F_pred - target_forces                      # [B, A, 3]
-                    # Per-structure force error, averaged per component
-                    n_atoms = tf.reduce_sum(amask, axis=1)               # [B]
-                    if _use_mae:
-                        f_err = tf.reduce_sum(
-                            tf.abs(diff_F) * amask[:, :, tf.newaxis],
-                            axis=[1, 2])                                 # [B]
-                        f_err = f_err / tf.maximum(n_atoms * 3.0, 1.0)
-                    else:
-                        f_err = tf.reduce_sum(
-                            tf.square(diff_F) * amask[:, :, tf.newaxis],
-                            axis=[1, 2])                                 # [B]
-                        f_err = f_err / tf.maximum(n_atoms * 3.0, 1.0)
-                    err = err + _fw * f_err
-
-                if _has_v:
-                    V_pred = self.model.compute_virial_batch(
-                        forces_pair, pos, boxes, gidx, nmask)            # [B, 6]
-                    diff_V = V_pred - target_virials                     # [B, 6]
-                    if _use_mae:
-                        v_err = tf.reduce_sum(tf.abs(diff_V), axis=1) / 6.0
-                    else:
-                        v_err = tf.reduce_sum(tf.square(diff_V), axis=1) / 6.0
-                    err = err + _vw * v_err
-
-                return err                                               # [B]
-
-            stacked = (W0, b0, W1, b1)
 
         else:
             W0, b0, W1, b1 = params

@@ -440,6 +440,6 @@ def process_trajectory(
 
 if __name__ == '__main__':
     model = train_model()
-    #model = load_model("models/n30_q165_pop80_20260405_122809/train_C_O_H_dipole_final_gen.npz")
-    #dipoles = process_trajectory(model, "datasets/Ethanol_tj.xyz", batch_size=1000)
+    #model = load_model("models/n30_q75_pop80_20260422_142744_water_monomer_dipole/water_monomer_O_H_dipole_best_val.npz")
+    #dipoles = process_trajectory(model, "datasets/water_monomer_traj.xyz", batch_size=3000)
     

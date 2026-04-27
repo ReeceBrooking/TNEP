@@ -314,25 +314,6 @@ def _scalar_acf_fft(signal: np.ndarray) -> np.ndarray:
     return acf
 
 
-def _cross_acf_fft(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Compute cross-correlation <a(0)·b(t)> via FFT.
-
-    Args:
-        a, b : [T] ndarrays
-
-    Returns:
-        ccf : [T] ndarray — unnormalised cross-correlation
-    """
-    T = len(a)
-    n_fft = 2 * T
-    fa = np.fft.rfft(a, n=n_fft)
-    fb = np.fft.rfft(b, n=n_fft)
-    power = np.real(fa * np.conj(fb))
-    ccf = np.fft.irfft(power, n=n_fft)[:T]
-    counts = np.arange(T, 0, -1, dtype=np.float64)
-    ccf /= counts
-    return ccf
-
 
 def compute_raman_acfs(polarizabilities: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Compute isotropic and anisotropic polarizability autocorrelation functions.

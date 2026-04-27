@@ -78,8 +78,7 @@ def _finish_fig(fig: plt.Figure, cfg: TNEPconfig, plot_name: str,
 
 
 def plot_snes_history(history: dict, cfg: TNEPconfig,
-                      save_plots: str | None = None, show_plots: bool = True,
-                      logy: bool = False) -> None:
+                      save_plots: str | None = None, show_plots: bool = True) -> None:
     """Plot train and validation RMSE vs generation with best/worst band."""
     g = np.asarray(history["generation"])
 
@@ -94,8 +93,6 @@ def plot_snes_history(history: dict, cfg: TNEPconfig,
     units = unit_label(cfg)
     plt.xlabel("Generation")
     plt.ylabel(f"Fitness RMSE ({units})")
-    if logy:
-        plt.yscale("log")
     plt.legend()
     plt.title("SNES fitness vs generation")
     _finish_fig(fig, cfg, "snes_fitness", save_plots, show_plots)
@@ -133,10 +130,6 @@ def plot_sigma_history(history: dict, cfg: TNEPconfig,
     plt.plot(g, history["sigma_max"], label="Sigma max", alpha=0.6)
     plt.fill_between(g, history["sigma_min"], history["sigma_max"],
                      alpha=0.15, color="blue")
-
-    for reset_gen in history.get("sigma_resets", []):
-        plt.axvline(x=reset_gen, color="red", linestyle="--", alpha=0.7,
-                    label="Sigma intervention" if reset_gen == history["sigma_resets"][0] else None)
 
     plt.xlabel("Generation")
     plt.ylabel("\u03c3")

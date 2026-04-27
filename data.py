@@ -186,70 +186,6 @@ def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]
             'missing_targets': missing_targets}
 
 
-def _gpaw_dipole_worker(args):
-    """Compute GPAW dipole for a single structure in a worker process."""
-    import os
-    os.environ['OMP_NUM_THREADS'] = str(args['omp_threads'])
-    os.environ['MKL_NUM_THREADS'] = str(args['omp_threads'])
-    from gpaw import GPAW
-    mol = args['mol']
-    calc = GPAW(mode='lcao', xc='LDA', basis='dzp', h=0.4, txt=None,
-                convergence={'energy': 0.01, 'density': 0.01},
-                occupations={'name': 'fermi-dirac', 'width': 0.2},
-                maxiter=50)
-    mol.center(vacuum=4.0)
-    return calc.get_dipole_moment(mol)
-
-
-def find_rigorous_bad_data(
-    dataset: list[Atoms],
-    target_key: str,
-    threshold: float,
-) -> list[int]:
-    """Recompute targets with GPAW and find structures with low cosine similarity.
-
-    Runs parallel GPAW dipole calculations, compares against dataset targets
-    using cosine similarity, and returns indices below the threshold.
-
-    Args:
-        dataset    : list of ase.Atoms
-        target_key : key for the target property
-        threshold  : cosine similarity threshold — structures below this are flagged
-
-    Returns:
-        list of structure indices with cosine similarity < threshold
-    """
-    import os
-    from multiprocessing import Pool
-    from tqdm import tqdm
-
-    logical = os.cpu_count() or 1
-    n_workers = max(logical // 2, 1)
-    omp_per_worker = 1
-
-    worker_args = [{'mol': s.copy(), 'omp_threads': omp_per_worker} for s in dataset]
-    print(f"  Rigorous filter: running {len(dataset)} GPAW calculations with "
-          f"{n_workers} workers ({omp_per_worker} OMP threads each)")
-
-    with Pool(n_workers) as pool:
-        target_calcs = list(tqdm(pool.imap(_gpaw_dipole_worker, worker_args),
-                                 total=len(worker_args), desc="  GPAW dipoles"))
-
-    target_actuals = [_extract_target(s, target_key) for s in dataset]
-    target_calcs = tf.convert_to_tensor(target_calcs, dtype=tf.float32)
-    target_actuals = tf.stack(target_actuals)
-
-    dot = tf.reduce_sum(target_calcs * target_actuals, axis=-1)
-    norm = tf.norm(target_calcs, axis=-1) * tf.norm(target_actuals, axis=-1)
-    similarity = dot / norm
-
-    print(f"  Cosine similarity: mean={float(tf.reduce_mean(similarity)):.4f}  "
-          f"min={float(tf.reduce_min(similarity)):.4f}")
-
-    bad_indices = [i for i in range(len(dataset)) if float(similarity[i]) < threshold]
-    return bad_indices
-
-
 def filter_bad_data(
     dataset: list[Atoms],
     dataset_types_int: list[np.ndarray],
@@ -264,7 +200,7 @@ def filter_bad_data(
         dataset           : list of ase.Atoms
         dataset_types_int : list of ndarray [N_i] — integer type index per atom
         cfg               : TNEPconfig with filter_nan_positions, filter_nan_targets,
-                            filter_zero_targets, filter_rigorous flags
+                            filter_zero_targets flags
 
     Returns:
         filtered_dataset, filtered_types_int : filtered parallel lists
@@ -279,8 +215,8 @@ def filter_bad_data(
         bad_indices.update(bad['missing_targets'])
         print(f"  Filtering {len(bad['missing_targets'])} structures with missing '{target_key}' key")
 
-    if not (cfg.filter_nan_positions or cfg.filter_nan_targets or cfg.filter_zero_targets
-            or cfg.filter_rigorous) and not bad_indices:
+    if not (cfg.filter_nan_positions or cfg.filter_nan_targets
+            or cfg.filter_zero_targets) and not bad_indices:
         return dataset, dataset_types_int
 
     if cfg.filter_nan_positions:
@@ -295,12 +231,6 @@ def filter_bad_data(
         bad_indices.update(bad['zero_targets'])
         if bad['zero_targets']:
             print(f"  Filtering {len(bad['zero_targets'])} structures with zero targets")
-
-    if cfg.filter_rigorous:
-        rigorous_bad = find_rigorous_bad_data(dataset, target_key, cfg.rigorous_threshold)
-        bad_indices.update(rigorous_bad)
-        if rigorous_bad:
-            print(f"  Filtering {len(rigorous_bad)} structures with cosine similarity < {cfg.rigorous_threshold}")
 
     if bad_indices:
         dataset = [s for i, s in enumerate(dataset) if i not in bad_indices]
@@ -461,11 +391,11 @@ def assemble_data_dict(
         if _dataset_has_key(dataset, _get_forces):
             data["forces"] = [tf.convert_to_tensor(_get_forces(s), dtype=tf.float32)
                               for s in dataset]
-            print(f"  PES mode: forces detected in dataset (weight={cfg.force_weight})")
+            print("  PES mode: forces detected in dataset")
         if _dataset_has_key(dataset, _get_virial):
             data["virials"] = [tf.convert_to_tensor(_get_virial(s), dtype=tf.float32)
                                for s in dataset]
-            print(f"  PES mode: virials detected in dataset (weight={cfg.virial_weight})")
+            print("  PES mode: virials detected in dataset")
 
     return data
 
@@ -531,8 +461,7 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         train_types_int = [dataset_types_int[i] for i in train_idx]
 
         # Load and prepare external test set
-        from ase.io import read as ase_read
-        test_structures = ase_read(cfg.test_data_path, index=":")
+        test_structures = read(cfg.test_data_path, index=":")
         if cfg.allowed_species is not None:
             # Filter before type assignment — test file may contain unknown species
             from ase.data import atomic_numbers
