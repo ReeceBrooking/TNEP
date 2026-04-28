@@ -27,7 +27,7 @@ from data import (collect, split, pad_and_stack,
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
                       plot_timing, plot_correlation, plot_cosine_similarity,
                       plot_loss_breakdown, plot_error_vs_magnitude)
-from model_io import save_model, setup_run_directory, load_model
+from model_io import save_model, save_history, setup_run_directory, load_model
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
                            compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
@@ -123,10 +123,11 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     metrics, test_preds = best_val_model.score(test_data)
     print_score_summary(metrics, cfg, prefix="Best-val test set")
 
-    # Save models
+    # Save models and history
     if cfg.save_path is not None:
         save_model(best_val_model, cfg, cfg.save_path, label="best_val")
         save_model(final_model, cfg, cfg.save_path, label="final_gen")
+        save_history(history, cfg)
 
     # Timing summary
     timing = history.get("timing", {})

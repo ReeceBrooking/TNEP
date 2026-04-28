@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import numpy as np
 import os
+import h5py
 from TNEPconfig import TNEPconfig
 from TNEP import TNEP
 
@@ -15,7 +16,7 @@ def setup_run_directory(cfg: TNEPconfig) -> str:
             n{neurons}_q{dim_q}_pop{pop_size}_{YYYYMMDD_HHMMSS}/
                 plots/
                 config.txt
-                (model .npz saved here after training)
+                (model .h5 saved here after training)
 
     Requires cfg.dim_q to be set (call after descriptor building).
     Updates cfg.save_path and cfg.save_plots in place.
@@ -59,55 +60,21 @@ def setup_run_directory(cfg: TNEPconfig) -> str:
 
 
 def _z_to_symbol(z: int) -> str:
-    """Convert atomic number to element symbol."""
     from ase.data import chemical_symbols
     return chemical_symbols[z]
 
 
 def _generate_model_filename(cfg: TNEPconfig) -> str:
-    """Generate a model filename from config: {dataset}_{elements}_{mode}.npz
-
-    Examples:
-        train_C_H_O_dipole.npz
-        water_O_H_pes.npz
-    """
+    """Generate a model filename: {dataset}_{elements}_{mode}.h5"""
     mode_names = {0: "pes", 1: "dipole", 2: "polar"}
     mode = mode_names.get(cfg.target_mode, f"mode{cfg.target_mode}")
     dataset_name = os.path.splitext(os.path.basename(cfg.data_path))[0]
     elements = "_".join(_z_to_symbol(z) for z in cfg.types)
-    return f"{dataset_name}_{elements}_{mode}.npz"
+    return f"{dataset_name}_{elements}_{mode}.h5"
 
 
-def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
-               label: str | None = None) -> None:
-    """Save trained TNEP model weights and config to a .npz file.
-
-    Saves all config attributes as a JSON string for full reproducibility.
-    Also saves model weights and Z-to-type-index mapping.
-
-    If path is True or "auto", generates filename from dataset name,
-    element types, and target mode.
-
-    Args:
-        model : trained TNEP model
-        cfg   : TNEPconfig used for training
-        path  : str or None — output file path. If None, auto-generates.
-        label : optional suffix inserted before .npz (e.g. "best_val", "final_gen")
-    """
-    if path is None or path.endswith("auto"):
-        directory = os.path.dirname(path) if path and os.path.dirname(path) else "."
-        os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, _generate_model_filename(cfg))
-
-    if label:
-        base, ext = os.path.splitext(path)
-        path = f"{base}_{label}{ext}"
-
-    # Build Z -> type index mapping: {atomic_number: layer_index}
-    z_to_type_index = np.array(
-        [[z, idx] for idx, z in enumerate(cfg.types)], dtype=np.int32)
-
-    # Serialize full config as JSON — convert numpy types to native Python
+def _serialize_config(cfg: TNEPconfig) -> dict:
+    """Convert TNEPconfig to a JSON-serialisable dict."""
     config_dict = {}
     for k, v in vars(cfg).items():
         if k.startswith('_'):
@@ -128,60 +95,195 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
                  float(x) if isinstance(x, np.floating) else x
                  for x in v]
         config_dict[k] = v
+    return config_dict
 
-    data = {
-        # --- Model weights ---
-        "W0": model.W0.numpy(),
-        "b0": model.b0.numpy(),
-        "W1": model.W1.numpy(),
-        "b1": model.b1.numpy(),
-        # --- Species mapping ---
-        "z_to_type_index": z_to_type_index,
-        # --- Full config ---
-        "config_json": np.array(json.dumps(config_dict)),
-    }
-    if cfg.target_mode == 2:
-        data["W0_pol"] = model.W0_pol.numpy()
-        data["b0_pol"] = model.b0_pol.numpy()
-        data["W1_pol"] = model.W1_pol.numpy()
-        data["b1_pol"] = model.b1_pol.numpy()
 
-    if cfg.descriptor_mean is not None:
-        data["descriptor_mean"] = np.asarray(cfg.descriptor_mean)
+def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
+               label: str | None = None) -> None:
+    """Save trained TNEP model weights and config to an HDF5 (.h5) file.
 
-    # Save PCA projection if used
-    if hasattr(cfg, '_descriptor_pca') and cfg._descriptor_pca is not None:
-        data.update(cfg._descriptor_pca.to_dict())
+    File layout:
+        /                       — top-level attributes: target_mode, num_types,
+                                  num_neurons, dim_q, elements (quick inspection)
+        /weights/               — W0, b0, W1, b1 (+ pol variants for mode 2)
+        /descriptor/            — z_to_type_index, descriptor_mean (if set)
+        /pca/                   — pca_components, pca_mean, … (if PCA used)
+        /config                 — full TNEPconfig serialised as JSON string
 
-    np.savez(path, **data)
+    Load with:
+        import h5py
+        with h5py.File('model.h5', 'r') as f:
+            W0 = f['weights/W0'][:]
+            cfg_dict = json.loads(f['config'][()])
+
+    Args:
+        model : trained TNEP model
+        cfg   : TNEPconfig used for training
+        path  : output file path. None or ending "auto" = auto-generate.
+        label : optional suffix before .h5 (e.g. "best_val", "final_gen")
+    """
+    if path is None or path.endswith("auto"):
+        directory = os.path.dirname(path) if path and os.path.dirname(path) else "."
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, _generate_model_filename(cfg))
+
+    if label:
+        base, ext = os.path.splitext(path)
+        path = f"{base}_{label}{ext}"
+
+    config_dict = _serialize_config(cfg)
+    z_to_type_index = np.array(
+        [[z, idx] for idx, z in enumerate(cfg.types)], dtype=np.int32)
+
+    with h5py.File(path, "w") as f:
+        # Top-level metadata — visible via `h5ls -v model.h5` without loading weights
+        f.attrs["target_mode"] = cfg.target_mode
+        f.attrs["num_types"] = cfg.num_types
+        f.attrs["num_neurons"] = cfg.num_neurons
+        f.attrs["dim_q"] = cfg.dim_q
+        f.attrs["elements"] = json.dumps(cfg.types)
+
+        # Weights
+        wg = f.create_group("weights")
+        wg.create_dataset("W0", data=model.W0.numpy())
+        wg.create_dataset("b0", data=model.b0.numpy())
+        wg.create_dataset("W1", data=model.W1.numpy())
+        wg.create_dataset("b1", data=model.b1.numpy())
+        if cfg.target_mode == 2:
+            wg.create_dataset("W0_pol", data=model.W0_pol.numpy())
+            wg.create_dataset("b0_pol", data=model.b0_pol.numpy())
+            wg.create_dataset("W1_pol", data=model.W1_pol.numpy())
+            wg.create_dataset("b1_pol", data=model.b1_pol.numpy())
+
+        # Descriptor metadata
+        dg = f.create_group("descriptor")
+        dg.create_dataset("z_to_type_index", data=z_to_type_index)
+        if cfg.descriptor_mean is not None:
+            dg.create_dataset("descriptor_mean", data=np.asarray(cfg.descriptor_mean))
+
+        # PCA projection
+        if hasattr(cfg, '_descriptor_pca') and cfg._descriptor_pca is not None:
+            pg = f.create_group("pca")
+            for k, v in cfg._descriptor_pca.to_dict().items():
+                pg.create_dataset(k, data=v)
+
+        # Full config as JSON string
+        f.create_dataset("config", data=json.dumps(config_dict))
+
     print(f"Model saved to {path}")
 
 
-def load_model(path: str = "tnep_model.npz") -> TNEP:
-    """Load a trained TNEP model from a .npz file.
+def save_history(history: dict, cfg: TNEPconfig) -> None:
+    """Write training history to history.csv in the run directory.
 
-    Reconstructs a TNEPconfig and TNEP model with the saved weights.
-    Supports both new format (config_json) and legacy format (individual fields).
+    CSV format: load with pd.read_csv('history.csv') or
+    np.loadtxt('history.csv', delimiter=',', skiprows=1).
 
-    Args:
-        path : str — path to saved .npz file
-
-    Returns:
-        model : TNEP model with loaded weights
+    Columns: generation, train_loss (RMSE + reg), val_loss, L1, L2,
+             best_rmse, worst_rmse, sigma_min, sigma_max, sigma_mean, sigma_median.
     """
+    run_dir = os.path.dirname(cfg.save_path) if cfg.save_path else "."
+    path = os.path.join(run_dir, "history.csv")
+
+    cols = [
+        "generation", "train_loss", "val_loss",
+        "L1", "L2", "best_rmse", "worst_rmse",
+        "sigma_min", "sigma_max", "sigma_mean", "sigma_median",
+    ]
+    int_cols = {"generation"}
+
+    with open(path, "w") as f:
+        f.write(",".join(cols) + "\n")
+        for i in range(len(history["generation"])):
+            row = ",".join(
+                str(int(history[c][i])) if c in int_cols else f"{history[c][i]:.6g}"
+                for c in cols
+            )
+            f.write(row + "\n")
+    print(f"History saved to {path}")
+
+
+def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
+                  W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None) -> None:
+    model.W0.assign(W0)
+    model.b0.assign(b0)
+    model.W1.assign(W1)
+    model.b1.assign(b1)
+    if cfg.target_mode == 2:
+        model.W0_pol.assign(W0_pol)
+        model.b0_pol.assign(b0_pol)
+        model.W1_pol.assign(W1_pol)
+        model.b1_pol.assign(b1_pol)
+
+
+def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
+    from ase.data import chemical_symbols
+    type_str = ", ".join(f"{chemical_symbols[z]}(Z={z})→{idx}"
+                         for z, idx in cfg.type_map.items())
+    print(f"Model loaded from {path}")
+    print(f"  target_mode={cfg.target_mode}, dim_q={cfg.dim_q}, "
+          f"num_types={cfg.num_types}")
+    print(f"  Type mapping: {type_str}")
+
+
+def _load_model_h5(path: str) -> TNEP:
+    cfg = TNEPconfig()
+
+    # Read everything into memory before constructing TNEP (which initialises
+    # quippy descriptors) so the file handle is closed as early as possible.
+    with h5py.File(path, "r") as f:
+        config_dict = json.loads(f["config"][()])
+
+        cfg.type_map = {int(row[0]): int(row[1])
+                        for row in f["descriptor/z_to_type_index"][:]}
+
+        descriptor_mean = (f["descriptor/descriptor_mean"][:].astype(np.float32)
+                           if "descriptor/descriptor_mean" in f else None)
+
+        pca_dict = ({k: f[f"pca/{k}"][:] for k in f["pca"]}
+                    if "pca" in f else None)
+
+        wg = f["weights"]
+        weights = {
+            "W0": wg["W0"][:], "b0": wg["b0"][:],
+            "W1": wg["W1"][:], "b1": wg["b1"][()],
+            "W0_pol": wg["W0_pol"][:] if "W0_pol" in wg else None,
+            "b0_pol": wg["b0_pol"][:] if "b0_pol" in wg else None,
+            "W1_pol": wg["W1_pol"][:] if "W1_pol" in wg else None,
+            "b1_pol": wg["b1_pol"][:] if "b1_pol" in wg else None,
+        }
+
+    for k, v in config_dict.items():
+        if k == "descriptor_mean" and v is not None:
+            v = np.array(v, dtype=np.float32)
+        setattr(cfg, k, v)
+
+    if descriptor_mean is not None:
+        cfg.descriptor_mean = descriptor_mean
+
+    if pca_dict is not None:
+        from descriptor_pca import DescriptorPCA
+        cfg._descriptor_pca = DescriptorPCA.from_dict(pca_dict)
+
+    model = TNEP(cfg)
+    _load_weights(model, cfg, **weights)
+
+    _print_load_summary(path, cfg)
+    return model
+
+
+def _load_model_npz(path: str) -> TNEP:
+    """Legacy loader for .npz checkpoints."""
     data = np.load(path, allow_pickle=True)
     cfg = TNEPconfig()
 
     if "config_json" in data:
-        # New format: restore full config from JSON
         config_dict = json.loads(str(data["config_json"]))
         for k, v in config_dict.items():
-            # descriptor_mean is serialized as list in JSON; convert back to ndarray
             if k == "descriptor_mean" and v is not None:
                 v = np.array(v, dtype=np.float32)
             setattr(cfg, k, v)
     else:
-        # Legacy fallback: load individual fields
         cfg.num_types = int(data["num_types"])
         cfg.num_neurons = int(data["num_neurons"])
         cfg.dim_q = int(data["dim_q"])
@@ -191,17 +293,14 @@ def load_model(path: str = "tnep_model.npz") -> TNEP:
         cfg.alpha_max = int(data["alpha_max"])
         cfg.activation = str(data["activation"])
         cfg.data_path = str(data["data_path"])
-        # Map old rc -> rcut_hard/rcut_soft
         if "rc" in data:
             rc = float(data["rc"])
             cfg.rcut_hard = rc
             cfg.rcut_soft = rc - 0.5
 
-    # Restore descriptor_mean from dedicated array key (takes precedence over JSON)
     if "descriptor_mean" in data:
         cfg.descriptor_mean = data["descriptor_mean"].astype(np.float32)
 
-    # Restore PCA projection if saved
     if "pca_components" in data:
         from descriptor_pca import DescriptorPCA
         cfg._descriptor_pca = DescriptorPCA.from_dict({
@@ -211,26 +310,29 @@ def load_model(path: str = "tnep_model.npz") -> TNEP:
             "pca_n_components": data["pca_n_components"],
         })
 
-    # Reconstruct Z -> type index mapping and store in cfg
     cfg.type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}
 
     model = TNEP(cfg)
-    model.W0.assign(data["W0"])
-    model.b0.assign(data["b0"])
-    model.W1.assign(data["W1"])
-    model.b1.assign(data["b1"])
+    _load_weights(
+        model, cfg,
+        data["W0"], data["b0"], data["W1"], data["b1"],
+        data.get("W0_pol"), data.get("b0_pol"),
+        data.get("W1_pol"), data.get("b1_pol"),
+    )
 
-    if cfg.target_mode == 2:
-        model.W0_pol.assign(data["W0_pol"])
-        model.b0_pol.assign(data["b0_pol"])
-        model.W1_pol.assign(data["W1_pol"])
-        model.b1_pol.assign(data["b1_pol"])
-
-    from ase.data import chemical_symbols
-    type_str = ", ".join(f"{chemical_symbols[z]}(Z={z})→{idx}"
-                         for z, idx in cfg.type_map.items())
-    print(f"Model loaded from {path}")
-    print(f"  target_mode={cfg.target_mode}, dim_q={cfg.dim_q}, "
-          f"num_types={cfg.num_types}")
-    print(f"  Type mapping: {type_str}")
+    _print_load_summary(path, cfg)
     return model
+
+
+def load_model(path: str) -> TNEP:
+    """Load a trained TNEP model from an HDF5 (.h5) or legacy NumPy (.npz) file.
+
+    Args:
+        path : path to saved model file
+
+    Returns:
+        model : TNEP model with loaded weights and reconstructed TNEPconfig
+    """
+    if path.endswith(".npz"):
+        return _load_model_npz(path)
+    return _load_model_h5(path)
