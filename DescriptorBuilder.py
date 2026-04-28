@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-import multiprocessing
+import concurrent.futures
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras import layers
@@ -9,20 +9,6 @@ from TNEPconfig import TNEPconfig
 from quippy.descriptors import Descriptor
 
 from ase import Atoms
-
-
-def _worker_init(omp_threads: int) -> None:
-    """Set OMP/MKL thread counts in each worker process before any tasks run.
-
-    Called via Pool(initializer=...) so env vars are in place before the first
-    Descriptor.calc() call. Note: with forkserver, quippy is already imported
-    in the server process from which workers are forked; whether the OMP thread
-    pool resizes depends on the runtime (MKL re-reads per-call; OpenMP
-    thread pools may not resize after pool-init).
-    """
-    import os
-    os.environ['OMP_NUM_THREADS'] = str(omp_threads)
-    os.environ['MKL_NUM_THREADS'] = str(omp_threads)
 
 
 def _describe_structure_worker(
@@ -151,7 +137,7 @@ class DescriptorBuilder(layers.Layer):
 
         if cfg.num_descriptor_workers is None:
             _slurm = os.environ.get('SLURM_CPUS_PER_TASK')
-            self._num_workers = int(_slurm) if _slurm else 1
+            self._num_workers = int(_slurm) if _slurm else max(os.cpu_count() // 2, 1)
         else:
             self._num_workers = cfg.num_descriptor_workers
 
@@ -224,19 +210,31 @@ class DescriptorBuilder(layers.Layer):
                 dataset_grad_index.append(grad_indexes)
 
         else:
-            # Outside SLURM, falls back to num_workers as total CPUs → omp_per_worker=1 (safe)
-            _slurm_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', self._num_workers))
-            omp_per_worker = max(1, _slurm_cpus // self._num_workers)
+            _total_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+            omp_per_worker = max(1, _total_cpus // self._num_workers)
 
-            ctx = multiprocessing.get_context('forkserver')
-            args = [
-                (structure, self._soap_strings)
-                for structure in dataset
-            ]
-            with ctx.Pool(self._num_workers,
-                          initializer=_worker_init,
-                          initargs=(omp_per_worker,)) as pool:
-                results = pool.map(_describe_structure_worker, args)
+            # ThreadPoolExecutor avoids multiprocessing pickling entirely.
+            # quippy's Descriptor.calc() is a C extension that releases the GIL,
+            # so threads run in true parallel for the compute-heavy part.
+            # soap_strings is captured by closure — no serialisation needed.
+            soap_strings = self._soap_strings
+
+            def _thread_worker(structure):
+                return _describe_structure_worker((structure, soap_strings))
+
+            # OMP_NUM_THREADS is process-wide; setting it before the pool starts
+            # means each thread's first quippy OMP context picks up omp_per_worker.
+            old_omp = os.environ.get('OMP_NUM_THREADS')
+            os.environ['OMP_NUM_THREADS'] = str(omp_per_worker)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=self._num_workers) as exe:
+                    results = list(exe.map(_thread_worker, dataset))
+            finally:
+                if old_omp is not None:
+                    os.environ['OMP_NUM_THREADS'] = old_omp
+                else:
+                    os.environ.pop('OMP_NUM_THREADS', None)
 
             for descriptors_np, gradients_np, grad_indexes in results:
                 dataset_descriptors.append(tf.convert_to_tensor(descriptors_np, dtype=tf.float32))

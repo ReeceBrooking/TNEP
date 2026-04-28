@@ -124,8 +124,6 @@ class TNEPconfig:
     show_plots: bool = False
     # Show extra info in progress bar (L1, L2 regularisation)
     debug: bool = False
-    # Negate predictions for structures detected as sign-flipped (cos_sim < -0.9)
-    fix_sign_flips: bool = False
     # Scale input descriptors by their training-set statistics (per component)
     scale_descriptors: bool = False
     # Descriptor scaling method: "range" (GPUMD-style 1/(max-min)) or "mean" (mean(|x|)*sqrt(dim_q))

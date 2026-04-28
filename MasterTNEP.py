@@ -3,26 +3,18 @@ from __future__ import annotations
 import numpy as np
 import os
 
-# CPU parallelisation: detect GPU vs CPU-only and set thread counts accordingly
 _slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
 _cpu_threads = int(_slurm_cpus) if _slurm_cpus else max(os.cpu_count() // 2, 1)
 
 _cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
 _has_gpu = (_cuda_visible not in ('', '-1')) or os.path.exists('/dev/nvidiactl')
 
+os.environ['OMP_NUM_THREADS'] = str(_cpu_threads)
+os.environ['MKL_NUM_THREADS'] = str(_cpu_threads)
+os.environ['TF_NUM_INTRAOP_THREADS'] = str(_cpu_threads)
+os.environ['TF_NUM_INTEROP_THREADS'] = '2'
 if _has_gpu:
-    # OMP_NUM_THREADS=4 (was 2) — main process only governs TF CPU ops and the serial
-    # descriptor fallback; workers set their own omp_per_worker inside each process.
-    os.environ['OMP_NUM_THREADS'] = '4'
-    os.environ['MKL_NUM_THREADS'] = '4'
-    os.environ['TF_NUM_INTRAOP_THREADS'] = '4'
-    os.environ['TF_NUM_INTEROP_THREADS'] = '2'
     os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
-else:
-    os.environ['OMP_NUM_THREADS'] = str(_cpu_threads)
-    os.environ['MKL_NUM_THREADS'] = str(_cpu_threads)
-    os.environ['TF_NUM_INTRAOP_THREADS'] = str(_cpu_threads)
-    os.environ['TF_NUM_INTEROP_THREADS'] = '4'  # interop governs graph-level parallelism; 4 is sufficient
 
 import tensorflow as tf
 
@@ -39,8 +31,6 @@ from model_io import save_model, setup_run_directory, load_model
 from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
                            compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
-from debug_signs import (diagnose_sign_flips, correct_sign_flips, check_cells,
-                         characterize_flipped, test_target_negation)
 from ase.io import read
 from tqdm import tqdm
 
@@ -132,67 +122,6 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     # Score best-val model
     metrics, test_preds = best_val_model.score(test_data)
     print_score_summary(metrics, cfg, prefix="Best-val test set")
-
-    # Debug sign-flipped dipole predictions
-    if cfg.target_mode == 1:
-        diag = diagnose_sign_flips(best_val_model, test_data)
-        if cfg.test_data_path is not None:
-            test_structures = read(cfg.test_data_path, index=":")
-            if cfg.allowed_species:
-                from ase.data import atomic_numbers
-                allowed = set(atomic_numbers[z] if isinstance(z, str) else z
-                              for z in cfg.allowed_species)
-                test_structures = [s for s in test_structures
-                                   if set(s.numbers).issubset(allowed)]
-        else:
-            n_test = int(cfg.test_ratio * len(cfg.indices))
-            test_idx = cfg.indices[:n_test]
-            test_structures = [dataset[i] for i in test_idx]
-        check_cells(test_structures)
-        if diag["flipped_idx"]:
-            characterize_flipped(test_structures, diag["flipped_idx"], diag["good_idx"])
-            test_target_negation(diag["preds"], diag["targets"], diag["flipped_idx"])
-        # NOTE: verify_gradient_sign() is not called here because it invokes
-        # quippy's C descriptor code again, which can cause heap corruption
-        # (malloc_consolidate) after training. Run it standalone if needed:
-        #   verify_gradient_sign(model, structures, cfg, structure_idx=0)
-
-        # Correct flipped predictions and recompute metrics
-        if cfg.fix_sign_flips and diag["flipped_idx"]:
-            corrected_preds = correct_sign_flips(diag["preds"], diag["cos_sim"])
-            test_preds = tf.constant(corrected_preds, dtype=tf.float32)
-            targets_tf = test_data["targets"]
-            diff = test_preds - targets_tf
-            metrics["rmse"] = tf.sqrt(tf.reduce_mean(tf.square(diff)))
-            ss_res = tf.reduce_sum(tf.square(diff))
-            ss_tot = tf.reduce_sum(tf.square(targets_tf - tf.reduce_mean(targets_tf, axis=0)))
-            metrics["r2"] = 1.0 - ss_res / ss_tot
-            ss_res_comp = tf.reduce_sum(tf.square(diff), axis=0)
-            ss_tot_comp = tf.reduce_sum(
-                tf.square(targets_tf - tf.reduce_mean(targets_tf, axis=0)), axis=0)
-            metrics["r2_components"] = 1.0 - ss_res_comp / tf.maximum(ss_tot_comp, 1e-12)
-            dot = tf.reduce_sum(test_preds * targets_tf, axis=1)
-            norm_p = tf.linalg.norm(test_preds, axis=1)
-            norm_t = tf.linalg.norm(targets_tf, axis=1)
-            cos_sim = dot / tf.maximum(norm_p * norm_t, 1e-12)
-            metrics["cos_sim_mean"] = tf.reduce_mean(cos_sim)
-            metrics["cos_sim_all"] = cos_sim
-            if "total_rmse" in metrics:
-                na = tf.cast(test_data["num_atoms"], tf.float32)[:, tf.newaxis]
-                total_diff = test_preds * na - targets_tf * na
-                metrics["total_rmse"] = tf.sqrt(tf.reduce_mean(tf.square(total_diff)))
-                total_ss_res = tf.reduce_sum(tf.square(total_diff))
-                total_targets = targets_tf * na
-                total_ss_tot = tf.reduce_sum(tf.square(
-                    total_targets - tf.reduce_mean(total_targets, axis=0)))
-                metrics["total_r2"] = 1.0 - total_ss_res / total_ss_tot
-                total_ss_res_comp = tf.reduce_sum(tf.square(total_diff), axis=0)
-                total_ss_tot_comp = tf.reduce_sum(tf.square(
-                    total_targets - tf.reduce_mean(total_targets, axis=0)), axis=0)
-                metrics["total_r2_components"] = 1.0 - total_ss_res_comp / tf.maximum(total_ss_tot_comp, 1e-12)
-            print("\n=== After sign-flip correction ===")
-            print(f"  RMSE:          {float(metrics['rmse']):.4f}")
-            print(f"  Mean cos_sim:  {float(metrics['cos_sim_mean']):.4f}")
 
     # Save models
     if cfg.save_path is not None:

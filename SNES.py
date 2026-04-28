@@ -861,26 +861,41 @@ class SNES:
 
         all_fitness = []
 
+        # One .numpy() call reads the entire struct_ptr index into CPU memory,
+        # eliminating per-iteration int() syncs that would stall the GPU.
+        ptr = batch_data["struct_ptr"].numpy()
+
+        # Pre-build all structure chunk dicts once. Slice/dict work is not repeated
+        # per pop_chunk iteration, and COO pair_struct offsets are applied here.
+        struct_chunks = []
+        for s_start in range(0, B, struct_chunk):
+            s_end        = min(s_start + struct_chunk, B)
+            p_lo, p_hi   = int(ptr[s_start]), int(ptr[s_end])
+            chunk        = {key: batch_data[key][s_start:s_end] for key in struct_only_keys}
+            chunk["grad_values"] = batch_data["grad_values"][p_lo:p_hi]
+            chunk["pair_atom"]   = batch_data["pair_atom"][p_lo:p_hi]
+            chunk["pair_gidx"]   = batch_data["pair_gidx"][p_lo:p_hi]
+            chunk["pair_struct"] = batch_data["pair_struct"][p_lo:p_hi] - s_start
+            struct_chunks.append(chunk)
+
+        # Stage all chunks to GPU before any pop_chunk iteration.
+        # When pin_data_to_cpu=True data lives in CPU-pinned memory; issuing all DMA
+        # transfers here lets subsequent pop_chunk iterations find the tensors already
+        # on device instead of triggering a mid-compute transfer each time.
+        if self.cfg.pin_data_to_cpu:
+            with tf.device('/GPU:0'):
+                struct_chunks = [
+                    {k: tf.identity(v) for k, v in chunk.items()}
+                    for chunk in struct_chunks
+                ]
+
         for p_start in range(0, P, pop_chunk):
-            p_end = min(p_start + pop_chunk, P)
+            p_end      = min(p_start + pop_chunk, P)
             candidates = samples_tf[p_start:p_end]  # [C, dim]
 
-            # Accumulate per-structure error across structure chunks
-            chunk_parts = []  # list of [C, B_chunk_i]
-
-            for s_start in range(0, B, struct_chunk):
-                s_end = min(s_start + struct_chunk, B)
-                struct_batch = {key: batch_data[key][s_start:s_end]
-                                for key in struct_only_keys}
-                # Slice COO pairs for this structure chunk via struct_ptr
-                p_lo = int(batch_data["struct_ptr"][s_start])
-                p_hi = int(batch_data["struct_ptr"][s_end])
-                struct_batch["grad_values"] = batch_data["grad_values"][p_lo:p_hi]
-                struct_batch["pair_atom"]   = batch_data["pair_atom"][p_lo:p_hi]
-                struct_batch["pair_gidx"]   = batch_data["pair_gidx"][p_lo:p_hi]
-                struct_batch["pair_struct"] = batch_data["pair_struct"][p_lo:p_hi] - s_start
-                chunk_err = self._evaluate_chunk(candidates, struct_batch)
-                chunk_parts.append(chunk_err)          # [C, B_chunk_i]
+            chunk_parts = []
+            for chunk in struct_chunks:
+                chunk_parts.append(self._evaluate_chunk(candidates, chunk))
 
             # Concatenate structure chunks → [C, B]
             per_struct_err = tf.concat(chunk_parts, axis=1)
@@ -990,13 +1005,12 @@ class SNES:
                     return tf.reduce_sum(tf.square(diff) * pol_weights, axis=1)  # [B]
 
             stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
+            return tf.vectorized_map(_forward_one_candidate, stacked)  # [C, B]
 
         else:
             W0, b0, W1, b1 = params
 
-            # For dipole mode, precompute W_atom outside vectorized_map so pfor treats
-            # it as a loop-invariant (not expanded by C). This replaces the [C,P,Q]
-            # gather_nd intermediate with an [B,A,3,Q] segment_sum computed once.
+            # Precompute W_atom [B, A, 3, Q] once — independent of all candidates.
             if self.cfg.target_mode == 1:
                 W_atom = self.model._precompute_dipole_kernel(
                     grad_values, pair_struct, pair_atom, pair_gidx,
@@ -1005,24 +1019,17 @@ class SNES:
             else:
                 W_atom = None
 
-            def _forward_one_candidate(args):
-                w0, bb0, w1, bb1 = args
-                preds = self.model.predict_batch(
-                    desc, grad_values, pair_atom, pair_gidx, pair_struct,
-                    pos, Z, boxes, amask,
-                    w0, bb0, w1, bb1, None, None, None, None,
-                    prescaled=True,
-                    W_atom=W_atom,  # closure variable — not per-candidate, pfor won't expand
-                )
-                if _scale_preds:
-                    preds = preds * inv_num_atoms
+            # Evaluate all C candidates simultaneously using explicit batched GEMMs.
+            # predict_batch_candidates executes one GEMM per type in each direction
+            # rather than C separate matmuls inside vectorized_map.
+            preds = self.model.predict_batch_candidates(
+                desc, W_atom, Z, amask, W0, b0, W1, b1)  # [C, B, T_dim]
 
-                diff = preds - targets
-                if _use_mae:
-                    return tf.reduce_sum(tf.abs(diff), axis=1)     # [B]
-                else:
-                    return tf.reduce_sum(tf.square(diff), axis=1)  # [B]
+            if _scale_preds:
+                preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]
 
-            stacked = (W0, b0, W1, b1)
-
-        return tf.vectorized_map(_forward_one_candidate, stacked)  # [C, B]
+            diff = preds - targets[tf.newaxis]  # [C, B, T_dim]
+            if _use_mae:
+                return tf.reduce_sum(tf.abs(diff), axis=2)     # [C, B]
+            else:
+                return tf.reduce_sum(tf.square(diff), axis=2)  # [C, B]

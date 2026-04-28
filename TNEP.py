@@ -436,6 +436,98 @@ class TNEP(layers.Layer):
         else:
             tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
 
+    @tf.function
+    def predict_batch_candidates(self,
+                                  descriptors: tf.Tensor,
+                                  W_atom: tf.Tensor | None,
+                                  Z: tf.Tensor,
+                                  atom_mask: tf.Tensor,
+                                  W0: tf.Tensor, b0: tf.Tensor,
+                                  W1: tf.Tensor, b1: tf.Tensor) -> tf.Tensor:
+        """Forward pass for C candidates × B structures using explicit batched GEMMs.
+
+        Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
+        Both the input→hidden and hidden→descriptor matmuls are executed as
+        single large GEMMs over all C candidates simultaneously:
+
+            Forward:  [B*A, Q] @ [Q, C*H]    → [B*A, C*H] → [C, B, A, H]
+            Backward: [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]  (batched GEMM)
+
+        Descriptors are assumed pre-scaled by the caller.
+
+        Args:
+            descriptors : [B, A, Q]
+            W_atom      : [B, A, 3, Q]  precomputed dipole kernel (mode 1 only)
+            Z           : [B, A]        type indices
+            atom_mask   : [B, A]        1.0 real, 0.0 pad
+            W0          : [C, T, Q, H]
+            b0          : [C, T, H]
+            W1          : [C, T, H]
+            b1          : [C]
+
+        Returns:
+            predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
+        """
+        Q = self.dim_q
+        H = self.num_neurons
+        T = self.num_types
+
+        B = tf.shape(descriptors)[0]
+        A = tf.shape(descriptors)[1]
+        C = tf.shape(W0)[0]
+
+        # Type masks [B, A, 1] — independent of C, reused for both matmul directions
+        type_masks = [
+            tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
+            for t in range(T)
+        ]
+
+        # ── Forward: input→hidden ─────────────────────────────────────────────
+        # Per type: [B*A, Q] @ [Q, C*H] → [B*A, C*H] → [C, B, A, H]
+        # One GEMM per type instead of C separate GEMMs inside pfor.
+        desc_flat = tf.reshape(descriptors, [B * A, Q])
+        pre_h_terms = []
+        for t in range(T):
+            W0_t     = W0[:, t, :, :]                                              # [C, Q, H]
+            W0_t_mat = tf.reshape(tf.transpose(W0_t, [1, 0, 2]), [Q, C * H])      # [Q, C*H]
+            ph_flat  = tf.matmul(desc_flat, W0_t_mat)                             # [B*A, C*H]
+            ph       = tf.transpose(tf.reshape(ph_flat, [B, A, C, H]), [2, 0, 1, 3])  # [C,B,A,H]
+            pre_h_terms.append(ph * type_masks[t][tf.newaxis])
+        pre_h = tf.add_n(pre_h_terms)  # [C, B, A, H]
+
+        # ── Bias / output-weight gathers ──────────────────────────────────────
+        # tf.gather along T axis: b0[C,T,H] gathered by Z_flat[B*A] → [C,B*A,H]
+        Z_flat   = tf.reshape(Z, [B * A])
+        b0_t_all = tf.reshape(tf.gather(b0, Z_flat, axis=1), [C, B, A, H])
+        W1_t_all = tf.reshape(tf.gather(W1, Z_flat, axis=1), [C, B, A, H])
+
+        # ── Activation ────────────────────────────────────────────────────────
+        h = self.activation(pre_h + b0_t_all)
+        h = h * atom_mask[tf.newaxis, :, :, tf.newaxis]
+
+        # ── PES ───────────────────────────────────────────────────────────────
+        if self.cfg.target_mode == 0:
+            E = tf.reduce_sum(h * W1_t_all, axis=3) + b1[:, tf.newaxis, tf.newaxis]
+            E = E * atom_mask[tf.newaxis]
+            return -tf.reduce_sum(E, axis=2, keepdims=True)  # [C, B, 1]
+
+        # ── Dipole: backward matmul ───────────────────────────────────────────
+        dtanh    = 1.0 - tf.square(h)
+        de_da    = dtanh * W1_t_all                           # [C, B, A, H]
+        de_da_flat = tf.reshape(de_da, [C, B * A, H])         # [C, B*A, H]
+
+        # Per type: [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]  (batched GEMM over C)
+        de_dq_terms = []
+        for t in range(T):
+            W0_t_T  = tf.transpose(W0[:, t, :, :], [0, 2, 1])    # [C, H, Q]
+            dq_flat = tf.matmul(de_da_flat, W0_t_T)               # [C, B*A, Q]
+            dq      = tf.reshape(dq_flat, [C, B, A, Q])
+            de_dq_terms.append(dq * type_masks[t][tf.newaxis])
+        de_dq = tf.add_n(de_dq_terms)  # [C, B, A, Q]
+
+        # W_atom [B, A, 3, Q]: dipole[c,b,s] = -Σ_{a,q} de_dq[c,b,a,q]*W_atom[b,a,s,q]
+        return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
+
     def _calc_forces_coo(self, de_dq: tf.Tensor, grad_values: tf.Tensor,
                          pair_struct: tf.Tensor, pair_atom: tf.Tensor) -> tf.Tensor:
         """Compute per-pair forces via COO gather + einsum.
