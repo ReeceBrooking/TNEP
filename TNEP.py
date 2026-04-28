@@ -257,7 +257,7 @@ class TNEP(layers.Layer):
         """Evaluate RMSE, R², per-component R², and cosine similarity.
 
         Args:
-            test_data : dict with padded tensors from pad_and_stack()
+            test_data : dict with COO tensors from pad_and_stack()
 
         Returns:
             metrics : dict with keys:
@@ -269,10 +269,10 @@ class TNEP(layers.Layer):
             preds : [S, T] tensor of predictions
         """
         raw_preds = self.predict_batch(
-            test_data["descriptors"], test_data["gradients"],
-            test_data["grad_index"], test_data["positions"],
-            test_data["Z_int"], test_data["boxes"],
-            test_data["atom_mask"], test_data["neighbor_mask"],
+            test_data["descriptors"], test_data["grad_values"],
+            test_data["pair_atom"], test_data["pair_gidx"], test_data["pair_struct"],
+            test_data["positions"], test_data["Z_int"], test_data["boxes"],
+            test_data["atom_mask"],
             self.W0, self.b0, self.W1, self.b1,
             getattr(self, 'W0_pol', None),
             getattr(self, 'b0_pol', None),
@@ -339,56 +339,60 @@ class TNEP(layers.Layer):
         return metrics, preds
 
     @tf.function
-    def predict_batch(self, descriptors: tf.Tensor, gradients: tf.Tensor,
-                      grad_index: tf.Tensor, positions: tf.Tensor, Z: tf.Tensor,
-                      boxes: tf.Tensor, atom_mask: tf.Tensor, neighbor_mask: tf.Tensor,
+    def predict_batch(self, descriptors: tf.Tensor, grad_values: tf.Tensor,
+                      pair_atom: tf.Tensor, pair_gidx: tf.Tensor, pair_struct: tf.Tensor,
+                      positions: tf.Tensor, Z: tf.Tensor,
+                      boxes: tf.Tensor, atom_mask: tf.Tensor,
                       W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor, b1: tf.Tensor,
                       W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
                       W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
-                      prescaled: bool = False) -> tf.Tensor:
-        """Batched forward pass for B structures with explicit weight tensors.
+                      prescaled: bool = False,
+                      W_atom: tf.Tensor | None = None) -> tf.Tensor:
+        """Batched forward pass for B structures using COO gradient storage.
 
         Weights are passed explicitly (not read from self) so this method can
         be used for SNES population evaluation with different candidate weights.
 
         Args:
-            descriptors    : [B, A, Q]        padded descriptors
-            gradients      : [B, A, M, 3, Q]  padded descriptor gradients
-            grad_index     : [B, A, M]        padded neighbor indices
-            positions      : [B, A, 3]        padded positions
-            Z              : [B, A]           padded type indices
-            boxes          : [B, 3, 3]        lattice vectors
-            atom_mask      : [B, A]           atom mask
-            neighbor_mask  : [B, A, M]        neighbor mask
-            W0             : [T, Q, H]        input weights (shared across batch)
-            b0             : [T, H]           hidden bias
-            W1             : [T, H]           output weights
-            b1             : ()               scalar bias
-            W0_pol ... b1_pol : same shapes, for mode 2 only (None otherwise)
-            prescaled      : bool — if True, skip descriptor/gradient scaling
-                             (caller already applied it). Traces separately for
-                             True/False since it's a Python bool.
+            descriptors : [B, A, Q]    padded descriptors
+            grad_values : [P, 3, Q]    COO gradient blocks (P = total pairs in batch)
+            pair_atom   : [P]          center atom index for each pair
+            pair_gidx   : [P]         neighbor atom index for each pair
+            pair_struct : [P]          batch-relative structure index for each pair
+            positions   : [B, A, 3]   padded positions
+            Z           : [B, A]      padded type indices
+            boxes       : [B, 3, 3]   lattice vectors
+            atom_mask   : [B, A]      atom mask (1.0 real, 0.0 padding)
+            W0          : [T, Q, H]   input weights
+            b0          : [T, H]      hidden bias
+            W1          : [T, H]      output weights
+            b1          : ()          scalar bias
+            W0_pol..b1_pol : same shapes, for mode 2 only (None otherwise)
+            prescaled   : bool — if True, skip descriptor/gradient scaling
 
         Returns:
             predictions : [B, T_dim]  where T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
-        # Scale descriptors and gradients by the same factor (chain rule)
         if not prescaled and self._scale_descriptors:
             scale = self._descriptor_mean
             descriptors = descriptors / scale
-            gradients = gradients / scale
+            grad_values = grad_values / scale
 
-        # Precompute box inverse once (shared across all atoms and candidates)
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
-        # Gather per-type weights for each atom in each structure
-        W0_t = tf.gather(W0, Z)   # [B, A, Q, H]
         b0_t = tf.gather(b0, Z)   # [B, A, H]
         W1_t = tf.gather(W1, Z)   # [B, A, H]
 
-        # Hidden layer
-        h = tf.einsum('bnd,bndh->bnh', descriptors, W0_t)  # [B, A, H]
-        h = h + b0_t
+        # Per-type loop for W0: avoids materialising [B, A, Q, H] (dominant memory cost).
+        # b0/W1 only have [B, A, H] so their gathers are fine.
+        type_masks = [
+            tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
+            for t in range(self.num_types)
+        ]
+        h = tf.add_n([
+            tf.einsum('baq,qh->bah', descriptors, W0[t]) * type_masks[t]
+            for t in range(self.num_types)
+        ]) + b0_t
         h = self.activation(h)
         h = h * atom_mask[:, :, tf.newaxis]
 
@@ -398,36 +402,63 @@ class TNEP(layers.Layer):
             E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
             return -E
 
-        # Modes 1 and 2: compute forces
-        forces = self._calc_forces_batch(h, gradients, W1_t, W0_t, neighbor_mask)
+        # de_dq: energy derivative w.r.t. descriptor, one per atom per structure.
+        # Type loop keeps peak at [B, A, Q] rather than [B, A, Q, H].
+        dtanh = 1.0 - tf.square(h)
+        de_da = dtanh * W1_t
+        de_dq = tf.add_n([
+            tf.einsum('bah,qh->baq', de_da, W0[t]) * type_masks[t]
+            for t in range(self.num_types)
+        ])
+
+        B = tf.shape(descriptors)[0]
+
+        if self.cfg.target_mode == 1 and W_atom is not None:
+            # Precomputed-kernel path: avoids [C, P, Q] inside vectorized_map.
+            # Mathematically: dipole[b,s] = -Σ_{a,q} de_dq[b,a,q] * W_atom[b,a,s,q]
+            #   = -Σ_p rij²[p] * Σ_q de_dq[struct[p],atom[p],q] * grad_values[p,s,q]
+            # (identical to the COO forces path, proven by substituting W_atom definition)
+            return -tf.einsum('baq,basq->bs', de_dq, W_atom)  # [B, 3]
+
+        # Standard COO path (used when W_atom is not precomputed: score(), predict())
+        forces_per_pair = self._calc_forces_coo(de_dq, grad_values, pair_struct, pair_atom)
 
         if self.cfg.target_mode == 1:
-            return self._dipole_batch(forces, positions, boxes, box_inv,
-                                      grad_index, atom_mask, neighbor_mask)
+            return self._dipole_coo(forces_per_pair, pair_struct, pair_atom, pair_gidx,
+                                    positions, boxes, box_inv, B)
 
         elif self.cfg.target_mode == 2:
-            return self._polarizability_batch(
-                descriptors, forces, positions, boxes, box_inv, Z, grad_index,
-                atom_mask, neighbor_mask,
-                W0_pol, b0_pol, W1_pol, b1_pol)
+            return self._polarizability_coo(
+                descriptors, forces_per_pair, pair_struct, pair_atom, pair_gidx,
+                positions, boxes, box_inv, Z, atom_mask,
+                W0_pol, b0_pol, W1_pol, b1_pol, B)
 
         else:
             tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
 
-    def _calc_forces_batch(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
-                           W0_t: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:
-        """Batched calc_forces: [B,A,H] inputs -> [B,A,M,3] forces."""
-        dtanh = 1.0 - tf.square(h)                                    # [B, A, H]
-        de_da = dtanh * W1_t                                           # [B, A, H]
-        de_dq = tf.einsum('bnh,bnqh->bnq', de_da, W0_t)              # [B, A, Q]
-        forces = tf.einsum('bnq,bnmcq->bnmc', de_dq, gradients)      # [B, A, M, 3]
-        forces = forces * neighbor_mask[:, :, :, tf.newaxis]
-        return forces
+    def _calc_forces_coo(self, de_dq: tf.Tensor, grad_values: tf.Tensor,
+                         pair_struct: tf.Tensor, pair_atom: tf.Tensor) -> tf.Tensor:
+        """Compute per-pair forces via COO gather + einsum.
+
+        Args:
+            de_dq       : [B, A, Q]   energy derivative w.r.t. descriptor
+            grad_values : [P, 3, Q]   COO gradient blocks
+            pair_struct : [P]         batch-relative structure index
+            pair_atom   : [P]         center atom index
+
+        Returns:
+            forces_per_pair : [P, 3]
+        """
+        ba = tf.stack([pair_struct, pair_atom], axis=1)          # [P, 2]
+        de_dq_per_pair = tf.gather_nd(de_dq, ba)                 # [P, Q]
+        return tf.einsum('kq,kcq->kc', de_dq_per_pair, grad_values)  # [P, 3]
 
     def _neighbor_displacements_single(self, positions: tf.Tensor,
                                        box: tf.Tensor,
                                        grad_index: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute neighbor displacements for a single structure.
+        """Compute neighbor displacements for a single structure (padded interface).
+
+        Used by the single-structure predict() path (e.g. spectroscopy).
 
         Args:
             positions  : [A, 3]
@@ -438,135 +469,172 @@ class TNEP(layers.Layer):
             dr  : [A, M, 3]  displacement vectors to neighbors
             rij : [A, M]     scalar distances to neighbors
         """
-        box_inv = tf.linalg.inv(box)                                      # [3, 3]
-        s = tf.einsum('ij,nj->ni', box_inv, positions)                    # [A, 3]
-        s_j = tf.gather(s, grad_index)                                     # [A, M, 3]
-        s_i = s[:, tf.newaxis, :]                                          # [A, 1, 3]
-        ds = s_j - s_i                                                     # [A, M, 3]
+        box_inv = tf.linalg.inv(box)
+        s = tf.einsum('ij,nj->ni', box_inv, positions)       # [A, 3]
+        s_j = tf.gather(s, grad_index)                        # [A, M, 3]
+        s_i = s[:, tf.newaxis, :]                             # [A, 1, 3]
+        ds = s_j - s_i
         ds = ds - tf.round(ds)
-        dr = tf.einsum('ij,nmj->nmi', box, ds)                            # [A, M, 3]
-        rij = tf.linalg.norm(dr, axis=-1)                                  # [A, M]
+        dr = tf.einsum('ij,nmj->nmi', box, ds)                # [A, M, 3]
+        rij = tf.linalg.norm(dr, axis=-1)                     # [A, M]
         return dr, rij
 
-    def _neighbor_displacements_batch(self, positions: tf.Tensor,
-                                      boxes: tf.Tensor,
-                                      box_inv: tf.Tensor,
-                                      grad_index: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute displacements only for actual neighbors (not full A×A matrix).
+    def _precompute_dipole_kernel(self, grad_values: tf.Tensor,
+                                  pair_struct: tf.Tensor, pair_atom: tf.Tensor,
+                                  pair_gidx: tf.Tensor, positions: tf.Tensor,
+                                  boxes: tf.Tensor, B: tf.Tensor,
+                                  A: tf.Tensor) -> tf.Tensor:
+        """Aggregate rij²-weighted gradients per (structure, atom) — independent of candidates.
 
-        Uses grad_index to gather neighbor positions directly, avoiding O(A²)
-        memory and compute. Padded neighbors (grad_index=0) produce garbage
-        displacements that are zeroed out downstream by neighbor_mask.
+        W_atom[b,a,s,q] = Σ_{p: struct[p]=b, atom[p]=a} rij²[p] × grad_values[p,s,q]
+
+        Dipole is then -einsum('baq,basq->bs', de_dq, W_atom) with no P dimension
+        inside vectorized_map, eliminating the [C, P, Q] intermediate.
+
+        Args:
+            grad_values : [P, 3, Q]  (already scaled if descriptor scaling is active)
+            pair_struct : [P]
+            pair_atom   : [P]
+            pair_gidx   : [P]
+            positions   : [B, A, 3]
+            boxes       : [B, 3, 3]
+            B           : number of structures
+            A           : max atoms (padded)
+
+        Returns:
+            W_atom : [B, A, 3, Q]
+        """
+        box_inv = tf.linalg.inv(boxes)
+        _, rij2 = self._neighbor_displacements_coo(
+            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)  # rij2: [P]
+
+        P = tf.shape(grad_values)[0]
+        Q = tf.shape(grad_values)[2]
+        W = rij2[:, tf.newaxis, tf.newaxis] * grad_values   # [P, 3, Q]
+        W_flat = tf.reshape(W, [P, 3 * Q])                  # [P, 3*Q]
+        ba_linear = pair_struct * A + pair_atom              # [P] linear index into [B*A]
+        W_atom_flat = tf.math.unsorted_segment_sum(
+            W_flat, ba_linear, num_segments=B * A)           # [B*A, 3*Q]
+        return tf.reshape(W_atom_flat, [B, A, 3, Q])         # [B, A, 3, Q]
+
+    def _neighbor_displacements_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
+                                    box_inv: tf.Tensor, pair_struct: tf.Tensor,
+                                    pair_atom: tf.Tensor,
+                                    pair_gidx: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        """Compute per-pair displacements in COO format with MIC wrapping.
 
         Args:
             positions  : [B, A, 3]
             boxes      : [B, 3, 3]
-            box_inv    : [B, 3, 3]  pre-computed inverse of boxes
-            grad_index : [B, A, M]  neighbor indices
+            box_inv    : [B, 3, 3]
+            pair_struct: [P]  batch-relative structure index
+            pair_atom  : [P]  center atom index
+            pair_gidx  : [P]  neighbor atom index
 
         Returns:
-            dr  : [B, A, M, 3]  displacement vectors to neighbors
-            rij : [B, A, M]     scalar distances to neighbors
+            dr   : [P, 3]  displacement vectors (neighbor - center)
+            rij2 : [P]     squared distances
         """
-        # Fractional coordinates for all atoms
-        s = tf.einsum('bij,bnj->bni', box_inv, positions)             # [B, A, 3]
-        # Gather neighbor fractional coords: s_j[b,a,m] = s[b, grad_index[b,a,m]]
-        s_j = tf.gather(s, grad_index, batch_dims=1)                  # [B, A, M, 3]
-        # Central atom fractional coords broadcast to [B, A, 1, 3]
-        s_i = s[:, :, tf.newaxis, :]                                   # [B, A, 1, 3]
-        ds = s_j - s_i                                                 # [B, A, M, 3]
-        ds = ds - tf.round(ds)                                         # MIC wrap
-        # Back to Cartesian
-        dr = tf.einsum('bij,bnmj->bnmi', boxes, ds)                   # [B, A, M, 3]
-        rij = tf.linalg.norm(dr, axis=-1)                              # [B, A, M]
-        return dr, rij
+        ba_c = tf.stack([pair_struct, pair_atom], axis=1)   # [P, 2]
+        ba_n = tf.stack([pair_struct, pair_gidx], axis=1)   # [P, 2]
+        pos_c   = tf.gather_nd(positions, ba_c)              # [P, 3]
+        pos_n   = tf.gather_nd(positions, ba_n)              # [P, 3]
+        box_k   = tf.gather(boxes,   pair_struct)            # [P, 3, 3]
+        binv_k  = tf.gather(box_inv, pair_struct)            # [P, 3, 3]
+        s_c = tf.einsum('kij,kj->ki', binv_k, pos_c)        # [P, 3] fractional
+        s_n = tf.einsum('kij,kj->ki', binv_k, pos_n)
+        ds  = s_n - s_c
+        ds  = ds - tf.round(ds)                              # MIC wrap
+        dr  = tf.einsum('kij,kj->ki', box_k, ds)            # [P, 3] Cartesian
+        rij2 = tf.reduce_sum(tf.square(dr), axis=-1)         # [P]
+        return dr, rij2
 
-    def _dipole_batch(self, forces: tf.Tensor, positions: tf.Tensor, boxes: tf.Tensor,
-                      box_inv: tf.Tensor, grad_index: tf.Tensor, atom_mask: tf.Tensor,
-                      neighbor_mask: tf.Tensor) -> tf.Tensor:
-        """Batched dipole prediction.
+    def _dipole_coo(self, forces_per_pair: tf.Tensor, pair_struct: tf.Tensor,
+                    pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
+                    positions: tf.Tensor, boxes: tf.Tensor,
+                    box_inv: tf.Tensor, B: tf.Tensor) -> tf.Tensor:
+        """Batched dipole prediction using COO forces.
 
         Args:
-            forces        : [B, A, M, 3]
-            positions     : [B, A, 3]
-            boxes         : [B, 3, 3]
-            box_inv       : [B, 3, 3]
-            grad_index    : [B, A, M]
-            atom_mask     : [B, A]
-            neighbor_mask : [B, A, M]
+            forces_per_pair : [P, 3]
+            pair_struct     : [P]
+            pair_atom       : [P]
+            pair_gidx       : [P]
+            positions       : [B, A, 3]
+            boxes           : [B, 3, 3]
+            box_inv         : [B, 3, 3]
+            B               : int scalar — number of structures
 
         Returns:
             dipole : [B, 3]
         """
-        dr, rij = self._neighbor_displacements_batch(positions, boxes, box_inv, grad_index)
-
-        rij2 = tf.square(rij) * neighbor_mask                           # [B, A, M]
-
-        dipole_contribs = rij2[:, :, :, tf.newaxis] * forces             # [B, A, M, 3]
-        dipole = -tf.reduce_sum(dipole_contribs, axis=[1, 2])            # [B, 3]
+        _, rij2 = self._neighbor_displacements_coo(positions, boxes, box_inv,
+                                                    pair_struct, pair_atom, pair_gidx)
+        dipole_contrib = rij2[:, tf.newaxis] * forces_per_pair           # [P, 3]
+        dipole = -tf.math.unsorted_segment_sum(
+            dipole_contrib, pair_struct, num_segments=B)                  # [B, 3]
         return dipole
 
-    def _polarizability_batch(self, descriptors: tf.Tensor, forces: tf.Tensor,
-                              positions: tf.Tensor, boxes: tf.Tensor,
-                              box_inv: tf.Tensor, Z: tf.Tensor,
-                              grad_index: tf.Tensor, atom_mask: tf.Tensor,
-                              neighbor_mask: tf.Tensor, W0_pol: tf.Tensor,
-                              b0_pol: tf.Tensor, W1_pol: tf.Tensor,
-                              b1_pol: tf.Tensor) -> tf.Tensor:
-        """Batched polarizability via dual ANN (GPUMD approach).
-
-        Scalar ANN (W0_pol..b1_pol) -> isotropic diagonal.
-        Tensor ANN (primary, via forces) -> anisotropic virial.
+    def _polarizability_coo(self, descriptors: tf.Tensor, forces_per_pair: tf.Tensor,
+                            pair_struct: tf.Tensor, pair_atom: tf.Tensor,
+                            pair_gidx: tf.Tensor, positions: tf.Tensor,
+                            boxes: tf.Tensor, box_inv: tf.Tensor,
+                            Z: tf.Tensor, atom_mask: tf.Tensor,
+                            W0_pol: tf.Tensor, b0_pol: tf.Tensor,
+                            W1_pol: tf.Tensor, b1_pol: tf.Tensor,
+                            B: tf.Tensor) -> tf.Tensor:
+        """Batched polarizability via dual ANN using COO forces.
 
         Args:
-            descriptors   : [B, A, Q]
-            forces        : [B, A, M, 3]
-            positions     : [B, A, 3]
-            boxes         : [B, 3, 3]
-            box_inv       : [B, 3, 3]
-            Z             : [B, A]
-            grad_index    : [B, A, M]
-            atom_mask     : [B, A]
-            neighbor_mask : [B, A, M]
-            W0_pol..b1_pol: scalar ANN weights [T,Q,H] etc.
+            descriptors     : [B, A, Q]
+            forces_per_pair : [P, 3]
+            pair_struct     : [P]
+            pair_atom       : [P]
+            pair_gidx       : [P]
+            positions       : [B, A, 3]
+            boxes           : [B, 3, 3]
+            box_inv         : [B, 3, 3]
+            Z               : [B, A]
+            atom_mask       : [B, A]
+            W0_pol..b1_pol  : scalar ANN weights
 
         Returns:
             pol : [B, 6]  — [xx, yy, zz, xy, yz, zx]
         """
-        dr_gathered, _ = self._neighbor_displacements_batch(positions, boxes, box_inv, grad_index)
+        dr, _ = self._neighbor_displacements_coo(positions, boxes, box_inv,
+                                                  pair_struct, pair_atom, pair_gidx)
 
-        # Scalar ANN (isotropic)
-        W0p_t = tf.gather(W0_pol, Z)  # [B, A, Q, H]
-        b0p_t = tf.gather(b0_pol, Z)  # [B, A, H]
-        W1p_t = tf.gather(W1_pol, Z)  # [B, A, H]
-
-        h_pol = tf.einsum('bnd,bndh->bnh', descriptors, W0p_t)
-        h_pol = h_pol + b0p_t
+        # Scalar ANN (isotropic contribution) — same type-loop pattern as main ANN
+        b0p_t = tf.gather(b0_pol, Z)   # [B, A, H]
+        W1p_t = tf.gather(W1_pol, Z)   # [B, A, H]
+        type_masks_p = [
+            tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
+            for t in range(self.num_types)
+        ]
+        h_pol = tf.add_n([
+            tf.einsum('baq,qh->bah', descriptors, W0_pol[t]) * type_masks_p[t]
+            for t in range(self.num_types)
+        ]) + b0p_t
         h_pol = self.activation(h_pol)
         h_pol = h_pol * atom_mask[:, :, tf.newaxis]
         F_pol = tf.reduce_sum(h_pol * W1p_t, axis=2) + b1_pol  # [B, A]
         F_pol = F_pol * atom_mask
-        scalar_sum = tf.reduce_sum(F_pol, axis=1)  # [B]
+        scalar_sum = tf.reduce_sum(F_pol, axis=1)               # [B]
 
-        # Tensor part: outer product (anisotropic virial)
-        pol_outer = -tf.einsum('bnmi,bnmj->bnmij', dr_gathered, forces)  # [B,A,M,3,3]
-        pol_outer = pol_outer * neighbor_mask[:, :, :, tf.newaxis, tf.newaxis]
-        pol_matrix = tf.reduce_sum(pol_outer, axis=[1, 2])  # [B, 3, 3]
+        # Tensor part: per-pair outer product, then segment-sum per structure
+        pol_outer = -tf.einsum('ki,kj->kij', dr, forces_per_pair)  # [P, 3, 3]
+        pol_flat  = tf.reshape(pol_outer, [-1, 9])                  # [P, 9]
+        pol_mat_flat = tf.math.unsorted_segment_sum(
+            pol_flat, pair_struct, num_segments=B)                  # [B, 9]
+        pol_matrix = tf.reshape(pol_mat_flat, [B, 3, 3])
 
-        # Extract 6 components
         pol = tf.stack([
-            pol_matrix[:, 0, 0],
-            pol_matrix[:, 1, 1],
-            pol_matrix[:, 2, 2],
-            pol_matrix[:, 0, 1],
-            pol_matrix[:, 1, 2],
-            pol_matrix[:, 2, 0],
+            pol_matrix[:, 0, 0], pol_matrix[:, 1, 1], pol_matrix[:, 2, 2],
+            pol_matrix[:, 0, 1], pol_matrix[:, 1, 2], pol_matrix[:, 2, 0],
         ], axis=1)  # [B, 6]
 
-        # Add scalar to diagonal
         diag_add = tf.stack([scalar_sum, scalar_sum, scalar_sum,
                              tf.zeros_like(scalar_sum),
                              tf.zeros_like(scalar_sum),
-                             tf.zeros_like(scalar_sum)], axis=1)  # [B, 6]
-        pol = pol + diag_add
-        return pol
+                             tf.zeros_like(scalar_sum)], axis=1)
+        return pol + diag_add

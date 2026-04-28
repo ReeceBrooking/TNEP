@@ -445,15 +445,27 @@ class SNES:
             else:
                 batch_idx_tf = tf.argsort(
                     self.tf_rng.uniform(shape=[S_train]))[:cfg.batch_size]
-                gather_keys = ["descriptors", "gradients", "grad_index",
-                               "positions", "Z_int", "boxes", "targets",
-                               "atom_mask", "neighbor_mask"]
+                struct_keys = ["descriptors", "positions", "Z_int", "boxes",
+                               "targets", "atom_mask"]
                 if "types_contained" in train_data:
-                    gather_keys.append("types_contained")
+                    struct_keys.append("types_contained")
                 batch_data = {
                     key: tf.gather(train_data[key], batch_idx_tf)
-                    for key in gather_keys
+                    for key in struct_keys
                 }
+                # COO pair gather: select pairs belonging to the sampled structures
+                pair_starts = tf.gather(train_data["struct_ptr"], batch_idx_tf)
+                pair_ends   = tf.gather(train_data["struct_ptr"], batch_idx_tf + 1)
+                pair_ranges = tf.ragged.range(pair_starts, pair_ends)
+                flat_pair_idx = tf.cast(pair_ranges.flat_values, tf.int32)
+                batch_data["grad_values"] = tf.gather(train_data["grad_values"], flat_pair_idx)
+                batch_data["pair_atom"]   = tf.gather(train_data["pair_atom"],   flat_pair_idx)
+                batch_data["pair_gidx"]   = tf.gather(train_data["pair_gidx"],   flat_pair_idx)
+                batch_data["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
+                # Build batch-local struct_ptr for struct_chunk slicing
+                batch_pair_counts = tf.cast(pair_ranges.row_lengths(), tf.int32)
+                batch_data["struct_ptr"] = tf.concat(
+                    [[0], tf.cumsum(batch_pair_counts)], axis=0)
 
             t1 = time.perf_counter()
 
@@ -620,13 +632,23 @@ class SNES:
             val_idx_tf = tf.argsort(
                 self.tf_rng.uniform(shape=[S_val]))[:self.cfg.val_size]
 
-            val_keys = ["descriptors", "gradients", "grad_index",
-                        "positions", "Z_int", "boxes", "targets",
-                        "atom_mask", "neighbor_mask"]
+            val_struct_keys = ["descriptors", "positions", "Z_int", "boxes",
+                               "targets", "atom_mask"]
             batch_data = {
                 key: tf.gather(val_data[key], val_idx_tf)
-                for key in val_keys
+                for key in val_struct_keys
             }
+            pair_starts = tf.gather(val_data["struct_ptr"], val_idx_tf)
+            pair_ends   = tf.gather(val_data["struct_ptr"], val_idx_tf + 1)
+            pair_ranges = tf.ragged.range(pair_starts, pair_ends)
+            flat_pair_idx = tf.cast(pair_ranges.flat_values, tf.int32)
+            batch_data["grad_values"] = tf.gather(val_data["grad_values"], flat_pair_idx)
+            batch_data["pair_atom"]   = tf.gather(val_data["pair_atom"],   flat_pair_idx)
+            batch_data["pair_gidx"]   = tf.gather(val_data["pair_gidx"],   flat_pair_idx)
+            batch_data["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
+            batch_pair_counts = tf.cast(pair_ranges.row_lengths(), tf.int32)
+            batch_data["struct_ptr"] = tf.concat(
+                [[0], tf.cumsum(batch_pair_counts)], axis=0)
 
         if mu_tf is not None:
             params = self.reconstruct_params_tf(mu_tf)
@@ -643,10 +665,10 @@ class SNES:
             b1p = getattr(self.model, 'b1_pol', None)
 
         preds = self.model.predict_batch(
-            batch_data["descriptors"], batch_data["gradients"],
-            batch_data["grad_index"], batch_data["positions"],
-            batch_data["Z_int"], batch_data["boxes"],
-            batch_data["atom_mask"], batch_data["neighbor_mask"],
+            batch_data["descriptors"], batch_data["grad_values"],
+            batch_data["pair_atom"], batch_data["pair_gidx"], batch_data["pair_struct"],
+            batch_data["positions"], batch_data["Z_int"], batch_data["boxes"],
+            batch_data["atom_mask"],
             W0, b0, W1, b1, W0p, b0p, W1p, b1p,
         )
         if self.cfg.scale_targets and self.cfg.target_mode == 1:
@@ -819,9 +841,10 @@ class SNES:
         pop_chunk = self.cfg.population_chunk_size if self.cfg.population_chunk_size is not None else P
         struct_chunk = self.cfg.batch_chunk_size if self.cfg.batch_chunk_size is not None else B
 
-        batch_keys = ["descriptors", "gradients", "grad_index",
-                      "positions", "Z_int", "boxes", "targets",
-                      "atom_mask", "neighbor_mask"]
+        struct_only_keys = ["descriptors", "positions", "Z_int", "boxes",
+                            "targets", "atom_mask"]
+        if "types_contained" in batch_data:
+            struct_only_keys.append("types_contained")
 
         T = self.cfg.num_types
         T_dim_f = tf.cast(T_dim, tf.float32)
@@ -848,7 +871,14 @@ class SNES:
             for s_start in range(0, B, struct_chunk):
                 s_end = min(s_start + struct_chunk, B)
                 struct_batch = {key: batch_data[key][s_start:s_end]
-                                for key in batch_keys}
+                                for key in struct_only_keys}
+                # Slice COO pairs for this structure chunk via struct_ptr
+                p_lo = int(batch_data["struct_ptr"][s_start])
+                p_hi = int(batch_data["struct_ptr"][s_end])
+                struct_batch["grad_values"] = batch_data["grad_values"][p_lo:p_hi]
+                struct_batch["pair_atom"]   = batch_data["pair_atom"][p_lo:p_hi]
+                struct_batch["pair_gidx"]   = batch_data["pair_gidx"][p_lo:p_hi]
+                struct_batch["pair_struct"] = batch_data["pair_struct"][p_lo:p_hi] - s_start
                 chunk_err = self._evaluate_chunk(candidates, struct_batch)
                 chunk_parts.append(chunk_err)          # [C, B_chunk_i]
 
@@ -912,22 +942,22 @@ class SNES:
         Returns:
             err : [C, B] — per-structure sum of squared (or absolute) errors
         """
-        desc = batch_data["descriptors"]       # [B, A, Q]
-        grads = batch_data["gradients"]        # [B, A, M, 3, Q]
-        gidx = batch_data["grad_index"]        # [B, A, M]
-        pos = batch_data["positions"]          # [B, A, 3]
-        Z = batch_data["Z_int"]               # [B, A]
-        boxes = batch_data["boxes"]            # [B, 3, 3]
-        targets = batch_data["targets"]        # [B, T_dim]
-        amask = batch_data["atom_mask"]        # [B, A]
-        nmask = batch_data["neighbor_mask"]    # [B, A, M]
+        desc        = batch_data["descriptors"]   # [B, A, Q]
+        grad_values = batch_data["grad_values"]   # [P, 3, Q]
+        pair_atom   = batch_data["pair_atom"]     # [P]
+        pair_gidx   = batch_data["pair_gidx"]     # [P]
+        pair_struct = batch_data["pair_struct"]   # [P]
+        pos         = batch_data["positions"]     # [B, A, 3]
+        Z           = batch_data["Z_int"]         # [B, A]
+        boxes       = batch_data["boxes"]         # [B, 3, 3]
+        targets     = batch_data["targets"]       # [B, T_dim]
+        amask       = batch_data["atom_mask"]     # [B, A]
 
-        # Pre-scale descriptors and gradients once for all candidates
-        # (avoids redundant per-candidate scaling inside vectorized_map)
+        # Pre-scale descriptors and COO gradients once for all candidates
         if self.model._scale_descriptors:
             scale = self.model._descriptor_mean
-            desc = desc / scale
-            grads = grads / scale
+            desc        = desc        / scale
+            grad_values = grad_values / scale
 
         # Precompute per-atom normalization factor once (not per-candidate)
         _scale_preds = self.cfg.scale_targets and self.cfg.target_mode == 1
@@ -948,7 +978,8 @@ class SNES:
             def _forward_one_candidate(args):
                 w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
                 preds = self.model.predict_batch(
-                    desc, grads, gidx, pos, Z, boxes, amask, nmask,
+                    desc, grad_values, pair_atom, pair_gidx, pair_struct,
+                    pos, Z, boxes, amask,
                     w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
                     prescaled=True,
                 )
@@ -963,12 +994,25 @@ class SNES:
         else:
             W0, b0, W1, b1 = params
 
+            # For dipole mode, precompute W_atom outside vectorized_map so pfor treats
+            # it as a loop-invariant (not expanded by C). This replaces the [C,P,Q]
+            # gather_nd intermediate with an [B,A,3,Q] segment_sum computed once.
+            if self.cfg.target_mode == 1:
+                W_atom = self.model._precompute_dipole_kernel(
+                    grad_values, pair_struct, pair_atom, pair_gidx,
+                    pos, boxes,
+                    tf.shape(desc)[0], tf.shape(desc)[1])
+            else:
+                W_atom = None
+
             def _forward_one_candidate(args):
                 w0, bb0, w1, bb1 = args
                 preds = self.model.predict_batch(
-                    desc, grads, gidx, pos, Z, boxes, amask, nmask,
+                    desc, grad_values, pair_atom, pair_gidx, pair_struct,
+                    pos, Z, boxes, amask,
                     w0, bb0, w1, bb1, None, None, None, None,
                     prescaled=True,
+                    W_atom=W_atom,  # closure variable — not per-candidate, pfor won't expand
                 )
                 if _scale_preds:
                     preds = preds * inv_num_atoms

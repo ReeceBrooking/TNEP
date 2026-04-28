@@ -107,6 +107,11 @@ class TNEPconfig:
     # 1    = serial (current behaviour, default outside SLURM)
     # N    = use N worker processes
     num_descriptor_workers: int | None = None
+    # Pin dataset tensors to CPU memory instead of GPU.
+    # Required when the full dataset is too large to fit in GPU VRAM (most cases).
+    # When True, each training batch is copied CPU→GPU implicitly during evaluation.
+    # Set to False only if the entire dataset comfortably fits on the GPU.
+    pin_data_to_cpu: bool = True
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
     plot_interval: int | None = 10000

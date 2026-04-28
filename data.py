@@ -588,13 +588,17 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     return train_data, test_data, val_data
 
 
-def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tensor]:
-    """Convert variable-length list-of-tensors data into dense padded tensors.
+def pad_and_stack(data: dict, num_types: int | None = None,
+                  pin_to_cpu: bool = True) -> dict[str, tf.Tensor]:
+    """Convert variable-length list-of-tensors data into COO + padded tensors.
 
-    Transforms the output of split() into fixed-shape tensors suitable for
-    batched GPU evaluation. Variable atom counts and neighbor counts are
-    padded to their maximums with zeros, and boolean masks track real vs
-    padded entries.
+    Gradient data is stored in COO (Coordinate) sparse format to avoid the
+    O(S * A_max * M_max * 3 * Q) dense allocation. Only real atom-neighbor
+    pairs are stored, giving memory proportional to actual neighbor count
+    rather than the padded maximum.
+
+    Descriptors, positions, and other per-atom fields remain structure-padded
+    as [S, A_max, ...] since their size is dominated by A_max, not M_max.
 
     Args:
         data : dict from split() with keys:
@@ -608,68 +612,68 @@ def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tens
 
     Returns:
         padded : dict with keys:
-            descriptors    : [S, A, Q]        float32
-            gradients      : [S, A, M, 3, Q]  float32
-            grad_index     : [S, A, M]        int32
-            positions      : [S, A, 3]        float32
-            Z_int          : [S, A]           int32
-            targets        : [S, T]           float32  (T=1 for PES, 3 for dipole, 6 for pol)
-            boxes          : [S, 3, 3]        float32
-            atom_mask      : [S, A]           float32  (1.0 for real atoms, 0.0 for padding)
-            neighbor_mask  : [S, A, M]        float32  (1.0 for real neighbors, 0.0 for padding)
-            num_atoms      : [S]              int32    (actual atom count per structure)
-        where S = num_structures, A = max_atoms, M = max_neighbors, Q = dim_q
+            descriptors : [S, A, Q]       float32  — padded per-atom descriptors
+            grad_values : [P, 3, Q]       float32  — COO gradient blocks (P = total pairs)
+            pair_struct : [P]             int32    — structure index for each pair
+            pair_atom   : [P]             int32    — center atom index for each pair
+            pair_gidx   : [P]            int32    — neighbor atom index for each pair
+            struct_ptr  : [S+1]          int32    — CSR row pointer: pairs for struct s
+                                                     are grad_values[struct_ptr[s]:struct_ptr[s+1]]
+            positions   : [S, A, 3]      float32
+            Z_int       : [S, A]         int32
+            targets     : [S, T]         float32
+            boxes       : [S, 3, 3]      float32
+            atom_mask   : [S, A]         float32  — 1.0 for real atoms, 0.0 for padding
+            num_atoms   : [S]            int32
+        where S = num_structures, A = max_atoms, Q = dim_q, P = total atom-neighbor pairs
     """
     S = len(data["descriptors"])
     dim_q = data["descriptors"][0].shape[-1]
-
-    # Find max atom count across all structures
     atom_counts = [data["descriptors"][i].shape[0] for i in range(S)]
     max_atoms = max(atom_counts)
 
-    # Find max neighbor count across all atoms in all structures
-    max_neighbors = 0
-    for s in range(S):
-        for i in range(atom_counts[s]):
-            n_nbrs = data["gradients"][s][i].shape[0]
-            if n_nbrs > max_neighbors:
-                max_neighbors = n_nbrs
-
-    # Target dimensionality
     target_sample = data["targets"][0]
-    if target_sample.shape == ():
-        target_dim = 1
-    else:
-        target_dim = target_sample.shape[0]
-
-    # Detect optional force/virial targets (PES mode)
+    target_dim = 1 if target_sample.shape == () else target_sample.shape[0]
     has_forces = "forces" in data
     has_virials = "virials" in data
 
-    # Pre-allocate numpy arrays (faster than list comprehension for padding)
-    desc_np = np.zeros((S, max_atoms, dim_q), dtype=np.float32)
-    grad_np = np.zeros((S, max_atoms, max_neighbors, 3, dim_q), dtype=np.float32)
-    gidx_np = np.zeros((S, max_atoms, max_neighbors), dtype=np.int32)
-    pos_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
-    z_np = np.zeros((S, max_atoms), dtype=np.int32)
-    tgt_np = np.zeros((S, target_dim), dtype=np.float32)
-    box_np = np.zeros((S, 3, 3), dtype=np.float32)
+    # Count pairs per structure to build CSR struct_ptr and size COO arrays
+    pair_counts = [
+        sum(data["gradients"][s][i].shape[0] for i in range(atom_counts[s]))
+        for s in range(S)
+    ]
+    N_pairs_total = sum(pair_counts)
+    struct_ptr_np = np.zeros(S + 1, dtype=np.int32)
+    for s in range(S):
+        struct_ptr_np[s + 1] = struct_ptr_np[s] + pair_counts[s]
+
+    # COO arrays: one entry per real atom-neighbor pair
+    grad_values_np = np.zeros((N_pairs_total, 3, dim_q), dtype=np.float32)
+    pair_struct_np = np.zeros(N_pairs_total, dtype=np.int32)
+    pair_atom_np   = np.zeros(N_pairs_total, dtype=np.int32)
+    pair_gidx_np   = np.zeros(N_pairs_total, dtype=np.int32)
+
+    # Structure-padded arrays (no M dimension)
+    desc_np      = np.zeros((S, max_atoms, dim_q), dtype=np.float32)
+    pos_np       = np.zeros((S, max_atoms, 3), dtype=np.float32)
+    z_np         = np.zeros((S, max_atoms), dtype=np.int32)
+    tgt_np       = np.zeros((S, target_dim), dtype=np.float32)
+    box_np       = np.zeros((S, 3, 3), dtype=np.float32)
     atom_mask_np = np.zeros((S, max_atoms), dtype=np.float32)
-    nbr_mask_np = np.zeros((S, max_atoms, max_neighbors), dtype=np.float32)
     num_atoms_np = np.array(atom_counts, dtype=np.int32)
     if has_forces:
         force_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
     if has_virials:
         virial_np = np.zeros((S, 6), dtype=np.float32)
-
     if num_types is not None:
         types_contained_np = np.zeros((S, num_types), dtype=np.float32)
 
+    pair_offset = 0
     for s in range(S):
         N_s = atom_counts[s]
-        desc_np[s, :N_s, :] = data["descriptors"][s].numpy()
-        pos_np[s, :N_s, :] = data["positions"][s].numpy()
-        z_np[s, :N_s] = data["Z_int"][s].numpy()
+        desc_np[s, :N_s, :]  = data["descriptors"][s].numpy()
+        pos_np[s, :N_s, :]   = data["positions"][s].numpy()
+        z_np[s, :N_s]        = data["Z_int"][s].numpy()
         if num_types is not None:
             z_vals = z_np[s, :N_s]
             for t in range(num_types):
@@ -691,29 +695,35 @@ def pad_and_stack(data: dict, num_types: int | None = None) -> dict[str, tf.Tens
 
         for i in range(N_s):
             n_nbrs = data["gradients"][s][i].shape[0]
-            grad_np[s, i, :n_nbrs, :, :] = data["gradients"][s][i].numpy()
-            gidx_np[s, i, :n_nbrs] = data["grad_index"][s][i]
-            nbr_mask_np[s, i, :n_nbrs] = 1.0
+            k_end  = pair_offset + n_nbrs
+            grad_values_np[pair_offset:k_end] = data["gradients"][s][i].numpy()
+            pair_struct_np[pair_offset:k_end] = s
+            pair_atom_np[pair_offset:k_end]   = i
+            pair_gidx_np[pair_offset:k_end]   = data["grad_index"][s][i]
+            pair_offset += n_nbrs
 
-    with tf.device('/CPU:0'):
-        result = {
-            "descriptors": tf.constant(desc_np),
-            "gradients": tf.constant(grad_np),
-            "grad_index": tf.constant(gidx_np),
-            "positions": tf.constant(pos_np),
-            "Z_int": tf.constant(z_np),
-            "targets": tf.constant(tgt_np),
-            "boxes": tf.constant(box_np),
-            "atom_mask": tf.constant(atom_mask_np),
-            "neighbor_mask": tf.constant(nbr_mask_np),
-            "num_atoms": tf.constant(num_atoms_np),
-        }
+    # Convert each numpy array to a TF tensor then immediately delete the numpy
+    # copy so peak RAM stays at ~1x dataset size rather than ~2x.
+    with tf.device('/CPU:0' if pin_to_cpu else '/GPU:0'):
+        result = {}
+        result["descriptors"] = tf.constant(desc_np);    del desc_np
+        result["grad_values"] = tf.constant(grad_values_np); del grad_values_np
+        result["pair_struct"] = tf.constant(pair_struct_np); del pair_struct_np
+        result["pair_atom"]   = tf.constant(pair_atom_np);   del pair_atom_np
+        result["pair_gidx"]   = tf.constant(pair_gidx_np);   del pair_gidx_np
+        result["struct_ptr"]  = tf.constant(struct_ptr_np);  del struct_ptr_np
+        result["positions"]   = tf.constant(pos_np);         del pos_np
+        result["Z_int"]       = tf.constant(z_np);           del z_np
+        result["targets"]     = tf.constant(tgt_np);         del tgt_np
+        result["boxes"]       = tf.constant(box_np);         del box_np
+        result["atom_mask"]   = tf.constant(atom_mask_np);   del atom_mask_np
+        result["num_atoms"]   = tf.constant(num_atoms_np);   del num_atoms_np
         if has_forces:
-            result["forces"] = tf.constant(force_np)
+            result["forces"]  = tf.constant(force_np);       del force_np
         if has_virials:
-            result["virials"] = tf.constant(virial_np)
+            result["virials"] = tf.constant(virial_np);      del virial_np
         if num_types is not None:
-            result["types_contained"] = tf.constant(types_contained_np)
+            result["types_contained"] = tf.constant(types_contained_np); del types_contained_np
     return result
 
 
