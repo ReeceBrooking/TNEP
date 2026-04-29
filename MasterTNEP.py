@@ -28,11 +28,12 @@ from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_histor
                       plot_timing, plot_correlation, plot_cosine_similarity,
                       plot_loss_breakdown, plot_error_vs_magnitude)
 from model_io import save_model, save_history, setup_run_directory, load_model
-from spectroscopy import (predict_dipole_trajectory, predict_polarizability_trajectory,
+from spectroscopy import (predict_dipole_batch, predict_polarizability_batch,
                            compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
-from ase.io import read
+from DescriptorBuilder import DescriptorBuilder
 from tqdm import tqdm
+from ase.io import read, iread
 
 
 def train_model(cfg: TNEPconfig | None = None) -> TNEP:
@@ -292,6 +293,29 @@ def test_model(
     return metrics, predictions
 
 
+def _count_xyz_frames(path: str) -> int:
+    """Count frames in an XYZ trajectory by walking only the atom-count headers.
+
+    Each frame is: <N> line, comment line, then N atom lines. We read the N
+    integer and skip N+1 lines per frame — no parsing, just counting.
+    """
+    n_frames = 0
+    with open(path) as f:
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            try:
+                n_atoms = int(line.strip())
+            except ValueError:
+                break
+            for _ in range(n_atoms + 1):
+                if not f.readline():
+                    return n_frames
+            n_frames += 1
+    return n_frames
+
+
 def process_trajectory(
     model: TNEP,
     trajectory_path: str,
@@ -299,6 +323,7 @@ def process_trajectory(
     save_plots: str | None = "plots",
     show_plots: bool = False,
     batch_size: int | None = None,
+    pin_to_cpu: bool = True,
 ) -> dict:
     """Predict properties along an MD trajectory and compute spectra.
 
@@ -306,60 +331,98 @@ def process_trajectory(
     For polarizability models (mode 2): predicts polarizability trajectory and
     computes Raman spectrum.
 
+    Frames are processed in batches: descriptors are built, inferred, and discarded
+    per batch so peak memory is O(batch_size) not O(all_frames).
+
     Args:
         model           : trained TNEP model (config accessed via model.cfg)
         trajectory_path : str — path to .xyz trajectory file
         dt_fs           : float — MD timestep in femtoseconds
         save_plots      : str or None — directory to save plot into (default "plots")
         show_plots      : bool — True to display plot interactively (default False)
-        batch_size      : int or None — if set, process the trajectory in batches of
-                          this many frames to avoid computing all descriptors at once.
-                          If None, process the entire trajectory in one go.
+        batch_size      : int or None — frames per inference batch; None processes
+                          the whole trajectory as one batch.
+        pin_to_cpu      : bool — place batch tensors on CPU instead of GPU.
+                          Required when a single batch's COO tensors exceed VRAM
+                          (large systems × large batch_size). Default True.
 
     Returns:
         For mode 1 (dipole):
-            dict with keys: dipoles, freq_cm, intensity, acf
+            dict with keys: dipoles, freq_cm, intensity, power, acf
         For mode 2 (polarizability):
             dict with keys: polarizabilities, freq_cm, I_VV, I_VH, I_total,
                             acf_iso, acf_aniso
     """
     cfg = model.cfg
-    trajectory = read(trajectory_path, index=":")
-    print(f"Loaded {len(trajectory)} frames from {trajectory_path}")
 
-    dataset_types_int = assign_type_indices(trajectory, cfg.types)
+    if cfg.target_mode not in (1, 2):
+        raise ValueError(f"Spectroscopy not supported for target_mode={cfg.target_mode} (PES). "
+                         f"Use mode 1 (dipole) or mode 2 (polarizability).")
+
+    if save_plots:
+        os.makedirs(save_plots, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(trajectory_path))[0]
+
+    # Fast frame count (line-skip, no parsing) so the progress bar can show a total.
+    n_total = _count_xyz_frames(trajectory_path)
+    print(f"Loaded {n_total} frames from {trajectory_path}")
+    total_batches = (((n_total + batch_size - 1) // batch_size)
+                     if batch_size else 1)
+
+    # One DescriptorBuilder reused across all batches — quippy descriptors are
+    # expensive to construct, so we build once.
+    builder = DescriptorBuilder(cfg)
+
+    predict_fn = (predict_dipole_batch if cfg.target_mode == 1
+                  else predict_polarizability_batch)
+
+    # Stream frames in fixed-size batches: build → pack → predict → append → drop.
+    # Only batch_size ASE Atoms exist in memory at any moment.
+    def _stream_batches():
+        buf = []
+        for frame in iread(trajectory_path, index=":"):
+            buf.append(frame)
+            if batch_size is not None and len(buf) == batch_size:
+                yield buf
+                buf = []
+        if buf:
+            yield buf
+
+    result_batches = []
+    n_frames = 0
+    for batch_frames in tqdm(_stream_batches(), total=total_batches,
+                             desc="Trajectory batches", unit="batch"):
+        batch_types = assign_type_indices(batch_frames, cfg.types)
+        result_batches.append(
+            predict_fn(model, builder, batch_frames, batch_types,
+                       pin_to_cpu=pin_to_cpu))
+        n_frames += len(batch_frames)
+        del batch_frames, batch_types
+
+    print(f"Processed {n_frames} frames from {trajectory_path}")
+    results = np.concatenate(result_batches, axis=0)
+    del result_batches
 
     if cfg.target_mode == 1:
-        if batch_size is None:
-            dipoles = predict_dipole_trajectory(model, trajectory, dataset_types_int)
-        else:
-            n_frames = len(trajectory)
-            batches = []
-            starts = list(range(0, n_frames, batch_size))
-            for start in tqdm(starts, desc="Dipole batches", unit="batch"):
-                end = min(start + batch_size, n_frames)
-                batch_dipoles = predict_dipole_trajectory(
-                    model, trajectory[start:end], dataset_types_int[start:end])
-                batches.append(batch_dipoles)
-            dipoles = np.concatenate(batches, axis=0)
+        dipoles = results
+        if save_plots:
+            txt_path = os.path.join(save_plots, f"{stem}_dipoles.txt")
+            np.savetxt(txt_path, dipoles, fmt="%.8e",
+                       header="dipole_x  dipole_y  dipole_z  (e*Angstrom)")
+            print(f"Dipoles saved to {txt_path}")
         freq_cm, intensity, power, acf = compute_ir_spectrum(dipoles, dt_fs=dt_fs)
         plot_ir_spectrum(freq_cm, intensity, cfg, save_plots, show_plots)
         plot_power_spectrum(freq_cm, power, cfg, save_plots, show_plots)
-        return {"dipoles": dipoles, "freq_cm": freq_cm, "intensity": intensity, "power": power, "acf": acf}
+        return {"dipoles": dipoles, "freq_cm": freq_cm, "intensity": intensity,
+                "power": power, "acf": acf}
 
-    elif cfg.target_mode == 2:
-        if batch_size is None:
-            pols = predict_polarizability_trajectory(model, trajectory, dataset_types_int)
-        else:
-            n_frames = len(trajectory)
-            batches = []
-            starts = list(range(0, n_frames, batch_size))
-            for start in tqdm(starts, desc="Polarizability batches", unit="batch"):
-                end = min(start + batch_size, n_frames)
-                batch_pols = predict_polarizability_trajectory(
-                    model, trajectory[start:end], dataset_types_int[start:end])
-                batches.append(batch_pols)
-            pols = np.concatenate(batches, axis=0)
+    else:
+        pols = results
+        if save_plots:
+            txt_path = os.path.join(save_plots, f"{stem}_polarizabilities.txt")
+            np.savetxt(txt_path, pols, fmt="%.8e",
+                       header="alpha_xx  alpha_yy  alpha_zz  alpha_xy  alpha_yz  alpha_zx")
+            print(f"Polarizabilities saved to {txt_path}")
         freq_cm, I_VV, I_VH, I_total, acf_iso, acf_aniso = compute_raman_spectrum(
             pols, dt_fs=dt_fs)
         plot_raman_spectrum(freq_cm, I_VV, I_VH, I_total, cfg, save_plots, show_plots)
@@ -367,13 +430,9 @@ def process_trajectory(
                 "I_VV": I_VV, "I_VH": I_VH, "I_total": I_total,
                 "acf_iso": acf_iso, "acf_aniso": acf_aniso}
 
-    else:
-        raise ValueError(f"Spectroscopy not supported for target_mode={cfg.target_mode} (PES). "
-                         f"Use mode 1 (dipole) or mode 2 (polarizability).")
-
 
 if __name__ == '__main__':
-    model = train_model()
-    #model = load_model("models/n30_q75_pop80_20260422_142744_water_monomer_dipole/water_monomer_O_H_dipole_best_val.npz")
-    #dipoles = process_trajectory(model, "datasets/water_monomer_traj.xyz", batch_size=3000)
+    #model = train_model()
+    model = load_model("models/n30_q75_pop80_20260428_120216/train_waterbulk_O_H_dipole_best_val.npz")
+    dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=10)
     

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import concurrent.futures
 import tensorflow as tf
 import numpy as np
@@ -11,20 +12,36 @@ from quippy.descriptors import Descriptor
 from ase import Atoms
 
 
+# Per-thread cache of quippy Descriptor objects, keyed by SOAP-string tuple.
+# Building Descriptors is expensive (Fortran/C state allocation); caching per
+# thread avoids rebuilding for every frame while keeping each thread's
+# Descriptor objects isolated (quippy is not guaranteed thread-safe across
+# concurrent .calc() calls on the same object).
+_thread_local = threading.local()
+
+
+def _get_thread_builders(soap_strings: list[str]) -> list:
+    """Return this thread's cached Descriptor objects, building them on first use."""
+    cache = getattr(_thread_local, "cache", None)
+    if cache is None:
+        cache = _thread_local.cache = {}
+    key = tuple(soap_strings)
+    builders = cache.get(key)
+    if builders is None:
+        builders = [Descriptor(s) for s in soap_strings]
+        cache[key] = builders
+    return builders
+
+
 def _describe_structure_worker(
     args: tuple[Atoms, list[str]],
 ) -> tuple[np.ndarray, list[np.ndarray], list[list[int]]]:
-    """Compute SOAP descriptors for one structure inside a worker process.
+    """Compute SOAP descriptors for one structure inside a worker thread.
 
-    Rebuilds quippy Descriptor objects from plain strings (C extensions cannot
-    cross process boundaries). OMP/MKL thread counts are set by the Pool
-    initializer (_worker_init) before this function runs.
+    Reuses thread-local Descriptor objects across calls — the previous version
+    rebuilt them per frame, which dominated runtime for trajectory inference.
     """
     structure, soap_strings = args
-
-    from ase import Atoms
-    import numpy as np
-    from quippy.descriptors import Descriptor
 
     cell = structure.cell.array
     if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
@@ -39,7 +56,7 @@ def _describe_structure_worker(
         pbc=pbc,
     )
 
-    builders = [Descriptor(s) for s in soap_strings]
+    builders = _get_thread_builders(soap_strings)
     outs = [b.calc(structure, grad=True) for b in builders]
 
     N = len(structure)
@@ -62,6 +79,73 @@ def _describe_structure_worker(
     descriptors_np = np.array(descriptors, dtype=np.float32).squeeze(axis=1)
     gradients_np   = [np.array(g, dtype=np.float32) for g in gradients]
     return descriptors_np, gradients_np, grad_indexes
+
+
+def _describe_structure_worker_flat(
+    structure: Atoms,
+    soap_strings: list[str],
+    dim_q: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute SOAP descriptors and return flat COO arrays directly.
+
+    Skips the per-atom bucketisation that the legacy worker does — quippy
+    already gives us per-pair gradients and per-atom descriptors, and our
+    consumer (_pack_traj_batch_from_flat) wants flat COO. Avoids ~65,000
+    Python-level appends per batch on a 100-frame × 655-atom trajectory.
+
+    Returns:
+        descriptors : [N, dim_q]      float32
+        grad_values : [P, 3, dim_q]   float32 — one entry per (centre, neighbour) pair
+        pair_atom   : [P]             int32   — centre atom index (0-based)
+        pair_gidx   : [P]             int32   — neighbour atom index (0-based)
+    """
+    cell = structure.cell.array
+    if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
+        cell = 1000.0 * np.eye(3, dtype=np.float32)
+        pbc = False
+    else:
+        pbc = structure.pbc
+    structure = Atoms(
+        numbers=structure.numbers,
+        positions=structure.positions,
+        cell=cell,
+        pbc=pbc,
+    )
+    N = len(structure)
+
+    builders = _get_thread_builders(soap_strings)
+    outs = [b.calc(structure, grad=True) for b in builders]
+
+    descriptors = np.zeros((N, dim_q), dtype=np.float32)
+    grad_chunks = []
+    pair_atom_chunks = []
+    pair_gidx_chunks = []
+
+    for out in outs:
+        data = out.get("data")
+        if data is None or data.size == 0 or data.shape[1] == 0:
+            continue
+        # ci is 1-based; data is [N_type, dim_q] — vectorised assign by centre atom
+        ci = np.asarray(out["ci"], dtype=np.int32) - 1
+        descriptors[ci] = np.asarray(data, dtype=np.float32)
+
+        grad_idx = out.get("grad_index_0based")
+        if grad_idx is not None and len(grad_idx) > 0:
+            grad_idx = np.asarray(grad_idx, dtype=np.int32)
+            grad_chunks.append(np.asarray(out["grad_data"], dtype=np.float32))
+            pair_atom_chunks.append(grad_idx[:, 0])
+            pair_gidx_chunks.append(grad_idx[:, 1])
+
+    if grad_chunks:
+        grad_values = np.concatenate(grad_chunks, axis=0)
+        pair_atom   = np.concatenate(pair_atom_chunks)
+        pair_gidx   = np.concatenate(pair_gidx_chunks)
+    else:
+        grad_values = np.zeros((0, 3, dim_q), dtype=np.float32)
+        pair_atom   = np.zeros(0, dtype=np.int32)
+        pair_gidx   = np.zeros(0, dtype=np.int32)
+
+    return descriptors, grad_values, pair_atom, pair_gidx
 
 
 class DescriptorBuilder(layers.Layer):
@@ -244,4 +328,49 @@ class DescriptorBuilder(layers.Layer):
                 dataset_grad_index.append(grad_indexes)
 
         return dataset_descriptors, dataset_gradients, dataset_grad_index
+
+    def build_descriptors_flat(
+        self, dataset: list[Atoms],
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Compute SOAP descriptors and return flat per-frame COO arrays.
+
+        Optimised for trajectory inference. Skips the per-atom bucketisation
+        and tf.Tensor wrapping that the standard build_descriptors() path does
+        for compatibility with the training pipeline.
+
+        Args:
+            dataset : list of ase.Atoms
+
+        Returns:
+            list of (descriptors, grad_values, pair_atom, pair_gidx) tuples,
+            one per structure. All arrays are numpy:
+                descriptors : [N, dim_q]      float32
+                grad_values : [P, 3, dim_q]   float32
+                pair_atom   : [P]             int32
+                pair_gidx   : [P]             int32
+        """
+        soap_strings = self._soap_strings
+        dim_q = self.cfg.dim_q
+
+        if self._num_workers <= 1:
+            return [_describe_structure_worker_flat(s, soap_strings, dim_q)
+                    for s in dataset]
+
+        _total_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+        omp_per_worker = max(1, _total_cpus // self._num_workers)
+
+        def _thread_worker(structure):
+            return _describe_structure_worker_flat(structure, soap_strings, dim_q)
+
+        old_omp = os.environ.get('OMP_NUM_THREADS')
+        os.environ['OMP_NUM_THREADS'] = str(omp_per_worker)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self._num_workers) as exe:
+                return list(exe.map(_thread_worker, dataset))
+        finally:
+            if old_omp is not None:
+                os.environ['OMP_NUM_THREADS'] = old_omp
+            else:
+                os.environ.pop('OMP_NUM_THREADS', None)
 

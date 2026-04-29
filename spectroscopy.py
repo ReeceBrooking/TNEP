@@ -3,6 +3,7 @@ from __future__ import annotations
 import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 from typing import TYPE_CHECKING
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
@@ -11,37 +12,6 @@ from data import cell_to_box
 if TYPE_CHECKING:
     from ase import Atoms
     from TNEP import TNEP
-
-
-def _pad_gradients_for_structure(
-    gradients: list[tf.Tensor],
-    grad_index: list[list[int]],
-    N: int,
-    dim_q: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Pad per-atom gradients and neighbour indices to uniform shape for a single structure.
-
-    Args:
-        gradients  : list of N tensors each [M_i, 3, dim_q]
-        grad_index : list of N lists each [M_i] ints
-        N          : number of atoms
-        dim_q      : descriptor dimension
-
-    Returns:
-        grad_padded : [N, max_nbrs, 3, dim_q] float32
-        gidx_padded : [N, max_nbrs] int32
-        nbr_mask    : [N, max_nbrs] float32
-    """
-    max_nbrs = max(gradients[i].shape[0] for i in range(N))
-    grad_padded = np.zeros((N, max_nbrs, 3, dim_q), dtype=np.float32)
-    gidx_padded = np.zeros((N, max_nbrs), dtype=np.int32)
-    nbr_mask = np.zeros((N, max_nbrs), dtype=np.float32)
-    for i in range(N):
-        n_nbrs = gradients[i].shape[0]
-        grad_padded[i, :n_nbrs] = gradients[i].numpy()
-        gidx_padded[i, :n_nbrs] = grad_index[i]
-        nbr_mask[i, :n_nbrs] = 1.0
-    return grad_padded, gidx_padded, nbr_mask
 
 
 def compute_dipole_acf(dipoles: np.ndarray) -> np.ndarray:
@@ -128,12 +98,10 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
 
     acf_prepared = acf * w * kronecker
 
-    # Cosine transform (DCT) to obtain line shape — guaranteed real & non-negative
-    # M(k) = Σ_t acf(t) · cos(2πkt / (2Nmax-1))
-    t_idx = np.arange(Nmax)
-    M_omega = np.zeros(Nmax)
-    for k in range(Nmax):
-        M_omega[k] = np.sum(acf_prepared * np.cos(2.0 * np.pi * k * t_idx / (2 * Nmax - 1)))
+    # Cosine transform: M(k) = Σ_t acf(t) · cos(2πkt / (2Nmax-1)) is the real
+    # part of the rfft of acf_prepared zero-padded to length 2Nmax-1.
+    # O(N log N) in C vs O(N²) in Python.
+    M_omega = np.fft.rfft(acf_prepared, n=2 * Nmax - 1).real
 
     # Frequency axis: convert from DCT index to cm⁻¹
     # k-th bin corresponds to frequency k / ((2*Nmax-1) * dt_fs) in 1/fs
@@ -223,76 +191,239 @@ def plot_power_spectrum(freq_cm: np.ndarray, power: np.ndarray, cfg: TNEPconfig,
     _finish_fig(fig, cfg, "power_spectrum", save_plots, show_plots)
 
 
-def predict_dipole_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray]) -> np.ndarray:
-    """Predict dipole moments for each frame in an MD trajectory.
+def _pack_traj_batch_coo(
+    frames: list,
+    types_int_batch: list[np.ndarray],
+    descriptors: list,
+    gradients: list,
+    grad_index: list,
+    dim_q: int,
+    pin_to_cpu: bool = True,
+) -> dict:
+    """Pack a batch of trajectory frames into COO format for predict_batch.
+
+    Mirrors pad_and_stack() from data.py: same COO layout, same CPU pinning option,
+    same del-numpy-after-tf.constant pattern to keep peak RAM at ~1× rather than 2×.
 
     Args:
-        model             : trained TNEP model (target_mode = 1, config via model.cfg)
-        trajectory        : list of ase.Atoms — MD frames (ordered in time)
-        dataset_types_int : list of [N_i] int arrays — type indices per frame
+        pin_to_cpu : True = place tensors on CPU (transferred to GPU implicitly during
+                     predict_batch). Required for trajectories too large to fit in VRAM.
 
     Returns:
-        dipoles : [T, 3] ndarray — predicted dipole moment per frame
+        dict with descriptors [B,A,Q], grad_values [P,3,Q], pair_atom/gidx/struct [P],
+        positions [B,A,3], Z_int [B,A], boxes [B,3,3], atom_mask [B,A] as tf.Tensor
     """
-    builder = DescriptorBuilder(model.cfg)
-    descriptors, gradients, grad_index = builder.build_descriptors(trajectory)
-    actual_dim_q = descriptors[0].shape[-1]
+    S = len(frames)
+    atom_counts = [descriptors[s].shape[0] for s in range(S)]
+    max_atoms = max(atom_counts)
 
-    dipoles = []
-    for s in range(len(trajectory)):
-        struct = trajectory[s]
-        N = len(struct)
-        pos = tf.convert_to_tensor(struct.positions, dtype=tf.float32)
-        Z = tf.convert_to_tensor(dataset_types_int[s], dtype=tf.int32)
-        box = tf.convert_to_tensor(cell_to_box(struct), dtype=tf.float32)
-        desc = descriptors[s]
-        atom_mask = tf.ones([N], dtype=tf.float32)
+    pair_counts = [
+        sum(gradients[s][i].shape[0] for i in range(atom_counts[s]))
+        for s in range(S)
+    ]
+    N_pairs = sum(pair_counts)
 
-        grad_padded, gidx_padded, nbr_mask = _pad_gradients_for_structure(
-            gradients[s], grad_index[s], N, actual_dim_q)
+    grad_values_np = np.zeros((N_pairs, 3, dim_q), dtype=np.float32)
+    pair_struct_np = np.zeros(N_pairs, dtype=np.int32)
+    pair_atom_np   = np.zeros(N_pairs, dtype=np.int32)
+    pair_gidx_np   = np.zeros(N_pairs, dtype=np.int32)
 
-        mu = model.predict(
-            desc, tf.convert_to_tensor(grad_padded), tf.convert_to_tensor(gidx_padded),
-            pos, Z, box, atom_mask, tf.convert_to_tensor(nbr_mask, dtype=tf.float32))
-        dipoles.append(mu.numpy())
+    desc_np      = np.zeros((S, max_atoms, dim_q), dtype=np.float32)
+    pos_np       = np.zeros((S, max_atoms, 3),     dtype=np.float32)
+    z_np         = np.zeros((S, max_atoms),         dtype=np.int32)
+    box_np       = np.zeros((S, 3, 3),              dtype=np.float32)
+    atom_mask_np = np.zeros((S, max_atoms),         dtype=np.float32)
+    num_atoms_np = np.array(atom_counts, dtype=np.int32)
 
-    return np.array(dipoles)
+    pair_offset = 0
+    for s in range(S):
+        N_s = atom_counts[s]
+        desc_np[s, :N_s]      = descriptors[s].numpy()
+        pos_np[s, :N_s]       = frames[s].positions.astype(np.float32)
+        z_np[s, :N_s]         = types_int_batch[s]
+        box_np[s]             = cell_to_box(frames[s])
+        atom_mask_np[s, :N_s] = 1.0
+
+        for i in range(N_s):
+            n_nbrs = gradients[s][i].shape[0]
+            k_end  = pair_offset + n_nbrs
+            grad_values_np[pair_offset:k_end] = gradients[s][i].numpy()
+            pair_struct_np[pair_offset:k_end] = s
+            pair_atom_np[pair_offset:k_end]   = i
+            pair_gidx_np[pair_offset:k_end]   = grad_index[s][i]
+            pair_offset = k_end
+
+    # Convert numpy → tf.Tensor under the chosen device, then drop the numpy
+    # buffers immediately so peak RAM stays at ~1× the batch size.
+    with tf.device('/CPU:0' if pin_to_cpu else '/GPU:0'):
+        result = {}
+        result["descriptors"] = tf.constant(desc_np);        del desc_np
+        result["grad_values"] = tf.constant(grad_values_np); del grad_values_np
+        result["pair_atom"]   = tf.constant(pair_atom_np);   del pair_atom_np
+        result["pair_gidx"]   = tf.constant(pair_gidx_np);   del pair_gidx_np
+        result["pair_struct"] = tf.constant(pair_struct_np); del pair_struct_np
+        result["positions"]   = tf.constant(pos_np);         del pos_np
+        result["Z_int"]       = tf.constant(z_np);           del z_np
+        result["boxes"]       = tf.constant(box_np);         del box_np
+        result["atom_mask"]   = tf.constant(atom_mask_np);   del atom_mask_np
+        result["num_atoms"]   = tf.constant(num_atoms_np);   del num_atoms_np
+    return result
 
 
-def predict_polarizability_trajectory(model: TNEP, trajectory: list[Atoms], dataset_types_int: list[np.ndarray]) -> np.ndarray:
-    """Predict polarizability tensors for each frame in an MD trajectory.
+def _pack_traj_batch_from_flat(
+    frame_results: list,
+    frames: list,
+    types_int_batch: list[np.ndarray],
+    dim_q: int,
+    pin_to_cpu: bool = True,
+) -> dict:
+    """Pack flat per-frame COO arrays into a stacked batch.
+
+    Each frame_results[s] = (descriptors[N,Q], grad_values[P_s,3,Q],
+    pair_atom[P_s], pair_gidx[P_s]) all numpy. We concatenate the pair-level
+    arrays in one shot and assemble a struct-index from the per-frame counts —
+    no per-atom Python loop, no .numpy() round-trips.
+
+    Returns the same dict layout as _pack_traj_batch_coo so predict_batch
+    consumes it unchanged.
+    """
+    S = len(frames)
+    atom_counts = [r[0].shape[0] for r in frame_results]
+    max_atoms = max(atom_counts)
+    pair_counts = np.array([r[1].shape[0] for r in frame_results], dtype=np.int32)
+    N_pairs = int(pair_counts.sum())
+
+    # Pair-level COO: single concat per field
+    grad_values_np = (np.concatenate([r[1] for r in frame_results], axis=0)
+                      if N_pairs else np.zeros((0, 3, dim_q), dtype=np.float32))
+    pair_atom_np   = (np.concatenate([r[2] for r in frame_results])
+                      if N_pairs else np.zeros(0, dtype=np.int32))
+    pair_gidx_np   = (np.concatenate([r[3] for r in frame_results])
+                      if N_pairs else np.zeros(0, dtype=np.int32))
+    pair_struct_np = np.repeat(np.arange(S, dtype=np.int32), pair_counts)
+
+    # Structure-padded fields
+    desc_np      = np.zeros((S, max_atoms, dim_q), dtype=np.float32)
+    pos_np       = np.zeros((S, max_atoms, 3),     dtype=np.float32)
+    z_np         = np.zeros((S, max_atoms),         dtype=np.int32)
+    box_np       = np.zeros((S, 3, 3),              dtype=np.float32)
+    atom_mask_np = np.zeros((S, max_atoms),         dtype=np.float32)
+    num_atoms_np = np.array(atom_counts, dtype=np.int32)
+
+    for s in range(S):
+        N_s = atom_counts[s]
+        desc_np[s, :N_s]      = frame_results[s][0]
+        pos_np[s, :N_s]       = frames[s].positions.astype(np.float32)
+        z_np[s, :N_s]         = types_int_batch[s]
+        box_np[s]             = cell_to_box(frames[s])
+        atom_mask_np[s, :N_s] = 1.0
+
+    with tf.device('/CPU:0' if pin_to_cpu else '/GPU:0'):
+        result = {}
+        result["descriptors"] = tf.constant(desc_np);        del desc_np
+        result["grad_values"] = tf.constant(grad_values_np); del grad_values_np
+        result["pair_atom"]   = tf.constant(pair_atom_np);   del pair_atom_np
+        result["pair_gidx"]   = tf.constant(pair_gidx_np);   del pair_gidx_np
+        result["pair_struct"] = tf.constant(pair_struct_np); del pair_struct_np
+        result["positions"]   = tf.constant(pos_np);         del pos_np
+        result["Z_int"]       = tf.constant(z_np);           del z_np
+        result["boxes"]       = tf.constant(box_np);         del box_np
+        result["atom_mask"]   = tf.constant(atom_mask_np);   del atom_mask_np
+        result["num_atoms"]   = tf.constant(num_atoms_np);   del num_atoms_np
+    return result
+
+
+def predict_dipole_batch(
+    model: TNEP,
+    builder: DescriptorBuilder,
+    batch_frames: list[Atoms],
+    batch_types: list[np.ndarray],
+    pin_to_cpu: bool = True,
+) -> np.ndarray:
+    """Run dipole prediction on one batch of frames.
+
+    Build → pack → predict → return. Caller is responsible for the outer batch
+    loop and for releasing batch_frames after the call.
 
     Args:
-        model             : trained TNEP model (target_mode = 2, config via model.cfg)
-        trajectory        : list of ase.Atoms — MD frames (ordered in time)
-        dataset_types_int : list of [N_i] int arrays — type indices per frame
+        model        : trained TNEP model (target_mode = 1)
+        builder      : reusable DescriptorBuilder (constructed once per trajectory)
+        batch_frames : list of ase.Atoms in this batch
+        batch_types  : list of [N_i] int arrays — type indices per frame
+        pin_to_cpu   : place batch tensors on CPU (transferred to GPU implicitly).
+                       Required for trajectories too large to fit in VRAM.
 
     Returns:
-        pols : [T, 6] ndarray — predicted polarizability [xx, yy, zz, xy, yz, zx] per frame
+        [B, 3] numpy array — total system dipole per frame in the batch
     """
-    builder = DescriptorBuilder(model.cfg)
-    descriptors, gradients, grad_index = builder.build_descriptors(trajectory)
-    actual_dim_q = descriptors[0].shape[-1]
+    cfg = model.cfg
+    frame_results = builder.build_descriptors_flat(batch_frames)
+    batch = _pack_traj_batch_from_flat(frame_results, batch_frames, batch_types,
+                                       cfg.dim_q, pin_to_cpu=pin_to_cpu)
+    del frame_results
 
-    pols = []
-    for s in range(len(trajectory)):
-        struct = trajectory[s]
-        N = len(struct)
-        pos = tf.convert_to_tensor(struct.positions, dtype=tf.float32)
-        Z = tf.convert_to_tensor(dataset_types_int[s], dtype=tf.int32)
-        box = tf.convert_to_tensor(cell_to_box(struct), dtype=tf.float32)
-        desc = descriptors[s]
-        atom_mask = tf.ones([N], dtype=tf.float32)
+    preds = model.predict_batch(
+        batch["descriptors"], batch["grad_values"],
+        batch["pair_atom"], batch["pair_gidx"], batch["pair_struct"],
+        batch["positions"], batch["Z_int"], batch["boxes"],
+        batch["atom_mask"],
+        model.W0, model.b0, model.W1, model.b1,
+        None, None, None, None,
+    )
+    # Training scales dipole targets to per-atom (target / N), so the model
+    # outputs per-atom dipole. Multiply by N here to recover the total system
+    # dipole that spectroscopy expects.
+    if cfg.scale_targets:
+        num_atoms_col = tf.cast(batch["num_atoms"], tf.float32)[:, tf.newaxis]
+        preds = preds * num_atoms_col
+    out = preds.numpy()
+    del batch, preds
+    return out
 
-        grad_padded, gidx_padded, nbr_mask = _pad_gradients_for_structure(
-            gradients[s], grad_index[s], N, actual_dim_q)
 
-        pol = model.predict(
-            desc, tf.convert_to_tensor(grad_padded), tf.convert_to_tensor(gidx_padded),
-            pos, Z, box, atom_mask, tf.convert_to_tensor(nbr_mask, dtype=tf.float32))
-        pols.append(pol.numpy())
+def predict_polarizability_batch(
+    model: TNEP,
+    builder: DescriptorBuilder,
+    batch_frames: list[Atoms],
+    batch_types: list[np.ndarray],
+    pin_to_cpu: bool = True,
+) -> np.ndarray:
+    """Run polarizability prediction on one batch of frames.
 
-    return np.array(pols)
+    Build → pack → predict → return. Caller is responsible for the outer batch
+    loop and for releasing batch_frames after the call.
+
+    Args:
+        model        : trained TNEP model (target_mode = 2)
+        builder      : reusable DescriptorBuilder (constructed once per trajectory)
+        batch_frames : list of ase.Atoms in this batch
+        batch_types  : list of [N_i] int arrays — type indices per frame
+        pin_to_cpu   : place batch tensors on CPU (transferred to GPU implicitly).
+                       Required for trajectories too large to fit in VRAM.
+
+    Returns:
+        [B, 6] numpy array — polarizability [xx, yy, zz, xy, yz, zx] per frame
+    """
+    cfg = model.cfg
+    frame_results = builder.build_descriptors_flat(batch_frames)
+    batch = _pack_traj_batch_from_flat(frame_results, batch_frames, batch_types,
+                                       cfg.dim_q, pin_to_cpu=pin_to_cpu)
+    del frame_results
+
+    preds = model.predict_batch(
+        batch["descriptors"], batch["grad_values"],
+        batch["pair_atom"], batch["pair_gidx"], batch["pair_struct"],
+        batch["positions"], batch["Z_int"], batch["boxes"],
+        batch["atom_mask"],
+        model.W0, model.b0, model.W1, model.b1,
+        getattr(model, 'W0_pol', None),
+        getattr(model, 'b0_pol', None),
+        getattr(model, 'W1_pol', None),
+        getattr(model, 'b1_pol', None),
+    )
+    out = preds.numpy()
+    del batch, preds
+    return out
 
 
 def _scalar_acf_fft(signal: np.ndarray) -> np.ndarray:

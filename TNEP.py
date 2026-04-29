@@ -338,7 +338,7 @@ class TNEP(layers.Layer):
 
         return metrics, preds
 
-    @tf.function
+    @tf.function(reduce_retracing=True)
     def predict_batch(self, descriptors: tf.Tensor, grad_values: tf.Tensor,
                       pair_atom: tf.Tensor, pair_gidx: tf.Tensor, pair_struct: tf.Tensor,
                       positions: tf.Tensor, Z: tf.Tensor,
@@ -436,7 +436,7 @@ class TNEP(layers.Layer):
         else:
             tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
 
-    @tf.function
+    @tf.function(reduce_retracing=True)
     def predict_batch_candidates(self,
                                   descriptors: tf.Tensor,
                                   W_atom: tf.Tensor | None,
