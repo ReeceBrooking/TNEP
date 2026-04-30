@@ -56,6 +56,16 @@ class TNEPconfig:
     # falls back to a clear error if other settings are requested.
     descriptor_mode: int = 0
 
+    # Internal precision for the GPU descriptor compute. The Fortran reference
+    # uses double-precision throughout; "float64" mirrors that exactly. The
+    # opt-in "float32" path keeps roughly half the VRAM and runs faster on
+    # consumer GPUs (which are 2-32× more performant in fp32 than fp64), at
+    # the cost of slightly looser agreement with quippy. Trajectory-inference
+    # outputs are always cast to float32 at the boundary regardless of this
+    # setting, so the user-visible difference is dominated by accumulation
+    # noise in the radial recursion. Has no effect for descriptor_mode=0.
+    descriptor_precision: str = "float64"
+
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
     lambda_1: float | None = 0.001

@@ -247,13 +247,34 @@ def _get_fused_predict(model: 'TNEP'):
     W1p_t = _to_tensor(getattr(model, "W1_pol", None))
     b1p_t = _to_tensor(getattr(model, "b1_pol", None))
 
+    # NOTE: not jit_compile=True. The descriptor-side XLA path (locked
+    # compute fns built with jit_compile=True for trajectory) handles the
+    # heavy SOAP work. predict_batch internally has shape-dependent stacks
+    # in _calc_forces_coo that XLA can't lower (varying P per call), so
+    # we keep this graph as a regular @tf.function trace. Per-op launch
+    # overhead at this stage is dwarfed by the fused descriptor compute.
     @tf.function(input_signature=sig, reduce_retracing=False)
     def fused(soap_concat, grad_concat, pa_concat, pg_concat,
               atom_counts, pair_counts,
               positions, Z, boxes, atom_mask, num_atoms):
         S = tf.shape(num_atoms)[0]
-        ragged = tf.RaggedTensor.from_row_lengths(soap_concat, atom_counts)
-        descriptors = ragged.to_tensor(default_value=0.0)
+        # Pad descriptors via scatter_nd. RaggedTensor.to_tensor is the
+        # natural choice but the underlying RaggedTensorToTensor op has no
+        # XLA kernel, so we build the dense [S, A_max, Q] layout directly
+        # from per-row struct/intra indices.
+        A_max = tf.shape(atom_mask)[1]
+        struct_idx_long = tf.repeat(tf.range(S, dtype=tf.int64), atom_counts)
+        cum = tf.concat([[tf.constant(0, dtype=tf.int64)],
+                         tf.cumsum(atom_counts)[:-1]], axis=0)
+        intra_idx = (tf.range(tf.shape(soap_concat)[0], dtype=tf.int64)
+                     - tf.gather(cum, struct_idx_long))
+        scatter_idx = tf.stack(
+            [tf.cast(struct_idx_long, tf.int32),
+             tf.cast(intra_idx, tf.int32)],
+            axis=-1)
+        descriptors = tf.scatter_nd(
+            scatter_idx, soap_concat,
+            shape=tf.stack([S, A_max, tf.constant(dim_q, tf.int32)]))
         pair_struct = tf.repeat(tf.range(S, dtype=tf.int32), pair_counts)
         preds = model.predict_batch(
             descriptors, grad_concat, pa_concat, pg_concat, pair_struct,
@@ -508,6 +529,8 @@ def predict_trajectory_batch(
     pin_to_cpu: bool = True,
     descriptor_batch_frames: int | None = 1,
     descriptor_memory_budget_bytes: int | None = None,
+    descriptor_precision: str | None = None,
+    descriptor_pair_tile_size: int | None = None,
 ) -> np.ndarray:
     """Run dipole/polarizability prediction on one batch of trajectory frames.
 
@@ -530,6 +553,10 @@ def predict_trajectory_batch(
                        auto-sizer when descriptor_batch_frames is None. None
                        falls back to the builder's default (6 GiB). Quippy mode
                        and explicit-int batch sizes ignore this field.
+        descriptor_precision : "float64" (default, mirrors quippy/Fortran),
+                       "float32" (~2× throughput, ~½ VRAM, looser quippy
+                       agreement). None falls back to the builder's
+                       cfg.descriptor_precision. Quippy mode ignores this.
 
     Returns:
         [B, 3] for dipole models, [B, 6] for polarizability models.
@@ -549,11 +576,31 @@ def predict_trajectory_batch(
         # predict_batch, and applies the dipole scale factor — all in one
         # graph trace, so XLA can fuse across the boundaries that used to be
         # eager-mode op launches.
+        # Switch the builder's compute precision before this batch if a
+        # trajectory-time override was passed; build_descriptors_flat
+        # rebuilds the locked compute fns lazily when precision changes.
+        if descriptor_precision is not None:
+            builder.set_precision(descriptor_precision)
+        if descriptor_pair_tile_size is not None:
+            builder.set_pair_tile_size(int(descriptor_pair_tile_size))
+        # XLA-JIT only when pair-tiling is active. Without tiling, the per-
+        # call shape varies with both n_atoms_chunk AND total pair count P
+        # (which changes by handfuls between frames), which forces XLA to
+        # recompile (ptxas spill warnings every batch, ~5-7 s/compile).
+        # With pair-tiling enabled, pairs are padded to a multiple of
+        # pair_tile_size, so the tf.while_loop body has a deterministic
+        # per-iteration shape — XLA compiles each (n_atoms_chunk, n_tiles)
+        # combination ONCE and reuses across same-sized chunks. For a
+        # fixed-size MD trajectory this is one compile total and the per-
+        # tile kernel runs at full XLA-fused speed afterward.
+        ptile = int(getattr(builder, "_pair_tile_size", 0))
+        use_xla = ptile > 0
         frame_results = builder.build_descriptors_flat(
             batch_frames,
             batch_frames=descriptor_batch_frames,
             memory_budget_bytes=descriptor_memory_budget_bytes,
             return_tf=True,
+            jit_compile=use_xla,
         )
         fused_inputs = _build_fused_inputs(
             frame_results, batch_frames, batch_types, cfg.dim_q,

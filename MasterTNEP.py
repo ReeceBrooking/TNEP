@@ -327,6 +327,8 @@ def process_trajectory(
     descriptor_mode: int | None = None,
     descriptor_batch_frames: int | None = 1,
     descriptor_memory_budget_bytes: int | None = None,
+    descriptor_precision: str | None = None,
+    descriptor_pair_tile_size: int | None = None,
 ) -> dict:
     """Predict properties along an MD trajectory and compute spectra.
 
@@ -362,6 +364,13 @@ def process_trajectory(
                           descriptor_batch_frames is None. None falls back to
                           the builder's default (6 GiB). Quippy mode and
                           explicit-int batch sizes ignore this field.
+        descriptor_precision : str or None — internal compute precision for
+                          the GPU descriptor kernels (mode 1 only):
+                          "float64" (default, mirrors Fortran reference),
+                          "float32" (~2× throughput, ~½ VRAM, slight loss of
+                          agreement vs quippy). None falls back to
+                          cfg.descriptor_precision. Outputs are always cast
+                          to float32 at the trajectory boundary regardless.
 
     Returns:
         For mode 1 (dipole):
@@ -391,7 +400,14 @@ def process_trajectory(
     # cfg.descriptor_mode (0 = quippy, 1 = native TF/GPU); the per-call
     # `descriptor_mode` argument above overrides for this trajectory only.
     builder = make_descriptor_builder(cfg, mode=descriptor_mode)
-    print(f"Descriptor backend: {type(builder).__name__}")
+    # Trajectory-time precision override: used by mode-1 builder only. Quippy
+    # backend simply ignores the kwarg via its existing build_descriptors_flat
+    # signature (memory_budget_bytes / precision are no-ops there).
+    _resolved_precision = (descriptor_precision
+                           if descriptor_precision is not None
+                           else getattr(cfg, "descriptor_precision", "float64"))
+    print(f"Descriptor backend: {type(builder).__name__}  "
+          f"(precision: {_resolved_precision})")
 
     # Stream frames in fixed-size batches: build → pack → predict → append → drop.
     # Only batch_size ASE Atoms exist in memory at any moment.
@@ -440,7 +456,9 @@ def process_trajectory(
                 predict_trajectory_batch(model, builder, batch_frames, batch_types,
                                          pin_to_cpu=pin_to_cpu,
                                          descriptor_batch_frames=descriptor_batch_frames,
-                                         descriptor_memory_budget_bytes=descriptor_memory_budget_bytes))
+                                         descriptor_memory_budget_bytes=descriptor_memory_budget_bytes,
+                                         descriptor_precision=_resolved_precision,
+                                         descriptor_pair_tile_size=descriptor_pair_tile_size))
             n_frames += len(batch_frames)
             pbar.update(1)
             del batch_frames, batch_types, item
@@ -485,5 +503,5 @@ def process_trajectory(
 if __name__ == '__main__':
     #model = train_model()
     model = load_model("models/n30_q75_pop80_20260428_120216/train_waterbulk_O_H_dipole_best_val.npz")
-    dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=20, descriptor_mode=1, descriptor_batch_frames=5, pin_to_cpu=False)
+    dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=40, descriptor_mode=1, descriptor_batch_frames=40, pin_to_cpu=False, descriptor_precision="float32", descriptor_pair_tile_size=8000)
     

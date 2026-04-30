@@ -43,25 +43,49 @@ from DescriptorBuilderGPU import (
 
 
 # =========================================================================
+# Precision helper
+#   Each SOAP helper derives its working dtype from a leading tensor argument
+#   (e.g. rjs / x / cnk / phis). _matching_complex maps a real dtype to its
+#   matching complex dtype. The locked compute fn casts user inputs to the
+#   chosen real dtype once at entry — everything downstream then traces with
+#   that dtype, so fp64 (Fortran-equivalent) and fp32 (faster, lower VRAM)
+#   paths share the exact same Python source.
+# =========================================================================
+
+
+def _matching_complex(real_dtype: tf.DType) -> tf.DType:
+    if real_dtype == tf.float32:
+        return tf.complex64
+    return tf.complex128
+
+
+def _matching_real(complex_dtype: tf.DType) -> tf.DType:
+    if complex_dtype == tf.complex64:
+        return tf.float32
+    return tf.float64
+
+
+# =========================================================================
 # Radial expansion (TF)
 # =========================================================================
 
 
 def _radial_first_integral_tf(
-    rjs: tf.Tensor,                 # [P] float64 (normalised by rcut_hard)
+    rjs: tf.Tensor,                 # [P] (normalised by rcut_hard)
     alpha_max: int,
     rcut_soft: float,               # normalised
-    atom_sigma_scaled: tf.Tensor,   # [P] float64
+    atom_sigma_scaled: tf.Tensor,   # [P]
 ) -> tf.Tensor:
     """First-integral recursion over [0, rcut_soft]. Returns [alpha_max, P]."""
-    sq2 = tf.constant(np.sqrt(2.0), dtype=tf.float64)
+    dtype = rjs.dtype
+    sq2 = tf.constant(np.sqrt(2.0), dtype=dtype)
     s2 = atom_sigma_scaled ** 2
     P = tf.shape(rjs)[0]
 
     I_n = tf.zeros_like(rjs)
-    N_n = tf.constant(1.0, dtype=tf.float64)
-    N_np1 = tf.constant(_N_a(-2), dtype=tf.float64)
-    sqrt_pi_2 = tf.constant(np.sqrt(np.pi / 2.0), dtype=tf.float64)
+    N_n = tf.constant(1.0, dtype=dtype)
+    N_np1 = tf.constant(_N_a(-2), dtype=dtype)
+    sqrt_pi_2 = tf.constant(np.sqrt(np.pi / 2.0), dtype=dtype)
     I_np1 = (sqrt_pi_2 * atom_sigma_scaled
              * (tf.math.erf((rcut_soft - rjs) / (sq2 * atom_sigma_scaled))
                 - tf.math.erf((-rjs) / (sq2 * atom_sigma_scaled))) / N_np1)
@@ -76,7 +100,7 @@ def _radial_first_integral_tf(
     out_list = []
     for n in range(-1, alpha_max + 1):
         C1 = C1 * dr
-        N_np2 = tf.constant(_N_a(n), dtype=tf.float64)
+        N_np2 = tf.constant(_N_a(n), dtype=dtype)
         I_np2 = (s2 * (n + 1) * (N_n / N_np2) * I_n
                  - N_np1 * (rjs - 1.0) / N_np2 * I_np1
                  + C1 / N_np2
@@ -98,7 +122,8 @@ def _radial_second_integral_tf(
     nf: float,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Soft-cutoff filter contribution. Returns (temp2 [alpha_max, P], pref_f [P])."""
-    sq2 = tf.constant(np.sqrt(2.0), dtype=tf.float64)
+    dtype = rjs.dtype
+    sq2 = tf.constant(np.sqrt(2.0), dtype=dtype)
     s2 = atom_sigma_scaled ** 2
     dr = 1.0 - rcut_soft
     denom = s2 + dr ** 2 / nf ** 2
@@ -108,9 +133,9 @@ def _radial_second_integral_tf(
     pref_f = tf.math.exp(-0.5 * (rcut_soft - rjs) ** 2 / denom)
 
     I_n = tf.zeros_like(rjs)
-    N_n = tf.constant(1.0, dtype=tf.float64)
-    N_np1 = tf.constant(_N_a(-2), dtype=tf.float64)
-    sqrt_pi_2 = tf.constant(np.sqrt(np.pi / 2.0), dtype=tf.float64)
+    N_n = tf.constant(1.0, dtype=dtype)
+    N_np1 = tf.constant(_N_a(-2), dtype=dtype)
+    sqrt_pi_2 = tf.constant(np.sqrt(np.pi / 2.0), dtype=dtype)
     I_np1 = (sqrt_pi_2 * atom_sigma_f
              * (tf.math.erf((1.0 - rj_f) / (sq2 * atom_sigma_f))
                 - tf.math.erf((rcut_soft - rj_f) / (sq2 * atom_sigma_f))) / N_np1)
@@ -123,7 +148,7 @@ def _radial_second_integral_tf(
     out_list = []
     for n in range(-1, alpha_max + 1):
         C2 = C2 * dr
-        N_np2 = tf.constant(_N_a(n), dtype=tf.float64)
+        N_np2 = tf.constant(_N_a(n), dtype=dtype)
         I_np2 = (sf2 * (n + 1) * (N_n / N_np2) * I_n
                  - N_np1 * (rj_f - 1.0) / N_np2 * I_np1
                  - C2 / N_np2)
@@ -146,10 +171,11 @@ def _radial_amplitude_with_der_tf(
     radial_enhancement: int,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Amplitude and its derivative. Mirrors the NumPy version exactly."""
+    dtype = rjs.dtype
     s2 = atom_sigma_scaled ** 2
     if amplitude_scaling == 0.0:
         amp = 1.0 / atom_sigma_scaled
-        amp_der = -tf.constant(atom_sigma_scaling, dtype=tf.float64) / s2
+        amp_der = -tf.constant(atom_sigma_scaling, dtype=dtype) / s2
     else:
         env = 1.0 + 2.0 * rjs ** 3 - 3.0 * rjs ** 2
         env_safe = tf.where(env > 1e-10, env, tf.ones_like(env))
@@ -169,13 +195,13 @@ def _radial_amplitude_with_der_tf(
     amp_der = tf.where(is_central, amp_der * central_weight, amp_der)
 
     if radial_enhancement == 1:
-        sqrt_2_pi = tf.constant(np.sqrt(2.0 / np.pi), dtype=tf.float64)
+        sqrt_2_pi = tf.constant(np.sqrt(2.0 / np.pi), dtype=dtype)
         amp_der_new = (amp * (1.0 + sqrt_2_pi * atom_sigma_scaling)
                        + amp_der * (rjs + sqrt_2_pi * atom_sigma_scaled))
         amp_new = amp * (rjs + sqrt_2_pi * atom_sigma_scaled)
         amp, amp_der = amp_new, amp_der_new
     elif radial_enhancement == 2:
-        sqrt_8_pi = tf.constant(np.sqrt(8.0 / np.pi), dtype=tf.float64)
+        sqrt_8_pi = tf.constant(np.sqrt(8.0 / np.pi), dtype=dtype)
         amp_der_new = (amp * (2.0 * rjs + 2.0 * atom_sigma_scaled * atom_sigma_scaling
                               + sqrt_8_pi * atom_sigma_scaled
                               + sqrt_8_pi * rjs * atom_sigma_scaling)
@@ -195,14 +221,15 @@ def _radial_first_integral_der_tf(
     atom_sigma_scaling: float,
 ) -> tf.Tensor:
     """Chain-rule derivative of first integral. Returns [alpha_max, P]."""
+    dtype = rjs.dtype
     s2 = atom_sigma_scaled ** 2
     rj_minus = rjs - 1.0
     sigma_term = atom_sigma_scaling * rj_minus / atom_sigma_scaled
     out_list = []
     for n_f in range(1, alpha_max + 1):
-        Na_n = tf.constant(_N_a(n_f), dtype=tf.float64)
-        Na_np1 = tf.constant(_N_a(n_f + 1), dtype=tf.float64)
-        Na_np2 = tf.constant(_N_a(n_f + 2), dtype=tf.float64)
+        Na_n = tf.constant(_N_a(n_f), dtype=dtype)
+        Na_np1 = tf.constant(_N_a(n_f + 1), dtype=dtype)
+        Na_np2 = tf.constant(_N_a(n_f + 2), dtype=dtype)
         py = n_f - 1
         out_list.append(
             rj_minus / s2 * (sigma_term - 1.0) * temp1_ext[py]
@@ -222,6 +249,7 @@ def _radial_second_integral_der_tf(
     nf: float,
 ) -> tf.Tensor:
     """Second-integral derivative including pref_f baked in. Returns [alpha_max, P]."""
+    dtype = rjs.dtype
     s2 = atom_sigma_scaled ** 2
     dr = 1.0 - rcut_soft
     denom = s2 + dr ** 2 / nf ** 2
@@ -250,9 +278,9 @@ def _radial_second_integral_der_tf(
 
     out_list = []
     for n_f in range(1, alpha_max + 1):
-        Na_n = tf.constant(_N_a(n_f), dtype=tf.float64)
-        Na_np1 = tf.constant(_N_a(n_f + 1), dtype=tf.float64)
-        Na_np2 = tf.constant(_N_a(n_f + 2), dtype=tf.float64)
+        Na_n = tf.constant(_N_a(n_f), dtype=dtype)
+        Na_np1 = tf.constant(_N_a(n_f + 1), dtype=dtype)
+        Na_np2 = tf.constant(_N_a(n_f + 2), dtype=dtype)
         py = n_f - 1
         out_list.append(
             pref_f * (
@@ -283,6 +311,7 @@ def radial_expansion_coeff_poly3_with_der_tf(
     global_scaling: float = 1.0,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Forward + d/d(rj) of radial expansion. Returns (radial, radial_der), each [n_max, P]."""
+    dtype = rjs.dtype
     rj_n = rjs / rcut_hard
     rcut_soft_n = rcut_soft / rcut_hard
     atom_sigma_n = atom_sigma_r / rcut_hard
@@ -310,7 +339,7 @@ def radial_expansion_coeff_poly3_with_der_tf(
     combined = temp1_ext[:alpha_max] + pref_f[None, :] * temp2_ext[:alpha_max]
     transformed = tf.linalg.matmul(W_single, combined)
     raw = (amplitude[None, :] * transformed
-           * tf.constant(global_scaling * np.sqrt(rcut_hard), dtype=tf.float64))
+           * tf.constant(global_scaling * np.sqrt(rcut_hard), dtype=dtype))
 
     temp1_der = _radial_first_integral_der_tf(
         rj_n, temp1_ext, alpha_max, atom_sigma_scaled, atom_sigma_r_scaling
@@ -328,9 +357,9 @@ def radial_expansion_coeff_poly3_with_der_tf(
                                     + pref_f[None, :] * temp2_ext[:alpha_max])
     )
     transformed_der = tf.linalg.matmul(W_single, der_combined)
-    raw_der = transformed_der * tf.constant(global_scaling / np.sqrt(rcut_hard), dtype=tf.float64)
+    raw_der = transformed_der * tf.constant(global_scaling / np.sqrt(rcut_hard), dtype=dtype)
 
-    pair_active_f = tf.cast(pair_active, tf.float64)
+    pair_active_f = tf.cast(pair_active, dtype)
     raw = raw * pair_active_f[None, :]
     raw_der = raw_der * pair_active_f[None, :]
 
@@ -340,7 +369,7 @@ def radial_expansion_coeff_poly3_with_der_tf(
     radial_blocks = []
     radial_der_blocks = []
     for s in range(n_species):
-        species_mask = tf.cast(tf.equal(pair_neighbour_species, s), tf.float64)
+        species_mask = tf.cast(tf.equal(pair_neighbour_species, s), dtype)
         radial_blocks.append(raw * species_mask[None, :])
         radial_der_blocks.append(raw_der * species_mask[None, :])
     radial = tf.concat(radial_blocks, axis=0)
@@ -386,7 +415,8 @@ def _get_plm_array_tf(x: tf.Tensor, l_max: int) -> tf.Tensor:
 
 
 def _get_ilexp_tf(x: tf.Tensor, l_max: int) -> tf.Tensor:
-    """i_l(x²)·exp(-x²) for l=0..l_max. x: [P] float64. Returns [l_max+1, P]."""
+    """i_l(x²)·exp(-x²) for l=0..l_max. x: [P] real. Returns [l_max+1, P]."""
+    dtype = x.dtype
     xcut = 1e-7
     x2 = x * x
     x4 = x2 * x2
@@ -397,8 +427,12 @@ def _get_ilexp_tf(x: tf.Tensor, l_max: int) -> tf.Tensor:
         f = f * (2.0 * i + 1.0)
         fact.append(f)
 
-    safe_x2 = tf.maximum(x2, tf.constant(1e-300, dtype=tf.float64))
-    safe_x4 = tf.maximum(x4, tf.constant(1e-300, dtype=tf.float64))
+    # Underflow guard: 1e-300 fits in float64 but not float32 (subnormal limit
+    # is ~1e-38). Use a dtype-appropriate floor so the value is positive but
+    # negligible at any working precision.
+    tiny = 1e-300 if dtype == tf.float64 else 1e-30
+    safe_x2 = tf.maximum(x2, tf.constant(tiny, dtype=dtype))
+    safe_x4 = tf.maximum(x4, tf.constant(tiny, dtype=dtype))
     full_flm2 = tf.abs((1.0 - tf.math.exp(-2.0 * x2)) / (2.0 * safe_x2))
     full_flm1 = tf.abs((x2 - 1.0 + tf.math.exp(-2.0 * x2) * (x2 + 1.0))
                        / (2.0 * safe_x4))
@@ -449,9 +483,10 @@ def _get_plm_array_der_tf(
     plm_extended: tf.Tensor, l_max: int,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """(plm_div_sin, plm_der_mul_sin) — modified forms for pole-singularity-free derivatives."""
+    dtype = plm_extended.dtype
     P = tf.shape(plm_extended)[1]
     k_max = (l_max + 1) * (l_max + 2) // 2
-    zeros = tf.zeros((P,), dtype=tf.float64)
+    zeros = tf.zeros((P,), dtype=dtype)
 
     der_dict = {}                                                  # k → [P]
     div_dict = {}
@@ -498,10 +533,12 @@ def _get_ilexp_der_tf(
     atom_sigma_scaling: float,
 ) -> tf.Tensor:
     """d(ilexp)/d(rj). Returns [l_max+1, P]."""
+    dtype = rj.dtype
     P = tf.shape(rj)[0]
     coeff1 = 2.0 * rj / atom_sigma ** 2
     coeff2 = 1.0 - atom_sigma_scaling * rj / atom_sigma
-    safe_rj = tf.maximum(rj, tf.constant(1e-300, dtype=tf.float64))
+    tiny = 1e-300 if dtype == tf.float64 else 1e-30
+    safe_rj = tf.maximum(rj, tf.constant(tiny, dtype=dtype))
 
     out_list = [coeff1 * (ilexp_array[1] - ilexp_array[0])]
     for l in range(1, l_max + 1):
@@ -509,7 +546,7 @@ def _get_ilexp_der_tf(
                          + coeff1 * ilexp_array[l - 1]))
     out = tf.stack(out_list, axis=0)
     out = out * coeff2[None, :]
-    safe = tf.cast(rj >= 1e-5, tf.float64)
+    safe = tf.cast(rj >= 1e-5, dtype)
     return out * safe[None, :]
 
 
@@ -524,7 +561,9 @@ def angular_expansion_coeff_with_der_tf(
     rcut: float,
     preflm: tf.Tensor,                # [k_max] float64
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Returns (exp_coeff, exp_coeff_rad_der, exp_coeff_azi_der, exp_coeff_pol_der), each [k_max, P] complex128."""
+    """Returns (exp_coeff, exp_coeff_rad_der, exp_coeff_azi_der, exp_coeff_pol_der), each [k_max, P] complex."""
+    dtype = rjs.dtype
+    cdtype = _matching_complex(dtype)
     k_max = (l_max + 1) * (l_max + 2) // 2
 
     x = tf.math.cos(thetas)
@@ -550,7 +589,7 @@ def angular_expansion_coeff_with_der_tf(
             eimphi_rad_der_list.append(prefl_rad_l_c * prefm[m])
     eimphi = tf.stack(eimphi_list, axis=0)
     eimphi_rad_der = tf.stack(eimphi_rad_der_list, axis=0)
-    eimphi_azi_der = eimphi * tf.constant(1j, dtype=tf.complex128)
+    eimphi_azi_der = eimphi * tf.constant(1j, dtype=cdtype)
 
     amplitude = rcut ** 2 / atom_sigma ** 2
     real_factor = amplitude[None, :] * preflm[:, None] * plm           # [k_max, P] real
@@ -572,8 +611,8 @@ def angular_expansion_coeff_with_der_tf(
     exp_coeff_azi_der = real_factor_div_sin_c * eimphi_azi_der
     exp_coeff_pol_der = real_factor_der_mul_sin_c * eimphi
 
-    pair_active_c = tf.complex(tf.cast(pair_active, tf.float64),
-                                tf.zeros((tf.shape(pair_active)[0],), dtype=tf.float64))
+    pair_active_c = tf.complex(tf.cast(pair_active, dtype),
+                                tf.zeros((tf.shape(pair_active)[0],), dtype=dtype))
     exp_coeff = exp_coeff * pair_active_c[None, :]
     exp_coeff_rad_der = exp_coeff_rad_der * pair_active_c[None, :]
     exp_coeff_azi_der = exp_coeff_azi_der * pair_active_c[None, :]
@@ -584,6 +623,33 @@ def angular_expansion_coeff_with_der_tf(
 # =========================================================================
 # cnk + power spectrum (TF)
 # =========================================================================
+
+
+def aggregate_cnk_der_only_tf(
+    R: tf.Tensor,                     # [n_max, P_tile] real
+    A: tf.Tensor,                     # [k_max, P_tile] complex
+    R_der: tf.Tensor,
+    A_rad_der: tf.Tensor,
+    A_azi_der: tf.Tensor,
+    A_pol_der: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Per-pair cnk derivatives only (no atom-scatter forward cnk).
+
+    Used by the pair-tiled gradient path: the forward `cnk` is computed once
+    over all pairs (cheap, per-atom), then for each pair tile we compute only
+    the three [k_max, n_max, P_tile] derivative tensors. This keeps the
+    dominant complex tensor proportional to P_tile, not the full P.
+    """
+    dtype = R.dtype
+    fac = tf.complex(tf.constant(4.0 * np.pi, dtype=dtype),
+                     tf.constant(0.0, dtype=dtype))
+    R_c = tf.complex(R, tf.zeros_like(R))
+    R_der_c = tf.complex(R_der, tf.zeros_like(R_der))
+    cnk_rad_der = fac * (A[:, None, :] * R_der_c[None, :, :]
+                          + A_rad_der[:, None, :] * R_c[None, :, :])
+    cnk_azi_der = fac * A_azi_der[:, None, :] * R_c[None, :, :]
+    cnk_pol_der = fac * A_pol_der[:, None, :] * R_c[None, :, :]
+    return cnk_rad_der, cnk_azi_der, cnk_pol_der
 
 
 def aggregate_cnk_with_der_tf(
@@ -597,9 +663,10 @@ def aggregate_cnk_with_der_tf(
     n_sites: int,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
     """Forward cnk + 3 per-pair spherical derivatives (NOT scattered)."""
-    fac = tf.complex(tf.constant(4.0 * np.pi, dtype=tf.float64),
-                     tf.constant(0.0, dtype=tf.float64))
-    R_c = tf.complex(R, tf.zeros_like(R))                        # [n_max, P] complex128
+    dtype = R.dtype
+    fac = tf.complex(tf.constant(4.0 * np.pi, dtype=dtype),
+                     tf.constant(0.0, dtype=dtype))
+    R_c = tf.complex(R, tf.zeros_like(R))                        # [n_max, P] complex
     R_der_c = tf.complex(R_der, tf.zeros_like(R_der))
 
     # cnk[k, n, i] = 4π · Σ_p [pair_struct[p]==i] A[k, p] · R[n, p]
@@ -634,53 +701,112 @@ def _build_kept_triples(skip_mask: np.ndarray, n_max: int, l_max: int) -> list[t
     return out
 
 
+def _build_kept_index_arrays(kept_triples: list, l_max: int):
+    """Pre-pad kept-triple indices into rectangular [n_kept, l_max+1] tensors.
+
+    The original power-spectrum loop iterates n_kept (=645 for 6-species
+    cfg) (n,n′,l) triples and produces one row each. Each iteration spawns
+    O(10) small ops, so XLA / the runtime see ~6500 ops of identical
+    structure. By pre-padding the variable l+1 multiplicity range to a
+    fixed l_max+1 and masking the excess, the whole reduction collapses to
+    a single gather + einsum, which fuses into one kernel.
+
+    Returns (kept_n, kept_np, kept_k_idx, kept_mult_idx, kept_mask) where
+      kept_n        : [n_kept]              int32  — n
+      kept_np       : [n_kept]              int32  — n′
+      kept_k_idx    : [n_kept, l_max+1]     int32  — k = l(l+1)/2 + m, padded
+      kept_mult_idx : [n_kept, l_max+1]     int32  — index into multiplicity_array
+      kept_mask     : [n_kept, l_max+1]     bool   — True where m ≤ l for this triple
+    """
+    n_kept = len(kept_triples)
+    M = l_max + 1
+    kept_n = np.empty(n_kept, dtype=np.int32)
+    kept_np = np.empty(n_kept, dtype=np.int32)
+    kept_k_idx = np.zeros((n_kept, M), dtype=np.int32)
+    kept_mult_idx = np.zeros((n_kept, M), dtype=np.int32)
+    kept_mask = np.zeros((n_kept, M), dtype=bool)
+    for t, (n, nprime, l, c2_start, c2_count) in enumerate(kept_triples):
+        kept_n[t] = n
+        kept_np[t] = nprime
+        k0 = l * (l + 1) // 2
+        for m in range(l + 1):  # c2_count = l + 1
+            kept_k_idx[t, m] = k0 + m
+            kept_mult_idx[t, m] = c2_start + m
+            kept_mask[t, m] = True
+    return kept_n, kept_np, kept_k_idx, kept_mult_idx, kept_mask
+
+
 def power_spectrum_with_grad_tf(
-    cnk: tf.Tensor,                   # [k_max, n_max, n_sites] complex128
+    cnk: tf.Tensor,                   # [k_max, n_max, n_sites] complex
     cnk_rad_der: tf.Tensor,           # [k_max, n_max, P]
     cnk_azi_der: tf.Tensor,
     cnk_pol_der: tf.Tensor,
     pair_atom: tf.Tensor,             # [P] int32
-    multiplicity_array: tf.Tensor,    # [n_active] float64
+    multiplicity_array: tf.Tensor,    # [n_active] real
     kept_triples: list,               # Python list — captured at trace time
     compressed_idx: tf.Tensor,        # [P_nonzero] int32
-    coeffs: tf.Tensor,                # [P_nonzero] float64
+    coeffs: tf.Tensor,                # [P_nonzero] real
     n_compressed: int,
     n_sites,                          # int OR scalar int32 tensor
+    l_max: int = None,                # captured at trace time
+    kept_tile_size: int = 16,         # tile width along the n_kept axis
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Returns (soap_norm [n_sites, n_compressed], soap_*_der each [n_compressed, P])."""
+    """Returns (soap_norm [n_sites, n_compressed], soap_*_der each [n_compressed, P]).
+
+    Vectorised + tiled: gathers cnk[k_idx, n_idx, :] over the kept triples
+    in tiles of `kept_tile_size`, multiplies by padded multiplicity, reduces
+    over m within each tile, then concatenates. Tiling caps peak memory at
+    ~kept_tile_size/n_kept of the fully-vectorised version (each tile only
+    materialises [tile, M, P] complex tensors, not [n_kept, M, P]) while
+    still amortising kernel-launch overhead across the tile rather than the
+    one-triple-at-a-time loop. Trades a small constant fraction of speed
+    for a large memory reduction — essential at high descriptor_batch_frames.
+    """
+    if l_max is None:
+        l_max = max(t[2] for t in kept_triples)
+    kept_n_np, kept_np_np, kept_k_np, kept_mult_idx_np, kept_mask_np = (
+        _build_kept_index_arrays(kept_triples, l_max)
+    )
+    kept_n = tf.constant(kept_n_np, dtype=tf.int32)
+    kept_np_idx = tf.constant(kept_np_np, dtype=tf.int32)
+    kept_k_idx = tf.constant(kept_k_np, dtype=tf.int32)
+    kept_mult_idx = tf.constant(kept_mult_idx_np, dtype=tf.int32)
+    kept_mask = tf.constant(kept_mask_np, dtype=tf.bool)
+
+    mult_padded = tf.gather(multiplicity_array, kept_mult_idx)
+    mult_padded = tf.where(kept_mask, mult_padded, tf.zeros_like(mult_padded))
+
     cnk_at = tf.gather(cnk, pair_atom, axis=2)                       # [k_max, n_max, P]
-    fwd_rows = []
-    rad_rows = []
-    azi_rows = []
-    pol_rows = []
-    for (n, nprime, l, c2_start, c2_count) in kept_triples:
-        k_start = l * (l + 1) // 2
-        k_end = k_start + (l + 1)
-        mult_tf = multiplicity_array[c2_start:c2_start + c2_count]
 
-        prod_fwd = (cnk[k_start:k_end, n, :]
-                    * tf.math.conj(cnk[k_start:k_end, nprime, :]))
-        fwd_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(prod_fwd), axis=0))
+    # Single-shot vectorised gather + reduce. The kept-axis is small for
+    # typical cfgs (n_kept = 75 for 2-species water, ~645 for 6-species
+    # organics) and tiling it just adds launch overhead.
+    n_b  = tf.broadcast_to(kept_n[:, None],     tf.shape(kept_k_idx))
+    np_b = tf.broadcast_to(kept_np_idx[:, None], tf.shape(kept_k_idx))
+    idx_n  = tf.stack([kept_k_idx, n_b],  axis=-1)
+    idx_np = tf.stack([kept_k_idx, np_b], axis=-1)
 
-        cnk_at_n = cnk_at[k_start:k_end, n, :]
-        cnk_at_np = cnk_at[k_start:k_end, nprime, :]
-        rn = cnk_rad_der[k_start:k_end, n, :]
-        rnp = cnk_rad_der[k_start:k_end, nprime, :]
-        an = cnk_azi_der[k_start:k_end, n, :]
-        anp = cnk_azi_der[k_start:k_end, nprime, :]
-        pn = cnk_pol_der[k_start:k_end, n, :]
-        pnp = cnk_pol_der[k_start:k_end, nprime, :]
-        rad_term = rn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(rnp)
-        azi_term = an * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(anp)
-        pol_term = pn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(pnp)
-        rad_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(rad_term), axis=0))
-        azi_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(azi_term), axis=0))
-        pol_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(pol_term), axis=0))
+    cnk_n   = tf.gather_nd(cnk, idx_n)
+    cnk_np_ = tf.gather_nd(cnk, idx_np)
+    prod_fwd = cnk_n * tf.math.conj(cnk_np_)
+    fwd_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(prod_fwd), axis=1)
+    del cnk_n, cnk_np_, prod_fwd
 
-    fwd_kept = tf.stack(fwd_rows, axis=0)                            # [n_kept, n_sites]
-    rad_kept = tf.stack(rad_rows, axis=0)                            # [n_kept, P]
-    azi_kept = tf.stack(azi_rows, axis=0)
-    pol_kept = tf.stack(pol_rows, axis=0)
+    cnk_at_n   = tf.gather_nd(cnk_at, idx_n)
+    cnk_at_np  = tf.gather_nd(cnk_at, idx_np)
+    rn  = tf.gather_nd(cnk_rad_der, idx_n)
+    rnp = tf.gather_nd(cnk_rad_der, idx_np)
+    an  = tf.gather_nd(cnk_azi_der, idx_n)
+    anp = tf.gather_nd(cnk_azi_der, idx_np)
+    pn  = tf.gather_nd(cnk_pol_der, idx_n)
+    pnp = tf.gather_nd(cnk_pol_der, idx_np)
+    rad_term = rn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(rnp)
+    azi_term = an * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(anp)
+    pol_term = pn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(pnp)
+    rad_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(rad_term), axis=1)
+    azi_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(azi_term), axis=1)
+    pol_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(pol_term), axis=1)
+    del cnk_at, cnk_at_n, cnk_at_np, rn, rnp, an, anp, pn, pnp, rad_term, azi_term, pol_term
 
     P_dim = tf.shape(pair_atom)[0]
     n_compressed_t = tf.constant(n_compressed, tf.int32)
@@ -759,7 +885,7 @@ def _spherical_to_cartesian_per_pair_tf(
     coef_pol_z = (sin_t * r_inv)[:, None]
     der_z = coef_rad_z * rad + coef_pol_z * pol
 
-    mask = tf.cast(pair_active, tf.float64)[:, None]
+    mask = tf.cast(pair_active, rjs.dtype)[:, None]
     der_x = der_x * mask
     der_y = der_y * mask
     der_z = der_z * mask
@@ -778,7 +904,7 @@ def _aggregate_self_derivative_tf(
     here — their gradient is subtracted from the rj=0 central slot, just like
     any other neighbour.
     """
-    is_central_f = tf.cast(pair_is_central, tf.float64)[:, None, None]   # [P, 1, 1]
+    is_central_f = tf.cast(pair_is_central, soap_cart_der.dtype)[:, None, None]   # [P, 1, 1]
     non_central = soap_cart_der * (1.0 - is_central_f)
     centre_sum = tf.math.unsorted_segment_sum(non_central, pair_atom, n_sites)
     neg_centre = -centre_sum
@@ -790,6 +916,98 @@ def _aggregate_self_derivative_tf(
 # =========================================================================
 # Top-level driver (TF, GPU)
 # =========================================================================
+
+
+def power_spectrum_grad_only_tile_tf(
+    cnk: tf.Tensor,                   # [k_max, n_max, n_sites] complex (full forward)
+    cnk_rad_der: tf.Tensor,           # [k_max, n_max, P_tile] complex (tile only)
+    cnk_azi_der: tf.Tensor,
+    cnk_pol_der: tf.Tensor,
+    pair_atom: tf.Tensor,             # [P_tile] int32
+    multiplicity_array: tf.Tensor,
+    kept_triples: list,
+    compressed_idx: tf.Tensor,
+    coeffs: tf.Tensor,
+    soap_unnorm: tf.Tensor,           # [n_compressed, n_sites] (full forward result)
+    sqrt_dot_p: tf.Tensor,            # [n_sites] (full forward result)
+    n_compressed: int,
+    l_max: int = None,
+    kept_tile_size: int = 16,
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Pair-tile derivative branch of the power spectrum.
+
+    Returns (soap_rad_der, soap_azi_der, soap_pol_der), each [n_compressed, P_tile],
+    L2-norm corrected against the full forward soap_unnorm / sqrt_dot_p.
+    Mirrors the derivative branch of `power_spectrum_with_grad_tf` exactly,
+    but the inputs are sliced to a tile of pairs — each call's peak memory is
+    proportional to P_tile, not the full P.
+    """
+    if l_max is None:
+        l_max = max(t[2] for t in kept_triples)
+    kept_n_np, kept_np_np, kept_k_np, kept_mult_idx_np, kept_mask_np = (
+        _build_kept_index_arrays(kept_triples, l_max)
+    )
+    n_kept = kept_n_np.shape[0]
+    kept_n = tf.constant(kept_n_np, dtype=tf.int32)
+    kept_np_idx = tf.constant(kept_np_np, dtype=tf.int32)
+    kept_k_idx = tf.constant(kept_k_np, dtype=tf.int32)
+    kept_mult_idx = tf.constant(kept_mult_idx_np, dtype=tf.int32)
+    kept_mask = tf.constant(kept_mask_np, dtype=tf.bool)
+
+    mult_padded = tf.gather(multiplicity_array, kept_mult_idx)
+    mult_padded = tf.where(kept_mask, mult_padded, tf.zeros_like(mult_padded))
+
+    cnk_at = tf.gather(cnk, pair_atom, axis=2)  # [k_max, n_max, P_tile]
+
+    rad_tiles = []; azi_tiles = []; pol_tiles = []
+    for start in range(0, n_kept, kept_tile_size):
+        end = min(start + kept_tile_size, n_kept)
+        t_n = kept_n[start:end]; t_np = kept_np_idx[start:end]
+        t_k = kept_k_idx[start:end]; t_mult = mult_padded[start:end]
+        n_b  = tf.broadcast_to(t_n[:, None],  tf.shape(t_k))
+        np_b = tf.broadcast_to(t_np[:, None], tf.shape(t_k))
+        idx_n  = tf.stack([t_k, n_b],  axis=-1)
+        idx_np = tf.stack([t_k, np_b], axis=-1)
+        cnk_at_n  = tf.gather_nd(cnk_at, idx_n)
+        cnk_at_np = tf.gather_nd(cnk_at, idx_np)
+        rn  = tf.gather_nd(cnk_rad_der, idx_n)
+        rnp = tf.gather_nd(cnk_rad_der, idx_np)
+        rad_term = rn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(rnp)
+        rad_tiles.append(tf.reduce_sum(t_mult[..., None] * tf.math.real(rad_term), axis=1))
+        del rn, rnp, rad_term
+        an  = tf.gather_nd(cnk_azi_der, idx_n)
+        anp = tf.gather_nd(cnk_azi_der, idx_np)
+        azi_term = an * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(anp)
+        azi_tiles.append(tf.reduce_sum(t_mult[..., None] * tf.math.real(azi_term), axis=1))
+        del an, anp, azi_term
+        pn  = tf.gather_nd(cnk_pol_der, idx_n)
+        pnp = tf.gather_nd(cnk_pol_der, idx_np)
+        pol_term = pn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(pnp)
+        pol_tiles.append(tf.reduce_sum(t_mult[..., None] * tf.math.real(pol_term), axis=1))
+        del pn, pnp, pol_term, cnk_at_n, cnk_at_np
+    rad_kept = tf.concat(rad_tiles, axis=0)
+    azi_kept = tf.concat(azi_tiles, axis=0)
+    pol_kept = tf.concat(pol_tiles, axis=0)
+    del rad_tiles, azi_tiles, pol_tiles, cnk_at
+
+    P_tile_dim = tf.shape(pair_atom)[0]
+    n_compressed_t = tf.constant(n_compressed, tf.int32)
+    soap_rad_der = tf.scatter_nd(compressed_idx[:, None], coeffs[:, None] * rad_kept,
+                                  shape=tf.stack([n_compressed_t, P_tile_dim]))
+    soap_azi_der = tf.scatter_nd(compressed_idx[:, None], coeffs[:, None] * azi_kept,
+                                  shape=tf.stack([n_compressed_t, P_tile_dim]))
+    soap_pol_der = tf.scatter_nd(compressed_idx[:, None], coeffs[:, None] * pol_kept,
+                                  shape=tf.stack([n_compressed_t, P_tile_dim]))
+    del rad_kept, azi_kept, pol_kept
+
+    sdpp = tf.gather(sqrt_dot_p, pair_atom)                      # [P_tile]
+    soap_per_pair = tf.gather(soap_unnorm, pair_atom, axis=1)    # [n_compressed, P_tile]
+
+    def _norm_der(der):
+        dot = tf.reduce_sum(soap_per_pair * der, axis=0)
+        return (der / sdpp[None, :]
+                - soap_per_pair / sdpp[None, :] ** 3 * dot[None, :])
+    return _norm_der(soap_rad_der), _norm_der(soap_azi_der), _norm_der(soap_pol_der)
 
 
 @tf.function(reduce_retracing=True)
@@ -804,36 +1022,180 @@ def _compute_soap_with_grad_inner_tf(
     atom_sigma_t, atom_sigma_t_scaling,
     amplitude_scaling, central_weight,
     radial_enhancement, nf, do_central, n_compressed, n_max,
+    pair_tile_size: int = 0,
 ):
-    """Inner TF compute. Inputs are TF tensors; constants are Python/NumPy."""
-    R, R_der = radial_expansion_coeff_poly3_with_der_tf(
-        rjs, pair_neighbour_species, pair_is_central,
+    """Inner TF compute. Inputs are TF tensors; constants are Python/NumPy.
+
+    Note: when the outer dtype is float32, the radial recursion still runs
+    in float64 internally — the +/- terms in the I_n recursion suffer
+    catastrophic cancellation in fp32 (max|ΔR| ~0.7 vs ~2e-6 fp32 worst-case
+    elsewhere). We cast the radial inputs up to fp64, run the recursion,
+    then cast outputs back.
+
+    pair_tile_size > 0 enables pair-tiled gradient compute: the dominant
+    [k_max, n_max, P] complex tensors (cnk_*_der) are constructed only for
+    P_tile pairs at a time, capping peak VRAM at O(P_tile/P) of the
+    untiled version. The forward path runs once over full pairs (cheap, per-
+    atom output) and shares its outputs across all derivative tiles.
+    pair_tile_size <= 0 keeps the original single-shot path.
+    """
+    is_fp32 = rjs.dtype == tf.float32
+    if is_fp32:
+        rjs_r = tf.cast(rjs, tf.float64)
+        W_r = tf.cast(W_single, tf.float64)
+    else:
+        rjs_r, W_r = rjs, W_single
+    R_full, R_der_full = radial_expansion_coeff_poly3_with_der_tf(
+        rjs_r, pair_neighbour_species, pair_is_central,
         n_species=n_species, alpha_max=alpha_max,
         rcut_hard=rcut_hard, rcut_soft=rcut_soft,
         atom_sigma_r=atom_sigma_r, atom_sigma_r_scaling=atom_sigma_r_scaling,
         amplitude_scaling=amplitude_scaling, central_weight=central_weight,
         radial_enhancement=radial_enhancement, nf=nf, do_central=do_central,
-        W_single=W_single,
+        W_single=W_r,
     )
-    A, A_rad, A_azi, A_pol = angular_expansion_coeff_with_der_tf(
+    if is_fp32:
+        R_full = tf.cast(R_full, rjs.dtype)
+        R_der_full = tf.cast(R_der_full, rjs.dtype)
+    A_full, A_rad_full, A_azi_full, A_pol_full = angular_expansion_coeff_with_der_tf(
         rjs, thetas, phis, pair_active,
         l_max=l_max, atom_sigma_t=atom_sigma_t,
         atom_sigma_t_scaling=atom_sigma_t_scaling,
         rcut=rcut_hard, preflm=preflm,
     )
-    cnk, cnk_rad, cnk_azi, cnk_pol = aggregate_cnk_with_der_tf(
-        R, A, R_der, A_rad, A_azi, A_pol, pair_atom, n_atoms,
+
+    if pair_tile_size <= 0:
+        # Original single-shot path: builds all per-pair derivative tensors
+        # at once. Lower kernel-launch overhead but high peak VRAM at large P.
+        cnk, cnk_rad, cnk_azi, cnk_pol = aggregate_cnk_with_der_tf(
+            R_full, A_full, R_der_full, A_rad_full, A_azi_full, A_pol_full,
+            pair_atom, n_atoms,
+        )
+        soap_norm, soap_rad_der, soap_azi_der, soap_pol_der = power_spectrum_with_grad_tf(
+            cnk, cnk_rad, cnk_azi, cnk_pol, pair_atom,
+            multiplicity_array, kept_triples, compressed_idx, coeffs,
+            n_compressed=n_compressed, n_sites=n_atoms, l_max=l_max,
+        )
+        grad_cart = _spherical_to_cartesian_per_pair_tf(
+            soap_rad_der, soap_azi_der, soap_pol_der,
+            rjs, thetas, phis, ~pair_is_central & pair_active,
+        )
+        grad_cart = _aggregate_self_derivative_tf(
+            grad_cart, pair_atom, pair_is_central, n_atoms)
+        return soap_norm, grad_cart
+
+    # ---- Pair-tiled gradient path -----------------------------------------
+    # 1) One full forward to get cnk (per-atom), soap_unnorm, sqrt_dot_p, soap_norm
+    cnk = aggregate_cnk_tf(R_full, A_full, pair_atom, n_atoms)
+
+    # Inline forward power-spectrum + L2 norm — same logic as the forward
+    # branch of `power_spectrum_with_grad_tf`, but we keep soap_unnorm and
+    # sqrt_dot_p alive for use across the pair tiles.
+    if l_max is None:
+        l_max_eff = max(t[2] for t in kept_triples)
+    else:
+        l_max_eff = l_max
+    kept_n_np, kept_np_np, kept_k_np, kept_mult_idx_np, kept_mask_np = (
+        _build_kept_index_arrays(kept_triples, l_max_eff)
     )
-    soap_norm, soap_rad_der, soap_azi_der, soap_pol_der = power_spectrum_with_grad_tf(
-        cnk, cnk_rad, cnk_azi, cnk_pol, pair_atom,
-        multiplicity_array, kept_triples, compressed_idx, coeffs,
-        n_compressed=n_compressed, n_sites=n_atoms,
+    n_kept = kept_n_np.shape[0]
+    kept_n_t = tf.constant(kept_n_np, dtype=tf.int32)
+    kept_np_t = tf.constant(kept_np_np, dtype=tf.int32)
+    kept_k_t = tf.constant(kept_k_np, dtype=tf.int32)
+    kept_mult_idx_t = tf.constant(kept_mult_idx_np, dtype=tf.int32)
+    kept_mask_t = tf.constant(kept_mask_np, dtype=tf.bool)
+
+    mult_padded = tf.gather(multiplicity_array, kept_mult_idx_t)
+    mult_padded = tf.where(kept_mask_t, mult_padded, tf.zeros_like(mult_padded))
+
+    fwd_tiles = []
+    for s in range(0, n_kept, 16):
+        e = min(s + 16, n_kept)
+        t_n = kept_n_t[s:e]; t_np = kept_np_t[s:e]
+        t_k = kept_k_t[s:e]; t_m = mult_padded[s:e]
+        n_b  = tf.broadcast_to(t_n[:, None], tf.shape(t_k))
+        np_b = tf.broadcast_to(t_np[:, None], tf.shape(t_k))
+        idx_n  = tf.stack([t_k, n_b],  axis=-1)
+        idx_np = tf.stack([t_k, np_b], axis=-1)
+        cnk_n   = tf.gather_nd(cnk, idx_n)
+        cnk_np_ = tf.gather_nd(cnk, idx_np)
+        prod_fwd = cnk_n * tf.math.conj(cnk_np_)
+        fwd_tiles.append(tf.reduce_sum(t_m[..., None] * tf.math.real(prod_fwd), axis=1))
+        del cnk_n, cnk_np_, prod_fwd
+    fwd_kept = tf.concat(fwd_tiles, axis=0); del fwd_tiles
+    n_compressed_t = tf.constant(n_compressed, tf.int32)
+    n_sites_t = tf.cast(n_atoms, tf.int32)
+    soap_unnorm = tf.scatter_nd(
+        compressed_idx[:, None], coeffs[:, None] * fwd_kept,
+        shape=tf.stack([n_compressed_t, n_sites_t]))
+    del fwd_kept
+    norms = tf.linalg.norm(soap_unnorm, axis=0)
+    sqrt_dot_p = tf.where(norms < 1e-5, tf.ones_like(norms), norms)
+    soap_norm = tf.transpose(soap_unnorm / sqrt_dot_p[None, :])
+
+    # 2) Pair-tiled derivative loop. The caller has padded all per-pair
+    # tensors so total P is a multiple of pair_tile_size — every tile is
+    # exactly pair_tile_size long, which lets XLA lower the loop body to a
+    # single fused kernel and reuse it across all iterations. parallel_
+    # iterations=1 keeps only one tile's intermediates live at any moment.
+    P = tf.shape(rjs)[0]
+    P_TILE = int(pair_tile_size)               # Python int (constant at trace)
+    P_tile_const = tf.constant(P_TILE, dtype=tf.int32)
+    n_tiles = P // P_tile_const                # P guaranteed % P_TILE == 0
+
+    grad_dtype = R_full.dtype
+    ta = tf.TensorArray(
+        dtype=grad_dtype, size=n_tiles, infer_shape=True, dynamic_size=False,
+        element_shape=tf.TensorShape([P_TILE, 3, n_compressed]),
     )
-    grad_cart = _spherical_to_cartesian_per_pair_tf(
-        soap_rad_der, soap_azi_der, soap_pol_der,
-        rjs, thetas, phis, ~pair_is_central & pair_active,
+
+    def _body(i, ta_):
+        # Fixed-size tile slice: every iteration sees exactly P_TILE pairs.
+        # tf.slice with a Python-int size is XLA-compatible (no tf.range
+        # with dynamic length, which fails XLA's compile-time-constant
+        # requirement).
+        start = i * P_tile_const
+        rjs_t          = tf.slice(rjs,            [start], [P_TILE])
+        thetas_t       = tf.slice(thetas,         [start], [P_TILE])
+        phis_t         = tf.slice(phis,           [start], [P_TILE])
+        pair_atom_t    = tf.slice(pair_atom,      [start], [P_TILE])
+        pair_active_t  = tf.slice(pair_active,    [start], [P_TILE])
+        pair_central_t = tf.slice(pair_is_central, [start], [P_TILE])
+
+        # 2-D slice along the pair axis (axis=1) of the [n_max/k_max, P]
+        # full tensors. tf.slice with begin/size makes the slice shape
+        # statically known to XLA.
+        R_t     = tf.slice(R_full,     [0, start], [tf.shape(R_full)[0],     P_TILE])
+        R_der_t = tf.slice(R_der_full, [0, start], [tf.shape(R_der_full)[0], P_TILE])
+        A_t     = tf.slice(A_full,     [0, start], [tf.shape(A_full)[0],     P_TILE])
+        A_rad_t = tf.slice(A_rad_full, [0, start], [tf.shape(A_rad_full)[0], P_TILE])
+        A_azi_t = tf.slice(A_azi_full, [0, start], [tf.shape(A_azi_full)[0], P_TILE])
+        A_pol_t = tf.slice(A_pol_full, [0, start], [tf.shape(A_pol_full)[0], P_TILE])
+
+        cnk_rad_t, cnk_azi_t, cnk_pol_t = aggregate_cnk_der_only_tf(
+            R_t, A_t, R_der_t, A_rad_t, A_azi_t, A_pol_t)
+
+        soap_rad_t, soap_azi_t, soap_pol_t = power_spectrum_grad_only_tile_tf(
+            cnk, cnk_rad_t, cnk_azi_t, cnk_pol_t, pair_atom_t,
+            multiplicity_array, kept_triples, compressed_idx, coeffs,
+            soap_unnorm, sqrt_dot_p,
+            n_compressed=n_compressed, l_max=l_max_eff,
+        )
+        grad_cart_t = _spherical_to_cartesian_per_pair_tf(
+            soap_rad_t, soap_azi_t, soap_pol_t,
+            rjs_t, thetas_t, phis_t, ~pair_central_t & pair_active_t,
+        )
+        return i + 1, ta_.write(i, grad_cart_t)
+
+    _, ta = tf.while_loop(
+        cond=lambda i, _ta: i < n_tiles,
+        body=_body,
+        loop_vars=[tf.constant(0, dtype=tf.int32), ta],
+        parallel_iterations=1,
     )
-    grad_cart = _aggregate_self_derivative_tf(grad_cart, pair_atom, pair_is_central, n_atoms)
+    grad_cart = ta.concat()
+    grad_cart = _aggregate_self_derivative_tf(
+        grad_cart, pair_atom, pair_is_central, n_atoms)
     return soap_norm, grad_cart
 
 
@@ -850,6 +1212,7 @@ def radial_expansion_coeff_poly3_tf(
     do_central: bool, W_single: tf.Tensor, global_scaling: float = 1.0,
 ) -> tf.Tensor:
     """Forward-only radial expansion. Returns [n_max, P]."""
+    dtype = rjs.dtype
     rj_n = rjs / rcut_hard
     rcut_soft_n = rcut_soft / rcut_hard
     atom_sigma_n = atom_sigma_r / rcut_hard
@@ -872,12 +1235,12 @@ def radial_expansion_coeff_poly3_tf(
     combined = temp1 + pref_f[None, :] * temp2
     transformed = tf.linalg.matmul(W_single, combined)
     raw = (amplitude[None, :] * transformed
-           * tf.constant(global_scaling * np.sqrt(rcut_hard), dtype=tf.float64))
-    pair_active_f = tf.cast(pair_active, tf.float64)
+           * tf.constant(global_scaling * np.sqrt(rcut_hard), dtype=dtype))
+    pair_active_f = tf.cast(pair_active, dtype)
     raw = raw * pair_active_f[None, :]
     radial_blocks = []
     for s in range(n_species):
-        species_mask = tf.cast(tf.equal(pair_neighbour_species, s), tf.float64)
+        species_mask = tf.cast(tf.equal(pair_neighbour_species, s), dtype)
         radial_blocks.append(raw * species_mask[None, :])
     return tf.concat(radial_blocks, axis=0)
 
@@ -887,7 +1250,8 @@ def angular_expansion_coeff_tf(
     l_max: int, atom_sigma_t: float, atom_sigma_t_scaling: float,
     rcut: float, preflm: tf.Tensor,
 ) -> tf.Tensor:
-    """Forward-only angular expansion. Returns [k_max, P] complex128."""
+    """Forward-only angular expansion. Returns [k_max, P] complex."""
+    dtype = rjs.dtype
     k_max = (l_max + 1) * (l_max + 2) // 2
     x = tf.math.cos(thetas)
     plm = _get_plm_array_tf(x, l_max)
@@ -906,8 +1270,8 @@ def angular_expansion_coeff_tf(
     real_factor_c = tf.complex(real_factor, tf.zeros_like(real_factor))
     exp_coeff = real_factor_c * eimphi
     pair_active_c = tf.complex(
-        tf.cast(pair_active, tf.float64),
-        tf.zeros((tf.shape(pair_active)[0],), dtype=tf.float64),
+        tf.cast(pair_active, dtype),
+        tf.zeros((tf.shape(pair_active)[0],), dtype=dtype),
     )
     return exp_coeff * pair_active_c[None, :]
 
@@ -915,9 +1279,10 @@ def angular_expansion_coeff_tf(
 def aggregate_cnk_tf(
     R: tf.Tensor, A: tf.Tensor, pair_struct: tf.Tensor, n_sites: int,
 ) -> tf.Tensor:
-    """Forward-only cnk scatter-sum. Returns [k_max, n_max, n_sites] complex128."""
-    fac = tf.complex(tf.constant(4.0 * np.pi, dtype=tf.float64),
-                     tf.constant(0.0, dtype=tf.float64))
+    """Forward-only cnk scatter-sum. Returns [k_max, n_max, n_sites] complex."""
+    dtype = R.dtype
+    fac = tf.complex(tf.constant(4.0 * np.pi, dtype=dtype),
+                     tf.constant(0.0, dtype=dtype))
     R_c = tf.complex(R, tf.zeros_like(R))
     prod = fac * A[:, None, :] * R_c[None, :, :]
     prod_perm = tf.transpose(prod, [2, 0, 1])
@@ -928,18 +1293,36 @@ def aggregate_cnk_tf(
 def power_spectrum_tf(
     cnk: tf.Tensor, multiplicity_array: tf.Tensor, kept_triples: list,
     compressed_idx: tf.Tensor, coeffs: tf.Tensor,
-    n_compressed: int, n_sites,
+    n_compressed: int, n_sites, l_max: int = None,
+    kept_tile_size: int = 16,
 ) -> tf.Tensor:
-    """Forward-only power spectrum. Returns [n_sites, n_compressed]."""
-    fwd_rows = []
-    for (n, nprime, l, c2_start, c2_count) in kept_triples:
-        k_start = l * (l + 1) // 2
-        k_end = k_start + (l + 1)
-        mult_tf = multiplicity_array[c2_start:c2_start + c2_count]
-        prod_fwd = (cnk[k_start:k_end, n, :]
-                    * tf.math.conj(cnk[k_start:k_end, nprime, :]))
-        fwd_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(prod_fwd), axis=0))
-    fwd_kept = tf.stack(fwd_rows, axis=0)
+    """Forward-only power spectrum. Returns [n_sites, n_compressed].
+
+    Tiled-vectorised mirror of `power_spectrum_with_grad_tf` forward branch.
+    """
+    if l_max is None:
+        l_max = max(t[2] for t in kept_triples)
+    kept_n_np, kept_np_np, kept_k_np, kept_mult_idx_np, kept_mask_np = (
+        _build_kept_index_arrays(kept_triples, l_max)
+    )
+    kept_n = tf.constant(kept_n_np, dtype=tf.int32)
+    kept_np_idx = tf.constant(kept_np_np, dtype=tf.int32)
+    kept_k_idx = tf.constant(kept_k_np, dtype=tf.int32)
+    kept_mult_idx = tf.constant(kept_mult_idx_np, dtype=tf.int32)
+    kept_mask = tf.constant(kept_mask_np, dtype=tf.bool)
+
+    mult_padded = tf.gather(multiplicity_array, kept_mult_idx)
+    mult_padded = tf.where(kept_mask, mult_padded, tf.zeros_like(mult_padded))
+
+    n_b  = tf.broadcast_to(kept_n[:, None],     tf.shape(kept_k_idx))
+    np_b = tf.broadcast_to(kept_np_idx[:, None], tf.shape(kept_k_idx))
+    idx_n  = tf.stack([kept_k_idx, n_b],  axis=-1)
+    idx_np = tf.stack([kept_k_idx, np_b], axis=-1)
+    cnk_n   = tf.gather_nd(cnk, idx_n)
+    cnk_np_ = tf.gather_nd(cnk, idx_np)
+    prod_fwd = cnk_n * tf.math.conj(cnk_np_)
+    fwd_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(prod_fwd), axis=1)
+    del cnk_n, cnk_np_, prod_fwd
     n_compressed_t = tf.constant(n_compressed, tf.int32)
     n_sites_t = (n_sites if tf.is_tensor(n_sites)
                  else tf.constant(int(n_sites), tf.int32))
@@ -966,15 +1349,25 @@ def _compute_soap_inner_tf(
     radial_enhancement, nf, do_central, n_compressed, n_max,
 ):
     """Forward-only inner pipeline (no derivatives)."""
+    # Same fp32 caveat as _compute_soap_with_grad_inner_tf: keep the radial
+    # recursion in fp64 to avoid catastrophic cancellation in the I_n loop.
+    is_fp32 = rjs.dtype == tf.float32
+    if is_fp32:
+        rjs_r = tf.cast(rjs, tf.float64)
+        W_r = tf.cast(W_single, tf.float64)
+    else:
+        rjs_r, W_r = rjs, W_single
     R = radial_expansion_coeff_poly3_tf(
-        rjs, pair_neighbour_species, pair_is_central,
+        rjs_r, pair_neighbour_species, pair_is_central,
         n_species=n_species, alpha_max=alpha_max,
         rcut_hard=rcut_hard, rcut_soft=rcut_soft,
         atom_sigma_r=atom_sigma_r, atom_sigma_r_scaling=atom_sigma_r_scaling,
         amplitude_scaling=amplitude_scaling, central_weight=central_weight,
         radial_enhancement=radial_enhancement, nf=nf, do_central=do_central,
-        W_single=W_single,
+        W_single=W_r,
     )
+    if is_fp32:
+        R = tf.cast(R, rjs.dtype)
     A = angular_expansion_coeff_tf(
         rjs, thetas, phis, pair_active,
         l_max=l_max, atom_sigma_t=atom_sigma_t,
@@ -984,7 +1377,7 @@ def _compute_soap_inner_tf(
     cnk = aggregate_cnk_tf(R, A, pair_atom, n_atoms)
     return power_spectrum_tf(
         cnk, multiplicity_array, kept_triples, compressed_idx, coeffs,
-        n_compressed=n_compressed, n_sites=n_atoms,
+        n_compressed=n_compressed, n_sites=n_atoms, l_max=l_max,
     )
 
 
@@ -1563,25 +1956,83 @@ class DescriptorBuilderGPUTF:
             central_weight=float(cfg.central_weight),
             radial_enhancement=int(cfg.radial_enhancement),
         )
+        # Precision: float64 (mirrors quippy/Fortran) or float32 (~2× faster,
+        # ~½ VRAM). Locked compute fns are cached by (dtype, jit_compile);
+        # changing precision invalidates the cache and the device constants.
+        self._real_dtype = (tf.float32
+                            if str(getattr(cfg, "descriptor_precision",
+                                            "float64")).lower() == "float32"
+                            else tf.float64)
+        # Pair-tile size for the gradient path. 0 = single-shot (lower
+        # launch overhead, higher VRAM); positive int = tile across pairs in
+        # P_tile-sized chunks (lower peak VRAM, sequential tile loop). Set
+        # via set_pair_tile_size() or process_trajectory's
+        # descriptor_pair_tile_size kwarg. The compute fns cache key includes
+        # the tile size, so changes invalidate the cache and retrace.
+        self._pair_tile_size = int(getattr(cfg, "descriptor_pair_tile_size", 0))
+
         # Precompute cfg-only-dependent constants once. Built lazily to allow
         # construction before cfg.types is populated; rebuilt automatically if
         # cfg.types changes after construction (rare).
         self._cache = None
         self._cache_species_key = None
-        self._with_grad_fn = None
-        self._fwd_only_fn = None
+        # Locked-signature @tf.function pair, keyed by (dtype, jit_compile).
+        # Default (fp64, no JIT) is built eagerly when cfg.types is set; the
+        # JIT-compiled / fp32 variants are added lazily on first call.
+        self._compute_fns: dict = {}
         if self._species_Z is not None:
             self._cache = _build_cfg_cache(self._species_Z, self._soap_params)
             self._cache_species_key = tuple(self._species_Z)
-            self._build_locked_compute_fns()
+            self._build_locked_compute_fns(jit_compile=False)
+
+    def set_pair_tile_size(self, pair_tile_size: int) -> None:
+        """Set the per-pair tile size for the gradient path.
+
+        0 = no tiling (single-shot, faster on small systems but high peak VRAM).
+        >0 = tile pairs into chunks of this size. Cuts peak VRAM at the dominant
+        [k_max, n_max, P] complex tensors to O(pair_tile_size/P) of the un-tiled
+        version. Trades some kernel-launch overhead per chunk for memory.
+        Sensible values for a typical 600-atom MD frame: 5000–20000.
+        """
+        size = int(pair_tile_size)
+        if size < 0:
+            raise ValueError(f"pair_tile_size must be >=0, got {size}")
+        if size == self._pair_tile_size:
+            return
+        self._pair_tile_size = size
+        # Compute fns capture pair_tile_size as a Python constant via
+        # common_static, so changing it requires a fresh trace.
+        self._compute_fns = {}
+
+    def set_precision(self, precision: str) -> None:
+        """Switch the GPU compute precision in place.
+
+        Valid values are "float64" (default) and "float32". A change clears
+        the locked compute-fn cache so the next build_descriptors_flat call
+        traces fresh graphs in the new dtype.
+        """
+        precision = str(precision).lower()
+        if precision not in ("float64", "float32"):
+            raise ValueError(f"descriptor_precision must be 'float64' or "
+                             f"'float32', got {precision!r}")
+        new_dtype = tf.float32 if precision == "float32" else tf.float64
+        if new_dtype is self._real_dtype:
+            return
+        self._real_dtype = new_dtype
+        # Clear cache: device constants and locked fns must rebuild in the
+        # new dtype; cache (W, multiplicity, etc.) is dtype-neutral until it
+        # gets pushed to the device, but the locked fns hold references to
+        # the previous dtype's tf.constant copies via closure.
+        self._compute_fns = {}
 
     def _ensure_cache(self):
         """Build (or rebuild if cfg.types changed) the constant cache.
 
         Also builds per-instance @tf.function wrappers with `input_signature`
         baked in. These take only TF tensors as args (cfg constants captured
-        via closure) and trace exactly once per (cfg, do_grad) combination —
-        eliminating per-call retracing on varying n_atoms / pair counts.
+        via closure) and trace exactly once per (cfg, dtype, jit_compile,
+        do_grad) combination — eliminating per-call retracing on varying
+        n_atoms / pair counts.
         """
         current_key = (tuple(int(z) for z in self.cfg.types)
                        if getattr(self.cfg, "types", None) else None)
@@ -1593,10 +2044,24 @@ class DescriptorBuilderGPUTF:
             self._species_Z = list(current_key)
             self._cache = _build_cfg_cache(self._species_Z, self._soap_params)
             self._cache_species_key = current_key
-            self._build_locked_compute_fns()
+            self._compute_fns = {}
+            self._build_locked_compute_fns(jit_compile=False)
 
-    def _build_locked_compute_fns(self):
-        """Construct @tf.function wrappers locked to a single trace per cfg."""
+    def _get_compute_fns(self, jit_compile: bool) -> tuple:
+        """Return (with_grad_fn, fwd_only_fn) for the current dtype + jit setting."""
+        key = (self._real_dtype, bool(jit_compile))
+        if key not in self._compute_fns:
+            self._build_locked_compute_fns(jit_compile=bool(jit_compile))
+        return self._compute_fns[key]
+
+    def _build_locked_compute_fns(self, jit_compile: bool = False):
+        """Construct @tf.function wrappers locked to a single trace per cfg.
+
+        Builds (and caches) the compute-fn pair for the current
+        self._real_dtype + the requested jit_compile setting. Each pair is
+        traced exactly once per (cfg, dtype, jit, do_grad) combination, so
+        switching precision or toggling JIT spawns at most a few graphs.
+        """
         cache = self._cache
         sp = self._soap_params
         kept_triples = cache["kept_triples"]
@@ -1605,13 +2070,22 @@ class DescriptorBuilderGPUTF:
         n_compressed = int(cache["mask_info"]["n_compressed"])
         device = "/GPU:0" if tf.config.list_physical_devices("GPU") else "/CPU:0"
 
-        # Pre-place cfg-constant tensors on the target device once
+        dtype = self._real_dtype
+        # Pre-place cfg-constant tensors on the target device once per dtype.
+        # We hold references on `self` so the closure captures stable handles.
         with tf.device(device):
-            self._W_t = tf.constant(cache["W_np"], dtype=tf.float64)
-            self._mult_t = tf.constant(cache["multiplicity_np"], dtype=tf.float64)
-            self._comp_idx_t = tf.constant(cache["mask_info"]["compressed_idx"], dtype=tf.int32)
-            self._coeffs_t = tf.constant(cache["mask_info"]["coeffs"], dtype=tf.float64)
-            self._preflm_t = tf.constant(cache["preflm_np"], dtype=tf.float64)
+            W_t       = tf.constant(cache["W_np"], dtype=dtype)
+            mult_t    = tf.constant(cache["multiplicity_np"], dtype=dtype)
+            comp_idx_t = tf.constant(cache["mask_info"]["compressed_idx"], dtype=tf.int32)
+            coeffs_t  = tf.constant(cache["mask_info"]["coeffs"], dtype=dtype)
+            preflm_t  = tf.constant(cache["preflm_np"], dtype=dtype)
+
+        # Backwards-compat: outside callers may read self._W_t / etc.
+        self._W_t = W_t
+        self._mult_t = mult_t
+        self._comp_idx_t = comp_idx_t
+        self._coeffs_t = coeffs_t
+        self._preflm_t = preflm_t
 
         # Common Python-int / float kwargs captured by closure (constants per cfg)
         common_static = dict(
@@ -1630,12 +2104,13 @@ class DescriptorBuilderGPUTF:
             nf=4.0,
             do_central=(float(sp["central_weight"]) != 0.0),
             n_compressed=n_compressed, n_max=n_max,
+            pair_tile_size=int(getattr(self, "_pair_tile_size", 0)),
         )
 
         sig = [
-            tf.TensorSpec(shape=[None], dtype=tf.float64, name="rjs"),
-            tf.TensorSpec(shape=[None], dtype=tf.float64, name="thetas"),
-            tf.TensorSpec(shape=[None], dtype=tf.float64, name="phis"),
+            tf.TensorSpec(shape=[None], dtype=dtype, name="rjs"),
+            tf.TensorSpec(shape=[None], dtype=dtype, name="thetas"),
+            tf.TensorSpec(shape=[None], dtype=dtype, name="phis"),
             tf.TensorSpec(shape=[None], dtype=tf.int32, name="pair_atom"),
             tf.TensorSpec(shape=[None], dtype=tf.int32, name="pair_gidx"),
             tf.TensorSpec(shape=[None], dtype=tf.int32, name="pair_neigh"),
@@ -1644,30 +2119,30 @@ class DescriptorBuilderGPUTF:
             tf.TensorSpec(shape=[], dtype=tf.int32, name="n_atoms"),
         ]
 
-        @tf.function(input_signature=sig)
+        @tf.function(input_signature=sig, jit_compile=jit_compile)
         def with_grad_fn(rjs, thetas, phis, pair_atom, pair_gidx,
                          pair_neigh, pair_central, pair_active, n_atoms):
             return _compute_soap_with_grad_inner_tf(
                 rjs, thetas, phis, pair_atom, pair_gidx, pair_neigh,
                 pair_central, pair_active,
-                self._W_t, self._mult_t, self._comp_idx_t, self._coeffs_t,
-                self._preflm_t,
+                W_t, mult_t, comp_idx_t, coeffs_t, preflm_t,
                 n_atoms=n_atoms, **common_static,
             )
 
         sig_fwd = [s for s in sig if s.name != "pair_gidx"]
 
-        @tf.function(input_signature=sig_fwd)
+        @tf.function(input_signature=sig_fwd, jit_compile=jit_compile)
         def fwd_only_fn(rjs, thetas, phis, pair_atom, pair_neigh,
                         pair_central, pair_active, n_atoms):
             return _compute_soap_inner_tf(
                 rjs, thetas, phis, pair_atom, pair_neigh,
                 pair_central, pair_active,
-                self._W_t, self._mult_t, self._comp_idx_t, self._coeffs_t,
-                self._preflm_t,
+                W_t, mult_t, comp_idx_t, coeffs_t, preflm_t,
                 n_atoms=n_atoms, **common_static,
             )
 
+        self._compute_fns[(dtype, bool(jit_compile))] = (with_grad_fn, fwd_only_fn)
+        # Backwards-compat aliases for the most-recently-built pair.
         self._with_grad_fn = with_grad_fn
         self._fwd_only_fn = fwd_only_fn
 
@@ -1683,6 +2158,7 @@ class DescriptorBuilderGPUTF:
         batch_frames: int | None = 1,
         memory_budget_bytes: int | None = None,
         return_tf: bool = False,
+        jit_compile: bool = False,
     ) -> list:
         """Per-frame flat COO output, with optional gradient computation.
 
@@ -1720,11 +2196,16 @@ class DescriptorBuilderGPUTF:
             )
         elif batch_frames < 1:
             raise ValueError(f"batch_frames must be >= 1 or None, got {batch_frames}")
+        # Resolve / build the locked compute fn pair for the requested
+        # (dtype, jit) combination. Cached after first call.
+        with_grad_fn, fwd_only_fn = self._get_compute_fns(jit_compile)
         results = []
         for chunk_start in range(0, len(dataset), batch_frames):
             chunk = dataset[chunk_start:chunk_start + batch_frames]
-            results.extend(self._build_flat_chunk(chunk, calc_gradients,
-                                                  return_tf=return_tf))
+            results.extend(self._build_flat_chunk(
+                chunk, calc_gradients, return_tf=return_tf,
+                with_grad_fn=with_grad_fn, fwd_only_fn=fwd_only_fn,
+            ))
         return results
 
     def _estimate_mem_per_frame_bytes(self, atoms, calc_gradients: bool) -> int:
@@ -1787,7 +2268,8 @@ class DescriptorBuilderGPUTF:
         return int(min(len(dataset), n))
 
     def _build_flat_chunk(self, chunk: list, calc_gradients: bool,
-                          return_tf: bool = False) -> list:
+                          return_tf: bool = False,
+                          with_grad_fn=None, fwd_only_fn=None) -> list:
         """Process a chunk of frames in one TF call.
 
         Single-frame chunks still go through the locked compute_fn (one trace
@@ -1797,7 +2279,14 @@ class DescriptorBuilderGPUTF:
         When return_tf=True the per-frame slices stay as TF tensors on the
         compute device (no .numpy()), so the trajectory pipeline can hand them
         straight to the pack/predict graphs without a host round-trip.
+
+        with_grad_fn / fwd_only_fn are the locked compute fns for the
+        currently-selected (dtype, jit_compile) — passed in so the chunk
+        loop doesn't repeatedly re-resolve them. Falls back to the default
+        (fp64, no JIT) pair if not supplied.
         """
+        if with_grad_fn is None or fwd_only_fn is None:
+            with_grad_fn, fwd_only_fn = self._get_compute_fns(jit_compile=False)
         # ---- Build pair lists for all frames; concatenate with global offsets ----
         rcut_hard = float(self._soap_params["rcut_hard"])
         z_to_idx = self._cache["z_to_idx"]
@@ -1863,12 +2352,37 @@ class DescriptorBuilderGPUTF:
         # below to build pa_frame / pg_frame; the rest can go.
         del all_rjs, all_thetas, all_phis, all_pneigh, all_central, all_active
 
+        # When pair tiling is on, pad the global pair list up to a multiple of
+        # pair_tile_size and append no-op pairs (rj=0, pair_active=False,
+        # pair_atom=0). This gives the tf.while_loop body a deterministic
+        # P_TILE-shaped iteration so XLA can compile the per-tile compute
+        # once and reuse it. Padded pairs are masked out via pair_active=False
+        # so they contribute nothing to the descriptor or gradient.
+        n_pairs_real = pa_c.shape[0]
+        ptile = int(getattr(self, "_pair_tile_size", 0))
+        if calc_gradients and ptile > 0 and n_pairs_real % ptile != 0:
+            pad = ptile - (n_pairs_real % ptile)
+            rjs_c    = np.concatenate([rjs_c,    np.zeros(pad, dtype=rjs_c.dtype)])
+            thetas_c = np.concatenate([thetas_c, np.zeros(pad, dtype=thetas_c.dtype)])
+            phis_c   = np.concatenate([phis_c,   np.zeros(pad, dtype=phis_c.dtype)])
+            pa_c     = np.concatenate([pa_c,     np.zeros(pad, dtype=pa_c.dtype)])
+            pg_c     = np.concatenate([pg_c,     np.zeros(pad, dtype=pg_c.dtype)])
+            pneigh_c = np.concatenate([pneigh_c, np.zeros(pad, dtype=pneigh_c.dtype)])
+            central_c = np.concatenate([central_c, np.zeros(pad, dtype=bool)])
+            active_c  = np.concatenate([active_c,  np.zeros(pad, dtype=bool)])
+            # Note: per_frame_n_pairs is for output slicing only; we drop the
+            # padded tail when slicing per-frame outputs back below, so no
+            # adjustment needed there.
+
         # ---- Single TF call via the locked-signature wrapper ----
         device = "/GPU:0" if tf.config.list_physical_devices("GPU") else "/CPU:0"
         with tf.device(device):
-            rjs_t = tf.constant(rjs_c, dtype=tf.float64)
-            thetas_t = tf.constant(thetas_c, dtype=tf.float64)
-            phis_t = tf.constant(phis_c, dtype=tf.float64)
+            # Push pair-list to device in the SOAP kernel's working dtype.
+            # The TF NL above produces float64 either way; the cast happens
+            # here so XLA / cuBLAS see a consistent dtype across the graph.
+            rjs_t = tf.constant(rjs_c, dtype=self._real_dtype)
+            thetas_t = tf.constant(thetas_c, dtype=self._real_dtype)
+            phis_t = tf.constant(phis_c, dtype=self._real_dtype)
             pair_atom_t = tf.constant(pa_c, dtype=tf.int32)
             pair_gidx_t = tf.constant(pg_c, dtype=tf.int32)
             pair_neigh_t = tf.constant(pneigh_c, dtype=tf.int32)
@@ -1880,14 +2394,14 @@ class DescriptorBuilderGPUTF:
             del rjs_c, thetas_c, phis_c, pneigh_c, central_c, active_c
 
             if calc_gradients:
-                soap_t, grad_t = self._with_grad_fn(
+                soap_t, grad_t = with_grad_fn(
                     rjs_t, thetas_t, phis_t, pair_atom_t, pair_gidx_t, pair_neigh_t,
                     central_t, active_t, n_atoms_t,
                 )
                 soap_t = tf.cast(soap_t, tf.float32)
                 grad_t = tf.cast(grad_t, tf.float32)
             else:
-                soap_t = self._fwd_only_fn(
+                soap_t = fwd_only_fn(
                     rjs_t, thetas_t, phis_t, pair_atom_t, pair_neigh_t,
                     central_t, active_t, n_atoms_t,
                 )
