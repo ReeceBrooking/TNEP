@@ -326,6 +326,7 @@ def process_trajectory(
     pin_to_cpu: bool = True,
     descriptor_mode: int | None = None,
     descriptor_batch_frames: int | None = 1,
+    descriptor_memory_budget_bytes: int | None = None,
 ) -> dict:
     """Predict properties along an MD trajectory and compute spectra.
 
@@ -353,8 +354,14 @@ def process_trajectory(
         descriptor_batch_frames : int or None — frames per descriptor-builder
                           TF graph call (mode 1 only). 1 = per-frame (default,
                           lowest memory). int >= 2 = multi-frame batching for
-                          throughput. None = auto-size to a 2 GiB GPU budget.
+                          throughput. None = auto-size to
+                          descriptor_memory_budget_bytes (default 6 GiB).
                           Quippy mode ignores this field.
+        descriptor_memory_budget_bytes : int or None — GPU memory budget
+                          (bytes) used by the auto-sizer when
+                          descriptor_batch_frames is None. None falls back to
+                          the builder's default (6 GiB). Quippy mode and
+                          explicit-int batch sizes ignore this field.
 
     Returns:
         For mode 1 (dipole):
@@ -388,27 +395,60 @@ def process_trajectory(
 
     # Stream frames in fixed-size batches: build → pack → predict → append → drop.
     # Only batch_size ASE Atoms exist in memory at any moment.
-    def _stream_batches():
-        buf = []
-        for frame in iread(trajectory_path, index=":"):
-            buf.append(frame)
-            if batch_size is not None and len(buf) == batch_size:
-                yield buf
-                buf = []
-        if buf:
-            yield buf
+    #
+    # Phase 6: a 2-deep prefetch ring buffer on a background thread overlaps
+    # ase.io.iread parsing with GPU compute. The producer also pre-runs
+    # assign_type_indices on the host so the consumer thread (which holds the
+    # GPU) doesn't pay that cost. _PREFETCH_DEPTH=2 keeps memory bounded to
+    # ~3 × batch_size ASE Atoms (current GPU batch + queued + producer's
+    # half-built batch).
+    import queue, threading
+
+    _PREFETCH_DEPTH = 2
+    q: queue.Queue = queue.Queue(maxsize=_PREFETCH_DEPTH)
+    _SENTINEL = object()
+    _producer_err: list = []
+
+    def _producer():
+        try:
+            buf = []
+            for frame in iread(trajectory_path, index=":"):
+                buf.append(frame)
+                if batch_size is not None and len(buf) == batch_size:
+                    q.put((buf, assign_type_indices(buf, cfg.types)))
+                    buf = []
+            if buf:
+                q.put((buf, assign_type_indices(buf, cfg.types)))
+        except Exception as e:
+            _producer_err.append(e)
+        finally:
+            q.put(_SENTINEL)
+
+    prod_thread = threading.Thread(target=_producer, name="traj-prefetch", daemon=True)
+    prod_thread.start()
 
     result_batches = []
     n_frames = 0
-    for batch_frames in tqdm(_stream_batches(), total=total_batches,
-                             desc="Trajectory batches", unit="batch"):
-        batch_types = assign_type_indices(batch_frames, cfg.types)
-        result_batches.append(
-            predict_trajectory_batch(model, builder, batch_frames, batch_types,
-                                     pin_to_cpu=pin_to_cpu,
-                                     descriptor_batch_frames=descriptor_batch_frames))
-        n_frames += len(batch_frames)
-        del batch_frames, batch_types
+    pbar = tqdm(total=total_batches, desc="Trajectory batches", unit="batch")
+    try:
+        while True:
+            item = q.get()
+            if item is _SENTINEL:
+                break
+            batch_frames, batch_types = item
+            result_batches.append(
+                predict_trajectory_batch(model, builder, batch_frames, batch_types,
+                                         pin_to_cpu=pin_to_cpu,
+                                         descriptor_batch_frames=descriptor_batch_frames,
+                                         descriptor_memory_budget_bytes=descriptor_memory_budget_bytes))
+            n_frames += len(batch_frames)
+            pbar.update(1)
+            del batch_frames, batch_types, item
+    finally:
+        pbar.close()
+        prod_thread.join()
+    if _producer_err:
+        raise _producer_err[0]
 
     print(f"Processed {n_frames} frames from {trajectory_path}")
     results = np.concatenate(result_batches, axis=0)
@@ -445,5 +485,5 @@ def process_trajectory(
 if __name__ == '__main__':
     #model = train_model()
     model = load_model("models/n30_q75_pop80_20260428_120216/train_waterbulk_O_H_dipole_best_val.npz")
-    dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=10, descriptor_mode=1, descriptor_batch_frames=5, pin_to_cpu=False)
+    dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=20, descriptor_mode=1, descriptor_batch_frames=5, pin_to_cpu=False)
     

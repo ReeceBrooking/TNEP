@@ -355,14 +355,19 @@ class DescriptorBuilder(layers.Layer):
         dataset: list[Atoms],
         calc_gradients: bool = True,
         batch_frames: int | None = 1,
+        memory_budget_bytes: int | None = None,
     ) -> list[tuple]:
         """Compute SOAP descriptors and return flat per-frame COO arrays.
 
         Args:
-            dataset        : list of ase.Atoms
-            calc_gradients : when False, gradient outputs are zero-length arrays
-                             (saves the quippy gradient computation, the
-                             dominant cost).
+            dataset             : list of ase.Atoms
+            calc_gradients      : when False, gradient outputs are zero-length
+                                  arrays (saves the quippy gradient
+                                  computation, the dominant cost).
+            batch_frames        : ignored (quippy is per-frame). Accepted for
+                                  signature parity with the TF GPU backend.
+            memory_budget_bytes : ignored (quippy is per-frame). Accepted for
+                                  signature parity with the TF GPU backend.
 
         Returns:
             list of (descriptors, grad_values, pair_atom, pair_gidx) tuples

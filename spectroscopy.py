@@ -190,6 +190,251 @@ def plot_power_spectrum(freq_cm: np.ndarray, power: np.ndarray, cfg: TNEPconfig,
     _finish_fig(fig, cfg, "power_spectrum", save_plots, show_plots)
 
 
+# --------------------------------------------------------------------------
+# Phase 3: fused pack + predict @tf.function. Cached per model instance so
+# the graph is traced exactly once. Input signature uses [None] dims so a
+# changing batch size / atom count / pair count does not retrigger tracing.
+# --------------------------------------------------------------------------
+_FUSED_PREDICT_CACHE: dict = {}
+
+
+def _get_fused_predict(model: 'TNEP'):
+    """Return (and cache) a per-model fused pack+predict @tf.function.
+
+    The graph captures the model weights via closure, so SNES candidate
+    evaluation (which swaps weights) must not use this path — it's
+    trajectory-inference-only. Per-model caching keyed by id(model) is
+    sufficient for that contract.
+    """
+    key = id(model)
+    cached = _FUSED_PREDICT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    cfg = model.cfg
+    dim_q = cfg.dim_q
+    sig = [
+        tf.TensorSpec(shape=[None, dim_q],     dtype=tf.float32),  # soap_concat
+        tf.TensorSpec(shape=[None, 3, dim_q],  dtype=tf.float32),  # grad_concat
+        tf.TensorSpec(shape=[None],            dtype=tf.int32),    # pa_concat
+        tf.TensorSpec(shape=[None],            dtype=tf.int32),    # pg_concat
+        tf.TensorSpec(shape=[None],            dtype=tf.int64),    # atom_counts (Ragged)
+        tf.TensorSpec(shape=[None],            dtype=tf.int32),    # pair_counts
+        tf.TensorSpec(shape=[None, None, 3],   dtype=tf.float32),  # positions
+        tf.TensorSpec(shape=[None, None],      dtype=tf.int32),    # Z
+        tf.TensorSpec(shape=[None, 3, 3],      dtype=tf.float32),  # boxes
+        tf.TensorSpec(shape=[None, None],      dtype=tf.float32),  # atom_mask
+        tf.TensorSpec(shape=[None],            dtype=tf.int32),    # num_atoms
+    ]
+
+    # Keras Variables aren't accepted as direct @tf.function args via the
+    # TraceTypeBuilder, so we materialise them into tf.constant tensors at
+    # trace time and capture via closure. Trajectory inference is fixed-
+    # weights, so this is safe; SNES population evaluation must not use
+    # this path (it needs per-call weight swapping).
+    def _to_tensor(v):
+        if v is None:
+            return None
+        # Keras 3 Variables expose .value (a Tensor); fall back to convert.
+        return tf.convert_to_tensor(v.value if hasattr(v, "value") else v)
+
+    W0_t  = _to_tensor(model.W0)
+    b0_t  = _to_tensor(model.b0)
+    W1_t  = _to_tensor(model.W1)
+    b1_t  = _to_tensor(model.b1)
+    W0p_t = _to_tensor(getattr(model, "W0_pol", None))
+    b0p_t = _to_tensor(getattr(model, "b0_pol", None))
+    W1p_t = _to_tensor(getattr(model, "W1_pol", None))
+    b1p_t = _to_tensor(getattr(model, "b1_pol", None))
+
+    @tf.function(input_signature=sig, reduce_retracing=False)
+    def fused(soap_concat, grad_concat, pa_concat, pg_concat,
+              atom_counts, pair_counts,
+              positions, Z, boxes, atom_mask, num_atoms):
+        S = tf.shape(num_atoms)[0]
+        ragged = tf.RaggedTensor.from_row_lengths(soap_concat, atom_counts)
+        descriptors = ragged.to_tensor(default_value=0.0)
+        pair_struct = tf.repeat(tf.range(S, dtype=tf.int32), pair_counts)
+        preds = model.predict_batch(
+            descriptors, grad_concat, pa_concat, pg_concat, pair_struct,
+            positions, Z, boxes, atom_mask,
+            W0_t, b0_t, W1_t, b1_t,
+            W0p_t, b0p_t, W1p_t, b1p_t,
+        )
+        # NOTE: predict_batch returns the TOTAL dipole, not per-atom — even
+        # when cfg.scale_targets is True. Training stores per-atom *targets*,
+        # and TNEP.score() divides raw_preds by N to compare on the same
+        # scale (TNEP.py:285-288). So preds here is already the total system
+        # dipole; do NOT multiply by num_atoms.
+        return preds
+
+    _FUSED_PREDICT_CACHE[key] = fused
+    return fused
+
+
+def _build_fused_inputs(
+    frame_results: list,
+    frames: list,
+    types_int_batch: list[np.ndarray],
+    dim_q: int,
+    pin_to_cpu: bool = True,
+) -> tuple:
+    """Concatenate per-frame TF tensors and build host-side padded fields.
+
+    The concats are eager TF ops over a Python list of GPU tensors (one
+    kernel each), and the host-built fields (positions, Z, boxes,
+    atom_mask, num_atoms) get a single CPU→device push per outer batch.
+    Returned tuple matches the input_signature of `_get_fused_predict`.
+
+    Destructive: clears `frame_results` after each field's concat is built,
+    so the per-frame device tensors are released as soon as their data is
+    folded into the chunk-level concats. This halves the peak VRAM during
+    the pack step (peak ~= one concatenation, not concat + originals).
+    """
+    S = len(frames)
+    atom_counts = [int(r[0].shape[0]) for r in frame_results]
+    max_atoms = max(atom_counts) if atom_counts else 0
+    pair_counts = [int(r[1].shape[0]) for r in frame_results]
+    pair_counts_arr = np.array(pair_counts, dtype=np.int32)
+    N_pairs = int(pair_counts_arr.sum())
+
+    if S:
+        soap_concat = tf.concat([r[0] for r in frame_results], axis=0)
+    else:
+        soap_concat = tf.zeros((0, dim_q), dtype=tf.float32)
+    if N_pairs > 0:
+        grad_concat = tf.concat([r[1] for r in frame_results], axis=0)
+        pa_concat   = tf.concat([r[2] for r in frame_results], axis=0)
+        pg_concat   = tf.concat([r[3] for r in frame_results], axis=0)
+    else:
+        grad_concat = tf.zeros((0, 3, dim_q), dtype=tf.float32)
+        pa_concat   = tf.zeros((0,), dtype=tf.int32)
+        pg_concat   = tf.zeros((0,), dtype=tf.int32)
+    # All per-frame data is now in the concat tensors; release the
+    # caller's list so the per-frame slices get garbage-collected.
+    frame_results.clear()
+
+    atom_counts_t = tf.constant(atom_counts, dtype=tf.int64)
+    pair_counts_t = tf.constant(pair_counts_arr, dtype=tf.int32)
+
+    pos_np       = np.zeros((S, max_atoms, 3), dtype=np.float32)
+    z_np         = np.zeros((S, max_atoms),    dtype=np.int32)
+    box_np       = np.zeros((S, 3, 3),         dtype=np.float32)
+    atom_mask_np = np.zeros((S, max_atoms),    dtype=np.float32)
+    num_atoms_np = np.array(atom_counts,       dtype=np.int32)
+    for s in range(S):
+        N_s = atom_counts[s]
+        pos_np[s, :N_s]       = frames[s].positions.astype(np.float32)
+        z_np[s, :N_s]         = types_int_batch[s]
+        box_np[s]             = cell_to_box(frames[s])
+        atom_mask_np[s, :N_s] = 1.0
+
+    with tf.device('/CPU:0' if pin_to_cpu else '/GPU:0'):
+        positions  = tf.constant(pos_np);       del pos_np
+        Z          = tf.constant(z_np);         del z_np
+        boxes      = tf.constant(box_np);       del box_np
+        atom_mask  = tf.constant(atom_mask_np); del atom_mask_np
+        num_atoms  = tf.constant(num_atoms_np); del num_atoms_np
+
+    return (soap_concat, grad_concat, pa_concat, pg_concat,
+            atom_counts_t, pair_counts_t,
+            positions, Z, boxes, atom_mask, num_atoms)
+
+
+def _pack_traj_batch_from_tf(
+    frame_results: list,
+    frames: list,
+    types_int_batch: list[np.ndarray],
+    dim_q: int,
+    pin_to_cpu: bool = True,
+) -> dict:
+    """TF-tensor variant of pack: avoids the NumPy round-trip on descriptors/grads.
+
+    Each frame_results[s] = (soap_t [N,Q], grad_t [P,3,Q], pa_t [P], pg_t [P]),
+    all TF tensors living on the descriptor-builder's compute device. This pack
+    concatenates them on-device with global atom-index offsets and returns the
+    same dict shape as `_pack_traj_batch_from_flat`. Auxiliary structure-padded
+    fields (positions, Z, boxes, atom_mask) still come from the ASE objects on
+    the host — they're built once per outer batch and respect pin_to_cpu.
+
+    Returns:
+        dict with descriptors [B,A,Q], grad_values [P,3,Q], pair_atom/gidx/struct [P],
+        positions [B,A,3], Z_int [B,A], boxes [B,3,3], atom_mask [B,A], num_atoms [B].
+    """
+    S = len(frames)
+    atom_counts = [int(r[0].shape[0]) for r in frame_results]
+    max_atoms = max(atom_counts) if atom_counts else 0
+    pair_counts = [int(r[1].shape[0]) for r in frame_results]
+    pair_counts_arr = np.array(pair_counts, dtype=np.int32)
+    N_pairs = int(pair_counts_arr.sum())
+
+    if N_pairs > 0:
+        # pair_atom / pair_gidx stay frame-local — predict_batch indexes them
+        # together with pair_struct, mirroring _pack_traj_batch_from_flat.
+        grad_values_t = tf.concat([r[1] for r in frame_results], axis=0)
+        pair_atom_t   = tf.concat([r[2] for r in frame_results], axis=0)
+        pair_gidx_t   = tf.concat([r[3] for r in frame_results], axis=0)
+        pair_struct_t = tf.repeat(tf.range(S, dtype=tf.int32),
+                                   tf.constant(pair_counts_arr, dtype=tf.int32))
+        # Pair-level data has been concatenated; release per-frame grad/pair
+        # tensors held in frame_results. Only the soap_concat below still
+        # needs the per-frame soap slices.
+    else:
+        grad_values_t = tf.zeros((0, 3, dim_q), dtype=tf.float32)
+        pair_atom_t = tf.zeros((0,), dtype=tf.int32)
+        pair_gidx_t = tf.zeros((0,), dtype=tf.int32)
+        pair_struct_t = tf.zeros((0,), dtype=tf.int32)
+
+    # Descriptors: per-frame [N_s, Q] → padded [B, A_max, Q] via RaggedTensor
+    # (one concat + one to_tensor, all on-device).
+    if S:
+        soap_concat = tf.concat([r[0] for r in frame_results], axis=0)
+        # Per-frame soap slices are now folded into soap_concat / desc_t —
+        # release the caller's list so they GC.
+        frame_results.clear()
+        desc_ragged = tf.RaggedTensor.from_row_lengths(
+            soap_concat, tf.constant(atom_counts, dtype=tf.int64))
+        desc_t = desc_ragged.to_tensor(default_value=0.0,
+                                        shape=(S, max_atoms, dim_q))
+        del soap_concat, desc_ragged
+    else:
+        desc_t = tf.zeros((0, 0, dim_q), dtype=tf.float32)
+        frame_results.clear()
+
+    # Structure-padded host-built fields (positions, Z, boxes, atom_mask).
+    pos_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
+    z_np = np.zeros((S, max_atoms), dtype=np.int32)
+    box_np = np.zeros((S, 3, 3), dtype=np.float32)
+    atom_mask_np = np.zeros((S, max_atoms), dtype=np.float32)
+    num_atoms_np = np.array(atom_counts, dtype=np.int32)
+    for s in range(S):
+        N_s = atom_counts[s]
+        pos_np[s, :N_s] = frames[s].positions.astype(np.float32)
+        z_np[s, :N_s] = types_int_batch[s]
+        box_np[s] = cell_to_box(frames[s])
+        atom_mask_np[s, :N_s] = 1.0
+
+    with tf.device('/CPU:0' if pin_to_cpu else '/GPU:0'):
+        positions_t = tf.constant(pos_np);     del pos_np
+        z_t         = tf.constant(z_np);       del z_np
+        box_t       = tf.constant(box_np);     del box_np
+        atom_mask_t = tf.constant(atom_mask_np); del atom_mask_np
+        num_atoms_t = tf.constant(num_atoms_np); del num_atoms_np
+
+    return {
+        "descriptors": desc_t,
+        "grad_values": grad_values_t,
+        "pair_atom":   pair_atom_t,
+        "pair_gidx":   pair_gidx_t,
+        "pair_struct": pair_struct_t,
+        "positions":   positions_t,
+        "Z_int":       z_t,
+        "boxes":       box_t,
+        "atom_mask":   atom_mask_t,
+        "num_atoms":   num_atoms_t,
+    }
+
+
 def _pack_traj_batch_from_flat(
     frame_results: list,
     frames: list,
@@ -262,6 +507,7 @@ def predict_trajectory_batch(
     batch_types: list[np.ndarray],
     pin_to_cpu: bool = True,
     descriptor_batch_frames: int | None = 1,
+    descriptor_memory_budget_bytes: int | None = None,
 ) -> np.ndarray:
     """Run dipole/polarizability prediction on one batch of trajectory frames.
 
@@ -279,45 +525,80 @@ def predict_trajectory_batch(
                        Required for trajectories too large to fit in VRAM.
         descriptor_batch_frames : number of frames per descriptor builder graph
                        call (TF GPU mode only). 1 = per-frame; int >= 2 = batched;
-                       None = auto-size to a 2 GiB GPU memory budget.
+                       None = auto-size to descriptor_memory_budget_bytes.
+        descriptor_memory_budget_bytes : GPU memory budget (bytes) used by the
+                       auto-sizer when descriptor_batch_frames is None. None
+                       falls back to the builder's default (6 GiB). Quippy mode
+                       and explicit-int batch sizes ignore this field.
 
     Returns:
         [B, 3] for dipole models, [B, 6] for polarizability models.
     """
     cfg = model.cfg
-    # Forward batch_frames kwarg if the builder accepts it (TF GPU + the new
-    # quippy signature). If a custom builder doesn't support it, fall back.
+    # Lazy import to avoid an unconditional TF GPU builder import for callers
+    # that only ever use the quippy backend.
     try:
+        from DescriptorBuilderGPU_tf import DescriptorBuilderGPUTF
+        prefers_tf = isinstance(builder, DescriptorBuilderGPUTF)
+    except ImportError:
+        prefers_tf = False
+
+    if prefers_tf:
+        # GPU descriptor builder → fused pack+predict graph (Phase 3).
+        # The fused @tf.function pads descriptors, builds pair_struct, runs
+        # predict_batch, and applies the dipole scale factor — all in one
+        # graph trace, so XLA can fuse across the boundaries that used to be
+        # eager-mode op launches.
         frame_results = builder.build_descriptors_flat(
-            batch_frames, batch_frames=descriptor_batch_frames,
+            batch_frames,
+            batch_frames=descriptor_batch_frames,
+            memory_budget_bytes=descriptor_memory_budget_bytes,
+            return_tf=True,
         )
-    except TypeError:
-        frame_results = builder.build_descriptors_flat(batch_frames)
-    batch = _pack_traj_batch_from_flat(frame_results, batch_frames, batch_types,
-                                       cfg.dim_q, pin_to_cpu=pin_to_cpu)
-    del frame_results
+        fused_inputs = _build_fused_inputs(
+            frame_results, batch_frames, batch_types, cfg.dim_q,
+            pin_to_cpu=pin_to_cpu,
+        )
+        # _build_fused_inputs cleared frame_results; drop the empty handle.
+        del frame_results
+        fused_predict = _get_fused_predict(model)
+        preds = fused_predict(*fused_inputs)
+        # The graph captured / copied its inputs already; drop the chunk-level
+        # concat tensors before the .numpy() sync so the next iteration has
+        # the full VRAM budget available for the SOAP build.
+        del fused_inputs
+        out = preds.numpy()
+        del preds
+    else:
+        # Legacy NumPy pack + eager predict_batch path (quippy and any
+        # custom builder that doesn't return TF tensors).
+        frame_results = builder.build_descriptors_flat(
+            batch_frames,
+            batch_frames=descriptor_batch_frames,
+            memory_budget_bytes=descriptor_memory_budget_bytes,
+        )
+        batch = _pack_traj_batch_from_flat(frame_results, batch_frames, batch_types,
+                                           cfg.dim_q, pin_to_cpu=pin_to_cpu)
+        del frame_results
 
-    preds = model.predict_batch(
-        batch["descriptors"], batch["grad_values"],
-        batch["pair_atom"], batch["pair_gidx"], batch["pair_struct"],
-        batch["positions"], batch["Z_int"], batch["boxes"],
-        batch["atom_mask"],
-        model.W0, model.b0, model.W1, model.b1,
-        getattr(model, 'W0_pol', None),
-        getattr(model, 'b0_pol', None),
-        getattr(model, 'W1_pol', None),
-        getattr(model, 'b1_pol', None),
-    )
-
-    # Training scales dipole targets to per-atom (target / N), so the model
-    # outputs per-atom dipole. Multiply by N here to recover the total system
-    # dipole that spectroscopy expects. Mode 2 (polarizability) is never scaled.
-    if cfg.target_mode == 1 and cfg.scale_targets:
-        num_atoms_col = tf.cast(batch["num_atoms"], tf.float32)[:, tf.newaxis]
-        preds = preds * num_atoms_col
-
-    out = preds.numpy()
-    del batch, preds
+        preds = model.predict_batch(
+            batch["descriptors"], batch["grad_values"],
+            batch["pair_atom"], batch["pair_gidx"], batch["pair_struct"],
+            batch["positions"], batch["Z_int"], batch["boxes"],
+            batch["atom_mask"],
+            model.W0, model.b0, model.W1, model.b1,
+            getattr(model, 'W0_pol', None),
+            getattr(model, 'b0_pol', None),
+            getattr(model, 'W1_pol', None),
+            getattr(model, 'b1_pol', None),
+        )
+        # NOTE: predict_batch returns the TOTAL dipole regardless of
+        # cfg.scale_targets. Training stores per-atom *targets*, and
+        # TNEP.score() divides raw_preds by N to compare on the same scale
+        # (TNEP.py:285-288). So preds is already the total system dipole;
+        # no per-atom→total rescaling is needed here.
+        out = preds.numpy()
+        del batch, preds
     return out
 
 
