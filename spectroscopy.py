@@ -643,18 +643,25 @@ def predict_trajectory_batch(
             builder.set_precision(descriptor_precision)
         if descriptor_pair_tile_size is not None:
             builder.set_pair_tile_size(int(descriptor_pair_tile_size))
-        # XLA-JIT only when pair-tiling is active. Without tiling, the per-
-        # call shape varies with both n_atoms_chunk AND total pair count P
-        # (which changes by handfuls between frames), which forces XLA to
-        # recompile (ptxas spill warnings every batch, ~5-7 s/compile).
-        # With pair-tiling enabled, pairs are padded to a multiple of
-        # pair_tile_size, so the tf.while_loop body has a deterministic
-        # per-iteration shape — XLA compiles each (n_atoms_chunk, n_tiles)
-        # combination ONCE and reuses across same-sized chunks. For a
-        # fixed-size MD trajectory this is one compile total and the per-
-        # tile kernel runs at full XLA-fused speed afterward.
+        # XLA-JIT is reserved for the (fp32 + pair-tiling) path only.
+        #   - fp64 + XLA suffers from severe register pressure (fp64 takes
+        #     2× the register space of fp32), causing big spill kernels and
+        #     a net slowdown that more than negates the fusion benefit. We
+        #     observed ~10× slowdowns on water_bulk fp64 under XLA. Best
+        #     to keep fp64 always non-XLA.
+        #   - Without pair-tiling the per-call shape varies and XLA
+        #     recompiles each batch (~5-7 s ptxas per compile, with
+        #     register-spill warnings).
+        # With pair-tiling enabled and fp32 selected, pairs are padded to a
+        # multiple of pair_tile_size and each tile body has a fixed shape;
+        # XLA compiles each (n_atoms_chunk, n_tiles) bucket once and runs
+        # at full fused-kernel speed afterward.
         ptile = int(getattr(builder, "_pair_tile_size", 0))
-        use_xla = ptile > 0
+        builder_is_fp32 = (
+            getattr(builder, "_real_dtype", None) is not None
+            and builder._real_dtype == tf.float32
+        )
+        use_xla = ptile > 0 and builder_is_fp32
         frame_results = builder.build_descriptors_flat(
             batch_frames,
             batch_frames=descriptor_batch_frames,

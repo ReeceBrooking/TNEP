@@ -10,12 +10,12 @@ class TNEPconfig:
     data loading (num_types, types, dim_q, indices).
     """
 
-    data_path: str = "datasets/train_waterbulk.xyz"
+    data_path: str = "datasets/train.xyz"
     # Separate test dataset (None = split from data_path; str = path to external .xyz)
-    test_data_path: str | None = "datasets/test_waterbulk.xyz"
+    test_data_path: str | None = "datasets/test.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
-    allowed_species: list[int | str] | None = ["C", "H", "O"]
+    allowed_species: list[int | str] | None = None
     # Species filter mode: "subset" = keep structures with only allowed species,
     # "exact" = keep structures containing exactly all allowed species
     filter_mode: str = "subset"
@@ -54,7 +54,7 @@ class TNEPconfig:
     # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU when available).
     # The GPU path supports basis="poly3" and compress_mode="trivial" only;
     # falls back to a clear error if other settings are requested.
-    descriptor_mode: int = 0
+    descriptor_mode: int = 1
 
     # Internal precision for the GPU descriptor compute. The Fortran reference
     # uses double-precision throughout; "float64" mirrors that exactly. The
@@ -65,6 +65,27 @@ class TNEPconfig:
     # setting, so the user-visible difference is dominated by accumulation
     # noise in the radial recursion. Has no effect for descriptor_mode=0.
     descriptor_precision: str = "float64"
+
+    # Number of structures concatenated into a single SOAP graph call.
+    #   1     : per-frame (lowest VRAM, highest launch overhead)
+    #   int>1 : multi-frame batching, amortises kernel launches
+    #   None  : auto — choose the largest batch that fits the memory budget
+    # Used by both training (DescriptorBuilder.build_descriptors) and
+    # trajectory inference. process_trajectory's `descriptor_batch_frames`
+    # kwarg overrides this value for that call only.
+    descriptor_batch_frames: int | None = 100
+
+    # Pair-tile size for the gradient compute. 0 = single-shot (lower
+    # launch overhead, higher peak VRAM). >0 = tile pairs in chunks of
+    # this size (cuts peak VRAM at the dominant [k_max,n_max,P] tensors;
+    # at fp32 also auto-enables XLA fusion in the trajectory path).
+    # Sensible value for ~600-atom systems: 8000.
+    descriptor_pair_tile_size: int = 0
+
+    # GPU memory budget (bytes) used by the auto-sizer when
+    # descriptor_batch_frames is None. None falls back to the builder's
+    # default (6 GiB).
+    descriptor_memory_budget_bytes: int | None = None
 
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
@@ -103,7 +124,7 @@ class TNEPconfig:
     # Test split ratio
     test_ratio: float = 0.3
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N: int | None = 1000
+    total_N: int | None = None
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)

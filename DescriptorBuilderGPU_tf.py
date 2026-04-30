@@ -26,6 +26,7 @@ from __future__ import annotations
 import numpy as np
 import tensorflow as tf
 from ase import Atoms
+from tqdm import tqdm
 
 # Reuse CPU-only helpers and NumPy reference from the main module
 from DescriptorBuilderGPU import (
@@ -748,65 +749,50 @@ def power_spectrum_with_grad_tf(
     coeffs: tf.Tensor,                # [P_nonzero] real
     n_compressed: int,
     n_sites,                          # int OR scalar int32 tensor
-    l_max: int = None,                # captured at trace time
-    kept_tile_size: int = 16,         # tile width along the n_kept axis
+    l_max: int = None,                # accepted for sig parity (unused here)
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Returns (soap_norm [n_sites, n_compressed], soap_*_der each [n_compressed, P]).
-
-    Vectorised + tiled: gathers cnk[k_idx, n_idx, :] over the kept triples
-    in tiles of `kept_tile_size`, multiplies by padded multiplicity, reduces
-    over m within each tile, then concatenates. Tiling caps peak memory at
-    ~kept_tile_size/n_kept of the fully-vectorised version (each tile only
-    materialises [tile, M, P] complex tensors, not [n_kept, M, P]) while
-    still amortising kernel-launch overhead across the tile rather than the
-    one-triple-at-a-time loop. Trades a small constant fraction of speed
-    for a large memory reduction — essential at high descriptor_batch_frames.
-    """
-    if l_max is None:
-        l_max = max(t[2] for t in kept_triples)
-    kept_n_np, kept_np_np, kept_k_np, kept_mult_idx_np, kept_mask_np = (
-        _build_kept_index_arrays(kept_triples, l_max)
-    )
-    kept_n = tf.constant(kept_n_np, dtype=tf.int32)
-    kept_np_idx = tf.constant(kept_np_np, dtype=tf.int32)
-    kept_k_idx = tf.constant(kept_k_np, dtype=tf.int32)
-    kept_mult_idx = tf.constant(kept_mult_idx_np, dtype=tf.int32)
-    kept_mask = tf.constant(kept_mask_np, dtype=tf.bool)
-
-    mult_padded = tf.gather(multiplicity_array, kept_mult_idx)
-    mult_padded = tf.where(kept_mask, mult_padded, tf.zeros_like(mult_padded))
-
+    """Returns (soap_norm [n_sites, n_compressed], soap_*_der each [n_compressed, P])."""
+    # Per-triple Python loop. Each iteration produces small slices
+    # ([≤ l_max+1, n_sites] / [≤ l_max+1, P] complex) which are reduced
+    # immediately, so live memory stays small. Under XLA the loop is
+    # unrolled at trace time and the resulting ~600 small ops fuse cleanly.
+    # The earlier "vectorised gather_nd" form built a single
+    # [n_kept, M, P] tensor instead — bigger memory footprint, slower in
+    # both fp64 (where memory bandwidth dominates) and fp32 without XLA.
     cnk_at = tf.gather(cnk, pair_atom, axis=2)                       # [k_max, n_max, P]
+    fwd_rows = []
+    rad_rows = []
+    azi_rows = []
+    pol_rows = []
+    for (n, nprime, l, c2_start, c2_count) in kept_triples:
+        k_start = l * (l + 1) // 2
+        k_end = k_start + (l + 1)
+        mult_tf = multiplicity_array[c2_start:c2_start + c2_count]
 
-    # Single-shot vectorised gather + reduce. The kept-axis is small for
-    # typical cfgs (n_kept = 75 for 2-species water, ~645 for 6-species
-    # organics) and tiling it just adds launch overhead.
-    n_b  = tf.broadcast_to(kept_n[:, None],     tf.shape(kept_k_idx))
-    np_b = tf.broadcast_to(kept_np_idx[:, None], tf.shape(kept_k_idx))
-    idx_n  = tf.stack([kept_k_idx, n_b],  axis=-1)
-    idx_np = tf.stack([kept_k_idx, np_b], axis=-1)
+        prod_fwd = (cnk[k_start:k_end, n, :]
+                    * tf.math.conj(cnk[k_start:k_end, nprime, :]))
+        fwd_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(prod_fwd), axis=0))
 
-    cnk_n   = tf.gather_nd(cnk, idx_n)
-    cnk_np_ = tf.gather_nd(cnk, idx_np)
-    prod_fwd = cnk_n * tf.math.conj(cnk_np_)
-    fwd_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(prod_fwd), axis=1)
-    del cnk_n, cnk_np_, prod_fwd
+        cnk_at_n = cnk_at[k_start:k_end, n, :]
+        cnk_at_np = cnk_at[k_start:k_end, nprime, :]
+        rn = cnk_rad_der[k_start:k_end, n, :]
+        rnp = cnk_rad_der[k_start:k_end, nprime, :]
+        an = cnk_azi_der[k_start:k_end, n, :]
+        anp = cnk_azi_der[k_start:k_end, nprime, :]
+        pn = cnk_pol_der[k_start:k_end, n, :]
+        pnp = cnk_pol_der[k_start:k_end, nprime, :]
+        rad_term = rn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(rnp)
+        azi_term = an * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(anp)
+        pol_term = pn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(pnp)
+        rad_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(rad_term), axis=0))
+        azi_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(azi_term), axis=0))
+        pol_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(pol_term), axis=0))
 
-    cnk_at_n   = tf.gather_nd(cnk_at, idx_n)
-    cnk_at_np  = tf.gather_nd(cnk_at, idx_np)
-    rn  = tf.gather_nd(cnk_rad_der, idx_n)
-    rnp = tf.gather_nd(cnk_rad_der, idx_np)
-    an  = tf.gather_nd(cnk_azi_der, idx_n)
-    anp = tf.gather_nd(cnk_azi_der, idx_np)
-    pn  = tf.gather_nd(cnk_pol_der, idx_n)
-    pnp = tf.gather_nd(cnk_pol_der, idx_np)
-    rad_term = rn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(rnp)
-    azi_term = an * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(anp)
-    pol_term = pn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(pnp)
-    rad_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(rad_term), axis=1)
-    azi_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(azi_term), axis=1)
-    pol_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(pol_term), axis=1)
-    del cnk_at, cnk_at_n, cnk_at_np, rn, rnp, an, anp, pn, pnp, rad_term, azi_term, pol_term
+    fwd_kept = tf.stack(fwd_rows, axis=0)                            # [n_kept, n_sites]
+    rad_kept = tf.stack(rad_rows, axis=0)                            # [n_kept, P]
+    azi_kept = tf.stack(azi_rows, axis=0)
+    pol_kept = tf.stack(pol_rows, axis=0)
+    del cnk_at, fwd_rows, rad_rows, azi_rows, pol_rows
 
     P_dim = tf.shape(pair_atom)[0]
     n_compressed_t = tf.constant(n_compressed, tf.int32)
@@ -932,63 +918,41 @@ def power_spectrum_grad_only_tile_tf(
     sqrt_dot_p: tf.Tensor,            # [n_sites] (full forward result)
     n_compressed: int,
     l_max: int = None,
-    kept_tile_size: int = 16,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """Pair-tile derivative branch of the power spectrum.
 
     Returns (soap_rad_der, soap_azi_der, soap_pol_der), each [n_compressed, P_tile],
     L2-norm corrected against the full forward soap_unnorm / sqrt_dot_p.
-    Mirrors the derivative branch of `power_spectrum_with_grad_tf` exactly,
+    Mirrors the derivative branch of `power_spectrum_with_grad_tf` exactly
+    (small-slice Python loop unrolled at trace time, fuses cleanly under XLA),
     but the inputs are sliced to a tile of pairs — each call's peak memory is
     proportional to P_tile, not the full P.
     """
-    if l_max is None:
-        l_max = max(t[2] for t in kept_triples)
-    kept_n_np, kept_np_np, kept_k_np, kept_mult_idx_np, kept_mask_np = (
-        _build_kept_index_arrays(kept_triples, l_max)
-    )
-    n_kept = kept_n_np.shape[0]
-    kept_n = tf.constant(kept_n_np, dtype=tf.int32)
-    kept_np_idx = tf.constant(kept_np_np, dtype=tf.int32)
-    kept_k_idx = tf.constant(kept_k_np, dtype=tf.int32)
-    kept_mult_idx = tf.constant(kept_mult_idx_np, dtype=tf.int32)
-    kept_mask = tf.constant(kept_mask_np, dtype=tf.bool)
-
-    mult_padded = tf.gather(multiplicity_array, kept_mult_idx)
-    mult_padded = tf.where(kept_mask, mult_padded, tf.zeros_like(mult_padded))
-
     cnk_at = tf.gather(cnk, pair_atom, axis=2)  # [k_max, n_max, P_tile]
 
-    rad_tiles = []; azi_tiles = []; pol_tiles = []
-    for start in range(0, n_kept, kept_tile_size):
-        end = min(start + kept_tile_size, n_kept)
-        t_n = kept_n[start:end]; t_np = kept_np_idx[start:end]
-        t_k = kept_k_idx[start:end]; t_mult = mult_padded[start:end]
-        n_b  = tf.broadcast_to(t_n[:, None],  tf.shape(t_k))
-        np_b = tf.broadcast_to(t_np[:, None], tf.shape(t_k))
-        idx_n  = tf.stack([t_k, n_b],  axis=-1)
-        idx_np = tf.stack([t_k, np_b], axis=-1)
-        cnk_at_n  = tf.gather_nd(cnk_at, idx_n)
-        cnk_at_np = tf.gather_nd(cnk_at, idx_np)
-        rn  = tf.gather_nd(cnk_rad_der, idx_n)
-        rnp = tf.gather_nd(cnk_rad_der, idx_np)
+    rad_rows = []; azi_rows = []; pol_rows = []
+    for (n, nprime, l, c2_start, c2_count) in kept_triples:
+        k_start = l * (l + 1) // 2
+        k_end = k_start + (l + 1)
+        mult_tf = multiplicity_array[c2_start:c2_start + c2_count]
+        cnk_at_n = cnk_at[k_start:k_end, n, :]
+        cnk_at_np = cnk_at[k_start:k_end, nprime, :]
+        rn = cnk_rad_der[k_start:k_end, n, :]
+        rnp = cnk_rad_der[k_start:k_end, nprime, :]
+        an = cnk_azi_der[k_start:k_end, n, :]
+        anp = cnk_azi_der[k_start:k_end, nprime, :]
+        pn = cnk_pol_der[k_start:k_end, n, :]
+        pnp = cnk_pol_der[k_start:k_end, nprime, :]
         rad_term = rn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(rnp)
-        rad_tiles.append(tf.reduce_sum(t_mult[..., None] * tf.math.real(rad_term), axis=1))
-        del rn, rnp, rad_term
-        an  = tf.gather_nd(cnk_azi_der, idx_n)
-        anp = tf.gather_nd(cnk_azi_der, idx_np)
         azi_term = an * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(anp)
-        azi_tiles.append(tf.reduce_sum(t_mult[..., None] * tf.math.real(azi_term), axis=1))
-        del an, anp, azi_term
-        pn  = tf.gather_nd(cnk_pol_der, idx_n)
-        pnp = tf.gather_nd(cnk_pol_der, idx_np)
         pol_term = pn * tf.math.conj(cnk_at_np) + cnk_at_n * tf.math.conj(pnp)
-        pol_tiles.append(tf.reduce_sum(t_mult[..., None] * tf.math.real(pol_term), axis=1))
-        del pn, pnp, pol_term, cnk_at_n, cnk_at_np
-    rad_kept = tf.concat(rad_tiles, axis=0)
-    azi_kept = tf.concat(azi_tiles, axis=0)
-    pol_kept = tf.concat(pol_tiles, axis=0)
-    del rad_tiles, azi_tiles, pol_tiles, cnk_at
+        rad_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(rad_term), axis=0))
+        azi_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(azi_term), axis=0))
+        pol_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(pol_term), axis=0))
+    rad_kept = tf.stack(rad_rows, axis=0)
+    azi_kept = tf.stack(azi_rows, axis=0)
+    pol_kept = tf.stack(pol_rows, axis=0)
+    del cnk_at, rad_rows, azi_rows, pol_rows
 
     P_tile_dim = tf.shape(pair_atom)[0]
     n_compressed_t = tf.constant(n_compressed, tf.int32)
@@ -1091,38 +1055,16 @@ def _compute_soap_with_grad_inner_tf(
     # Inline forward power-spectrum + L2 norm — same logic as the forward
     # branch of `power_spectrum_with_grad_tf`, but we keep soap_unnorm and
     # sqrt_dot_p alive for use across the pair tiles.
-    if l_max is None:
-        l_max_eff = max(t[2] for t in kept_triples)
-    else:
-        l_max_eff = l_max
-    kept_n_np, kept_np_np, kept_k_np, kept_mult_idx_np, kept_mask_np = (
-        _build_kept_index_arrays(kept_triples, l_max_eff)
-    )
-    n_kept = kept_n_np.shape[0]
-    kept_n_t = tf.constant(kept_n_np, dtype=tf.int32)
-    kept_np_t = tf.constant(kept_np_np, dtype=tf.int32)
-    kept_k_t = tf.constant(kept_k_np, dtype=tf.int32)
-    kept_mult_idx_t = tf.constant(kept_mult_idx_np, dtype=tf.int32)
-    kept_mask_t = tf.constant(kept_mask_np, dtype=tf.bool)
-
-    mult_padded = tf.gather(multiplicity_array, kept_mult_idx_t)
-    mult_padded = tf.where(kept_mask_t, mult_padded, tf.zeros_like(mult_padded))
-
-    fwd_tiles = []
-    for s in range(0, n_kept, 16):
-        e = min(s + 16, n_kept)
-        t_n = kept_n_t[s:e]; t_np = kept_np_t[s:e]
-        t_k = kept_k_t[s:e]; t_m = mult_padded[s:e]
-        n_b  = tf.broadcast_to(t_n[:, None], tf.shape(t_k))
-        np_b = tf.broadcast_to(t_np[:, None], tf.shape(t_k))
-        idx_n  = tf.stack([t_k, n_b],  axis=-1)
-        idx_np = tf.stack([t_k, np_b], axis=-1)
-        cnk_n   = tf.gather_nd(cnk, idx_n)
-        cnk_np_ = tf.gather_nd(cnk, idx_np)
-        prod_fwd = cnk_n * tf.math.conj(cnk_np_)
-        fwd_tiles.append(tf.reduce_sum(t_m[..., None] * tf.math.real(prod_fwd), axis=1))
-        del cnk_n, cnk_np_, prod_fwd
-    fwd_kept = tf.concat(fwd_tiles, axis=0); del fwd_tiles
+    l_max_eff = l_max if l_max is not None else max(t[2] for t in kept_triples)
+    fwd_rows = []
+    for (n, nprime, l, c2_start, c2_count) in kept_triples:
+        k_start = l * (l + 1) // 2
+        k_end = k_start + (l + 1)
+        mult_tf = multiplicity_array[c2_start:c2_start + c2_count]
+        prod_fwd = (cnk[k_start:k_end, n, :]
+                    * tf.math.conj(cnk[k_start:k_end, nprime, :]))
+        fwd_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(prod_fwd), axis=0))
+    fwd_kept = tf.stack(fwd_rows, axis=0); del fwd_rows
     n_compressed_t = tf.constant(n_compressed, tf.int32)
     n_sites_t = tf.cast(n_atoms, tf.int32)
     soap_unnorm = tf.scatter_nd(
@@ -1294,35 +1236,18 @@ def power_spectrum_tf(
     cnk: tf.Tensor, multiplicity_array: tf.Tensor, kept_triples: list,
     compressed_idx: tf.Tensor, coeffs: tf.Tensor,
     n_compressed: int, n_sites, l_max: int = None,
-    kept_tile_size: int = 16,
 ) -> tf.Tensor:
-    """Forward-only power spectrum. Returns [n_sites, n_compressed].
-
-    Tiled-vectorised mirror of `power_spectrum_with_grad_tf` forward branch.
-    """
-    if l_max is None:
-        l_max = max(t[2] for t in kept_triples)
-    kept_n_np, kept_np_np, kept_k_np, kept_mult_idx_np, kept_mask_np = (
-        _build_kept_index_arrays(kept_triples, l_max)
-    )
-    kept_n = tf.constant(kept_n_np, dtype=tf.int32)
-    kept_np_idx = tf.constant(kept_np_np, dtype=tf.int32)
-    kept_k_idx = tf.constant(kept_k_np, dtype=tf.int32)
-    kept_mult_idx = tf.constant(kept_mult_idx_np, dtype=tf.int32)
-    kept_mask = tf.constant(kept_mask_np, dtype=tf.bool)
-
-    mult_padded = tf.gather(multiplicity_array, kept_mult_idx)
-    mult_padded = tf.where(kept_mask, mult_padded, tf.zeros_like(mult_padded))
-
-    n_b  = tf.broadcast_to(kept_n[:, None],     tf.shape(kept_k_idx))
-    np_b = tf.broadcast_to(kept_np_idx[:, None], tf.shape(kept_k_idx))
-    idx_n  = tf.stack([kept_k_idx, n_b],  axis=-1)
-    idx_np = tf.stack([kept_k_idx, np_b], axis=-1)
-    cnk_n   = tf.gather_nd(cnk, idx_n)
-    cnk_np_ = tf.gather_nd(cnk, idx_np)
-    prod_fwd = cnk_n * tf.math.conj(cnk_np_)
-    fwd_kept = tf.reduce_sum(mult_padded[..., None] * tf.math.real(prod_fwd), axis=1)
-    del cnk_n, cnk_np_, prod_fwd
+    """Forward-only power spectrum. Returns [n_sites, n_compressed]."""
+    fwd_rows = []
+    for (n, nprime, l, c2_start, c2_count) in kept_triples:
+        k_start = l * (l + 1) // 2
+        k_end = k_start + (l + 1)
+        mult_tf = multiplicity_array[c2_start:c2_start + c2_count]
+        prod_fwd = (cnk[k_start:k_end, n, :]
+                    * tf.math.conj(cnk[k_start:k_end, nprime, :]))
+        fwd_rows.append(tf.reduce_sum(mult_tf[:, None] * tf.math.real(prod_fwd), axis=0))
+    fwd_kept = tf.stack(fwd_rows, axis=0)
+    del fwd_rows
     n_compressed_t = tf.constant(n_compressed, tf.int32)
     n_sites_t = (n_sites if tf.is_tensor(n_sites)
                  else tf.constant(int(n_sites), tf.int32))
@@ -2151,14 +2076,20 @@ class DescriptorBuilderGPUTF:
     # pipeline. Callers can override per-call via memory_budget_bytes.
     DEFAULT_AUTO_BATCH_MEMORY_BUDGET_BYTES = 6 * (1 << 30)   # 6 GiB
 
+    # Sentinel: distinguishes "user didn't pass an explicit value, fall back
+    # to cfg default" from "user passed None to enable auto-sizing".
+    _UNSET = object()
+
     def build_descriptors_flat(
         self,
         dataset: list,
         calc_gradients: bool = True,
-        batch_frames: int | None = 1,
-        memory_budget_bytes: int | None = None,
+        batch_frames=_UNSET,
+        memory_budget_bytes=_UNSET,
         return_tf: bool = False,
         jit_compile: bool = False,
+        progress: bool = False,
+        progress_desc: str = "Building descriptors",
     ) -> list:
         """Per-frame flat COO output, with optional gradient computation.
 
@@ -2189,6 +2120,12 @@ class DescriptorBuilderGPUTF:
         atom-index offsets, then unpacked back per frame after.
         """
         self._ensure_cache()
+        # Resolve cfg defaults when caller didn't pass an explicit value.
+        if batch_frames is self._UNSET:
+            batch_frames = getattr(self.cfg, "descriptor_batch_frames", 1)
+        if memory_budget_bytes is self._UNSET:
+            memory_budget_bytes = getattr(
+                self.cfg, "descriptor_memory_budget_bytes", None)
         if batch_frames is None:
             batch_frames = self._auto_batch_frames(
                 dataset, calc_gradients,
@@ -2200,7 +2137,15 @@ class DescriptorBuilderGPUTF:
         # (dtype, jit) combination. Cached after first call.
         with_grad_fn, fwd_only_fn = self._get_compute_fns(jit_compile)
         results = []
-        for chunk_start in range(0, len(dataset), batch_frames):
+        chunk_starts = list(range(0, len(dataset), batch_frames))
+        # Show a per-chunk progress bar when explicitly requested AND there
+        # are at least 2 chunks to process. Avoids spamming output for the
+        # trajectory pipeline (which has its own outer progress bar).
+        iterator = chunk_starts
+        if progress and len(chunk_starts) >= 2:
+            iterator = tqdm(chunk_starts, desc=progress_desc, unit="chunk",
+                            total=len(chunk_starts))
+        for chunk_start in iterator:
             chunk = dataset[chunk_start:chunk_start + batch_frames]
             results.extend(self._build_flat_chunk(
                 chunk, calc_gradients, return_tf=return_tf,
@@ -2485,7 +2430,8 @@ class DescriptorBuilderGPUTF:
         self,
         dataset: list,
         calc_gradients: bool = True,
-        batch_frames: int | None = 1,
+        batch_frames=_UNSET,
+        progress_desc: str = "Building descriptors",
     ):
         """Bucketised-by-atom format used by the training pipeline.
 
@@ -2500,8 +2446,18 @@ class DescriptorBuilderGPUTF:
               calc_gradients=True : full per-pair gradients per atom
               calc_gradients=False: empty lists for gradients/grad_index
         """
+        # Resolve effective chunk size for the user-facing print.
+        eff_batch_frames = (batch_frames if batch_frames is not self._UNSET
+                            else getattr(self.cfg, "descriptor_batch_frames", 1))
+        n = len(dataset)
+        print(f"  {progress_desc}: {n} structures "
+              f"(precision: {self._real_dtype.name}, "
+              f"batch_frames: {eff_batch_frames}, "
+              f"pair_tile_size: {self._pair_tile_size}, "
+              f"calc_gradients: {calc_gradients})")
         flat = self.build_descriptors_flat(
             dataset, calc_gradients=calc_gradients, batch_frames=batch_frames,
+            progress=True, progress_desc=progress_desc,
         )
         dataset_descriptors = []
         dataset_gradients = []

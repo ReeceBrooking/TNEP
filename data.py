@@ -488,9 +488,15 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         val_types_int = [dataset_types_int[i] for i in val_idx]
         train_types_int = [dataset_types_int[i] for i in train_idx]
 
-    train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset)
-    val_descriptors, val_gradients, val_grad_index = builder.build_descriptors(val_dataset)
-    test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(test_dataset)
+    # GPU builder accepts a progress label; quippy ignores extra kwargs via
+    # its existing signature. The "Building descriptors..." print + per-chunk
+    # tqdm is emitted by DescriptorBuilderGPUTF.build_descriptors.
+    _kw = {"progress_desc": "Building train descriptors"} if cfg.descriptor_mode == 1 else {}
+    train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset, **_kw)
+    _kw = {"progress_desc": "Building val descriptors"} if cfg.descriptor_mode == 1 else {}
+    val_descriptors,   val_gradients,   val_grad_index   = builder.build_descriptors(val_dataset, **_kw)
+    _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
+    test_descriptors,  test_gradients,  test_grad_index  = builder.build_descriptors(test_dataset, **_kw)
 
     if cfg.scale_descriptors:
         all_desc = tf.concat(train_descriptors, axis=0)  # [total_train_atoms, dim_q]
