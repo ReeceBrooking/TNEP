@@ -165,6 +165,66 @@ def plot_ir_spectrum(freq_cm: np.ndarray, intensity: np.ndarray, cfg: TNEPconfig
     _finish_fig(fig, cfg, "ir_spectrum", save_plots, show_plots)
 
 
+def ir_spectrum_from_file(
+    dipole_path: str,
+    dt_fs: float = 1.0,
+    save_path: str | None = None,
+    show: bool = True,
+    title: str | None = None,
+    **ir_kwargs,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load a saved dipole trajectory and plot its IR spectrum.
+
+    Convenience wrapper around `np.load`/`np.loadtxt` + `compute_ir_spectrum`
+    + a minimal matplotlib plot — no TNEPconfig required. Accepts either the
+    binary .npy or the human-readable .txt file written by
+    `process_trajectory`.
+
+    Args:
+        dipole_path : path to the dipole file (.npy or .txt). Shape [T, 3].
+        dt_fs       : MD timestep in femtoseconds.
+        save_path   : if given, save the plot here (e.g. "ir.png"). None = do
+                      not save.
+        show        : True to call plt.show() interactively.
+        title       : optional plot title (defaults to the file's basename).
+        **ir_kwargs : forwarded to `compute_ir_spectrum`
+                      (window, max_freq_cm, acf_ratio, smooth_k).
+
+    Returns:
+        (freq_cm, intensity) — 1-D arrays. The autocorrelation and power
+        spectrum returned by `compute_ir_spectrum` are computed but not
+        returned here; call that function directly if you need them.
+    """
+    import os
+    if dipole_path.lower().endswith(".npy"):
+        dipoles = np.load(dipole_path)
+    else:
+        dipoles = np.loadtxt(dipole_path)
+    if dipoles.ndim != 2 or dipoles.shape[1] != 3:
+        raise ValueError(
+            f"expected dipoles of shape [T, 3], got {dipoles.shape}"
+        )
+    freq_cm, intensity, _power, _acf = compute_ir_spectrum(
+        dipoles, dt_fs=dt_fs, **ir_kwargs)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(freq_cm, intensity, color="black", linewidth=0.8)
+    ax.set_xlabel("Wavenumber (cm⁻¹)")
+    ax.set_ylabel("IR Intensity (arb. units)")
+    ax.set_title(title or f"IR spectrum — {os.path.basename(dipole_path)}")
+    ax.set_xlim(freq_cm[0], freq_cm[-1])
+    ax.invert_xaxis()
+    ax.set_ylim(1, 0)
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
+    return freq_cm, intensity
+
+
 def plot_power_spectrum(freq_cm: np.ndarray, power: np.ndarray, cfg: TNEPconfig,
                         save_plots: str | None = "plots", show_plots: bool = False,
                         title: str = "Power Spectrum") -> None:

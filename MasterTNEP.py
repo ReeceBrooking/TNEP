@@ -472,13 +472,24 @@ def process_trajectory(
     results = np.concatenate(result_batches, axis=0)
     del result_batches
 
+    # Resolve where to write trajectory outputs. dipoles / polarizabilities
+    # are always saved (binary .npy + human-readable .txt) so a long-running
+    # MD inference is never lost just because plotting was disabled. Default
+    # location: save_plots dir if set, else next to the trajectory file.
+    if save_plots:
+        out_dir = save_plots
+    else:
+        out_dir = os.path.dirname(trajectory_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
     if cfg.target_mode == 1:
         dipoles = results
-        if save_plots:
-            txt_path = os.path.join(save_plots, f"{stem}_dipoles.txt")
-            np.savetxt(txt_path, dipoles, fmt="%.8e",
-                       header="dipole_x  dipole_y  dipole_z  (e*Angstrom)")
-            print(f"Dipoles saved to {txt_path}")
+        npy_path = os.path.join(out_dir, f"{stem}_dipoles.npy")
+        txt_path = os.path.join(out_dir, f"{stem}_dipoles.txt")
+        np.save(npy_path, dipoles)
+        np.savetxt(txt_path, dipoles, fmt="%.8e",
+                   header="dipole_x  dipole_y  dipole_z  (e*Angstrom)")
+        print(f"Dipoles saved to {npy_path} (binary) and {txt_path} (text)")
         freq_cm, intensity, power, acf = compute_ir_spectrum(dipoles, dt_fs=dt_fs)
         plot_ir_spectrum(freq_cm, intensity, cfg, save_plots, show_plots)
         plot_power_spectrum(freq_cm, power, cfg, save_plots, show_plots)
@@ -487,11 +498,12 @@ def process_trajectory(
 
     else:
         pols = results
-        if save_plots:
-            txt_path = os.path.join(save_plots, f"{stem}_polarizabilities.txt")
-            np.savetxt(txt_path, pols, fmt="%.8e",
-                       header="alpha_xx  alpha_yy  alpha_zz  alpha_xy  alpha_yz  alpha_zx")
-            print(f"Polarizabilities saved to {txt_path}")
+        npy_path = os.path.join(out_dir, f"{stem}_polarizabilities.npy")
+        txt_path = os.path.join(out_dir, f"{stem}_polarizabilities.txt")
+        np.save(npy_path, pols)
+        np.savetxt(txt_path, pols, fmt="%.8e",
+                   header="alpha_xx  alpha_yy  alpha_zz  alpha_xy  alpha_yz  alpha_zx")
+        print(f"Polarizabilities saved to {npy_path} (binary) and {txt_path} (text)")
         freq_cm, I_VV, I_VH, I_total, acf_iso, acf_aniso = compute_raman_spectrum(
             pols, dt_fs=dt_fs)
         plot_raman_spectrum(freq_cm, I_VV, I_VH, I_total, cfg, save_plots, show_plots)
