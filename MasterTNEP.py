@@ -28,10 +28,10 @@ from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_histor
                       plot_timing, plot_correlation, plot_cosine_similarity,
                       plot_loss_breakdown, plot_error_vs_magnitude)
 from model_io import save_model, save_history, setup_run_directory, load_model
-from spectroscopy import (predict_dipole_batch, predict_polarizability_batch,
+from spectroscopy import (predict_trajectory_batch,
                            compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
-from DescriptorBuilder import DescriptorBuilder
+from DescriptorBuilder import make_descriptor_builder
 from tqdm import tqdm
 from ase.io import read, iread
 
@@ -324,6 +324,8 @@ def process_trajectory(
     show_plots: bool = False,
     batch_size: int | None = None,
     pin_to_cpu: bool = True,
+    descriptor_mode: int | None = None,
+    descriptor_batch_frames: int | None = 1,
 ) -> dict:
     """Predict properties along an MD trajectory and compute spectra.
 
@@ -345,6 +347,14 @@ def process_trajectory(
         pin_to_cpu      : bool — place batch tensors on CPU instead of GPU.
                           Required when a single batch's COO tensors exceed VRAM
                           (large systems × large batch_size). Default True.
+        descriptor_mode : int or None — overrides cfg.descriptor_mode for this
+                          run only. 0 = quippy (CPU), 1 = native TF/GPU.
+                          None = use the value baked into model.cfg.
+        descriptor_batch_frames : int or None — frames per descriptor-builder
+                          TF graph call (mode 1 only). 1 = per-frame (default,
+                          lowest memory). int >= 2 = multi-frame batching for
+                          throughput. None = auto-size to a 2 GiB GPU budget.
+                          Quippy mode ignores this field.
 
     Returns:
         For mode 1 (dipole):
@@ -369,12 +379,12 @@ def process_trajectory(
     total_batches = (((n_total + batch_size - 1) // batch_size)
                      if batch_size else 1)
 
-    # One DescriptorBuilder reused across all batches — quippy descriptors are
-    # expensive to construct, so we build once.
-    builder = DescriptorBuilder(cfg)
-
-    predict_fn = (predict_dipole_batch if cfg.target_mode == 1
-                  else predict_polarizability_batch)
+    # One descriptor builder reused across all batches — quippy descriptors are
+    # expensive to construct, so we build once. The backend is selected by
+    # cfg.descriptor_mode (0 = quippy, 1 = native TF/GPU); the per-call
+    # `descriptor_mode` argument above overrides for this trajectory only.
+    builder = make_descriptor_builder(cfg, mode=descriptor_mode)
+    print(f"Descriptor backend: {type(builder).__name__}")
 
     # Stream frames in fixed-size batches: build → pack → predict → append → drop.
     # Only batch_size ASE Atoms exist in memory at any moment.
@@ -394,8 +404,9 @@ def process_trajectory(
                              desc="Trajectory batches", unit="batch"):
         batch_types = assign_type_indices(batch_frames, cfg.types)
         result_batches.append(
-            predict_fn(model, builder, batch_frames, batch_types,
-                       pin_to_cpu=pin_to_cpu))
+            predict_trajectory_batch(model, builder, batch_frames, batch_types,
+                                     pin_to_cpu=pin_to_cpu,
+                                     descriptor_batch_frames=descriptor_batch_frames))
         n_frames += len(batch_frames)
         del batch_frames, batch_types
 
@@ -434,5 +445,5 @@ def process_trajectory(
 if __name__ == '__main__':
     #model = train_model()
     model = load_model("models/n30_q75_pop80_20260428_120216/train_waterbulk_O_H_dipole_best_val.npz")
-    dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=10)
+    dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=10, descriptor_mode=1, descriptor_batch_frames=5, pin_to_cpu=False)
     

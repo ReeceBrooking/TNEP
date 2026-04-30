@@ -4,7 +4,7 @@ import tensorflow as tf
 from tensorflow.keras import layers
 from typing import Callable
 
-from DescriptorBuilder import DescriptorBuilder
+from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import TNEPconfig
 
@@ -43,7 +43,7 @@ class TNEP(layers.Layer):
         self.num_types = cfg.num_types
         self.num_neurons = cfg.num_neurons
         self.activation = tf.keras.activations.get(cfg.activation)
-        self.builder = DescriptorBuilder(cfg)
+        self.builder = make_descriptor_builder(cfg)
         self.optimizer = SNES(self)
 
         # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type

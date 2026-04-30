@@ -44,15 +44,17 @@ class TNEPconfig:
     compress_mode: str = "trivial"
     # Number of compressed radial channels (only used when compress_mode="linear"; None = quippy default)
     compress_P: int | None = None
-    # PCA compression of descriptors (applied after SOAP computation, before scaling)
-    # Uses compress_P for number of components. Independent of quippy's compress_mode.
-    compress_pca: bool = False
     atom_sigma_r: float = 0.5
     atom_sigma_t: float = 0.5
     atom_sigma_r_scaling: float = 0.0
     atom_sigma_t_scaling: float = 0.0
     amplitude_scaling: float = 1.0
     central_weight: float = 1.0
+
+    # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU when available).
+    # The GPU path supports basis="poly3" and compress_mode="trivial" only;
+    # falls back to a clear error if other settings are requested.
+    descriptor_mode: int = 0
 
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True

@@ -107,7 +107,6 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
                                   num_neurons, dim_q, elements (quick inspection)
         /weights/               — W0, b0, W1, b1 (+ pol variants for mode 2)
         /descriptor/            — z_to_type_index, descriptor_mean (if set)
-        /pca/                   — pca_components, pca_mean, … (if PCA used)
         /config                 — full TNEPconfig serialised as JSON string
 
     Load with:
@@ -160,12 +159,6 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         dg.create_dataset("z_to_type_index", data=z_to_type_index)
         if cfg.descriptor_mean is not None:
             dg.create_dataset("descriptor_mean", data=np.asarray(cfg.descriptor_mean))
-
-        # PCA projection
-        if hasattr(cfg, '_descriptor_pca') and cfg._descriptor_pca is not None:
-            pg = f.create_group("pca")
-            for k, v in cfg._descriptor_pca.to_dict().items():
-                pg.create_dataset(k, data=v)
 
         # Full config as JSON string
         f.create_dataset("config", data=json.dumps(config_dict))
@@ -240,9 +233,6 @@ def _load_model_h5(path: str) -> TNEP:
         descriptor_mean = (f["descriptor/descriptor_mean"][:].astype(np.float32)
                            if "descriptor/descriptor_mean" in f else None)
 
-        pca_dict = ({k: f[f"pca/{k}"][:] for k in f["pca"]}
-                    if "pca" in f else None)
-
         wg = f["weights"]
         weights = {
             "W0": wg["W0"][:], "b0": wg["b0"][:],
@@ -260,10 +250,6 @@ def _load_model_h5(path: str) -> TNEP:
 
     if descriptor_mean is not None:
         cfg.descriptor_mean = descriptor_mean
-
-    if pca_dict is not None:
-        from descriptor_pca import DescriptorPCA
-        cfg._descriptor_pca = DescriptorPCA.from_dict(pca_dict)
 
     model = TNEP(cfg)
     _load_weights(model, cfg, **weights)
@@ -300,15 +286,6 @@ def _load_model_npz(path: str) -> TNEP:
 
     if "descriptor_mean" in data:
         cfg.descriptor_mean = data["descriptor_mean"].astype(np.float32)
-
-    if "pca_components" in data:
-        from descriptor_pca import DescriptorPCA
-        cfg._descriptor_pca = DescriptorPCA.from_dict({
-            "pca_components": data["pca_components"],
-            "pca_mean": data["pca_mean"],
-            "pca_explained_variance_ratio": data["pca_explained_variance_ratio"],
-            "pca_n_components": data["pca_n_components"],
-        })
 
     cfg.type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}
 

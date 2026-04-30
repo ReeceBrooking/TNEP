@@ -18,7 +18,7 @@ The model uses **SOAP-turbo** descriptors to encode local atomic environments, a
 |---|---|
 | PES (energy + forces) | ✅ Implemented (`target_mode = 0`) |
 | Dipole moment | ✅ Implemented (`target_mode = 1`) |
-| Polarizability | 🚧 In progress (`target_mode = 2`) |
+| Polarizability | ✅ Implemented (`target_mode = 2`) |
 
 ---
 
@@ -26,17 +26,17 @@ The model uses **SOAP-turbo** descriptors to encode local atomic environments, a
 
 ```
 TNEP/
-├── MasterTNEP.py        # Entry point — data loading, train/test split, model training
-├── TNEP.py              # Core model: neural network, force calculation, dipole prediction
+├── MasterTNEP.py        # Entry point — train_model() and process_trajectory()
+├── TNEP.py              # Core model: per-type ANN, predict_batch (COO), score
 ├── TNEPconfig.py        # Configuration dataclass — all hyperparameters in one place
-├── DescriptorBuilder.py # SOAP-turbo descriptor and gradient computation via quippy-ase
+├── DescriptorBuilder.py # SOAP-turbo descriptor + gradient computation via quippy
 ├── SNES.py              # Separable Natural Evolution Strategy optimiser
-├── data.py              # Data loading, filtering, preprocessing, train/val/test splitting
-├── spectroscopy.py      # IR/Raman spectrum computation from MD trajectories
-├── plotting.py          # Visualization (fitness curves, correlation plots, spectra)
-├── model_io.py          # Model saving/loading (.npz format)
-├── train.xyz            # Example training dataset (extxyz format, dipole targets)
-└── PEStrain.xyz         # Example training dataset (extxyz format, PES targets — Te bulk)
+├── data.py              # Loading, filtering, splitting, COO pad-and-stack
+├── spectroscopy.py      # IR/Raman spectrum + trajectory inference (streaming batches)
+├── plotting.py          # Fitness curves, correlation plots, spectra
+├── model_io.py          # Model save/load (HDF5; legacy .npz still loadable)
+├── datasets/            # Training and trajectory data (extxyz)
+└── models/              # Auto-created run directories with config, history, plots
 ```
 
 ---
@@ -45,16 +45,16 @@ TNEP/
 
 | Package | Purpose |
 |---|---|
-| `tensorflow` | Neural network, tensor operations, autograd |
+| `tensorflow` | Neural network, tensor operations |
 | `numpy` | Numerical computing |
+| `h5py` | HDF5 model checkpoints |
 | `ase` | Reading extxyz datasets |
-| `quippy-ase` | Interface to SOAP-turbo for descriptors and descriptor gradients |
-| `matplotlib` | Plotting and visualization |
-
-Install Python dependencies:
+| `quippy-ase` | SOAP-turbo descriptors and descriptor gradients |
+| `matplotlib` | Plotting |
+| `tqdm` | Progress bars |
 
 ```bash
-pip install tensorflow numpy ase quippy-ase matplotlib
+pip install tensorflow numpy h5py ase quippy-ase matplotlib tqdm
 ```
 
 > **Note:** `quippy-ase` requires a working installation of [QUIP/GAP](https://github.com/libAtoms/QUIP). See the [quippy documentation](https://quippy.readthedocs.io) for platform-specific build instructions.
@@ -63,55 +63,107 @@ pip install tensorflow numpy ase quippy-ase matplotlib
 
 ## Configuration
 
-All hyperparameters are defined in `TNEPconfig.py`. Key settings:
+All hyperparameters are defined in `TNEPconfig.py`. Selected defaults shown below — see the source file for the full list of options.
 
 ```python
-data_path       = "train.xyz"   # Path to training data
-target_mode     = 1             # 0 = PES, 1 = Dipole, 2 = Polarizability (WIP)
+# Data
+data_path        = "datasets/train_waterbulk.xyz"
+test_data_path   = "datasets/test_waterbulk.xyz"   # None = split from data_path
+allowed_species  = ["C", "H", "O"]                  # Filter by atomic species
+filter_mode      = "subset"                          # "subset" or "exact"
+target_mode      = 1                                 # 0=PES, 1=Dipole, 2=Polarizability
+total_N          = 1000                              # Cap on training structures (None = all)
+test_ratio       = 0.3
 
-num_neurons     = 10            # Hidden layer size
-num_generations = 1000          # Number of SNES training generations
-batch_size      = 50            # Structures per training step
-pop_size        = 80            # SNES population size per generation
-total_N         = None          # Max structures to use (None = all)
-test_ratio      = 0.2           # Train/test split
+# Model
+num_neurons      = 30
+activation       = "tanh"
+init_sigma       = 0.1
 
-l_max           = 4             # Maximum angular momentum for SOAP-turbo
-alpha_max       = 4             # Maximum radial expansion order
-rcut_hard       = 3.7           # Hard cutoff radius (Å)
-rcut_soft       = 3.2           # Soft cutoff radius (Å)
-basis           = "poly3"       # Radial basis type
+# SNES training
+pop_size         = 80
+num_generations  = 60000
+batch_size       = None        # None = full train set per generation
+eta_sigma        = None        # None = auto from problem dimension
+patience         = None        # Early stopping (None = disabled)
+loss_type        = "mse"       # "mse" or "mae"
 
-activation      = 'tanh'
-init_sigma      = 0.1           # Initial SNES distribution std
-seed            = None          # Set for reproducibility
+# SOAP-turbo descriptor
+l_max            = 4
+alpha_max        = 4
+rcut_hard        = 6.0         # Hard cutoff (Å)
+rcut_soft        = 5.5         # Soft cutoff (Å)
+basis            = "poly3"
+
+# Regularisation
+toggle_regularization    = True
+lambda_1                 = 0.001    # L1
+lambda_2                 = 0.001    # L2
+per_type_regularization  = True     # Per-element ranking (GPUMD NEP4 style)
+
+# Target scaling (dipole only)
+scale_targets    = True        # Train against per-atom dipole; recovered at inference
+dipole_units     = "e*bohr"    # "e*angstrom", "e*bohr", or "debye"
+
+# Memory / parallelism
+pin_data_to_cpu          = True   # Required when full dataset doesn't fit on GPU
+num_descriptor_workers   = None   # None = auto from SLURM or cpu_count // 2
+
+# Output
+save_path        = "models/auto"   # Auto-creates run dir with timestamp
+plot_interval    = 10000           # Periodic plots every N generations
 ```
 
 ---
 
 ## Dataset Format
 
-Training data should be in **extxyz** format readable by ASE. The required properties depend on the target mode:
+Training data must be in **extxyz** format readable by ASE.
 
-**PES training (`PEStrain.xyz`):**
-```
-energy=-937.191 ... Properties=species:S:1:pos:R:3:force:R:3
-```
+| Mode | Required field |
+|---|---|
+| PES (`target_mode=0`) | `energy=...` in header; `force` per-atom column (optional but recommended); optional `virial` for stress |
+| Dipole (`target_mode=1`) | `dipole="..."` in header (3-vector) |
+| Polarizability (`target_mode=2`) | `pol="..."` in header (6-component Voigt: xx,yy,zz,xy,yz,zx) |
 
-**Dipole training (`train.xyz`):**
-Structures should include a `dipole` property in the extxyz header.
+Override the default key with `cfg.target_key = "mu"` for non-standard labels.
 
 ---
 
 ## Usage
 
-Edit `TNEPconfig.py` to set your data path and target mode, then run:
+### Training
+
+Edit `TNEPconfig.py` (or pass a `TNEPconfig` instance), then run:
 
 ```bash
 python MasterTNEP.py
 ```
 
-This will load the dataset, build SOAP descriptors, split into train/test sets, train the model using SNES, and report RMSE on the test set.
+This loads the dataset, builds SOAP descriptors, splits into train/test/val, trains via SNES, scores both the final-generation and best-validation models, and saves everything to `models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/`:
+
+- `config.txt` — hyperparameters used for the run
+- `history.csv` — per-generation losses, regularisation, σ stats
+- `*_best_val.h5` and `*_final_gen.h5` — model checkpoints (HDF5)
+- `plots/` — fitness curves, correlation plots, σ history, timing breakdown
+
+### Inference / Spectroscopy
+
+```python
+from MasterTNEP import process_trajectory
+from model_io import load_model
+
+model = load_model("models/.../train_waterbulk_O_H_dipole_best_val.h5")
+result = process_trajectory(
+    model, "datasets/water_bulk_traj.xyz",
+    dt_fs=1.0, batch_size=100, save_plots="plots", pin_to_cpu=True,
+)
+```
+
+The trajectory is streamed in `batch_size`-frame chunks: descriptors are built, packed to COO, run through `predict_batch`, appended, and discarded before the next batch — peak memory is `O(batch_size)` rather than `O(all_frames)`. Outputs are saved alongside the spectrum:
+
+- `<name>_dipoles.txt` (or `_polarizabilities.txt`) — predictions per frame
+- `ir_spectrum.png`, `power_spectrum.png` (mode 1) or `raman_spectrum.png` (mode 2)
 
 ---
 
@@ -123,35 +175,36 @@ Each atom's local environment is encoded as a SOAP descriptor vector **q**. A si
 qᵢ → [W0, b0] → tanh → [W1] → Uᵢ
 ```
 
-Per-type weight matrices are used so that each element has its own network parameters.
+Per-element weight matrices give each species its own network parameters. The total property is assembled from atomic contributions:
 
-The total property is assembled from atomic contributions:
+- **Energy** — sum of site energies; forces from descriptor gradients via the chain rule
+- **Dipole** (rank-1) — `μ = -Σᵢ Σⱼ |rᵢⱼ|² · (∂Uᵢ/∂rᵢⱼ)` (eq. 3 of the paper)
+- **Polarizability** (rank-2) — dual-ANN: scalar branch contributes the diagonal isotropic part, tensor branch contributes the anisotropic virial-like part (eq. 4)
 
-- **Energy** — sum of site energies; forces derived analytically from descriptor gradients
-- **Dipole (rank-1)** — assembled by contracting the virial-like tensor with squared interatomic distances rᵢⱼ² (eq. 3 in the paper)
-- **Polarizability (rank-2)** — combination of diagonal scalar and off-diagonal virial contributions (eq. 4 in the paper) — *in progress*
+Internally, descriptor gradients are stored in **COO sparse format** (`grad_values [P,3,Q]` + `pair_struct [P]` + `pair_atom [P]` + `pair_gidx [P]`), avoiding the dense `[B, A_max, M_max, 3, Q]` allocation that would otherwise dominate memory.
 
 ---
 
 ## Training Algorithm (SNES)
 
-Rather than standard gradient descent, the model is trained using a **Separable Natural Evolution Strategy**. In each generation:
+Rather than gradient descent, the model is trained using a **Separable Natural Evolution Strategy** (Schaul, 2011). Per generation:
 
-1. A population of perturbed parameter vectors is sampled from a Gaussian distribution
-2. Each candidate is evaluated on a batch of training structures
-3. The distribution mean and variance are updated based on fitness rankings
+1. Sample a population of `pop_size` perturbed parameter vectors from a diagonal Gaussian
+2. Evaluate each candidate on a batch of training structures (forward pass only)
+3. Update the distribution mean and per-parameter σ based on fitness rankings
 
-This avoids the need for backpropagation through the descriptor computation.
+When `per_type_regularization=True`, fitness is ranked per element type — driving per-type natural-gradient updates in the GPUMD NEP4 style.
+
+This avoids backpropagation through the descriptor computation and is naturally batchable across the population dimension.
 
 ---
 
-## Background: IR and Raman Spectra
+## Vibrational Spectra
 
-Once trained, TNEP models can be used to predict properties along MD trajectories to simulate vibrational spectra:
+Once trained, TNEP models predict properties along MD trajectories to simulate vibrational spectra:
 
-- **IR spectrum** — Fourier transform of the dipole moment autocorrelation function (ACF)
-- **Raman spectrum** — Fourier transform of the polarizability/susceptibility ACF
-- Isotropic (polarized) and anisotropic (depolarized) Raman components can be separated from the full polarizability tensor
+- **IR** — `σ(ω) ∝ ω² · M(ω)` where M(ω) is the cosine transform of the dipole autocorrelation function (Wiener–Khinchin via FFT, then DCT)
+- **Raman** — separate cosine transforms of the isotropic γ(t) = Tr(α)/3 and anisotropic β(t) = α − γI ACFs, combined into VV (polarised) and VH (depolarised) intensities with a Bose–Einstein occupation factor
 
 This enables nanosecond-scale sampling that would be prohibitive with ab initio MD.
 
@@ -172,4 +225,3 @@ If you use this code, please cite the original TNEP paper:
   doi={10.1021/acs.jctc.3c01343}
 }
 ```
-

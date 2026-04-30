@@ -34,14 +34,21 @@ def _get_thread_builders(soap_strings: list[str]) -> list:
 
 
 def _describe_structure_worker(
-    args: tuple[Atoms, list[str]],
+    args: tuple,
 ) -> tuple[np.ndarray, list[np.ndarray], list[list[int]]]:
     """Compute SOAP descriptors for one structure inside a worker thread.
 
     Reuses thread-local Descriptor objects across calls — the previous version
     rebuilt them per frame, which dominated runtime for trajectory inference.
+
+    args = (structure, soap_strings) or (structure, soap_strings, do_grad).
+    do_grad defaults to True for backwards compatibility.
     """
-    structure, soap_strings = args
+    if len(args) == 2:
+        structure, soap_strings = args
+        do_grad = True
+    else:
+        structure, soap_strings, do_grad = args
 
     cell = structure.cell.array
     if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
@@ -57,7 +64,7 @@ def _describe_structure_worker(
     )
 
     builders = _get_thread_builders(soap_strings)
-    outs = [b.calc(structure, grad=True) for b in builders]
+    outs = [b.calc(structure, grad=do_grad) for b in builders]
 
     N = len(structure)
     descriptors  = [[] for _ in range(N)]
@@ -70,14 +77,19 @@ def _describe_structure_worker(
             continue
         for k in range(len(out["ci"])):
             descriptors[out["ci"][k] - 1].append(out["data"][k])
-        for j in range(len(out["grad_index_0based"])):
-            center    = out["grad_index_0based"][j][0]
-            neighbour = out["grad_index_0based"][j][1]
-            gradients[center].append(out["grad_data"][j])
-            grad_indexes[center].append(neighbour)
+        if do_grad and out.get("grad_index_0based") is not None:
+            for j in range(len(out["grad_index_0based"])):
+                center    = out["grad_index_0based"][j][0]
+                neighbour = out["grad_index_0based"][j][1]
+                gradients[center].append(out["grad_data"][j])
+                grad_indexes[center].append(neighbour)
 
     descriptors_np = np.array(descriptors, dtype=np.float32).squeeze(axis=1)
-    gradients_np   = [np.array(g, dtype=np.float32) for g in gradients]
+    if do_grad:
+        gradients_np = [np.array(g, dtype=np.float32) for g in gradients]
+    else:
+        gradients_np = [np.zeros((0, 3, descriptors_np.shape[-1]), dtype=np.float32)
+                        for _ in range(N)]
     return descriptors_np, gradients_np, grad_indexes
 
 
@@ -85,6 +97,7 @@ def _describe_structure_worker_flat(
     structure: Atoms,
     soap_strings: list[str],
     dim_q: int,
+    do_grad: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute SOAP descriptors and return flat COO arrays directly.
 
@@ -114,7 +127,7 @@ def _describe_structure_worker_flat(
     N = len(structure)
 
     builders = _get_thread_builders(soap_strings)
-    outs = [b.calc(structure, grad=True) for b in builders]
+    outs = [b.calc(structure, grad=do_grad) for b in builders]
 
     descriptors = np.zeros((N, dim_q), dtype=np.float32)
     grad_chunks = []
@@ -225,32 +238,37 @@ class DescriptorBuilder(layers.Layer):
         else:
             self._num_workers = cfg.num_descriptor_workers
 
-    def build_descriptors(self, dataset: list[Atoms]) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
-        """Compute SOAP descriptors and their gradients for every structure.
+    def build_descriptors(
+        self,
+        dataset: list[Atoms],
+        calc_gradients: bool = True,
+        batch_frames: int | None = 1,
+    ) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
+        """Compute SOAP descriptors and (optionally) their gradients.
 
-        Runs each per-type quippy Descriptor with grad=True, then collects
-        results per centre atom.
+        Runs each per-type quippy Descriptor with `grad=calc_gradients`, then
+        collects results per centre atom.
 
         Args:
-            dataset : list of ase.Atoms structures
+            dataset        : list of ase.Atoms structures
+            calc_gradients : if False, gradients/grad_index are returned as
+                             empty per-atom lists (saves the quippy gradient
+                             calculation, which is the dominant cost).
 
         Returns:
-            dataset_descriptors : list of tensors, one per structure
-                Each tensor has shape [N, dim_q].
-            dataset_gradients   : list of (list of N tensors), one per structure
-                gradients[s][i] has shape [M_i, 3, dim_q] — the derivative of
-                atom i's descriptor w.r.t. each neighbour's position
-                (M_i neighbours, 3 Cartesian, dim_q descriptor components).
-            dataset_grad_index  : list of (list of N lists), one per structure
-                grad_index[s][i] is a list of M_i ints — the atom index of
-                each neighbour in gradients[s][i].
+            dataset_descriptors : list of tensors, one per structure [N, dim_q]
+            dataset_gradients   : per-structure list of N tensors
+                                  ([M_i, 3, dim_q] when calc_gradients=True,
+                                  [0, 3, dim_q] when False)
+            dataset_grad_index  : per-structure list of N lists of int neighbour
+                                  indices (empty when calc_gradients=False)
         """
         dataset_descriptors = []
         dataset_gradients   = []
         dataset_grad_index  = []
 
         if self._num_workers <= 1:
-            # Serial path — unchanged from original
+            # Serial path
             for structure in dataset:
                 cell = structure.cell.array
                 if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
@@ -264,31 +282,34 @@ class DescriptorBuilder(layers.Layer):
                     cell=cell,
                     pbc=pbc,
                 )
-                outs = [b.calc(structure, grad=True) for b in self.builders]
+                outs = [b.calc(structure, grad=calc_gradients) for b in self.builders]
 
-                descriptors  = [[] for _ in range(len(structure))]
-                gradients    = [[] for _ in range(len(structure))]
-                grad_indexes = [[] for _ in range(len(structure))]
+                N = len(structure)
+                descriptors  = [[] for _ in range(N)]
+                gradients    = [[] for _ in range(N)]
+                grad_indexes = [[] for _ in range(N)]
 
                 for out in outs:
                     data = out.get("data")
                     if data is None or data.size == 0 or data.shape[1] == 0:
                         continue
-                    # ci is 1-indexed centre atom index from quippy
                     for k in range(len(out["ci"])):
                         descriptors[out["ci"][k] - 1].append(out["data"][k])
-                    # grad_index_0based[j] = [centre, neighbour] (0-indexed)
-                    for j in range(len(out["grad_index_0based"])):
-                        center    = out["grad_index_0based"][j][0]
-                        neighbour = out["grad_index_0based"][j][1]
-                        gradients[center].append(out["grad_data"][j])
-                        grad_indexes[center].append(neighbour)
-
-                for i in range(len(gradients)):
-                    gradients[i] = tf.convert_to_tensor(gradients[i], dtype=tf.float32)
+                    if calc_gradients and out.get("grad_index_0based") is not None:
+                        for j in range(len(out["grad_index_0based"])):
+                            center    = out["grad_index_0based"][j][0]
+                            neighbour = out["grad_index_0based"][j][1]
+                            gradients[center].append(out["grad_data"][j])
+                            grad_indexes[center].append(neighbour)
 
                 descriptors = tf.convert_to_tensor(descriptors, dtype=tf.float32)
                 descriptors = tf.squeeze(descriptors, axis=1)
+                dim_q = int(descriptors.shape[-1])
+                if calc_gradients:
+                    for i in range(len(gradients)):
+                        gradients[i] = tf.convert_to_tensor(gradients[i], dtype=tf.float32)
+                else:
+                    gradients = [tf.zeros((0, 3, dim_q), dtype=tf.float32) for _ in range(N)]
                 dataset_descriptors.append(descriptors)
                 dataset_gradients.append(gradients)
                 dataset_grad_index.append(grad_indexes)
@@ -304,7 +325,7 @@ class DescriptorBuilder(layers.Layer):
             soap_strings = self._soap_strings
 
             def _thread_worker(structure):
-                return _describe_structure_worker((structure, soap_strings))
+                return _describe_structure_worker((structure, soap_strings, calc_gradients))
 
             # OMP_NUM_THREADS is process-wide; setting it before the pool starts
             # means each thread's first quippy OMP context picks up omp_per_worker.
@@ -330,37 +351,41 @@ class DescriptorBuilder(layers.Layer):
         return dataset_descriptors, dataset_gradients, dataset_grad_index
 
     def build_descriptors_flat(
-        self, dataset: list[Atoms],
-    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        self,
+        dataset: list[Atoms],
+        calc_gradients: bool = True,
+        batch_frames: int | None = 1,
+    ) -> list[tuple]:
         """Compute SOAP descriptors and return flat per-frame COO arrays.
 
-        Optimised for trajectory inference. Skips the per-atom bucketisation
-        and tf.Tensor wrapping that the standard build_descriptors() path does
-        for compatibility with the training pipeline.
-
         Args:
-            dataset : list of ase.Atoms
+            dataset        : list of ase.Atoms
+            calc_gradients : when False, gradient outputs are zero-length arrays
+                             (saves the quippy gradient computation, the
+                             dominant cost).
 
         Returns:
-            list of (descriptors, grad_values, pair_atom, pair_gidx) tuples,
-            one per structure. All arrays are numpy:
-                descriptors : [N, dim_q]      float32
-                grad_values : [P, 3, dim_q]   float32
-                pair_atom   : [P]             int32
-                pair_gidx   : [P]             int32
+            list of (descriptors, grad_values, pair_atom, pair_gidx) tuples
+            per structure. All arrays are numpy:
+                descriptors : [N, dim_q]   float32
+                grad_values : [P, 3, dim_q] (or [0,3,dim_q]) float32
+                pair_atom   : [P] (or [0]) int32
+                pair_gidx   : [P] (or [0]) int32
         """
         soap_strings = self._soap_strings
         dim_q = self.cfg.dim_q
 
         if self._num_workers <= 1:
-            return [_describe_structure_worker_flat(s, soap_strings, dim_q)
+            return [_describe_structure_worker_flat(s, soap_strings, dim_q,
+                                                     do_grad=calc_gradients)
                     for s in dataset]
 
         _total_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
         omp_per_worker = max(1, _total_cpus // self._num_workers)
 
         def _thread_worker(structure):
-            return _describe_structure_worker_flat(structure, soap_strings, dim_q)
+            return _describe_structure_worker_flat(structure, soap_strings, dim_q,
+                                                    do_grad=calc_gradients)
 
         old_omp = os.environ.get('OMP_NUM_THREADS')
         os.environ['OMP_NUM_THREADS'] = str(omp_per_worker)
@@ -374,3 +399,34 @@ class DescriptorBuilder(layers.Layer):
             else:
                 os.environ.pop('OMP_NUM_THREADS', None)
 
+
+
+# =========================================================================
+# Backend dispatcher
+# =========================================================================
+
+
+def make_descriptor_builder(cfg: TNEPconfig, mode: int | None = None):
+    """Return the descriptor builder selected by `cfg.descriptor_mode` or `mode`.
+
+    Args:
+        cfg  : TNEPconfig instance (provides default mode + hyperparameters)
+        mode : optional override (None → use cfg.descriptor_mode)
+
+    Returns:
+        - mode 0 : DescriptorBuilder (quippy / Fortran, CPU)
+        - mode 1 : DescriptorBuilderGPUTF (TF / GPU, native port)
+
+    The GPU backend is imported lazily so quippy-only deployments don't pull
+    in TF on every import of this module.
+    """
+    selected = cfg.descriptor_mode if mode is None else int(mode)
+    if selected == 0:
+        return DescriptorBuilder(cfg)
+    if selected == 1:
+        # Local import to avoid circular dependency at module load time
+        from DescriptorBuilderGPU_tf import DescriptorBuilderGPUTF
+        return DescriptorBuilderGPUTF(cfg)
+    raise ValueError(
+        f"Unknown descriptor_mode={selected}. Use 0 (quippy) or 1 (GPU TF)."
+    )
