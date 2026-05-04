@@ -878,58 +878,99 @@ class SNES:
             chunk["pair_struct"] = batch_data["pair_struct"][p_lo:p_hi] - s_start
             struct_chunks.append(chunk)
 
-        # Stage all chunks to GPU before any pop_chunk iteration.
-        # When pin_data_to_cpu=True data lives in CPU-pinned memory; issuing all DMA
-        # transfers here lets subsequent pop_chunk iterations find the tensors already
-        # on device instead of triggering a mid-compute transfer each time.
-        if self.cfg.pin_data_to_cpu:
-            with tf.device('/GPU:0'):
-                struct_chunks = [
-                    {k: tf.identity(v) for k, v in chunk.items()}
-                    for chunk in struct_chunks
-                ]
+        # Streaming evaluation: outer loop = structure chunks, inner = population
+        # chunks. Each struct chunk is staged to GPU just-in-time, evaluated
+        # against every population chunk, then released before the next struct
+        # chunk is staged. Per-chunk per-structure errors are reduced into
+        # running accumulators so the full [C, B] tensor never materialises.
+        # Peak VRAM = max(chunk_size) × C, not sum(chunk_size) × C as before.
+        # Critical for full-batch training where batch_size=None.
 
-        for p_start in range(0, P, pop_chunk):
-            p_end      = min(p_start + pop_chunk, P)
-            candidates = samples_tf[p_start:p_end]  # [C, dim]
+        # Pre-compute per-type counts on host (independent of population).
+        # tc_full is [B, T]; sums over the full batch. Per-chunk contributions
+        # are accumulated below.
+        if return_per_type:
+            tc_full = batch_data["types_contained"]                     # [B, T]
+            type_counts = tf.maximum(tf.reduce_sum(tc_full, axis=0), 1.0)  # [T]
 
-            chunk_parts = []
-            for chunk in struct_chunks:
-                chunk_parts.append(self._evaluate_chunk(candidates, chunk))
+        # Running accumulators: total error per candidate (and per-type when
+        # return_per_type is set). Shape [P] or [P, T+1] (last column is
+        # global). Built by concatenating per-pop-chunk reductions across
+        # structure chunks.
+        total_acc_parts: list = [None] * ((P + pop_chunk - 1) // pop_chunk)
+        per_type_acc_parts: list = [None] * len(total_acc_parts) if return_per_type else []
 
-            # Concatenate structure chunks → [C, B]
-            per_struct_err = tf.concat(chunk_parts, axis=1)
+        for chunk_idx, chunk in enumerate(struct_chunks):
+            # Stage just this chunk to GPU. When pin_data_to_cpu=False the
+            # tf.identity is essentially a no-op; when True it's the per-chunk
+            # DMA. Either way we hold one chunk's tensors at a time.
+            if self.cfg.pin_data_to_cpu:
+                with tf.device('/GPU:0'):
+                    chunk = {k: tf.identity(v) for k, v in chunk.items()}
 
-            # Apply inverse-magnitude weighting
-            if use_inv_weight:
-                per_struct_err = per_struct_err * inv_weights[tf.newaxis, :]  # [C, B]
+            B_chunk = chunk["descriptors"].shape[0]
+            chunk_lo = chunk_idx * struct_chunk
+            chunk_hi = chunk_lo + B_chunk
 
+            # Slice precomputed [B]-shaped quantities to this chunk's range.
+            inv_chunk = inv_weights[chunk_lo:chunk_hi] if use_inv_weight else None
+            tc_chunk = tc_full[chunk_lo:chunk_hi] if return_per_type else None
+
+            for pop_idx, p_start in enumerate(range(0, P, pop_chunk)):
+                p_end      = min(p_start + pop_chunk, P)
+                candidates = samples_tf[p_start:p_end]                  # [C, dim]
+                chunk_err = self._evaluate_chunk(candidates, chunk)      # [C, B_chunk]
+
+                if use_inv_weight:
+                    chunk_err = chunk_err * inv_chunk[tf.newaxis, :]
+
+                # Accumulate global sum over structures: [C]
+                global_part = tf.reduce_sum(chunk_err, axis=1)
+                if total_acc_parts[pop_idx] is None:
+                    total_acc_parts[pop_idx] = global_part
+                else:
+                    total_acc_parts[pop_idx] = total_acc_parts[pop_idx] + global_part
+
+                if return_per_type:
+                    # Per-type sums: einsum reduces both struct and m axes in
+                    # one fused op, yielding [C, T] per chunk.
+                    per_type_chunk = tf.einsum('cb,bt->ct', chunk_err, tc_chunk)  # [C, T]
+                    if per_type_acc_parts[pop_idx] is None:
+                        per_type_acc_parts[pop_idx] = per_type_chunk
+                    else:
+                        per_type_acc_parts[pop_idx] = per_type_acc_parts[pop_idx] + per_type_chunk
+
+                del chunk_err
+            # Drop the chunk reference so its GPU tensors can be freed before
+            # we stage the next chunk. Important when pin_data_to_cpu=True and
+            # the chunk was just DMA'd; harmless otherwise.
+            del chunk
+
+        # Convert accumulated sums of squared/abs errors → fitness (RMSE / MAE).
+        # The same reductions as the old code, just applied once after the
+        # streaming loop instead of per pop_chunk.
+        for pop_idx in range(len(total_acc_parts)):
+            global_err = total_acc_parts[pop_idx]                       # [C]
             if return_per_type:
-                tc = batch_data["types_contained"]  # [B, T]
+                per_type_err = per_type_acc_parts[pop_idx]              # [C, T]
                 per_type_parts = []
                 for t in range(T):
-                    tc_t = tc[:, t]                                    # [B] float mask
-                    n_t = tf.maximum(tf.reduce_sum(tc_t), 1.0)         # count
-                    type_err = tf.einsum('cb,b->c', per_struct_err, tc_t)  # [C]
                     if use_mae:
-                        type_fitness = type_err / (n_t * T_dim_f)
+                        per_type_parts.append(per_type_err[:, t] / (type_counts[t] * T_dim_f))
                     else:
-                        type_fitness = tf.sqrt(tf.maximum(type_err / (n_t * T_dim_f), 0.0))
-                    per_type_parts.append(type_fitness)
+                        per_type_parts.append(tf.sqrt(tf.maximum(
+                            per_type_err[:, t] / (type_counts[t] * T_dim_f), 0.0)))
                 # Global (index T)
-                global_err = tf.reduce_sum(per_struct_err, axis=1)     # [C]
                 if use_mae:
-                    global_fitness = global_err / (B_f * T_dim_f)
+                    per_type_parts.append(global_err / (B_f * T_dim_f))
                 else:
-                    global_fitness = tf.sqrt(tf.maximum(global_err / (B_f * T_dim_f), 0.0))
-                per_type_parts.append(global_fitness)
-                all_fitness.append(tf.stack(per_type_parts, axis=1))   # [C, T+1]
+                    per_type_parts.append(tf.sqrt(tf.maximum(global_err / (B_f * T_dim_f), 0.0)))
+                all_fitness.append(tf.stack(per_type_parts, axis=1))    # [C, T+1]
             else:
-                total_err = tf.reduce_sum(per_struct_err, axis=1)      # [C]
                 if use_mae:
-                    chunk_fitness = total_err / (B_f * T_dim_f)
+                    chunk_fitness = global_err / (B_f * T_dim_f)
                 else:
-                    chunk_fitness = tf.sqrt(tf.maximum(total_err / (B_f * T_dim_f), 0.0))
+                    chunk_fitness = tf.sqrt(tf.maximum(global_err / (B_f * T_dim_f), 0.0))
                 all_fitness.append(chunk_fitness)
 
         if return_per_type:

@@ -491,12 +491,13 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     # GPU builder accepts a progress label; quippy ignores extra kwargs via
     # its existing signature. The "Building descriptors..." print + per-chunk
     # tqdm is emitted by DescriptorBuilderGPUTF.build_descriptors.
+    # Test descriptors are NOT built here — they're constructed lazily at
+    # scoring time by `materialize_test_data` (avoids paying that cost
+    # before training when the user might want to abort early).
     _kw = {"progress_desc": "Building train descriptors"} if cfg.descriptor_mode == 1 else {}
     train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset, **_kw)
     _kw = {"progress_desc": "Building val descriptors"} if cfg.descriptor_mode == 1 else {}
     val_descriptors,   val_gradients,   val_grad_index   = builder.build_descriptors(val_dataset, **_kw)
-    _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
-    test_descriptors,  test_gradients,  test_grad_index  = builder.build_descriptors(test_dataset, **_kw)
 
     if cfg.scale_descriptors:
         all_desc = tf.concat(train_descriptors, axis=0)  # [total_train_atoms, dim_q]
@@ -567,17 +568,74 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         print("  Descriptor scaling roundtrip check passed.")
 
     train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
-    test_data = assemble_data_dict(test_dataset, test_types_int, test_descriptors, test_gradients, test_grad_index, cfg)
-    val_data = assemble_data_dict(val_dataset, val_types_int, val_descriptors, val_gradients, val_grad_index, cfg)
+    val_data   = assemble_data_dict(val_dataset,   val_types_int,   val_descriptors,   val_gradients,   val_grad_index,   cfg)
+    # Test set: deferred. Stash the raw atoms + per-atom type indices so
+    # `materialize_test_data` can build descriptors at scoring time. The
+    # rest of train_model treats this dict as opaque until then.
+    test_pending = {
+        "_pending_test": True,
+        "dataset": test_dataset,
+        "types_int": test_types_int,
+    }
     n_train = len(train_data["positions"])
-    n_test_actual = len(test_data["positions"])
-    n_val = len(val_data["positions"])
+    n_test  = len(test_dataset)
+    n_val   = len(val_data["positions"])
     if cfg.test_data_path is not None:
         print(f"{n_structures} structures split into train ({n_train}) + val ({n_val})")
-        print(f"External test set: {n_test_actual} structures from {cfg.test_data_path}")
+        print(f"External test set: {n_test} structures from {cfg.test_data_path} (descriptors deferred to scoring)")
     else:
-        print(f"{n_structures} structures split into train ({n_train}) + test ({n_test_actual}) + val ({n_val})")
-    return train_data, test_data, val_data
+        print(f"{n_structures} structures split into train ({n_train}) + test ({n_test}) + val ({n_val}) "
+              f"(test descriptors deferred to scoring)")
+    return train_data, test_pending, val_data
+
+
+def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
+                          num_types: int | None = None,
+                          pin_to_cpu: bool | None = None) -> dict:
+    """Build test descriptors on demand and return a ready-to-score data dict.
+
+    Idempotent: if `test_pending` has already been materialised, the cached
+    dict is returned unchanged. The cached dict is stashed in
+    `test_pending["_built"]` so callers can hold onto the same `test_pending`
+    handle across the training loop and scoring without rebuilding.
+
+    Args:
+        test_pending : dict from `split()`'s third return value with
+                       `_pending_test=True` plus raw `dataset` and
+                       `types_int` keys.
+        cfg          : TNEPconfig (descriptor backend, target_mode, ...)
+        num_types    : passed to `pad_and_stack`. Defaults to cfg.num_types.
+        pin_to_cpu   : passed to `pad_and_stack`. Defaults to
+                       cfg.pin_data_to_cpu.
+
+    Returns:
+        Padded, stacked test_data dict (same shape as train_data / val_data).
+    """
+    if not test_pending.get("_pending_test", False):
+        return test_pending  # already materialised or never deferred
+    cached = test_pending.get("_built")
+    if cached is not None:
+        return cached
+
+    if num_types is None:
+        num_types = cfg.num_types
+    if pin_to_cpu is None:
+        pin_to_cpu = cfg.pin_data_to_cpu
+
+    builder = make_descriptor_builder(cfg)
+    _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
+    test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(
+        test_pending["dataset"], **_kw)
+    test_data = assemble_data_dict(
+        test_pending["dataset"], test_pending["types_int"],
+        test_descriptors, test_gradients, test_grad_index, cfg)
+    test_data = pad_and_stack(test_data, num_types=num_types, pin_to_cpu=pin_to_cpu)
+    test_pending["_built"] = test_data
+    # Free the raw atom list now that descriptors are baked in (it can be
+    # large for organic test sets).
+    test_pending["dataset"] = None
+    test_pending["types_int"] = None
+    return test_data
 
 
 def pad_and_stack(data: dict, num_types: int | None = None,

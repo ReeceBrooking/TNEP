@@ -134,7 +134,7 @@ class TNEPconfig:
     # For very large systems (>50k edges per structure), start at 50 and reduce if OOM.
     population_chunk_size: int | None = None
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
-    batch_chunk_size: int | None = None
+    batch_chunk_size: int | None = 1000
     # Number of parallel workers for SOAP descriptor computation.
     # None = auto (reads SLURM_CPUS_PER_TASK at DescriptorBuilder init time, falls back to 1)
     # 1    = serial (current behaviour, default outside SLURM)

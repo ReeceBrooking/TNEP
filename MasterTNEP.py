@@ -23,7 +23,7 @@ from TNEPconfig import TNEPconfig
 from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
                   assign_type_indices, prepare_eval_data, print_score_summary,
-                  _resolve_target_key)
+                  _resolve_target_key, materialize_test_data)
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
                       plot_timing, plot_correlation, plot_cosine_similarity,
                       plot_loss_breakdown, plot_error_vs_magnitude)
@@ -59,13 +59,24 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
 
     cfg.randomise(dataset)
 
-    # Split into train/test/val and build SOAP descriptors (slow)
-    train_data, test_data, val_data = split(dataset, dataset_types_int, cfg)
+    # Split into train/val (built now) and a deferred test placeholder. The
+    # test descriptors are built on first scoring (materialize_test_data),
+    # not before training — saves time when the user aborts mid-run and
+    # avoids a large test-set descriptor build delaying generation 0.
+    train_data, test_pending, val_data = split(dataset, dataset_types_int, cfg)
 
-    # Convert to padded dense tensors for GPU-batched evaluation
+    # Convert to padded dense tensors for GPU-batched evaluation. test_data
+    # is intentionally NOT padded here; it gets padded by materialize_test_data
+    # the first time it's actually consumed.
     train_data = pad_and_stack(train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu)
-    test_data  = pad_and_stack(test_data,  num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu)
     val_data   = pad_and_stack(val_data,   num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu)
+
+    # Lazy-build helper. First call performs descriptor build + pad_and_stack;
+    # subsequent calls return the cached dict (idempotent on test_pending).
+    def get_test_data():
+        return materialize_test_data(test_pending, cfg,
+                                     num_types=cfg.num_types,
+                                     pin_to_cpu=cfg.pin_data_to_cpu)
 
     # dim_q is determined by the SOAP descriptor size
     cfg.dim_q = train_data["descriptors"][0].shape[-1]
@@ -83,6 +94,9 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     def periodic_plot_callback(history, gen):
         """Called during training at plot_interval to show progress."""
         print(f"\n--- Periodic plots at generation {gen} ---")
+        # First periodic plot triggers the deferred test descriptor build.
+        # Subsequent calls return the cached padded dict instantly.
+        test_data = get_test_data()
         m, preds = model.score(test_data)
         print(f"  Test RMSE: {float(m['rmse']):.4f}  R²: {float(m['r2']):.4f}")
         if "total_rmse" in m:
@@ -115,6 +129,10 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     history, final_model, best_val_model = model.fit(
         train_data, val_data,
         plot_callback=periodic_plot_callback if cfg.plot_interval else None)
+
+    # Build the test descriptors now (if not already built by a periodic
+    # plot during training), then score final + best-val on it.
+    test_data = get_test_data()
 
     # Score final-generation model
     final_metrics, final_preds = final_model.score(test_data)

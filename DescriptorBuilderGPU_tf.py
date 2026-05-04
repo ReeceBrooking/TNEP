@@ -2455,6 +2455,14 @@ class DescriptorBuilderGPUTF:
               f"batch_frames: {eff_batch_frames}, "
               f"pair_tile_size: {self._pair_tile_size}, "
               f"calc_gradients: {calc_gradients})")
+        # Resolve the storage device for the per-frame TF tensors. When
+        # pin_data_to_cpu=True we pin them on host RAM so the (potentially
+        # tens of thousands of small per-atom gradient tensors) don't pile
+        # up in VRAM between train/val/test descriptor builds. Without this,
+        # tf.convert_to_tensor uses the default device (GPU) and the
+        # accumulated per-frame state can OOM at large S.
+        pin = bool(getattr(self.cfg, "pin_data_to_cpu", True))
+        target_device = "/CPU:0" if pin else "/GPU:0"
         flat = self.build_descriptors_flat(
             dataset, calc_gradients=calc_gradients, batch_frames=batch_frames,
             progress=True, progress_desc=progress_desc,
@@ -2462,32 +2470,41 @@ class DescriptorBuilderGPUTF:
         dataset_descriptors = []
         dataset_gradients = []
         dataset_grad_index = []
-        for atoms, item in zip(dataset, flat):
-            soap, grad, pa, pg = item
-            N = soap.shape[0]
-            dataset_descriptors.append(
-                tf.convert_to_tensor(soap, dtype=tf.float32)
-            )
-            if calc_gradients:
-                grads_per_atom = [[] for _ in range(N)]
-                idx_per_atom = [[] for _ in range(N)]
-                for p in range(len(pa)):
-                    i = int(pa[p])
-                    grads_per_atom[i].append(grad[p])
-                    idx_per_atom[i].append(int(pg[p]))
-                grads_tf = [
-                    tf.convert_to_tensor(np.asarray(g, dtype=np.float32), dtype=tf.float32)
-                    for g in grads_per_atom
-                ]
-                dataset_gradients.append(grads_tf)
-                dataset_grad_index.append(idx_per_atom)
-            else:
-                # Empty per-atom lists: training pipeline will pad to zero pairs
-                dataset_gradients.append([
-                    tf.zeros((0, 3, soap.shape[1]), dtype=tf.float32)
-                    for _ in range(N)
-                ])
-                dataset_grad_index.append([[] for _ in range(N)])
+        # Stream the per-frame conversion under a single device-scope so
+        # every newly-created tensor lands on the right device. After each
+        # frame, drop the consumed `flat` entry so its NumPy backing buffer
+        # can be freed before we build the next.
+        with tf.device(target_device):
+            for atoms, item in zip(dataset, flat):
+                soap, grad, pa, pg = item
+                N = soap.shape[0]
+                dataset_descriptors.append(
+                    tf.convert_to_tensor(soap, dtype=tf.float32)
+                )
+                if calc_gradients:
+                    grads_per_atom = [[] for _ in range(N)]
+                    idx_per_atom = [[] for _ in range(N)]
+                    for p in range(len(pa)):
+                        i = int(pa[p])
+                        grads_per_atom[i].append(grad[p])
+                        idx_per_atom[i].append(int(pg[p]))
+                    grads_tf = [
+                        tf.convert_to_tensor(np.asarray(g, dtype=np.float32), dtype=tf.float32)
+                        for g in grads_per_atom
+                    ]
+                    dataset_gradients.append(grads_tf)
+                    dataset_grad_index.append(idx_per_atom)
+                else:
+                    # Empty per-atom lists: training pipeline will pad to zero pairs
+                    dataset_gradients.append([
+                        tf.zeros((0, 3, soap.shape[1]), dtype=tf.float32)
+                        for _ in range(N)
+                    ])
+                    dataset_grad_index.append([[] for _ in range(N)])
+        # Drop references to the source NumPy arrays so they can be GC'd
+        # before pad_and_stack runs. Otherwise both representations live
+        # in host RAM concurrently.
+        del flat
         return dataset_descriptors, dataset_gradients, dataset_grad_index
 
 
