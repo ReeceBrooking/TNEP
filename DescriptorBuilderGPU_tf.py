@@ -2090,6 +2090,7 @@ class DescriptorBuilderGPUTF:
         jit_compile: bool = False,
         progress: bool = False,
         progress_desc: str = "Building descriptors",
+        use_tf_nl: bool | None = None,
     ) -> list:
         """Per-frame flat COO output, with optional gradient computation.
 
@@ -2150,6 +2151,7 @@ class DescriptorBuilderGPUTF:
             results.extend(self._build_flat_chunk(
                 chunk, calc_gradients, return_tf=return_tf,
                 with_grad_fn=with_grad_fn, fwd_only_fn=fwd_only_fn,
+                use_tf_nl=use_tf_nl,
             ))
         return results
 
@@ -2214,7 +2216,8 @@ class DescriptorBuilderGPUTF:
 
     def _build_flat_chunk(self, chunk: list, calc_gradients: bool,
                           return_tf: bool = False,
-                          with_grad_fn=None, fwd_only_fn=None) -> list:
+                          with_grad_fn=None, fwd_only_fn=None,
+                          use_tf_nl: bool | None = None) -> list:
         """Process a chunk of frames in one TF call.
 
         Single-frame chunks still go through the locked compute_fn (one trace
@@ -2224,6 +2227,14 @@ class DescriptorBuilderGPUTF:
         When return_tf=True the per-frame slices stay as TF tensors on the
         compute device (no .numpy()), so the trajectory pipeline can hand them
         straight to the pack/predict graphs without a host round-trip.
+
+        use_tf_nl controls the neighbour-list backend. None = default
+        (NumPy NL). The TF NL pushes positions to the GPU and runs the NL
+        kernel there, but the per-frame outputs are immediately materialised
+        back to host for the (still-NumPy) per-frame bookkeeping below — so
+        for CPU-resident atoms (training) the TF NL is ~5 GPU↔CPU syncs
+        per frame of pure overhead. The trajectory pipeline can pass
+        use_tf_nl=True if it ever has positions already on-device.
 
         with_grad_fn / fwd_only_fn are the locked compute fns for the
         currently-selected (dtype, jit_compile) — passed in so the chunk
@@ -2241,10 +2252,12 @@ class DescriptorBuilderGPUTF:
         all_pa, all_pg, all_pneigh = [], [], []
         all_central, all_active = [], []
         atom_offset = 0
-        # Phase 4: when staying in TF land we use the TF NL (everything stays
-        # on-device through to the predict step). NumPy NL stays the default
-        # for the legacy / training path so a TF-NL regression is bisectable.
-        use_tf_nl = return_tf
+        # NumPy NL is the default for both training and the OTF/trajectory
+        # paths — for CPU-resident ASE atoms the TF NL only adds GPU↔CPU
+        # sync overhead. Callers with already-on-device positions can opt
+        # in via use_tf_nl=True.
+        if use_tf_nl is None:
+            use_tf_nl = False
         for atoms in chunk:
             positions = np.asarray(atoms.positions, dtype=np.float64)
             cell = np.asarray(atoms.cell.array, dtype=np.float64)
@@ -2506,6 +2519,94 @@ class DescriptorBuilderGPUTF:
         # in host RAM concurrently.
         del flat
         return dataset_descriptors, dataset_gradients, dataset_grad_index
+
+    def build_descriptors_streaming_to_disk(
+        self,
+        dataset: list,
+        gv_path: str,
+        chunk_size: int | None = None,
+        calc_gradients: bool = True,
+        progress_desc: str = "Building descriptors (streaming to disk)",
+    ) -> dict:
+        """Build SOAP descriptors+gradients with gradients streamed directly
+        to a binary file on disk.
+
+        Peak host RAM during the build is bounded by `chunk_size` structures'
+        worth of gradient (typically a few hundred MB for organics at
+        chunk_size=100), instead of the dataset-wide ~10 GB COO that the
+        normal `build_descriptors` path materialises before disk caching.
+
+        Args:
+            dataset        : list of ase.Atoms.
+            gv_path        : path to a binary file the gradient bytes are
+                             appended into. Truncated on entry.
+            chunk_size     : number of structures per build call. None falls
+                             back to cfg.descriptor_batch_frames (default 100).
+            calc_gradients : if False, the gradient slice is empty.
+            progress_desc  : tqdm label.
+
+        Returns dict with the data needed by `pad_and_stack` to assemble the
+        rest of the COO COO+padded outputs without ever holding all the
+        gradients in RAM:
+            descriptors            : list[np.ndarray [N_i, Q] float32]
+            pair_atom_per_struct   : list[np.ndarray [P_i] int32]
+            pair_gidx_per_struct   : list[np.ndarray [P_i] int32]
+            pair_count_per_struct  : list[int]
+            gv_path                : str
+            gv_shape               : (P_total, 3, Q)
+            gv_dtype               : np.dtype
+        """
+        self._ensure_cache()
+        if chunk_size is None:
+            chunk_size = getattr(self.cfg, "descriptor_batch_frames", 100) or 100
+        with_grad_fn, fwd_only_fn = self._get_compute_fns(jit_compile=False)
+
+        Q = int(self._cache["mask_info"]["n_compressed"])
+        descriptors: list = []
+        pair_atom_per_struct: list = []
+        pair_gidx_per_struct: list = []
+        pair_count_per_struct: list = []
+        P_total = 0
+
+        chunk_starts = list(range(0, len(dataset), int(chunk_size)))
+        iterator = chunk_starts
+        if len(chunk_starts) >= 2:
+            iterator = tqdm(chunk_starts, desc=progress_desc, unit="chunk",
+                            total=len(chunk_starts))
+
+        # Truncate / open output file. Append per-chunk via tofile().
+        with open(gv_path, "wb") as f:
+            for cstart in iterator:
+                chunk = dataset[cstart:cstart + int(chunk_size)]
+                # NumPy-output flat path: per-frame (soap, grad, pa, pg)
+                # numpy arrays — exactly the format we want to stream.
+                flat = self._build_flat_chunk(
+                    chunk, calc_gradients=calc_gradients, return_tf=False,
+                    with_grad_fn=with_grad_fn, fwd_only_fn=fwd_only_fn,
+                )
+                for soap, grad, pa, pg in flat:
+                    descriptors.append(np.asarray(soap, dtype=np.float32))
+                    pa32 = np.asarray(pa, dtype=np.int32)
+                    pg32 = np.asarray(pg, dtype=np.int32)
+                    pair_atom_per_struct.append(pa32)
+                    pair_gidx_per_struct.append(pg32)
+                    P_i = int(grad.shape[0]) if grad.size else 0
+                    pair_count_per_struct.append(P_i)
+                    if P_i:
+                        np.ascontiguousarray(grad, dtype=np.float32).tofile(f)
+                        P_total += P_i
+                # Drop the chunk's working tensors before the next build.
+                del flat
+
+        return dict(
+            descriptors=descriptors,
+            pair_atom_per_struct=pair_atom_per_struct,
+            pair_gidx_per_struct=pair_gidx_per_struct,
+            pair_count_per_struct=pair_count_per_struct,
+            gv_path=gv_path,
+            gv_shape=(P_total, 3, Q),
+            gv_dtype=np.dtype(np.float32),
+        )
 
 
 # =========================================================================

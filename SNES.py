@@ -439,26 +439,37 @@ class SNES:
 
             samples, s = self.ask()
 
-            # Select batch: None = full train set, int = random subset
+            # Select batch: None = full train set, int = random subset.
             if cfg.batch_size is None:
                 batch_data = train_data
             else:
                 batch_idx_tf = tf.argsort(
                     self.tf_rng.uniform(shape=[S_train]))[:cfg.batch_size]
                 struct_keys = ["descriptors", "positions", "Z_int", "boxes",
-                               "targets", "atom_mask"]
+                               "num_atoms", "targets", "atom_mask"]
                 if "types_contained" in train_data:
                     struct_keys.append("types_contained")
                 batch_data = {
                     key: tf.gather(train_data[key], batch_idx_tf)
                     for key in struct_keys
                 }
-                # COO pair gather: select pairs belonging to the sampled structures
+                # COO pair gather: select pairs belonging to the sampled
+                # structures.
                 pair_starts = tf.gather(train_data["struct_ptr"], batch_idx_tf)
                 pair_ends   = tf.gather(train_data["struct_ptr"], batch_idx_tf + 1)
                 pair_ranges = tf.ragged.range(pair_starts, pair_ends)
                 flat_pair_idx = tf.cast(pair_ranges.flat_values, tf.int32)
-                batch_data["grad_values"] = tf.gather(train_data["grad_values"], flat_pair_idx)
+                gv_full = train_data["grad_values"]
+                if train_data.get("_gv_disk_backed", False):
+                    # Disk-backed: read this batch's pair slice from the
+                    # memmap. ~85 MB at batch=50 / fp32 / Q=645 — one DMA
+                    # into the tf.constant; the chunk loop then gathers
+                    # that batch tensor per chunk in-GPU.
+                    flat_pair_idx_np = flat_pair_idx.numpy()
+                    batch_data["grad_values"] = tf.constant(
+                        np.asarray(gv_full[flat_pair_idx_np]))
+                else:
+                    batch_data["grad_values"] = tf.gather(gv_full, flat_pair_idx)
                 batch_data["pair_atom"]   = tf.gather(train_data["pair_atom"],   flat_pair_idx)
                 batch_data["pair_gidx"]   = tf.gather(train_data["pair_gidx"],   flat_pair_idx)
                 batch_data["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
@@ -625,30 +636,16 @@ class SNES:
         Returns:
             fitness : float — mean RMSE
         """
-        if self.cfg.val_size is None:
-            batch_data = val_data
-        else:
-            S_val = val_data["descriptors"].shape[0]
-            val_idx_tf = tf.argsort(
-                self.tf_rng.uniform(shape=[S_val]))[:self.cfg.val_size]
+        from data import slice_and_complete_chunk
+        S_val = val_data["num_atoms"].shape[0]
 
-            val_struct_keys = ["descriptors", "positions", "Z_int", "boxes",
-                               "targets", "atom_mask"]
-            batch_data = {
-                key: tf.gather(val_data[key], val_idx_tf)
-                for key in val_struct_keys
-            }
-            pair_starts = tf.gather(val_data["struct_ptr"], val_idx_tf)
-            pair_ends   = tf.gather(val_data["struct_ptr"], val_idx_tf + 1)
-            pair_ranges = tf.ragged.range(pair_starts, pair_ends)
-            flat_pair_idx = tf.cast(pair_ranges.flat_values, tf.int32)
-            batch_data["grad_values"] = tf.gather(val_data["grad_values"], flat_pair_idx)
-            batch_data["pair_atom"]   = tf.gather(val_data["pair_atom"],   flat_pair_idx)
-            batch_data["pair_gidx"]   = tf.gather(val_data["pair_gidx"],   flat_pair_idx)
-            batch_data["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
-            batch_pair_counts = tf.cast(pair_ranges.row_lengths(), tf.int32)
-            batch_data["struct_ptr"] = tf.concat(
-                [[0], tf.cumsum(batch_pair_counts)], axis=0)
+        # Resolve subsample indices once. None = full val set.
+        if self.cfg.val_size is None:
+            val_idx_tf = tf.range(S_val, dtype=tf.int32)
+        else:
+            val_idx_tf = tf.cast(
+                tf.argsort(self.tf_rng.uniform(shape=[S_val]))[:self.cfg.val_size],
+                tf.int32)
 
         if mu_tf is not None:
             params = self.reconstruct_params_tf(mu_tf)
@@ -664,26 +661,60 @@ class SNES:
             W1p = getattr(self.model, 'W1_pol', None)
             b1p = getattr(self.model, 'b1_pol', None)
 
-        preds = self.model.predict_batch(
-            batch_data["descriptors"], batch_data["grad_values"],
-            batch_data["pair_atom"], batch_data["pair_gidx"], batch_data["pair_struct"],
-            batch_data["positions"], batch_data["Z_int"], batch_data["boxes"],
-            batch_data["atom_mask"],
-            W0, b0, W1, b1, W0p, b0p, W1p, b1p,
-        )
-        if self.cfg.scale_targets and self.cfg.target_mode == 1:
-            num_atoms = tf.reduce_sum(batch_data["atom_mask"], axis=1)  # [B]
-            preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]
+        # Streaming chunk loop honours batch_chunk_size so disk reads (when
+        # cache_gradients_to_disk is set) and tensor materialisation stay
+        # bounded. Full-val (val_size=None) takes the contiguous-range path
+        # via `prefetched_chunks`; a random val subset falls back to the
+        # per-call slice path.
+        from data import slice_and_complete_chunk, prefetched_chunks
+        N_idx = int(val_idx_tf.shape[0])
+        struct_chunk = self.cfg.batch_chunk_size if self.cfg.batch_chunk_size is not None else N_idx
 
-        diff = preds - batch_data["targets"]
-        # Apply shear weighting for polarizability off-diagonal components
-        if self._pol_weights is not None:
-            diff_sq = tf.square(diff) * self._pol_weights
+        diff_sq_sum = tf.constant(0.0, dtype=tf.float32)
+        diff_count  = tf.constant(0.0, dtype=tf.float32)
+
+        def _consume(chunk):
+            nonlocal diff_sq_sum, diff_count
+            preds = self.model.predict_batch(
+                chunk["descriptors"], chunk["grad_values"],
+                chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
+                chunk["positions"], chunk["Z_int"], chunk["boxes"],
+                chunk["atom_mask"],
+                W0, b0, W1, b1, W0p, b0p, W1p, b1p,
+            )
+            if self.cfg.scale_targets and self.cfg.target_mode == 1:
+                num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
+                preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]
+            diff = preds - chunk["targets"]
+            if self._pol_weights is not None:
+                ds = tf.square(diff) * self._pol_weights
+            else:
+                ds = tf.square(diff)
+            diff_sq_sum += tf.reduce_sum(ds)
+            diff_count  += tf.cast(tf.size(ds), tf.float32)
+
+        if self.cfg.val_size is None:
+            ranges = [(s, min(s + struct_chunk, N_idx)) for s in range(0, N_idx, struct_chunk)]
+            for _, _, chunk in prefetched_chunks(
+                    val_data, ranges,
+                    pin_to_cpu=self.cfg.pin_data_to_cpu,
+                    enabled=getattr(self.cfg, "chunk_prefetch", True),
+                    depth=getattr(self.cfg, "prefetch_depth", 1)):
+                _consume(chunk)
+                del chunk
         else:
-            diff_sq = tf.square(diff)
+            for s_start in range(0, N_idx, struct_chunk):
+                s_end = min(s_start + struct_chunk, N_idx)
+                sub_idx = val_idx_tf[s_start:s_end]
+                chunk = slice_and_complete_chunk(val_data, sub_idx)
+                if self.cfg.pin_data_to_cpu:
+                    with tf.device('/GPU:0'):
+                        chunk = {k: (tf.identity(v) if not k.startswith("_") else v)
+                                 for k, v in chunk.items()}
+                _consume(chunk)
+                del chunk
 
-        rmse = tf.sqrt(tf.maximum(tf.reduce_mean(diff_sq), 0.0))
-
+        rmse = tf.sqrt(tf.maximum(diff_sq_sum / tf.maximum(diff_count, 1.0), 0.0))
         return float(rmse)
 
     def reconstruct_params_tf(self, param_vectors: tf.Tensor) -> tuple:
@@ -836,21 +867,28 @@ class SNES:
                       OR [P, T+1] if return_per_type=True
         """
         P = self.pop_size
-        B = batch_data["descriptors"].shape[0]
+        # B is the number of structures in the batch. In OTF mode the
+        # `descriptors` slot is zero-sized along the Q axis (placeholder),
+        # so use `num_atoms` whose leading axis is the structure count in
+        # both modes.
+        B = batch_data["num_atoms"].shape[0]
         T_dim = batch_data["targets"].shape[1]
         pop_chunk = self.cfg.population_chunk_size if self.cfg.population_chunk_size is not None else P
         struct_chunk = self.cfg.batch_chunk_size if self.cfg.batch_chunk_size is not None else B
-
-        struct_only_keys = ["descriptors", "positions", "Z_int", "boxes",
-                            "targets", "atom_mask"]
-        if "types_contained" in batch_data:
-            struct_only_keys.append("types_contained")
 
         T = self.cfg.num_types
         T_dim_f = tf.cast(T_dim, tf.float32)
         B_f = tf.cast(B, tf.float32)
         use_mae = self._use_mae
         use_inv_weight = self._use_inv_weight
+
+        # Pick between the standard and XLA-compiled chunk evaluator.
+        # XLA fuses the per-chunk eval into a single GPU kernel and is
+        # typically 1.5-2× faster, but compiles per unique (B, P) shape
+        # — paid as upfront cost in the first generation.
+        eval_chunk_fn = (self._evaluate_chunk_xla
+                         if getattr(self.cfg, "eval_jit_compile", False)
+                         else self._evaluate_chunk)
 
         # Precompute inverse-magnitude weights once: w[b] = 1 / max(||target_b||^2, eps)
         if use_inv_weight:
@@ -861,34 +899,15 @@ class SNES:
 
         all_fitness = []
 
-        # One .numpy() call reads the entire struct_ptr index into CPU memory,
-        # eliminating per-iteration int() syncs that would stall the GPU.
-        ptr = batch_data["struct_ptr"].numpy()
-
-        # Pre-build all structure chunk dicts once. Slice/dict work is not repeated
-        # per pop_chunk iteration, and COO pair_struct offsets are applied here.
-        struct_chunks = []
-        for s_start in range(0, B, struct_chunk):
-            s_end        = min(s_start + struct_chunk, B)
-            p_lo, p_hi   = int(ptr[s_start]), int(ptr[s_end])
-            chunk        = {key: batch_data[key][s_start:s_end] for key in struct_only_keys}
-            chunk["grad_values"] = batch_data["grad_values"][p_lo:p_hi]
-            chunk["pair_atom"]   = batch_data["pair_atom"][p_lo:p_hi]
-            chunk["pair_gidx"]   = batch_data["pair_gidx"][p_lo:p_hi]
-            chunk["pair_struct"] = batch_data["pair_struct"][p_lo:p_hi] - s_start
-            struct_chunks.append(chunk)
-
         # Streaming evaluation: outer loop = structure chunks, inner = population
-        # chunks. Each struct chunk is staged to GPU just-in-time, evaluated
-        # against every population chunk, then released before the next struct
-        # chunk is staged. Per-chunk per-structure errors are reduced into
-        # running accumulators so the full [C, B] tensor never materialises.
-        # Peak VRAM = max(chunk_size) × C, not sum(chunk_size) × C as before.
-        # Critical for full-batch training where batch_size=None.
+        # chunks. Each chunk is built just-in-time by `prefetched_chunks` —
+        # purely on-GPU when `_gv_resident_gpu` is set, otherwise via the
+        # disk-staging pipe with optional prefetch overlap. Per-chunk
+        # per-structure errors are reduced into running accumulators so the
+        # full [C, B] tensor never materialises.
+        from data import prefetched_chunks
 
         # Pre-compute per-type counts on host (independent of population).
-        # tc_full is [B, T]; sums over the full batch. Per-chunk contributions
-        # are accumulated below.
         if return_per_type:
             tc_full = batch_data["types_contained"]                     # [B, T]
             type_counts = tf.maximum(tf.reduce_sum(tc_full, axis=0), 1.0)  # [T]
@@ -900,17 +919,21 @@ class SNES:
         total_acc_parts: list = [None] * ((P + pop_chunk - 1) // pop_chunk)
         per_type_acc_parts: list = [None] * len(total_acc_parts) if return_per_type else []
 
-        for chunk_idx, chunk in enumerate(struct_chunks):
-            # Stage just this chunk to GPU. When pin_data_to_cpu=False the
-            # tf.identity is essentially a no-op; when True it's the per-chunk
-            # DMA. Either way we hold one chunk's tensors at a time.
-            if self.cfg.pin_data_to_cpu:
-                with tf.device('/GPU:0'):
-                    chunk = {k: tf.identity(v) for k, v in chunk.items()}
-
-            B_chunk = chunk["descriptors"].shape[0]
-            chunk_lo = chunk_idx * struct_chunk
-            chunk_hi = chunk_lo + B_chunk
+        ranges = [(s, min(s + struct_chunk, B)) for s in range(0, B, struct_chunk)]
+        # Pad pair arrays to the global per-data max so XLA-compiled eval
+        # sees one shape and compiles once. None = no padding.
+        pad_pairs_to = (batch_data.get("_max_chunk_pairs")
+                        if getattr(self.cfg, "eval_jit_compile", False)
+                        else None)
+        for chunk_idx, (s_start, s_end, chunk) in enumerate(prefetched_chunks(
+                batch_data, ranges,
+                pin_to_cpu=self.cfg.pin_data_to_cpu,
+                enabled=getattr(self.cfg, "chunk_prefetch", True),
+                depth=getattr(self.cfg, "prefetch_depth", 1),
+                pad_pairs_to=pad_pairs_to)):
+            B_chunk = s_end - s_start
+            chunk_lo = s_start
+            chunk_hi = s_end
 
             # Slice precomputed [B]-shaped quantities to this chunk's range.
             inv_chunk = inv_weights[chunk_lo:chunk_hi] if use_inv_weight else None
@@ -919,7 +942,7 @@ class SNES:
             for pop_idx, p_start in enumerate(range(0, P, pop_chunk)):
                 p_end      = min(p_start + pop_chunk, P)
                 candidates = samples_tf[p_start:p_end]                  # [C, dim]
-                chunk_err = self._evaluate_chunk(candidates, chunk)      # [C, B_chunk]
+                chunk_err = eval_chunk_fn(candidates, chunk)             # [C, B_chunk]
 
                 if use_inv_weight:
                     chunk_err = chunk_err * inv_chunk[tf.newaxis, :]
@@ -941,9 +964,11 @@ class SNES:
                         per_type_acc_parts[pop_idx] = per_type_acc_parts[pop_idx] + per_type_chunk
 
                 del chunk_err
-            # Drop the chunk reference so its GPU tensors can be freed before
-            # we stage the next chunk. Important when pin_data_to_cpu=True and
-            # the chunk was just DMA'd; harmless otherwise.
+            # When the GPU LRU cache is active it owns the chunk's tensors
+            # across generations; otherwise this `del` releases them so the
+            # next chunk's stage starts with the freed VRAM. The prefetch
+            # worker may already hold a strong reference to the next
+            # chunk's tensors — that's fine, those are *its* allocation.
             del chunk
 
         # Convert accumulated sums of squared/abs errors → fitness (RMSE / MAE).
@@ -986,6 +1011,19 @@ class SNES:
 
     @tf.function(reduce_retracing=True)
     def _evaluate_chunk(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
+        return self._evaluate_chunk_impl(chunk_samples, batch_data)
+
+    @tf.function(reduce_retracing=True, jit_compile=True)
+    def _evaluate_chunk_xla(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
+        """XLA-compiled variant of _evaluate_chunk. The body is identical;
+        only the @tf.function decorator differs. XLA fuses the dipole
+        kernel pre-compute + per-type matmul + reduction into one GPU
+        kernel (~1.5-2× faster on Ada/Hopper). Each unique (B, P) shape
+        compiles once; with deterministic full-batch chunks the compile
+        cost is amortised over the run."""
+        return self._evaluate_chunk_impl(chunk_samples, batch_data)
+
+    def _evaluate_chunk_impl(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
         """Evaluate a chunk of C candidates on B structures.
 
         Returns per-structure error (SSE or SAE depending on loss_type) so that
@@ -1009,12 +1047,6 @@ class SNES:
         targets     = batch_data["targets"]       # [B, T_dim]
         amask       = batch_data["atom_mask"]     # [B, A]
 
-        # Pre-scale descriptors and COO gradients once for all candidates
-        if self.model._scale_descriptors:
-            scale = self.model._descriptor_mean
-            desc        = desc        / scale
-            grad_values = grad_values / scale
-
         # Precompute per-atom normalization factor once (not per-candidate)
         _scale_preds = self.cfg.scale_targets and self.cfg.target_mode == 1
         if _scale_preds:
@@ -1037,7 +1069,6 @@ class SNES:
                     desc, grad_values, pair_atom, pair_gidx, pair_struct,
                     pos, Z, boxes, amask,
                     w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
-                    prescaled=True,
                 )
                 diff = preds - targets  # [B, 6]
                 if _use_mae:
@@ -1052,11 +1083,18 @@ class SNES:
             W0, b0, W1, b1 = params
 
             # Precompute W_atom [B, A, 3, Q] once — independent of all candidates.
+            # Use static shapes when known (XLA needs compile-time dims for
+            # the segment_sum's num_segments arg); fall back to tf.shape for
+            # truly dynamic graphs.
+            B_static = desc.shape[0]
+            A_static = desc.shape[1]
+            B_arg = B_static if B_static is not None else tf.shape(desc)[0]
+            A_arg = A_static if A_static is not None else tf.shape(desc)[1]
             if self.cfg.target_mode == 1:
                 W_atom = self.model._precompute_dipole_kernel(
                     grad_values, pair_struct, pair_atom, pair_gidx,
                     pos, boxes,
-                    tf.shape(desc)[0], tf.shape(desc)[1])
+                    B_arg, A_arg)
             else:
                 W_atom = None
 

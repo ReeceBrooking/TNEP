@@ -19,10 +19,10 @@ class TNEPconfig:
     # Species filter mode: "subset" = keep structures with only allowed species,
     # "exact" = keep structures containing exactly all allowed species
     filter_mode: str = "subset"
-    # Bad data filtering options
-    filter_nan_positions: bool = False
-    filter_nan_targets: bool = False
-    filter_zero_targets: bool = False
+    # When True, drop structures with NaN positions, NaN targets, or
+    # zero-vector targets. Structures with missing targets are always
+    # dropped regardless (they can't be trained against).
+    filter_bad_data: bool = False
     num_neurons: int = 30
     # Number of structures used in each train step
     batch_size: int | None = None
@@ -87,6 +87,82 @@ class TNEPconfig:
     # default (6 GiB).
     descriptor_memory_budget_bytes: int | None = None
 
+    # When True, the bulky grad_values COO tensor is written to a
+    # temporary directory on disk (created next to the working directory
+    # so it lands on the same filesystem — NVMe in typical setups) and
+    # accessed via numpy memory-map. The directory is automatically
+    # removed when training ends. For large datasets (S > ~3000 organic
+    # structures) grad_values is the dominant memory term — putting it
+    # on disk cuts host RAM footprint to <500 MB while preserving
+    # precomputed-mode speed (per-chunk disk reads at NVMe sequential
+    # bandwidth ~5-10 ms, vs ~50-100 ms/gen for the rest of the
+    # training step).
+    cache_gradients_to_disk: bool = True
+
+    # Overlap disk → GPU staging of chunks N+1..N+prefetch_depth with
+    # GPU evaluation of chunk N. Up to `prefetch_depth` background
+    # threads run slice_and_complete_chunk concurrently with the
+    # consumer. depth=1 is the simple producer/consumer (one chunk in
+    # flight); depth=2 hides both disk read and host→GPU DMA behind
+    # compute; depth=3 helps further only when GPU compute > 2× disk
+    # pipe. Memory cost: depth × per-chunk grad slice (~few hundred MB
+    # at full-batch chunk_size=500 each). Set chunk_prefetch=False to
+    # bisect threading issues.
+    chunk_prefetch: bool = True
+    prefetch_depth: int = 2
+
+    # Number of pinned host buffers in the pool. Must be >=
+    # prefetch_depth + 1 (one for the chunk currently held by the
+    # consumer, prefetch_depth for in-flight staging). Each buffer is
+    # sized to the worst-case chunk grad slice — typically a few hundred
+    # MB — and is page-locked, so the total pinned RAM is
+    # pinned_pool_size × buffer_bytes. Bump cautiously.
+    pinned_pool_size: int = 4
+
+    # When True and libcufile is loadable, the disk-backed gradient cache
+    # is read directly from NVMe into pre-allocated GPU buffers via
+    # cuFile (NVIDIA GPUDirect Storage). On systems with the nvidia_fs
+    # kernel module loaded, this is true zero-copy disk→GPU DMA at full
+    # NVMe bandwidth. On WSL or other systems without nvidia_fs, cuFile
+    # falls back transparently to compat mode (kernel-stage buffer +
+    # CUDA-managed copy) which still saturates PCIe at ~17 GB/s once the
+    # page cache is warm — well above the ~3-5 GB/s pinned-host path.
+    # Falls back to the pinned path silently if cuFile isn't usable.
+    use_cufile: bool = True
+
+    # Number of GPU buffers in the cuFile pool. Each is sized to the
+    # worst-case chunk grad slice; total VRAM cost is
+    # cufile_pool_size × buffer_bytes. Must be >= prefetch_depth + 1.
+    cufile_pool_size: int = 2
+
+    # XLA-compile the per-chunk eval (`_evaluate_chunk`). Fuses the
+    # dipole-kernel pre-compute and the per-type matmul + reduction ops
+    # into a single GPU kernel — typically 1.5-2× faster on Ada/Hopper.
+    # Each unique (B_chunk, P_chunk) shape triggers one XLA compile
+    # (~5-10 s the first time that shape is seen); for full-batch
+    # deterministic chunks this is a one-shot cost paid in the first
+    # generation, then steady-state runs at full XLA speed.
+    eval_jit_compile: bool = False
+
+    # Load the entire disk-backed grad_values into GPU memory once at
+    # startup, then slice per-chunk on-GPU instead of staging from
+    # disk every generation. Bypasses the cuFile / pinned / pool path
+    # entirely — fastest possible read path when the grad cache fits
+    # in VRAM. At full-batch full-data perf this saves the residual
+    # cuFile read time (which is the dominant remaining cost in the
+    # `evaluate` phase). Memory cost: P × 3 × dim_q × 4 bytes (e.g.
+    # 333k pairs × 645 dim_q ≈ 2.6 GB at total_N=2000). Disable if
+    # the cache exceeds available VRAM minus the model + activations.
+    gpu_resident_grad_cache: bool = False
+
+    # Use page-locked (pinned) host buffers for the disk-backed chunk
+    # staging path. With pinned source, tf.constant dispatches a true
+    # async cudaMemcpyAsync (no driver bounce buffer), saturating PCIe
+    # at ~12-16 GB/s instead of the ~6-8 GB/s pageable rate. Buffers
+    # are allocated via cudaMallocHost; pool size = 4. Set False if
+    # cudart is not loadable (rare) or to bisect a regression.
+    use_pinned_buffers: bool = True
+
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
     lambda_1: float | None = 0.001
@@ -132,7 +208,7 @@ class TNEPconfig:
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage).
     # None = no chunking (recommended for A100 at typical molecular sizes).
     # For very large systems (>50k edges per structure), start at 50 and reduce if OOM.
-    population_chunk_size: int | None = None
+    population_chunk_size: int | None = 10
     # Number of structures to process per GPU chunk during evaluation (None = all at once)
     batch_chunk_size: int | None = 1000
     # Number of parallel workers for SOAP descriptor computation.
@@ -157,12 +233,6 @@ class TNEPconfig:
     show_plots: bool = False
     # Show extra info in progress bar (L1, L2 regularisation)
     debug: bool = False
-    # Scale input descriptors by their training-set statistics (per component)
-    scale_descriptors: bool = False
-    # Descriptor scaling method: "range" (GPUMD-style 1/(max-min)) or "mean" (mean(|x|)*sqrt(dim_q))
-    descriptor_scale_mode: str = "mean"
-    # Floor for mean scaling: fraction of max component mean (None = no floor; ignored for range mode)
-    descriptor_scale_floor: float | None = 0.001
     # Scale dipole targets by atom count (per-atom dipole training)
     scale_targets: bool = True
     # Input units of dipole targets in the dataset.
@@ -176,7 +246,6 @@ class TNEPconfig:
     types: list[int] = []
     type_map: dict = {}
     indices: np.ndarray
-    descriptor_mean: np.ndarray | None = None
 
     def randomise(self, dataset: list) -> None:
         """Shuffle dataset indices and truncate to total_N.

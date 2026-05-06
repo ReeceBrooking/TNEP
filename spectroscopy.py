@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import os
+from typing import TYPE_CHECKING
+
 import tensorflow as tf
 import numpy as np
+
+# Headless-safe backend (see plotting.py).
+if not os.environ.get("MPLBACKEND") and not os.environ.get("DISPLAY"):
+    import matplotlib
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from typing import TYPE_CHECKING
+
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
-from data import cell_to_box
+from data import cell_to_box, pack_chunk_from_flat
 
 if TYPE_CHECKING:
     from ase import Atoms
@@ -443,44 +451,13 @@ def _pack_traj_batch_from_tf(
         positions [B,A,3], Z_int [B,A], boxes [B,3,3], atom_mask [B,A], num_atoms [B].
     """
     S = len(frames)
+    # Cache atom_counts before pack_chunk_from_flat clears frame_results.
     atom_counts = [int(r[0].shape[0]) for r in frame_results]
     max_atoms = max(atom_counts) if atom_counts else 0
-    pair_counts = [int(r[1].shape[0]) for r in frame_results]
-    pair_counts_arr = np.array(pair_counts, dtype=np.int32)
-    N_pairs = int(pair_counts_arr.sum())
 
-    if N_pairs > 0:
-        # pair_atom / pair_gidx stay frame-local — predict_batch indexes them
-        # together with pair_struct, mirroring _pack_traj_batch_from_flat.
-        grad_values_t = tf.concat([r[1] for r in frame_results], axis=0)
-        pair_atom_t   = tf.concat([r[2] for r in frame_results], axis=0)
-        pair_gidx_t   = tf.concat([r[3] for r in frame_results], axis=0)
-        pair_struct_t = tf.repeat(tf.range(S, dtype=tf.int32),
-                                   tf.constant(pair_counts_arr, dtype=tf.int32))
-        # Pair-level data has been concatenated; release per-frame grad/pair
-        # tensors held in frame_results. Only the soap_concat below still
-        # needs the per-frame soap slices.
-    else:
-        grad_values_t = tf.zeros((0, 3, dim_q), dtype=tf.float32)
-        pair_atom_t = tf.zeros((0,), dtype=tf.int32)
-        pair_gidx_t = tf.zeros((0,), dtype=tf.int32)
-        pair_struct_t = tf.zeros((0,), dtype=tf.int32)
-
-    # Descriptors: per-frame [N_s, Q] → padded [B, A_max, Q] via RaggedTensor
-    # (one concat + one to_tensor, all on-device).
-    if S:
-        soap_concat = tf.concat([r[0] for r in frame_results], axis=0)
-        # Per-frame soap slices are now folded into soap_concat / desc_t —
-        # release the caller's list so they GC.
-        frame_results.clear()
-        desc_ragged = tf.RaggedTensor.from_row_lengths(
-            soap_concat, tf.constant(atom_counts, dtype=tf.int64))
-        desc_t = desc_ragged.to_tensor(default_value=0.0,
-                                        shape=(S, max_atoms, dim_q))
-        del soap_concat, desc_ragged
-    else:
-        desc_t = tf.zeros((0, 0, dim_q), dtype=tf.float32)
-        frame_results.clear()
+    # Descriptor-shaped fields (descriptors, grad_values, pair_*) — shared
+    # with the OTF training path via pack_chunk_from_flat.
+    chunk = pack_chunk_from_flat(frame_results, dim_q)
 
     # Structure-padded host-built fields (positions, Z, boxes, atom_mask).
     pos_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
@@ -502,18 +479,12 @@ def _pack_traj_batch_from_tf(
         atom_mask_t = tf.constant(atom_mask_np); del atom_mask_np
         num_atoms_t = tf.constant(num_atoms_np); del num_atoms_np
 
-    return {
-        "descriptors": desc_t,
-        "grad_values": grad_values_t,
-        "pair_atom":   pair_atom_t,
-        "pair_gidx":   pair_gidx_t,
-        "pair_struct": pair_struct_t,
-        "positions":   positions_t,
-        "Z_int":       z_t,
-        "boxes":       box_t,
-        "atom_mask":   atom_mask_t,
-        "num_atoms":   num_atoms_t,
-    }
+    chunk["positions"] = positions_t
+    chunk["Z_int"]     = z_t
+    chunk["boxes"]     = box_t
+    chunk["atom_mask"] = atom_mask_t
+    chunk["num_atoms"] = num_atoms_t
+    return chunk
 
 
 def _pack_traj_batch_from_flat(

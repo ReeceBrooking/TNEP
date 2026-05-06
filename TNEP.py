@@ -78,14 +78,6 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        # Descriptor scaling
-        if hasattr(cfg, 'descriptor_mean') and cfg.descriptor_mean is not None:
-            self._descriptor_mean = tf.Variable(
-                cfg.descriptor_mean, dtype=tf.float32, trainable=False)
-            self._scale_descriptors = True
-        else:
-            self._scale_descriptors = False
-
         # Scalar ANN for polarizability mode (target_mode == 2)
         if cfg.target_mode == 2:
             self.W0_pol = self.add_weight(
@@ -133,12 +125,6 @@ class TNEP(layers.Layer):
             target_mode 1: [3]  dipole vector
             target_mode 2: [6]  polarizability tensor
         """
-        # Scale descriptors and gradients by the same factor (chain rule)
-        if self._scale_descriptors:
-            scale = self._descriptor_mean
-            descriptors = descriptors / scale
-            gradients = gradients / scale
-
         # Gather per-type weights for each atom
         W0_t = tf.gather(self.W0, Z)   # [A, dim_q, H]
         b0_t = tf.gather(self.b0, Z)   # [A, H]
@@ -268,17 +254,35 @@ class TNEP(layers.Layer):
                 cos_sim_all   : [S] tensor — per-structure cosine similarity (modes 1,2)
             preds : [S, T] tensor of predictions
         """
-        raw_preds = self.predict_batch(
-            test_data["descriptors"], test_data["grad_values"],
-            test_data["pair_atom"], test_data["pair_gidx"], test_data["pair_struct"],
-            test_data["positions"], test_data["Z_int"], test_data["boxes"],
-            test_data["atom_mask"],
-            self.W0, self.b0, self.W1, self.b1,
-            getattr(self, 'W0_pol', None),
-            getattr(self, 'b0_pol', None),
-            getattr(self, 'W1_pol', None),
-            getattr(self, 'b1_pol', None),
-        )
+        # Streaming chunked scoring. Bounds peak memory to one chunk's
+        # gradient slice — and is the only sensible mode when grad_values
+        # is disk-backed. With cfg.chunk_prefetch the disk-pipe of chunk N+1
+        # overlaps the model forward of chunk N.
+        from data import prefetched_chunks
+        S_test = test_data["num_atoms"].shape[0]
+        chunk_sz = (self.cfg.batch_chunk_size
+                    if self.cfg.batch_chunk_size is not None else S_test)
+        ranges = [(s, min(s + chunk_sz, S_test)) for s in range(0, S_test, chunk_sz)]
+        pred_parts: list = []
+        for _, _, chunk in prefetched_chunks(
+                test_data, ranges,
+                pin_to_cpu=self.cfg.pin_data_to_cpu,
+                enabled=getattr(self.cfg, "chunk_prefetch", True),
+                depth=getattr(self.cfg, "prefetch_depth", 1)):
+            pred_parts.append(self.predict_batch(
+                chunk["descriptors"], chunk["grad_values"],
+                chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
+                chunk["positions"], chunk["Z_int"], chunk["boxes"],
+                chunk["atom_mask"],
+                self.W0, self.b0, self.W1, self.b1,
+                getattr(self, 'W0_pol', None),
+                getattr(self, 'b0_pol', None),
+                getattr(self, 'W1_pol', None),
+                getattr(self, 'b1_pol', None),
+            ))
+            del chunk
+        raw_preds = tf.concat(pred_parts, axis=0)
+        del pred_parts
         targets = test_data["targets"]
 
         # Normalize predictions to per-atom space when target scaling is active
@@ -346,7 +350,6 @@ class TNEP(layers.Layer):
                       W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor, b1: tf.Tensor,
                       W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
                       W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
-                      prescaled: bool = False,
                       W_atom: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
@@ -368,16 +371,10 @@ class TNEP(layers.Layer):
             W1          : [T, H]      output weights
             b1          : ()          scalar bias
             W0_pol..b1_pol : same shapes, for mode 2 only (None otherwise)
-            prescaled   : bool — if True, skip descriptor/gradient scaling
 
         Returns:
             predictions : [B, T_dim]  where T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
-        if not prescaled and self._scale_descriptors:
-            scale = self._descriptor_mean
-            descriptors = descriptors / scale
-            grad_values = grad_values / scale
-
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
         b0_t = tf.gather(b0, Z)   # [B, A, H]

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 import os
+import shutil
+import tempfile
 
 _slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
 _cpu_threads = int(_slurm_cpus) if _slurm_cpus else max(os.cpu_count() // 2, 1)
@@ -36,6 +38,27 @@ from tqdm import tqdm
 from ase.io import read, iread
 
 
+def _resolve_scratch_dir() -> str:
+    """Pick a node-local fast-storage directory for the grad_values
+    cache. Honours the standard HPC env-vars in priority order:
+
+        SLURM_TMPDIR     (Slurm node-local scratch — Compute Canada,
+                          many academic clusters)
+        TMPDIR           (POSIX standard; Mahti/Puhti set this)
+        LOCAL_SCRATCH    (some sites; e.g. PBS environments)
+
+    Falls back to the current working directory when none of the above
+    are set (typical for local dev). On HPC nodes cwd is usually a
+    network filesystem (Lustre/GPFS) which is much slower than node-
+    local NVMe — so the env-vars matter.
+    """
+    for var in ("SLURM_TMPDIR", "TMPDIR", "LOCAL_SCRATCH"):
+        path = os.environ.get(var)
+        if path and os.path.isdir(path):
+            return path
+    return os.getcwd()
+
+
 def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     """Run full TNEP training pipeline: load, split, train, test, plot, save.
 
@@ -48,6 +71,170 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     if cfg is None:
         cfg = TNEPconfig()
 
+    # Allocate a per-run scratch directory for the disk-backed
+    # grad_values cache. Prefers node-local fast storage on HPC nodes
+    # (see _resolve_scratch_dir). Removed in the finally block at the
+    # end of the function.
+    cfg._gradient_cache_path = None
+    if getattr(cfg, "cache_gradients_to_disk", False):
+        scratch_root = _resolve_scratch_dir()
+        cfg._gradient_cache_path = tempfile.mkdtemp(
+            prefix=".grad_cache_", dir=scratch_root)
+        print(f"  cache_gradients_to_disk=True → scratch dir "
+              f"{cfg._gradient_cache_path}")
+
+    try:
+        return _train_model_inner(cfg)
+    finally:
+        # Always remove the scratch directory, even on exceptions, so
+        # repeated runs don't leak ~10 GB per attempt onto the disk.
+        cache_dir = getattr(cfg, "_gradient_cache_path", None)
+        if cache_dir is not None and os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            print(f"  cleaned up gradient scratch dir {cache_dir}")
+            cfg._gradient_cache_path = None
+
+
+def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
+                   suffix_per_atom: str, suffix_total: str,
+                   save_dir: str | None = None,
+                   show: bool | None = None) -> None:
+    """Emit the standard correlation / cos-sim / error-vs-magnitude
+    plots for one (data, predictions, metrics) triple. Always emits
+    the per-atom variant; emits the total variant (per-atom × num_atoms)
+    only when target-scaling produced `total_*` keys in the metrics
+    dict (i.e. dipole/polarizability with cfg.scale_targets=True).
+    Cosine similarity is omitted from the total plots because it's
+    scale-invariant and already shown at per-atom scale.
+
+    `save_dir` and `show` override cfg.save_plots / cfg.show_plots
+    when non-None — used by the periodic-plot callback (per-gen
+    subfolder) and by test_model (custom destination per call).
+    """
+    targets = data["targets"].numpy()
+    preds_np = preds.numpy()
+    save = save_dir if save_dir is not None else cfg.save_plots
+    show = show if show is not None else cfg.show_plots
+
+    plot_correlation(targets, preds_np, metrics, cfg, save, show, suffix=suffix_per_atom)
+    plot_cosine_similarity(metrics, cfg, save, show, suffix=suffix_per_atom)
+    plot_error_vs_magnitude(targets, preds_np, cfg, save, show, suffix=suffix_per_atom)
+
+    if "total_rmse" not in metrics:
+        return
+    scale = data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
+    total_targets = targets * scale
+    total_preds = preds_np * scale
+    total_metrics = {
+        "rmse": metrics["total_rmse"],
+        "r2": metrics["total_r2"],
+        "r2_components": metrics["total_r2_components"],
+    }
+    # Carry forward cos-sim annotations for plot_correlation; the
+    # standalone plot_cosine_similarity is intentionally omitted at
+    # total scale because cosine similarity is scale-invariant.
+    if "cos_sim_all" in metrics:
+        total_metrics["cos_sim_mean"] = metrics["cos_sim_mean"]
+        total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
+    plot_correlation(total_targets, total_preds, total_metrics, cfg, save, show, suffix=suffix_total)
+    plot_error_vs_magnitude(total_targets, total_preds, cfg, save, show, suffix=suffix_total)
+
+
+def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> None:
+    """Pre-stage per-chunk pair indices and either (a) load grad_values
+    onto GPU for resident slicing, or (b) attach pinned + cuFile pools
+    so the disk-backed staging path can DMA chunks straight to GPU.
+
+    Mode is per-data-dict (train and val handled identically). With
+    cfg.eval_jit_compile, pair indices are padded to the per-data
+    global max so the XLA-compiled eval kernel sees a single shape.
+    """
+    from data import (prestage_chunk_indices, compute_max_chunk_pairs,
+                      move_data_to_gpu, make_pinned_pool_for)
+
+    chunk = cfg.batch_chunk_size
+
+    # 1. Pre-stage pair indices for every chunk range. Tiny tensors,
+    # GPU-resident, reused every generation.
+    for d in (train_data, val_data):
+        S = int(d["num_atoms"].shape[0])
+        c = chunk if chunk is not None else S
+        ranges = [(s, min(s + c, S)) for s in range(0, S, c)]
+        pad_to = (compute_max_chunk_pairs(d, ranges)
+                  if getattr(cfg, "eval_jit_compile", False) else None)
+        prestage_chunk_indices(d, ranges, pad_to=pad_to)
+
+    # 2a. GPU-resident path: read the disk-backed grad_values fully
+    # into a tf.constant on the GPU, then move every other static
+    # field on-device too. The chunk-staging path becomes pure GPU
+    # gather/strided_slice — no host round-trip, no pools needed.
+    if getattr(cfg, "gpu_resident_grad_cache", False):
+        for d, tag in ((train_data, "train"), (val_data, "val")):
+            if not d.get("_gv_disk_backed", False):
+                continue
+            gv = d["grad_values"]
+            shape = tuple(int(x) for x in gv.shape)
+            nbytes = int(np.prod(shape)) * int(np.dtype(gv.dtype).itemsize)
+            with tf.device("/GPU:0"):
+                gv_gpu = tf.constant(np.asarray(gv))
+            d["grad_values"] = gv_gpu
+            d["_gv_disk_backed"] = False
+            d["_gv_resident_gpu"] = True
+            move_data_to_gpu(d)
+            print(f"  GPU-resident grad cache: {tag} loaded "
+                  f"{shape} {gv.dtype} = {nbytes/1e9:.2f} GB on /GPU:0")
+
+    # 2b. Disk-backed path: attach pinned-host and cuFile pools so the
+    # per-chunk slice DMAs from NVMe straight to a registered GPU
+    # buffer. Pool size must cover prefetch_depth in-flight stagings
+    # plus the chunk currently held by the consumer.
+    n_buffers = max(int(getattr(cfg, "pinned_pool_size", 4)),
+                    int(getattr(cfg, "prefetch_depth", 1)) + 1)
+    if getattr(cfg, "use_pinned_buffers", True):
+        for d, tag in ((train_data, "train"), (val_data, "val")):
+            if not d.get("_gv_disk_backed", False):
+                continue
+            pool = make_pinned_pool_for(d, batch_chunk_size=chunk,
+                                         n_buffers=n_buffers)
+            if pool is not None:
+                d["_pinned_pool"] = pool
+                print(f"  pinned-buffer pool ({len(pool._all)} × "
+                      f"{pool.buffer_nbytes/1e6:.0f} MB) attached to {tag}_data")
+
+    if getattr(cfg, "use_cufile", True):
+        try:
+            from cufile_io import (cuFile_available, CuFileHandle,
+                                   make_cufile_pool_for)
+        except Exception as e:
+            print(f"  cuFile import failed ({e}) — falling back to pinned path")
+            return
+        if not cuFile_available():
+            return
+        n_cf = max(int(getattr(cfg, "cufile_pool_size", 4)),
+                   int(getattr(cfg, "prefetch_depth", 1)) + 1)
+        for d, tag in ((train_data, "train"), (val_data, "val")):
+            if not d.get("_gv_disk_backed", False):
+                continue
+            gv = d.get("grad_values")
+            if not hasattr(gv, "filename"):
+                continue
+            pool = make_cufile_pool_for(d, batch_chunk_size=chunk,
+                                         n_buffers=n_cf)
+            if pool is None:
+                continue
+            try:
+                handle = CuFileHandle(gv.filename)
+            except Exception as e:
+                print(f"  cuFile open failed for {tag}: {e}")
+                continue
+            d["_cufile_ctx"] = {"handle": handle, "pool": pool}
+            print(f"  cuFile pool ({len(pool._all)} × "
+                  f"{pool.nbytes/1e6:.0f} MB) attached to {tag}_data")
+
+
+def _train_model_inner(cfg: TNEPconfig) -> TNEP:
+    """Body of train_model, factored out so the outer try/finally can
+    guarantee cleanup of the disk-backed gradient scratch directory."""
     # Load dataset, filter by species, then filter bad data
     dataset, dataset_types_int = collect(cfg)
     cfg.type_map = {z: idx for idx, z in enumerate(cfg.types)}
@@ -68,8 +255,16 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     # Convert to padded dense tensors for GPU-batched evaluation. test_data
     # is intentionally NOT padded here; it gets padded by materialize_test_data
     # the first time it's actually consumed.
-    train_data = pad_and_stack(train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu)
-    val_data   = pad_and_stack(val_data,   num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu)
+    train_data = pad_and_stack(
+        train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
+        gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
+        cache_tag="train")
+    val_data   = pad_and_stack(
+        val_data,   num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
+        gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
+        cache_tag="val")
+
+    _setup_grad_staging(cfg, train_data, val_data)
 
     # Lazy-build helper. First call performs descriptor build + pad_and_stack;
     # subsequent calls return the cached dict (idempotent on test_pending).
@@ -78,8 +273,17 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
                                      num_types=cfg.num_types,
                                      pin_to_cpu=cfg.pin_data_to_cpu)
 
-    # dim_q is determined by the SOAP descriptor size
-    cfg.dim_q = train_data["descriptors"][0].shape[-1]
+    # dim_q is determined by the SOAP descriptor size. It depends only on
+    # (alpha_max, l_max, num_types, compress_mode), so it can be resolved
+    # in closed form from cfg without instantiating a builder. Cross-check
+    # against the actual built shape so cfg / builder drift is caught.
+    from DescriptorBuilderGPU import compute_dim_q
+    cfg.dim_q = compute_dim_q(cfg)
+    built_dim_q = int(train_data["descriptors"][0].shape[-1])
+    if built_dim_q != cfg.dim_q:
+        raise RuntimeError(
+            f"compute_dim_q={cfg.dim_q} disagrees with built descriptor "
+            f"shape {built_dim_q}; cfg / builder mismatch.")
     print("Dimension of q: " + str(cfg.dim_q))
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/
@@ -94,36 +298,22 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     def periodic_plot_callback(history, gen):
         """Called during training at plot_interval to show progress."""
         print(f"\n--- Periodic plots at generation {gen} ---")
-        # First periodic plot triggers the deferred test descriptor build.
-        # Subsequent calls return the cached padded dict instantly.
+        # First periodic plot triggers the deferred test descriptor build;
+        # subsequent calls return the cached padded dict instantly.
         test_data = get_test_data()
         m, preds = model.score(test_data)
         print(f"  Test RMSE: {float(m['rmse']):.4f}  R²: {float(m['r2']):.4f}")
         if "total_rmse" in m:
             print(f"  Test total RMSE: {float(m['total_rmse']):.4f}  "
                   f"total R²: {float(m['total_r2']):.4f}")
-        # Save periodic plots into a generation-specific subfolder
         gen_save = os.path.join(cfg.save_plots, f"{gen}_plots") if cfg.save_plots else None
         plot_snes_history(history, cfg, gen_save, cfg.show_plots)
         plot_log_val_fitness(history, cfg, gen_save, cfg.show_plots)
         plot_sigma_history(history, cfg, gen_save, cfg.show_plots)
         plot_loss_breakdown(history, cfg, gen_save, cfg.show_plots)
         plot_timing(history, cfg, gen_save, cfg.show_plots)
-        plot_correlation(test_data["targets"].numpy(), preds.numpy(), m, cfg,
-                         gen_save, cfg.show_plots, suffix="per_atom")
-        plot_cosine_similarity(m, cfg, gen_save, cfg.show_plots,
-                               suffix="per_atom")
-        plot_error_vs_magnitude(test_data["targets"].numpy(), preds.numpy(), cfg,
-                                gen_save, cfg.show_plots, suffix="per_atom")
-        if "total_rmse" in m:
-            na = test_data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
-            plot_correlation(test_data["targets"].numpy() * na, preds.numpy() * na,
-                             {"rmse": m["total_rmse"], "r2": m["total_r2"],
-                              "r2_components": m["total_r2_components"],
-                              **({k: m[k] for k in ("cos_sim_mean", "cos_sim_all") if k in m})},
-                             cfg, gen_save, cfg.show_plots, suffix="total")
-            plot_error_vs_magnitude(test_data["targets"].numpy() * na, preds.numpy() * na, cfg,
-                                    gen_save, cfg.show_plots, suffix="total")
+        _plot_eval_set(cfg, test_data, preds, m,
+                       "per_atom", "total", save_dir=gen_save)
 
     # Train
     history, final_model, best_val_model = model.fit(
@@ -161,92 +351,20 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
             pct = 100 * t / max(grand, 1e-9)
             print(f"  {p:15s}: {t:.3f}s total ({pct:5.1f}%) | {avg*1000:.1f}ms/gen")
 
-    # Plots
+    # Training-history plots — independent of any test set.
     plot_snes_history(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_log_val_fitness(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_sigma_history(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
-    # Best-val model: test set plots (per-atom)
-    plot_correlation(test_data["targets"].numpy(), test_preds.numpy(), metrics, cfg,
-                     cfg.save_plots, cfg.show_plots, suffix="best_val_per_atom")
-    plot_cosine_similarity(metrics, cfg, cfg.save_plots, cfg.show_plots,
-                           suffix="best_val_per_atom")
-    plot_error_vs_magnitude(test_data["targets"].numpy(), test_preds.numpy(), cfg,
-                            cfg.save_plots, cfg.show_plots, suffix="best_val_per_atom")
-    # Best-val model: test set plots (total) — only when target scaling is active
-    # Cosine similarity omitted for total: scale-invariant, already plotted at per-atom scale
-    if "total_rmse" in metrics:
-        num_atoms = test_data["num_atoms"].numpy().astype(np.float32)
-        scale = num_atoms[:, np.newaxis]
-        total_targets = test_data["targets"].numpy() * scale
-        total_preds = test_preds.numpy() * scale
-        total_metrics = {
-            "rmse": metrics["total_rmse"],
-            "r2": metrics["total_r2"],
-            "r2_components": metrics["total_r2_components"],
-        }
-        if "cos_sim_all" in metrics:
-            total_metrics["cos_sim_mean"] = metrics["cos_sim_mean"]
-            total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
-        plot_correlation(total_targets, total_preds, total_metrics, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix="best_val_total")
-        plot_error_vs_magnitude(total_targets, total_preds, cfg,
-                                cfg.save_plots, cfg.show_plots, suffix="best_val_total")
 
-    # Best-val model: validation set plots (per-atom)
+    # Per-model × per-dataset correlation / error / cos-sim plots. Each
+    # combination produces a per-atom plot plus a "total" plot (per-atom
+    # values × num_atoms) when scale_targets is active.
     val_metrics, val_preds = best_val_model.score(val_data)
-    plot_correlation(val_data["targets"].numpy(), val_preds.numpy(), val_metrics, cfg,
-                     cfg.save_plots, cfg.show_plots, suffix="best_val_val_per_atom")
-    plot_cosine_similarity(val_metrics, cfg, cfg.save_plots, cfg.show_plots,
-                           suffix="best_val_val_per_atom")
-    plot_error_vs_magnitude(val_data["targets"].numpy(), val_preds.numpy(), cfg,
-                            cfg.save_plots, cfg.show_plots, suffix="best_val_val_per_atom")
-    # Best-val model: validation set plots (total)
-    # Cosine similarity omitted for total: scale-invariant, already plotted at per-atom scale
-    if "total_rmse" in val_metrics:
-        num_atoms_val = val_data["num_atoms"].numpy().astype(np.float32)
-        scale_val = num_atoms_val[:, np.newaxis]
-        val_total_targets = val_data["targets"].numpy() * scale_val
-        val_total_preds = val_preds.numpy() * scale_val
-        val_total_metrics = {
-            "rmse": val_metrics["total_rmse"],
-            "r2": val_metrics["total_r2"],
-            "r2_components": val_metrics["total_r2_components"],
-        }
-        if "cos_sim_all" in val_metrics:
-            val_total_metrics["cos_sim_mean"] = val_metrics["cos_sim_mean"]
-            val_total_metrics["cos_sim_all"] = val_metrics["cos_sim_all"]
-        plot_correlation(val_total_targets, val_total_preds, val_total_metrics, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix="best_val_val_total")
-        plot_error_vs_magnitude(val_total_targets, val_total_preds, cfg,
-                                cfg.save_plots, cfg.show_plots, suffix="best_val_val_total")
-
-    # Final-gen model: test set plots (per-atom)
-    plot_correlation(test_data["targets"].numpy(), final_preds.numpy(), final_metrics, cfg,
-                     cfg.save_plots, cfg.show_plots, suffix="final_gen_per_atom")
-    plot_cosine_similarity(final_metrics, cfg, cfg.save_plots, cfg.show_plots,
-                           suffix="final_gen_per_atom")
-    plot_error_vs_magnitude(test_data["targets"].numpy(), final_preds.numpy(), cfg,
-                            cfg.save_plots, cfg.show_plots, suffix="final_gen_per_atom")
-    # Final-gen model: test set plots (total)
-    # Cosine similarity omitted for total: scale-invariant, already plotted at per-atom scale
-    if "total_rmse" in final_metrics:
-        na = test_data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
-        fg_total_targets = test_data["targets"].numpy() * na
-        fg_total_preds = final_preds.numpy() * na
-        fg_total_metrics = {
-            "rmse": final_metrics["total_rmse"],
-            "r2": final_metrics["total_r2"],
-            "r2_components": final_metrics["total_r2_components"],
-        }
-        if "cos_sim_all" in final_metrics:
-            fg_total_metrics["cos_sim_mean"] = final_metrics["cos_sim_mean"]
-            fg_total_metrics["cos_sim_all"] = final_metrics["cos_sim_all"]
-        plot_correlation(fg_total_targets, fg_total_preds, fg_total_metrics, cfg,
-                         cfg.save_plots, cfg.show_plots, suffix="final_gen_total")
-        plot_error_vs_magnitude(fg_total_targets, fg_total_preds, cfg,
-                                cfg.save_plots, cfg.show_plots, suffix="final_gen_total")
+    _plot_eval_set(cfg, test_data, test_preds,  metrics,       "best_val_per_atom",     "best_val_total")
+    _plot_eval_set(cfg, val_data,  val_preds,   val_metrics,   "best_val_val_per_atom", "best_val_val_total")
+    _plot_eval_set(cfg, test_data, final_preds, final_metrics, "final_gen_per_atom",    "final_gen_total")
 
     print("Run complete!")
     return best_val_model
@@ -282,31 +400,9 @@ def test_model(
     metrics, predictions = model.score(data)
     print_score_summary(metrics, cfg, prefix="External test")
 
-    # Plot per-atom
-    plot_correlation(data["targets"].numpy(), predictions.numpy(), metrics, cfg,
-                     save_plots, show_plots, suffix="per_atom")
-    plot_cosine_similarity(metrics, cfg, save_plots, show_plots, suffix="per_atom")
-    plot_error_vs_magnitude(data["targets"].numpy(), predictions.numpy(), cfg,
-                            save_plots, show_plots, suffix="per_atom")
-
-    # Plot total
-    if "total_rmse" in metrics:
-        num_atoms = data["num_atoms"].numpy().astype(np.float32)
-        scale = num_atoms[:, np.newaxis]
-        total_targets = data["targets"].numpy() * scale
-        total_preds = predictions.numpy() * scale
-        total_metrics = {
-            "rmse": metrics["total_rmse"],
-            "r2": metrics["total_r2"],
-            "r2_components": metrics["total_r2_components"],
-        }
-        if "cos_sim_all" in metrics:
-            total_metrics["cos_sim_mean"] = metrics["cos_sim_mean"]
-            total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
-        plot_correlation(total_targets, total_preds, total_metrics, cfg,
-                         save_plots, show_plots, suffix="total")
-        plot_error_vs_magnitude(total_targets, total_preds, cfg,
-                                save_plots, show_plots, suffix="total")
+    _plot_eval_set(cfg, data, predictions, metrics,
+                   "per_atom", "total",
+                   save_dir=save_plots, show=show_plots)
 
     return metrics, predictions
 

@@ -106,7 +106,7 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         /                       — top-level attributes: target_mode, num_types,
                                   num_neurons, dim_q, elements (quick inspection)
         /weights/               — W0, b0, W1, b1 (+ pol variants for mode 2)
-        /descriptor/            — z_to_type_index, descriptor_mean (if set)
+        /descriptor/            — z_to_type_index
         /config                 — full TNEPconfig serialised as JSON string
 
     Load with:
@@ -157,8 +157,6 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         # Descriptor metadata
         dg = f.create_group("descriptor")
         dg.create_dataset("z_to_type_index", data=z_to_type_index)
-        if cfg.descriptor_mean is not None:
-            dg.create_dataset("descriptor_mean", data=np.asarray(cfg.descriptor_mean))
 
         # Full config as JSON string
         f.create_dataset("config", data=json.dumps(config_dict))
@@ -230,9 +228,6 @@ def _load_model_h5(path: str) -> TNEP:
         cfg.type_map = {int(row[0]): int(row[1])
                         for row in f["descriptor/z_to_type_index"][:]}
 
-        descriptor_mean = (f["descriptor/descriptor_mean"][:].astype(np.float32)
-                           if "descriptor/descriptor_mean" in f else None)
-
         wg = f["weights"]
         weights = {
             "W0": wg["W0"][:], "b0": wg["b0"][:],
@@ -244,12 +239,11 @@ def _load_model_h5(path: str) -> TNEP:
         }
 
     for k, v in config_dict.items():
-        if k == "descriptor_mean" and v is not None:
-            v = np.array(v, dtype=np.float32)
+        if k == "descriptor_mean":
+            # Legacy field — silently ignore on load (descriptor scaling
+            # has been removed from the runtime).
+            continue
         setattr(cfg, k, v)
-
-    if descriptor_mean is not None:
-        cfg.descriptor_mean = descriptor_mean
 
     model = TNEP(cfg)
     _load_weights(model, cfg, **weights)
@@ -266,8 +260,8 @@ def _load_model_npz(path: str) -> TNEP:
     if "config_json" in data:
         config_dict = json.loads(str(data["config_json"]))
         for k, v in config_dict.items():
-            if k == "descriptor_mean" and v is not None:
-                v = np.array(v, dtype=np.float32)
+            if k == "descriptor_mean":
+                continue  # legacy: ignore
             setattr(cfg, k, v)
     else:
         cfg.num_types = int(data["num_types"])
@@ -283,9 +277,6 @@ def _load_model_npz(path: str) -> TNEP:
             rc = float(data["rc"])
             cfg.rcut_hard = rc
             cfg.rcut_soft = rc - 0.5
-
-    if "descriptor_mean" in data:
-        cfg.descriptor_mean = data["descriptor_mean"].astype(np.float32)
 
     cfg.type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}
 

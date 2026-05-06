@@ -1,9 +1,21 @@
 from __future__ import annotations
 
-import re
-import numpy as np
-import matplotlib.pyplot as plt
 import os
+import re
+
+import numpy as np
+
+# Headless-safe backend selection. On HPC compute nodes there's no
+# DISPLAY, and matplotlib's default tk/qt backends will fail at import
+# time when no GUI is available. Selecting Agg up front keeps the
+# pipeline working in batch jobs while still letting interactive use
+# (where DISPLAY is set or MPLBACKEND is user-specified) get the
+# default backend.
+if not os.environ.get("MPLBACKEND") and not os.environ.get("DISPLAY"):
+    import matplotlib
+    matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 
 from TNEPconfig import TNEPconfig
 from data import component_labels
