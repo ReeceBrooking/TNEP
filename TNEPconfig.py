@@ -29,7 +29,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 60000
+    num_generations: int = 200000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
@@ -73,14 +73,14 @@ class TNEPconfig:
     # Used by both training (DescriptorBuilder.build_descriptors) and
     # trajectory inference. process_trajectory's `descriptor_batch_frames`
     # kwarg overrides this value for that call only.
-    descriptor_batch_frames: int | None = 100
+    descriptor_batch_frames: int | None = 500
 
     # Pair-tile size for the gradient compute. 0 = single-shot (lower
     # launch overhead, higher peak VRAM). >0 = tile pairs in chunks of
     # this size (cuts peak VRAM at the dominant [k_max,n_max,P] tensors;
     # at fp32 also auto-enables XLA fusion in the trajectory path).
     # Sensible value for ~600-atom systems: 8000.
-    descriptor_pair_tile_size: int = 0
+    descriptor_pair_tile_size: int = 8000
 
     # GPU memory budget (bytes) used by the auto-sizer when
     # descriptor_batch_frames is None. None falls back to the builder's
@@ -89,13 +89,14 @@ class TNEPconfig:
 
     # Master switch for CSC / Slurm-supercomputer mode (Mahti, Puhti,
     # LUMI etc.). When True:
-    #   - All gradient-caching options are forced off
-    #     (`cache_gradients_to_disk`, `gpu_resident_grad_cache`,
-    #     `chunk_prefetch`, `use_pinned_buffers`, `use_cufile`).
-    #     Grad_values stays in host RAM as a tf.constant — no NVMe
-    #     scratch, no pinned-host pool, no cuFile / GDS. CSC nodes
-    #     have ample host RAM and the cuFile compat-mode WSL path
-    #     doesn't generalise to their kernel / filesystem stack.
+    #   - All gradient-caching / IO options are forced off
+    #     (`cache_gradients_to_disk`, `chunk_prefetch`,
+    #     `use_pinned_buffers`, `use_cufile`). Grad_values stays
+    #     in RAM (or VRAM, depending on `pin_data_to_cpu`) — no
+    #     NVMe scratch, no pinned-host pool, no cuFile / GDS. CSC
+    #     nodes have ample host RAM and the cuFile compat-mode
+    #     WSL path doesn't generalise to their kernel / filesystem
+    #     stack.
     #   - The Slurm-specific scratch-dir resolver
     #     (`MasterTNEP._resolve_scratch_dir`) is allowed to consult
     #     `$SLURM_TMPDIR` / `$TMPDIR` / `$LOCAL_SCRATCH`. With this
@@ -115,7 +116,7 @@ class TNEPconfig:
     # precomputed-mode speed (per-chunk disk reads at NVMe sequential
     # bandwidth ~5-10 ms, vs ~50-100 ms/gen for the rest of the
     # training step).
-    cache_gradients_to_disk: bool = True
+    cache_gradients_to_disk: bool = False
 
     # Overlap disk → GPU staging of chunks N+1..N+prefetch_depth with
     # GPU evaluation of chunk N. Up to `prefetch_depth` background
@@ -162,17 +163,6 @@ class TNEPconfig:
     # generation, then steady-state runs at full XLA speed.
     eval_jit_compile: bool = False
 
-    # Load the entire disk-backed grad_values into GPU memory once at
-    # startup, then slice per-chunk on-GPU instead of staging from
-    # disk every generation. Bypasses the cuFile / pinned / pool path
-    # entirely — fastest possible read path when the grad cache fits
-    # in VRAM. At full-batch full-data perf this saves the residual
-    # cuFile read time (which is the dominant remaining cost in the
-    # `evaluate` phase). Memory cost: P × 3 × dim_q × 4 bytes (e.g.
-    # 333k pairs × 645 dim_q ≈ 2.6 GB at total_N=2000). Disable if
-    # the cache exceeds available VRAM minus the model + activations.
-    gpu_resident_grad_cache: bool = False
-
     # Use page-locked (pinned) host buffers for the disk-backed chunk
     # staging path. With pinned source, tf.constant dispatches a true
     # async cudaMemcpyAsync (no driver bounce buffer), saturating PCIe
@@ -183,8 +173,8 @@ class TNEPconfig:
 
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
-    lambda_1: float | None = 0.001
-    lambda_2: float | None = 0.001
+    lambda_1: float | None = 0.003
+    lambda_2: float | None = 0.003
     # Per-type regularization and ranking (GPUMD NEP4 style)
     # Each type's params are regularized separately, creating per-type fitness
     # rankings that drive per-type natural gradient updates.
@@ -234,14 +224,27 @@ class TNEPconfig:
     # 1    = serial (current behaviour, default outside SLURM)
     # N    = use N worker processes
     num_descriptor_workers: int | None = None
-    # Pin dataset tensors to CPU memory instead of GPU.
-    # Required when the full dataset is too large to fit in GPU VRAM (most cases).
-    # When True, each training batch is copied CPU→GPU implicitly during evaluation.
-    # Set to False only if the entire dataset comfortably fits on the GPU.
-    pin_data_to_cpu: bool = True
+    # Where the static training tensors (descriptors, grad_values,
+    # positions, pair indices, etc.) live, and which chunk-staging
+    # path the SNES eval / TNEP.score loops use:
+    #
+    #   True  : tensors stay on host CPU. Per-chunk slice → tf.gather
+    #           → implicit H2D copy each gen. Required when the full
+    #           dataset is too big for VRAM (the disk-backed grad
+    #           cache uses pinned-host / cuFile pools to DMA chunks
+    #           to GPU on demand).
+    #   False : tensors live on /GPU:0 — including grad_values, which
+    #           is loaded fully onto the GPU at startup (read from
+    #           the disk memmap when cache_gradients_to_disk=True).
+    #           The chunk-staging path becomes pure on-device
+    #           gather/strided_slice — no host round-trip, no pinned
+    #           pool, no cuFile. Fastest mode when the working set
+    #           (grad_values + descriptors + activations) fits in
+    #           VRAM.
+    pin_data_to_cpu: bool = False
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
-    plot_interval: int | None = 10000
+    plot_interval: int | None = 50000
 
     # Save model after training (None = disabled; "auto" = auto-generate run directory)
     save_path: str | None = "models/auto"

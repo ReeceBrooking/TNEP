@@ -73,7 +73,6 @@ def _apply_csc_overrides(cfg: TNEPconfig) -> None:
         return
     overrides = {
         "cache_gradients_to_disk": False,
-        "gpu_resident_grad_cache": False,
         "chunk_prefetch": False,
         "use_pinned_buffers": False,
         "use_cufile": False,
@@ -175,20 +174,31 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
 
 
 def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> None:
-    """Pre-stage per-chunk pair indices and either (a) load grad_values
-    onto GPU for resident slicing, or (b) attach pinned + cuFile pools
-    so the disk-backed staging path can DMA chunks straight to GPU.
+    """Pre-stage per-chunk pair indices, then pick the chunk-staging
+    mode for each data dict based on `cfg.pin_data_to_cpu`:
 
-    Mode is per-data-dict (train and val handled identically). With
-    cfg.eval_jit_compile, pair indices are padded to the per-data
-    global max so the XLA-compiled eval kernel sees a single shape.
+      pin_data_to_cpu=False : everything lives on /GPU:0. If grad
+        was disk-backed, read it fully into a GPU tf.constant and
+        drop the memmap. Move every other static field to GPU too.
+        The SNES eval / score loops then use the pure-GPU
+        `_stage_chunk_resident` fast path.
+
+      pin_data_to_cpu=True  : tensors stay on host. For disk-backed
+        grad_values, attach pinned-host + cuFile pools so per-chunk
+        slices DMA straight to GPU. For in-RAM grad_values the
+        passthrough branch in `_stage_finalize_tf` handles slicing.
+
+    With cfg.eval_jit_compile, pair indices are padded to the
+    per-data global max so the XLA-compiled eval kernel sees a
+    single shape and compiles once.
     """
     from data import (prestage_chunk_indices, compute_max_chunk_pairs,
                       move_data_to_gpu, make_pinned_pool_for)
 
     chunk = cfg.batch_chunk_size
+    pin = bool(getattr(cfg, "pin_data_to_cpu", True))
 
-    # 1. Pre-stage pair indices for every chunk range. Tiny tensors,
+    # Pre-stage pair indices for every chunk range. Tiny tensors,
     # GPU-resident, reused every generation.
     for d in (train_data, val_data):
         S = int(d["num_atoms"].shape[0])
@@ -198,30 +208,27 @@ def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> No
                   if getattr(cfg, "eval_jit_compile", False) else None)
         prestage_chunk_indices(d, ranges, pad_to=pad_to)
 
-    # 2a. GPU-resident path: read the disk-backed grad_values fully
-    # into a tf.constant on the GPU, then move every other static
-    # field on-device too. The chunk-staging path becomes pure GPU
-    # gather/strided_slice — no host round-trip, no pools needed.
-    if getattr(cfg, "gpu_resident_grad_cache", False):
+    # GPU-resident path. Loads disk-backed grad into a GPU tf.constant
+    # (if applicable), moves all other fields on-device, then sets the
+    # `_gv_resident_gpu` flag that triggers `_stage_chunk_resident` in
+    # `prefetched_chunks`.
+    if not pin:
         for d, tag in ((train_data, "train"), (val_data, "val")):
-            if not d.get("_gv_disk_backed", False):
-                continue
             gv = d["grad_values"]
-            shape = tuple(int(x) for x in gv.shape)
-            nbytes = int(np.prod(shape)) * int(np.dtype(gv.dtype).itemsize)
-            with tf.device("/GPU:0"):
-                gv_gpu = tf.constant(np.asarray(gv))
-            d["grad_values"] = gv_gpu
-            d["_gv_disk_backed"] = False
+            if d.get("_gv_disk_backed", False):
+                shape = tuple(int(x) for x in gv.shape)
+                nbytes = int(np.prod(shape)) * int(np.dtype(gv.dtype).itemsize)
+                with tf.device("/GPU:0"):
+                    gv_gpu = tf.constant(np.asarray(gv))
+                d["grad_values"] = gv_gpu
+                d["_gv_disk_backed"] = False
+                print(f"  GPU-resident: {tag} grad_values loaded from disk "
+                      f"{shape} {gv.dtype} = {nbytes/1e9:.2f} GB on /GPU:0")
             d["_gv_resident_gpu"] = True
             move_data_to_gpu(d)
-            print(f"  GPU-resident grad cache: {tag} loaded "
-                  f"{shape} {gv.dtype} = {nbytes/1e9:.2f} GB on /GPU:0")
+        return
 
-    # 2b. Disk-backed path: attach pinned-host and cuFile pools so the
-    # per-chunk slice DMAs from NVMe straight to a registered GPU
-    # buffer. Pool size must cover prefetch_depth in-flight stagings
-    # plus the chunk currently held by the consumer.
+    # Pinned / cuFile pool path. Only meaningful when grad is disk-backed.
     n_buffers = max(int(getattr(cfg, "pinned_pool_size", 4)),
                     int(getattr(cfg, "prefetch_depth", 1)) + 1)
     if getattr(cfg, "use_pinned_buffers", True):
@@ -377,11 +384,16 @@ def _train_model_inner(cfg: TNEPconfig) -> TNEP:
     if timing:
         phases = ["sample_batch", "evaluate", "rank_update", "validate", "overhead"]
         grand = sum(sum(timing[p]) for p in phases)
-        n_gens = len(timing["evaluate"])
-        print(f"\n=== Timing Breakdown ({grand:.2f}s over {n_gens} generations) ===")
+        # History is sampled once per val_interval, so n_recorded is the
+        # number of val ticks — not the total generation count. The
+        # per-tick averages are still representative of typical per-gen
+        # cost since each recorded tick is itself a single gen's timing.
+        n_recorded = len(timing["evaluate"])
+        print(f"\n=== Timing Breakdown ({grand:.2f}s sampled across "
+              f"{n_recorded} val ticks, val_interval={cfg.val_interval}) ===")
         for p in phases:
             t = sum(timing[p])
-            avg = t / max(n_gens, 1)
+            avg = t / max(n_recorded, 1)
             pct = 100 * t / max(grand, 1e-9)
             print(f"  {p:15s}: {t:.3f}s total ({pct:5.1f}%) | {avg*1000:.1f}ms/gen")
 

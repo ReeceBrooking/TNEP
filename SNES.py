@@ -519,25 +519,32 @@ class SNES:
 
             t4 = time.perf_counter()
 
-            history["generation"].append(gen)
-            history["train_loss"].append(avg_fitness)
-            history["val_loss"].append(val_fitness)
-            history["L1"].append(gen_l1)
-            history["L2"].append(gen_l2)
-            history["best_rmse"].append(best_rmse)
-            history["worst_rmse"].append(worst_rmse)
-
-            # Sigma stats: sample every 100 gens to avoid GPU→CPU transfer
+            # Sigma stats: sample every 100 gens to avoid GPU→CPU transfer.
+            # Cached scalars are reused on the off-cycles, so the value
+            # appended at the next val tick reflects the most recent
+            # sample within at most 100 gens of staleness.
             if gen % 100 == 0:
                 sigma_np = self.sigma.numpy()
                 sigma_min = float(np.min(sigma_np))
                 sigma_max = float(np.max(sigma_np))
                 sigma_mean = float(np.mean(sigma_np))
                 sigma_median = float(np.median(sigma_np))
-            history["sigma_min"].append(sigma_min)
-            history["sigma_max"].append(sigma_max)
-            history["sigma_mean"].append(sigma_mean)
-            history["sigma_median"].append(sigma_median)
+
+            # History is recorded once per val_interval (plus the final
+            # generation). Off-val gens contribute only to the progress
+            # bar and the early-stopping counter.
+            if _do_val:
+                history["generation"].append(gen)
+                history["train_loss"].append(avg_fitness)
+                history["val_loss"].append(val_fitness)
+                history["L1"].append(gen_l1)
+                history["L2"].append(gen_l2)
+                history["best_rmse"].append(best_rmse)
+                history["worst_rmse"].append(worst_rmse)
+                history["sigma_min"].append(sigma_min)
+                history["sigma_max"].append(sigma_max)
+                history["sigma_mean"].append(sigma_mean)
+                history["sigma_median"].append(sigma_median)
 
             # Progress bar
             frac = (gen + 1) / cfg.num_generations
@@ -585,11 +592,12 @@ class SNES:
 
             t5 = time.perf_counter()
 
-            history["timing"]["sample_batch"].append(t1 - t0)
-            history["timing"]["evaluate"].append(t2 - t1)
-            history["timing"]["rank_update"].append(t3 - t2)
-            history["timing"]["validate"].append(t4 - t3)
-            history["timing"]["overhead"].append(t5 - t4)
+            if _do_val:
+                history["timing"]["sample_batch"].append(t1 - t0)
+                history["timing"]["evaluate"].append(t2 - t1)
+                history["timing"]["rank_update"].append(t3 - t2)
+                history["timing"]["validate"].append(t4 - t3)
+                history["timing"]["overhead"].append(t5 - t4)
 
             # Periodic plotting callback
             if gen + 1 < cfg.num_generations:
