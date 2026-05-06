@@ -9,6 +9,23 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from TNEP import TNEP
 
+def _format_duration(seconds: float) -> str:
+    """Format a non-negative duration as HH:MM:SS, or as Dd HH:MM:SS
+    when it exceeds 24 h. Avoids the day-rollover bug in
+    `time.strftime('%H:%M:%S', time.gmtime(seconds))`, which silently
+    truncates anything past one day to the hour-of-day component.
+    """
+    if not (seconds == seconds) or seconds < 0:  # NaN or negative guard
+        return "--:--:--"
+    total = int(seconds)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight arrays directly into the TNEP model's tf.Variables.
 
@@ -427,13 +444,6 @@ class SNES:
         sigma_min = sigma_max = sigma_mean = sigma_median = float(cfg.init_sigma)
         train_start = time.perf_counter()
 
-        # Report per-type structure coverage
-        if self._per_type:
-            tc = train_data["types_contained"].numpy()  # [S, T]
-            for t in range(cfg.num_types):
-                coverage = tc[:, t].sum() / S_train
-                print(f"  Type {t}: present in {coverage:.1%} of structures")
-
         for gen in range(cfg.num_generations):
             t0 = time.perf_counter()
 
@@ -489,10 +499,15 @@ class SNES:
             else:
                 fitness = self.evaluate_population(samples, batch_data)
 
-            # GPU sync: extract scalar metrics
-            avg_fitness = float(tf.reduce_mean(fitness))
-            best_rmse = float(tf.reduce_min(fitness))
-            worst_rmse = float(tf.reduce_max(fitness))
+            # GPU→CPU sync. Stack the three reductions and pull them
+            # in one transfer — three separate `float(reduce_*)` calls
+            # would issue three independent device syncs every gen.
+            metrics_gpu = tf.stack([
+                tf.reduce_mean(fitness),
+                tf.reduce_min(fitness),
+                tf.reduce_max(fitness),
+            ])
+            avg_fitness, best_rmse, worst_rmse = (float(x) for x in metrics_gpu.numpy())
 
             t2 = time.perf_counter()
 
@@ -553,8 +568,8 @@ class SNES:
             bar = "█" * filled + "░" * (bar_len - filled)
             elapsed = time.perf_counter() - train_start
             eta = elapsed / frac * (1 - frac) if frac > 0 else 0
-            elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
+            elapsed_str = _format_duration(elapsed)
+            eta_str = _format_duration(eta)
             line = (f"\r{bar} {gen + 1}/{cfg.num_generations} "
                     f"train RMSE: {avg_fitness:.6f}  "
                     f"val RMSE: {val_fitness:.6f}  "

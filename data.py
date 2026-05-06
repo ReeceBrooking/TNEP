@@ -102,6 +102,19 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
     # Filter bad data based on config flags
     dataset, dataset_types_int = filter_bad_data(dataset, dataset_types_int, cfg)
 
+    # Per-type structure coverage: fraction of structures that contain
+    # at least one atom of each type. Useful for spotting under-represented
+    # species early — under-represented types regularise unstably and
+    # are typically the first thing to investigate when train RMSE
+    # plateaus per-type.
+    if dataset_types_int:
+        from ase.data import chemical_symbols
+        S = len(dataset_types_int)
+        for t, z in enumerate(cfg.types):
+            n_with_t = sum(1 for ts in dataset_types_int if (ts == t).any())
+            sym = chemical_symbols[int(z)] if 0 <= int(z) < len(chemical_symbols) else "?"
+            print(f"  Type {t} ({sym}, Z={int(z)}): present in {n_with_t/S:.1%} of structures")
+
     return dataset, dataset_types_int
 
 

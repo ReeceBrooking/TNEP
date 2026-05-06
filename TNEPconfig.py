@@ -15,7 +15,7 @@ class TNEPconfig:
     test_data_path: str | None = "datasets/test.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
-    allowed_species: list[int | str] | None = None
+    allowed_species: list[int | str] | None = [6, 1, 8, 7]
     # Species filter mode: "subset" = keep structures with only allowed species,
     # "exact" = keep structures containing exactly all allowed species
     filter_mode: str = "subset"
@@ -29,7 +29,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 200000
+    num_generations: int = 30000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
@@ -208,11 +208,11 @@ class TNEPconfig:
     # Test split ratio
     test_ratio: float = 0.3
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N: int | None = None
+    total_N: int | None = 4000
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)
-    val_interval: int = 1
+    val_interval: int = 10
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage).
     # None = no chunking (recommended for A100 at typical molecular sizes).
     # For very large systems (>50k edges per structure), start at 50 and reduce if OOM.

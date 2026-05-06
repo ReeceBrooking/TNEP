@@ -189,7 +189,13 @@ def plot_timing(history: dict, cfg: TNEPconfig,
     if not timing or not timing.get("evaluate"):
         return
 
-    g = np.arange(len(timing["evaluate"]))
+    # Use actual generation indices so the x-axis is correct under any
+    # val_interval. Falls back to record index only if generation
+    # wasn't recorded (older history dicts).
+    n = len(timing["evaluate"])
+    gens_recorded = history.get("generation", [])
+    g = (np.asarray(gens_recorded[:n])
+         if len(gens_recorded) >= n else np.arange(n))
     phases = ["evaluate", "validate", "rank_update", "sample_batch", "overhead"]
     colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#95a5a6"]
 
