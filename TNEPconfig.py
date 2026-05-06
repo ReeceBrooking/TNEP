@@ -87,6 +87,24 @@ class TNEPconfig:
     # default (6 GiB).
     descriptor_memory_budget_bytes: int | None = None
 
+    # Master switch for CSC / Slurm-supercomputer mode (Mahti, Puhti,
+    # LUMI etc.). When True:
+    #   - All gradient-caching options are forced off
+    #     (`cache_gradients_to_disk`, `gpu_resident_grad_cache`,
+    #     `chunk_prefetch`, `use_pinned_buffers`, `use_cufile`).
+    #     Grad_values stays in host RAM as a tf.constant — no NVMe
+    #     scratch, no pinned-host pool, no cuFile / GDS. CSC nodes
+    #     have ample host RAM and the cuFile compat-mode WSL path
+    #     doesn't generalise to their kernel / filesystem stack.
+    #   - The Slurm-specific scratch-dir resolver
+    #     (`MasterTNEP._resolve_scratch_dir`) is allowed to consult
+    #     `$SLURM_TMPDIR` / `$TMPDIR` / `$LOCAL_SCRATCH`. With this
+    #     flag False those env-vars are ignored even if set, so a
+    #     local dev environment that happens to define `TMPDIR`
+    #     doesn't accidentally land scratch there.
+    # Default False keeps non-HPC behaviour identical.
+    csc_enable: bool = False
+
     # When True, the bulky grad_values COO tensor is written to a
     # temporary directory on disk (created next to the working directory
     # so it lands on the same filesystem — NVMe in typical setups) and

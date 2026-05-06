@@ -38,25 +38,53 @@ from tqdm import tqdm
 from ase.io import read, iread
 
 
-def _resolve_scratch_dir() -> str:
+def _resolve_scratch_dir(cfg: TNEPconfig) -> str:
     """Pick a node-local fast-storage directory for the grad_values
-    cache. Honours the standard HPC env-vars in priority order:
+    cache. **Slurm env-vars are only consulted when
+    `cfg.csc_enable=True`** — outside CSC mode this method always
+    returns the current working directory, so a local dev environment
+    that happens to set `$TMPDIR` doesn't have its scratch redirected.
 
-        SLURM_TMPDIR     (Slurm node-local scratch — Compute Canada,
-                          many academic clusters)
-        TMPDIR           (POSIX standard; Mahti/Puhti set this)
+    With `cfg.csc_enable=True` the resolver tries (in priority order):
+
+        SLURM_TMPDIR     (Slurm node-local scratch)
+        TMPDIR           (POSIX standard; Mahti / Puhti set this)
         LOCAL_SCRATCH    (some sites; e.g. PBS environments)
 
-    Falls back to the current working directory when none of the above
-    are set (typical for local dev). On HPC nodes cwd is usually a
-    network filesystem (Lustre/GPFS) which is much slower than node-
-    local NVMe — so the env-vars matter.
+    falling back to cwd when none are set. On HPC compute nodes cwd
+    is usually a network filesystem (Lustre/GPFS) which is much
+    slower than node-local NVMe — so the env-vars matter there.
     """
-    for var in ("SLURM_TMPDIR", "TMPDIR", "LOCAL_SCRATCH"):
-        path = os.environ.get(var)
-        if path and os.path.isdir(path):
-            return path
+    if getattr(cfg, "csc_enable", False):
+        for var in ("SLURM_TMPDIR", "TMPDIR", "LOCAL_SCRATCH"):
+            path = os.environ.get(var)
+            if path and os.path.isdir(path):
+                return path
     return os.getcwd()
+
+
+def _apply_csc_overrides(cfg: TNEPconfig) -> None:
+    """When `cfg.csc_enable=True`, force every gradient-caching
+    option off. Grad_values then stays in host RAM as a normal
+    tf.constant; the chunk-staging path uses the in-RAM passthrough
+    branch with no NVMe scratch, no pinned pool, no cuFile.
+    """
+    if not getattr(cfg, "csc_enable", False):
+        return
+    overrides = {
+        "cache_gradients_to_disk": False,
+        "gpu_resident_grad_cache": False,
+        "chunk_prefetch": False,
+        "use_pinned_buffers": False,
+        "use_cufile": False,
+    }
+    changed = []
+    for k, v in overrides.items():
+        if getattr(cfg, k, None) != v:
+            changed.append(f"{k}={getattr(cfg, k, None)!r}→{v!r}")
+            setattr(cfg, k, v)
+    print(f"  csc_enable=True — caching options disabled"
+          + (f" ({', '.join(changed)})" if changed else ""))
 
 
 def train_model(cfg: TNEPconfig | None = None) -> TNEP:
@@ -71,13 +99,19 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
     if cfg is None:
         cfg = TNEPconfig()
 
+    # CSC / Slurm-supercomputer mode: force every cache off before any
+    # downstream code reads those flags. Must run before scratch-dir
+    # resolution and pad_and_stack, both of which branch on
+    # cfg.cache_gradients_to_disk.
+    _apply_csc_overrides(cfg)
+
     # Allocate a per-run scratch directory for the disk-backed
     # grad_values cache. Prefers node-local fast storage on HPC nodes
-    # (see _resolve_scratch_dir). Removed in the finally block at the
-    # end of the function.
+    # when csc_enable=True (see _resolve_scratch_dir). Removed in the
+    # finally block at the end of the function.
     cfg._gradient_cache_path = None
     if getattr(cfg, "cache_gradients_to_disk", False):
-        scratch_root = _resolve_scratch_dir()
+        scratch_root = _resolve_scratch_dir(cfg)
         cfg._gradient_cache_path = tempfile.mkdtemp(
             prefix=".grad_cache_", dir=scratch_root)
         print(f"  cache_gradients_to_disk=True → scratch dir "
