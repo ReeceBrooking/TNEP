@@ -140,7 +140,11 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         f.attrs["num_types"] = cfg.num_types
         f.attrs["num_neurons"] = cfg.num_neurons
         f.attrs["dim_q"] = cfg.dim_q
-        f.attrs["elements"] = json.dumps(cfg.types)
+        # Store as a native int array attribute — h5py handles this
+        # directly (visible via `h5ls -v model.h5`), avoiding the JSON
+        # round-trip that the full `config` dataset below needs for
+        # heterogeneous dict serialisation.
+        f.attrs["elements"] = np.asarray(cfg.types, dtype=np.int32)
 
         # Weights
         wg = f.create_group("weights")
@@ -194,6 +198,117 @@ def save_history(history: dict, cfg: TNEPconfig) -> None:
     print(f"History saved to {path}")
 
 
+def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
+                    history: dict, last_gen: int) -> None:
+    """Write a rolling training checkpoint at `path`. Atomically
+    overwrites any existing checkpoint at the same path so a
+    half-written file can never confuse the loader.
+
+    `state` keys:
+        mu, sigma                 : tf.Variable / np.ndarray — current SNES distribution
+        best_mu, best_sigma       : tf.Tensor / np.ndarray — best-val params seen
+        best_val_loss             : float
+        gens_without_improvement  : int
+        tf_rng_state              : tf.Tensor / np.ndarray (optional) — Generator state
+    """
+    config_dict = _serialize_config(cfg)
+    z_to_type_index = np.array(
+        [[z, idx] for idx, z in enumerate(cfg.types)], dtype=np.int32)
+
+    def _np(x):
+        return x.numpy() if hasattr(x, "numpy") else np.asarray(x)
+
+    tmp = path + ".tmp"
+    with h5py.File(tmp, "w") as f:
+        # Inspection attrs (h5ls-friendly)
+        f.attrs["target_mode"] = cfg.target_mode
+        f.attrs["num_types"] = cfg.num_types
+        f.attrs["num_neurons"] = cfg.num_neurons
+        f.attrs["dim_q"] = cfg.dim_q
+        f.attrs["elements"] = np.asarray(cfg.types, dtype=np.int32)
+        f.attrs["last_gen"] = int(last_gen)
+        f.attrs["num_generations"] = int(cfg.num_generations)
+        # Full cfg + descriptor type map for sturdy reload
+        f.create_dataset("config", data=json.dumps(config_dict))
+        f.create_dataset("descriptor/z_to_type_index", data=z_to_type_index)
+        # SNES state
+        sg = f.create_group("snes")
+        sg.create_dataset("mu",         data=_np(state["mu"]))
+        sg.create_dataset("sigma",      data=_np(state["sigma"]))
+        sg.create_dataset("best_mu",    data=_np(state["best_mu"]))
+        sg.create_dataset("best_sigma", data=_np(state["best_sigma"]))
+        sg.attrs["best_val_loss"] = float(state["best_val_loss"])
+        sg.attrs["gens_without_improvement"] = int(state["gens_without_improvement"])
+        rng = state.get("tf_rng_state")
+        if rng is not None:
+            sg.create_dataset("rng_state", data=_np(rng))
+        # History (so plots / early-stop continuity carry over)
+        hg = f.create_group("history")
+        for k, v in history.items():
+            if k == "timing":
+                tg = hg.create_group("timing")
+                for tk, tv in v.items():
+                    tg.create_dataset(tk, data=np.asarray(tv, dtype=np.float64))
+            else:
+                hg.create_dataset(k, data=np.asarray(v))
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
+    """Load a training checkpoint. Returns `(cfg, resume_state)` where
+    `cfg` is the fully-restored config (architecture + indices + run
+    params) and `resume_state` carries the SNES + history fields needed
+    to continue training from `last_gen + 1`.
+
+    The cfg returned is identical to the one that was running when the
+    checkpoint was written — the architecture-defining fields (dim_q,
+    num_types, types, type_map, etc.) and the train/val split (via
+    cfg.indices) come straight from the file. Any cfg passed by the
+    caller of `train_model` is ignored when `checkpoint=` is set.
+    """
+    cfg = TNEPconfig()
+    with h5py.File(path, "r") as f:
+        config_dict = json.loads(f["config"][()])
+        for k, v in config_dict.items():
+            if k in ("descriptor_mean", "type_map"):
+                # Legacy / re-derived below.
+                continue
+            setattr(cfg, k, v)
+        # Restore types as Python ints (json may have int64 → int already
+        # via _serialize_config, but enforce here for old checkpoints).
+        if hasattr(cfg, "types"):
+            cfg.types = [int(z) for z in cfg.types]
+        # Indices come back as a list from json — coerce to ndarray so
+        # downstream code that indexes with cfg.indices keeps working.
+        if isinstance(getattr(cfg, "indices", None), list):
+            cfg.indices = np.asarray(cfg.indices, dtype=np.int64)
+        cfg.type_map = {int(row[0]): int(row[1])
+                         for row in f["descriptor/z_to_type_index"][:]}
+
+        last_gen = int(f.attrs["last_gen"])
+        sg = f["snes"]
+        resume_state = {
+            "mu":         sg["mu"][:],
+            "sigma":      sg["sigma"][:],
+            "best_mu":    sg["best_mu"][:],
+            "best_sigma": sg["best_sigma"][:],
+            "best_val_loss":            float(sg.attrs["best_val_loss"]),
+            "gens_without_improvement": int(sg.attrs["gens_without_improvement"]),
+            "rng_state":  sg["rng_state"][:] if "rng_state" in sg else None,
+            "last_gen":   last_gen,
+        }
+        hg = f["history"]
+        history = {}
+        for k in hg:
+            if k == "timing":
+                history["timing"] = {tk: list(hg["timing"][tk][:])
+                                      for tk in hg["timing"]}
+            else:
+                history[k] = list(hg[k][:])
+    resume_state["history"] = history
+    return cfg, resume_state
+
+
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None) -> None:
     model.W0.assign(W0)
@@ -242,6 +357,13 @@ def _load_model_h5(path: str) -> TNEP:
         if k == "descriptor_mean":
             # Legacy field — silently ignore on load (descriptor scaling
             # has been removed from the runtime).
+            continue
+        if k == "type_map":
+            # JSON stringifies dict keys, so the round-tripped value
+            # has str keys ("6": 0) instead of int. The authoritative
+            # int-keyed type_map was already built from the
+            # `descriptor/z_to_type_index` dataset above — don't
+            # overwrite it.
             continue
         setattr(cfg, k, v)
 

@@ -280,15 +280,12 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
     rmse = float(metrics["rmse"])
     r2 = float(metrics["r2"])
     r2_comp = metrics["r2_components"].numpy()
-
-    # Relative RMSE per component: RMSE_i / mean(|target_i|)
-    rrmse_comp = np.array([
-        np.sqrt(np.mean((targets[:, i] - predictions[:, i]) ** 2))
-        / max(np.mean(np.abs(targets[:, i])), 1e-12)
-        for i in range(T)
-    ])
-    # Overall RRMSE
-    rrmse = rmse / max(np.mean(np.abs(targets)), 1e-12)
+    # RRMSE is provided pre-computed by the caller (always derived
+    # from total-scale RMSE / total-scale mean-|target|) so the same
+    # value appears on both per-atom and total panels — RRMSE is a
+    # model-vs-dataset property, not a scale-dependent quantity.
+    rrmse = float(metrics["rrmse"])
+    rrmse_comp = np.asarray(metrics["rrmse_components"])
 
     labels = component_labels(cfg.target_mode, T)
     units = unit_label(cfg)

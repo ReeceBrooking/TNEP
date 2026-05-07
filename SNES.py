@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import time
 import numpy as np
@@ -395,7 +396,7 @@ class SNES:
         self.mu.assign_add(self.sigma * grad_mu)
         self.sigma.assign(self.sigma * tf.exp(self.eta_sigma * grad_sigma))
 
-    def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor], plot_callback: Callable | None = None) -> dict:
+    def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor], plot_callback: Callable | None = None, resume_state: dict | None = None) -> dict:
         """Run the SNES training loop using GPU-batched population evaluation.
 
         All sampling, ranking, and update operations run on GPU.
@@ -414,37 +415,73 @@ class SNES:
         cfg = self.cfg
         S_train = train_data["descriptors"].shape[0]
 
-        history = {
-            "generation": [],
-            "train_loss": [],
-            "val_loss": [],
-            "L1": [],
-            "L2": [],
-            "best_rmse": [],
-            "worst_rmse": [],
-            "sigma_min": [],
-            "sigma_max": [],
-            "sigma_mean": [],
-            "sigma_median": [],
-            "timing": {
-                "sample_batch": [],
-                "evaluate": [],
-                "rank_update": [],
-                "validate": [],
-                "overhead": [],
-            },
-        }
+        if resume_state is not None:
+            history = resume_state["history"]
+            # Make sure the timing sub-dict exists with all expected keys
+            # (older checkpoints might not have it).
+            history.setdefault("timing", {})
+            for k in ("sample_batch", "evaluate", "rank_update",
+                      "validate", "overhead"):
+                history["timing"].setdefault(k, [])
+            self.mu.assign(resume_state["mu"])
+            self.sigma.assign(resume_state["sigma"])
+            best_mu = tf.constant(resume_state["best_mu"], dtype=tf.float32)
+            best_sigma = tf.constant(resume_state["best_sigma"], dtype=tf.float32)
+            best_val_loss = float(resume_state["best_val_loss"])
+            gens_without_improvement = int(resume_state["gens_without_improvement"])
+            rng = resume_state.get("rng_state")
+            if rng is not None:
+                try:
+                    self.tf_rng.state.assign(np.asarray(rng))
+                except Exception:
+                    # Generator-state shape can shift across TF versions;
+                    # fall back to keeping the freshly-seeded generator
+                    # rather than aborting the resume.
+                    pass
+            start_gen = int(resume_state["last_gen"]) + 1
+            # Offset train_start so the displayed elapsed continues from
+            # the checkpointed wall-time rather than restarting at zero.
+            prior_elapsed = float(sum(
+                sum(history["timing"][k])
+                for k in history["timing"]))
+            train_start = time.perf_counter() - prior_elapsed
+            print(f"  resuming from gen {start_gen} "
+                  f"(best_val={best_val_loss:.6f}, "
+                  f"history points={len(history['generation'])}, "
+                  f"prior elapsed={prior_elapsed:.1f}s)")
+        else:
+            history = {
+                "generation": [],
+                "train_loss": [],
+                "val_loss": [],
+                "L1": [],
+                "L2": [],
+                "best_rmse": [],
+                "worst_rmse": [],
+                "sigma_min": [],
+                "sigma_max": [],
+                "sigma_mean": [],
+                "sigma_median": [],
+                "timing": {
+                    "sample_batch": [],
+                    "evaluate": [],
+                    "rank_update": [],
+                    "validate": [],
+                    "overhead": [],
+                },
+            }
+            best_val_loss = float('inf')
+            best_mu = tf.identity(self.mu)
+            best_sigma = tf.identity(self.sigma)
+            gens_without_improvement = 0
+            start_gen = 0
+            train_start = time.perf_counter()
 
-        best_val_loss = float('inf')
-        best_mu = tf.identity(self.mu)
-        best_sigma = tf.identity(self.sigma)
-        gens_without_improvement = 0
         gen_l1, gen_l2 = 0.0, 0.0
         val_fitness = float('inf')
         sigma_min = sigma_max = sigma_mean = sigma_median = float(cfg.init_sigma)
-        train_start = time.perf_counter()
 
-        for gen in range(cfg.num_generations):
+        for gen in range(start_gen, cfg.num_generations):
             t0 = time.perf_counter()
 
             samples, s = self.ask()
@@ -626,6 +663,30 @@ class SNES:
                     # Restore current mu back into model (training continues)
                     params = self.reconstruct_params_tf(self.mu)
                     _set_model_params(self.model, *params)
+
+            # Periodic checkpoint save (rolling — overwrites previous).
+            # cfg.save_path follows the {run_dir}/auto convention used
+            # by setup_run_directory, so the checkpoint goes in the
+            # parent (run) dir alongside the eventual .h5 model files.
+            ci = getattr(cfg, "checkpoint_interval", None)
+            if (ci is not None and ci > 0 and cfg.save_path
+                    and (gen + 1) % ci == 0
+                    and gen + 1 < cfg.num_generations):
+                from model_io import save_checkpoint
+                run_dir = os.path.dirname(cfg.save_path) or "."
+                os.makedirs(run_dir, exist_ok=True)
+                ckpt_path = os.path.join(run_dir, "checkpoint.h5")
+                save_checkpoint(ckpt_path, cfg, {
+                    "mu": self.mu, "sigma": self.sigma,
+                    "best_mu": best_mu, "best_sigma": best_sigma,
+                    "best_val_loss": best_val_loss,
+                    "gens_without_improvement": gens_without_improvement,
+                    "tf_rng_state": self.tf_rng.state,
+                }, history, gen)
+                # Print a one-line note above the in-place progress bar.
+                sys.stdout.write(
+                    f"\n  checkpoint saved at gen {gen + 1} → {ckpt_path}\n")
+                sys.stdout.flush()
 
         print()  # newline after progress bar
 

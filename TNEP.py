@@ -221,7 +221,8 @@ class TNEP(layers.Layer):
         return forces
 
     def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor],
-            plot_callback: Callable | None = None) -> dict:
+            plot_callback: Callable | None = None,
+            resume_state: dict | None = None) -> dict:
         """Train the model using the SNES evolutionary optimizer.
 
         Args:
@@ -229,6 +230,10 @@ class TNEP(layers.Layer):
                             positions, Z_int, targets, boxes (lists over structures)
             val_data      : same structure, used for validation each generation
             plot_callback : optional callable(history, gen) for periodic plotting
+            resume_state  : optional dict from `model_io.load_checkpoint`,
+                            carries SNES distribution + best-val + history +
+                            RNG state. When provided, training continues from
+                            `resume_state['last_gen'] + 1`.
 
         Returns:
             history         : dict with keys generation, train_loss, val_loss (lists)
@@ -236,7 +241,8 @@ class TNEP(layers.Layer):
             best_val_model  : TNEP model with weights from the best validation generation
         """
         history, final_model, best_val_model = self.optimizer.fit(
-            train_data, val_data, plot_callback=plot_callback)
+            train_data, val_data, plot_callback=plot_callback,
+            resume_state=resume_state)
         return history, final_model, best_val_model
 
     def score(self, test_data: dict[str, tf.Tensor]) -> tuple[dict[str, tf.Tensor], tf.Tensor]:

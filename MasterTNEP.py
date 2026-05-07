@@ -86,16 +86,34 @@ def _apply_csc_overrides(cfg: TNEPconfig) -> None:
           + (f" ({', '.join(changed)})" if changed else ""))
 
 
-def train_model(cfg: TNEPconfig | None = None) -> TNEP:
+def train_model(cfg: TNEPconfig | None = None,
+                checkpoint: str | None = None) -> TNEP:
     """Run full TNEP training pipeline: load, split, train, test, plot, save.
 
     Args:
-        cfg : TNEPconfig or None (uses defaults)
+        cfg        : TNEPconfig or None (uses defaults). Ignored when
+                     `checkpoint` is set — the checkpoint embeds the
+                     full cfg used for the original run, including the
+                     train/val split (cfg.indices) and architecture
+                     fields. Continuing with a different cfg would
+                     break determinism or shape-match.
+        checkpoint : optional path to a `checkpoint.h5` written by a
+                     previous run via `cfg.checkpoint_interval`. When
+                     provided, the cfg is loaded from the file and
+                     training resumes from `last_gen + 1`. Default
+                     None starts a fresh run.
 
     Returns:
         model  : trained TNEP model (access config via model.cfg)
     """
-    if cfg is None:
+    resume_state = None
+    if checkpoint is not None:
+        from model_io import load_checkpoint
+        cfg, resume_state = load_checkpoint(checkpoint)
+        print(f"Resuming training from {checkpoint} "
+              f"(continuing at gen {resume_state['last_gen'] + 1} "
+              f"of {cfg.num_generations})")
+    elif cfg is None:
         cfg = TNEPconfig()
 
     # CSC / Slurm-supercomputer mode: force every cache off before any
@@ -117,7 +135,7 @@ def train_model(cfg: TNEPconfig | None = None) -> TNEP:
               f"{cfg._gradient_cache_path}")
 
     try:
-        return _train_model_inner(cfg)
+        return _train_model_inner(cfg, resume_state=resume_state)
     finally:
         # Always remove the scratch directory, even on exceptions, so
         # repeated runs don't leak ~10 GB per attempt onto the disk.
@@ -149,19 +167,43 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
     save = save_dir if save_dir is not None else cfg.save_plots
     show = show if show is not None else cfg.show_plots
 
-    plot_correlation(targets, preds_np, metrics, cfg, save, show, suffix=suffix_per_atom)
+    # RRMSE is computed once from total-scale targets / total-scale RMSE
+    # and shown identically on both per-atom and total plots — RRMSE is
+    # a model-vs-dataset property that shouldn't depend on which scale
+    # the correlation panel happens to be drawn in.
+    has_total = "total_rmse" in metrics
+    if has_total:
+        scale = data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
+        total_targets = targets * scale
+        total_preds = preds_np * scale
+        total_rmse_scalar = float(metrics["total_rmse"])
+    else:
+        # cfg.scale_targets=False or PES — `targets` is already total.
+        total_targets = targets
+        total_preds = preds_np
+        total_rmse_scalar = float(metrics["rmse"])
+
+    total_diff = total_targets - total_preds
+    target_abs_mean = max(float(np.mean(np.abs(total_targets))), 1e-12)
+    target_abs_mean_comp = np.maximum(np.mean(np.abs(total_targets), axis=0), 1e-12)
+    rmse_comp_total = np.sqrt(np.mean(total_diff ** 2, axis=0))
+    rrmse_payload = {
+        "rrmse": total_rmse_scalar / target_abs_mean,
+        "rrmse_components": rmse_comp_total / target_abs_mean_comp,
+    }
+
+    plot_correlation(targets, preds_np, {**metrics, **rrmse_payload},
+                     cfg, save, show, suffix=suffix_per_atom)
     plot_cosine_similarity(metrics, cfg, save, show, suffix=suffix_per_atom)
     plot_error_vs_magnitude(targets, preds_np, cfg, save, show, suffix=suffix_per_atom)
 
-    if "total_rmse" not in metrics:
+    if not has_total:
         return
-    scale = data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
-    total_targets = targets * scale
-    total_preds = preds_np * scale
     total_metrics = {
         "rmse": metrics["total_rmse"],
         "r2": metrics["total_r2"],
         "r2_components": metrics["total_r2_components"],
+        **rrmse_payload,
     }
     # Carry forward cos-sim annotations for plot_correlation; the
     # standalone plot_cosine_similarity is intentionally omitted at
@@ -273,9 +315,16 @@ def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> No
                   f"{pool.nbytes/1e6:.0f} MB) attached to {tag}_data")
 
 
-def _train_model_inner(cfg: TNEPconfig) -> TNEP:
+def _train_model_inner(cfg: TNEPconfig,
+                        resume_state: dict | None = None) -> TNEP:
     """Body of train_model, factored out so the outer try/finally can
-    guarantee cleanup of the disk-backed gradient scratch directory."""
+    guarantee cleanup of the disk-backed gradient scratch directory.
+
+    On resume (`resume_state` provided), the train/val split is taken
+    from the checkpoint's `cfg.indices` rather than re-shuffled, and
+    the run directory setup is skipped so outputs land in the existing
+    model dir.
+    """
     # Load dataset, filter by species, then filter bad data
     dataset, dataset_types_int = collect(cfg)
     cfg.type_map = {z: idx for idx, z in enumerate(cfg.types)}
@@ -285,7 +334,15 @@ def _train_model_inner(cfg: TNEPconfig) -> TNEP:
     elif cfg.target_mode == 2:
         print_polarizability_statistics(dataset, target_key=_resolve_target_key(cfg))
 
-    cfg.randomise(dataset)
+    if resume_state is not None and isinstance(getattr(cfg, "indices", None), np.ndarray):
+        # Indices already restored from checkpoint — would re-shuffle to
+        # the same values anyway (deterministic via cfg.seed), but
+        # skipping makes the resume self-explanatory and avoids any
+        # surprise if the dataset was extended between runs.
+        print(f"  resume: using checkpoint train/val split "
+              f"({len(cfg.indices)} indices)")
+    else:
+        cfg.randomise(dataset)
 
     # Split into train/val (built now) and a deferred test placeholder. The
     # test descriptors are built on first scoring (materialize_test_data),
@@ -328,8 +385,16 @@ def _train_model_inner(cfg: TNEPconfig) -> TNEP:
     print("Dimension of q: " + str(cfg.dim_q))
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/
-    if cfg.save_path is not None:
+    # On resume, save_path is already an existing run dir from the
+    # checkpoint — skip directory creation so outputs continue to land
+    # there and the original timestamped name is preserved.
+    if cfg.save_path is not None and resume_state is None:
         setup_run_directory(cfg)
+    elif resume_state is not None and cfg.save_path is not None:
+        run_dir = os.path.dirname(cfg.save_path) or "."
+        os.makedirs(os.path.join(run_dir, "plots"), exist_ok=True)
+        cfg.save_plots = os.path.join(run_dir, "plots")
+        print(f"  resume: writing outputs to existing run dir {run_dir}")
 
     model = TNEP(cfg)
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
@@ -359,7 +424,8 @@ def _train_model_inner(cfg: TNEPconfig) -> TNEP:
     # Train
     history, final_model, best_val_model = model.fit(
         train_data, val_data,
-        plot_callback=periodic_plot_callback if cfg.plot_interval else None)
+        plot_callback=periodic_plot_callback if cfg.plot_interval else None,
+        resume_state=resume_state)
 
     # Build the test descriptors now (if not already built by a periodic
     # plot during training), then score final + best-val on it.

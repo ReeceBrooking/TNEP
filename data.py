@@ -72,7 +72,7 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
         structure_types_int = np.zeros_like(structure.numbers)
 
         for i in range(len(structure.numbers)):
-            z = structure.numbers[i]
+            z = int(structure.numbers[i])  # cast np.int64 → Python int
             if z not in types:
                 types.append(z)
             structure_types_int[i] = types.index(z)
@@ -89,12 +89,15 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
         dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species, mode=cfg.filter_mode)
         print("After species filter (" + cfg.filter_mode + "): " + str(len(dataset)) + " structures")
 
-    # Recompute type list and indices after species filtering
+    # Recompute type list and indices after species filtering. Coerce
+    # to Python int — `struct.numbers` is a numpy array, so the raw
+    # entries are np.int64 and would later fail json.dumps in model_io.
     cfg.types = []
     for struct in dataset:
         for z in struct.numbers:
-            if z not in cfg.types:
-                cfg.types.append(z)
+            zi = int(z)
+            if zi not in cfg.types:
+                cfg.types.append(zi)
     cfg.num_types = len(cfg.types)
     dataset_types_int = assign_type_indices(dataset, cfg.types)
     print("Species: " + str(cfg.types) + " (" + str(cfg.num_types) + " types)")

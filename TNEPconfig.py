@@ -29,7 +29,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 80
     # Number of training generations (number of updates to the model)
-    num_generations: int = 30000
+    num_generations: int = 60000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
@@ -173,8 +173,8 @@ class TNEPconfig:
 
     # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
     toggle_regularization: bool = True
-    lambda_1: float | None = 0.003
-    lambda_2: float | None = 0.003
+    lambda_1: float | None = 0.03
+    lambda_2: float | None = 0.03
     # Per-type regularization and ranking (GPUMD NEP4 style)
     # Each type's params are regularized separately, creating per-type fitness
     # rankings that drive per-type natural gradient updates.
@@ -244,7 +244,17 @@ class TNEPconfig:
     pin_data_to_cpu: bool = False
 
     # Periodic plotting interval (None = disabled; int = plot every N generations)
-    plot_interval: int | None = 50000
+    plot_interval: int | None = None
+
+    # Periodic training checkpoint interval. None (default) = no
+    # checkpointing. int = write a rolling checkpoint to
+    # `{save_path}/checkpoint.h5` every N generations, overwriting any
+    # previous checkpoint at that path. The checkpoint embeds the full
+    # cfg, current SNES distribution (mu, sigma), best-val state,
+    # full history, RNG state, and last completed gen — enough to
+    # resume identically via `train_model(checkpoint=path)`. Requires
+    # `save_path` to be set; warned and skipped otherwise.
+    checkpoint_interval: int | None = 1000
 
     # Save model after training (None = disabled; "auto" = auto-generate run directory)
     save_path: str | None = "models/auto"
