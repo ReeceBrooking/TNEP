@@ -1,200 +1,437 @@
+from __future__ import annotations
+
+import os
+import threading
+import concurrent.futures
 import tensorflow as tf
 import numpy as np
-from tensorflow.keras import layers, Model, Sequential, optimizers, losses
+from tensorflow.keras import layers
 from TNEPconfig import TNEPconfig
+from quippy.descriptors import Descriptor
+
+from ase import Atoms
+
+
+# Per-thread cache of quippy Descriptor objects, keyed by SOAP-string tuple.
+# Building Descriptors is expensive (Fortran/C state allocation); caching per
+# thread avoids rebuilding for every frame while keeping each thread's
+# Descriptor objects isolated (quippy is not guaranteed thread-safe across
+# concurrent .calc() calls on the same object).
+_thread_local = threading.local()
+
+
+def _get_thread_builders(soap_strings: list[str]) -> list:
+    """Return this thread's cached Descriptor objects, building them on first use."""
+    cache = getattr(_thread_local, "cache", None)
+    if cache is None:
+        cache = _thread_local.cache = {}
+    key = tuple(soap_strings)
+    builders = cache.get(key)
+    if builders is None:
+        builders = [Descriptor(s) for s in soap_strings]
+        cache[key] = builders
+    return builders
+
+
+def _describe_structure_worker(
+    args: tuple,
+) -> tuple[np.ndarray, list[np.ndarray], list[list[int]]]:
+    """Compute SOAP descriptors for one structure inside a worker thread.
+
+    Reuses thread-local Descriptor objects across calls — the previous version
+    rebuilt them per frame, which dominated runtime for trajectory inference.
+
+    args = (structure, soap_strings) or (structure, soap_strings, do_grad).
+    do_grad defaults to True for backwards compatibility.
+    """
+    if len(args) == 2:
+        structure, soap_strings = args
+        do_grad = True
+    else:
+        structure, soap_strings, do_grad = args
+
+    cell = structure.cell.array
+    if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
+        cell = 1000.0 * np.eye(3, dtype=np.float32)
+        pbc = False
+    else:
+        pbc = structure.pbc
+    structure = Atoms(
+        numbers=structure.numbers,
+        positions=structure.positions,
+        cell=cell,
+        pbc=pbc,
+    )
+
+    builders = _get_thread_builders(soap_strings)
+    outs = [b.calc(structure, grad=do_grad) for b in builders]
+
+    N = len(structure)
+    descriptors  = [[] for _ in range(N)]
+    gradients    = [[] for _ in range(N)]
+    grad_indexes = [[] for _ in range(N)]
+
+    for out in outs:
+        data = out.get("data")
+        if data is None or data.size == 0 or data.shape[1] == 0:
+            continue
+        for k in range(len(out["ci"])):
+            descriptors[out["ci"][k] - 1].append(out["data"][k])
+        if do_grad and out.get("grad_index_0based") is not None:
+            for j in range(len(out["grad_index_0based"])):
+                center    = out["grad_index_0based"][j][0]
+                neighbour = out["grad_index_0based"][j][1]
+                gradients[center].append(out["grad_data"][j])
+                grad_indexes[center].append(neighbour)
+
+    descriptors_np = np.array(descriptors, dtype=np.float32).squeeze(axis=1)
+    if do_grad:
+        gradients_np = [np.array(g, dtype=np.float32) for g in gradients]
+    else:
+        gradients_np = [np.zeros((0, 3, descriptors_np.shape[-1]), dtype=np.float32)
+                        for _ in range(N)]
+    return descriptors_np, gradients_np, grad_indexes
+
+
+def _describe_structure_worker_flat(
+    structure: Atoms,
+    soap_strings: list[str],
+    dim_q: int,
+    do_grad: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute SOAP descriptors and return flat COO arrays directly.
+
+    Skips the per-atom bucketisation that the legacy worker does — quippy
+    already gives us per-pair gradients and per-atom descriptors, and our
+    consumer (_pack_traj_batch_from_flat) wants flat COO. Avoids ~65,000
+    Python-level appends per batch on a 100-frame × 655-atom trajectory.
+
+    Returns:
+        descriptors : [N, dim_q]      float32
+        grad_values : [P, 3, dim_q]   float32 — one entry per (centre, neighbour) pair
+        pair_atom   : [P]             int32   — centre atom index (0-based)
+        pair_gidx   : [P]             int32   — neighbour atom index (0-based)
+    """
+    cell = structure.cell.array
+    if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
+        cell = 1000.0 * np.eye(3, dtype=np.float32)
+        pbc = False
+    else:
+        pbc = structure.pbc
+    structure = Atoms(
+        numbers=structure.numbers,
+        positions=structure.positions,
+        cell=cell,
+        pbc=pbc,
+    )
+    N = len(structure)
+
+    builders = _get_thread_builders(soap_strings)
+    outs = [b.calc(structure, grad=do_grad) for b in builders]
+
+    descriptors = np.zeros((N, dim_q), dtype=np.float32)
+    grad_chunks = []
+    pair_atom_chunks = []
+    pair_gidx_chunks = []
+
+    for out in outs:
+        data = out.get("data")
+        if data is None or data.size == 0 or data.shape[1] == 0:
+            continue
+        # ci is 1-based; data is [N_type, dim_q] — vectorised assign by centre atom
+        ci = np.asarray(out["ci"], dtype=np.int32) - 1
+        descriptors[ci] = np.asarray(data, dtype=np.float32)
+
+        grad_idx = out.get("grad_index_0based")
+        if grad_idx is not None and len(grad_idx) > 0:
+            grad_idx = np.asarray(grad_idx, dtype=np.int32)
+            grad_chunks.append(np.asarray(out["grad_data"], dtype=np.float32))
+            pair_atom_chunks.append(grad_idx[:, 0])
+            pair_gidx_chunks.append(grad_idx[:, 1])
+
+    if grad_chunks:
+        grad_values = np.concatenate(grad_chunks, axis=0)
+        pair_atom   = np.concatenate(pair_atom_chunks)
+        pair_gidx   = np.concatenate(pair_gidx_chunks)
+    else:
+        grad_values = np.zeros((0, 3, dim_q), dtype=np.float32)
+        pair_atom   = np.zeros(0, dtype=np.int32)
+        pair_gidx   = np.zeros(0, dtype=np.int32)
+
+    return descriptors, grad_values, pair_atom, pair_gidx
+
 
 class DescriptorBuilder(layers.Layer):
+    """Builds SOAP-turbo descriptors and their gradients using quippy.
+
+    Constructs one quippy Descriptor per atom type (central_index), then
+    aggregates per-atom descriptors, descriptor gradients, and neighbour
+    indices for each structure in a dataset.
+
+    Also provides geometry utilities (pairwise displacements under MIC)
+    needed by the dipole prediction branch.
     """
-    Per-atom descriptors:
-      - Radial: summed radial basis over neighbors
-      - Angular: 3-body invariants from angular_basis, summed over neighbor pairs
-    """
+
     def __init__(self,
                  cfg: TNEPconfig,
-                 **kwargs):
+                 **kwargs) -> None:
         super().__init__(**kwargs)
 
-        # Angular 3-body basis parameters
-        self.K_radial = cfg.n_radial
-        self.Lmax = cfg.Lmax
-        self.n_radial_ang = cfg.n_radial_ang
-        self.rc = tf.constant(cfg.rc, tf.float32)
-        self.pi = tf.constant(np.pi, tf.float32)
+        self.cfg = cfg
+        self.types = cfg.types
+        self.num_types = cfg.num_types
 
-    def build_descriptors(self, R, box):
-        """
-        inputs = (R, Z, box)
-        R:   [N,3]  Cartesian Å
-        Z:   [N]    int types (unused here but kept for extensibility)
-        box: [3,3]  lattice vectors
+        base = (
+            f"soap_turbo l_max={cfg.l_max} "
+            f"rcut_hard={cfg.rcut_hard} rcut_soft={cfg.rcut_soft} "
+            f"basis={cfg.basis} scaling_mode={cfg.scaling_mode} "
+            f"add_species=F "
+            f"radial_enhancement={cfg.radial_enhancement} "
+            f"compress_mode={cfg.compress_mode} "
+        )
+        if cfg.compress_P is not None:
+            base += f"compress_P={cfg.compress_P} "
 
-        returns Q: [N, D] per-atom descriptor
-        """
-        N = tf.shape(R)[0]
+        alpha_max = " alpha_max={"
+        atom_sigma_r = " atom_sigma_r={"
+        atom_sigma_t = " atom_sigma_t={"
+        atom_sigma_r_scaling = " atom_sigma_r_scaling={"
+        atom_sigma_t_scaling = " atom_sigma_t_scaling={"
+        amplitude_scaling = " amplitude_scaling={"
+        central_weight = " central_weight={"
 
-        # --- Pairwise displacements and distances (PBC) ---
-        dr, rij = self.pairwise_displacements(R, box)  # dr: [N,N,3], rij: [N,N]
+        for a in range(self.num_types):
+            alpha_max += f"{cfg.alpha_max} "
+            atom_sigma_r += f"{cfg.atom_sigma_r} "
+            atom_sigma_t += f"{cfg.atom_sigma_t} "
+            atom_sigma_r_scaling += f"{cfg.atom_sigma_r_scaling} "
+            atom_sigma_t_scaling += f"{cfg.atom_sigma_t_scaling} "
+            amplitude_scaling += f"{cfg.amplitude_scaling} "
+            central_weight += f"{cfg.central_weight} "
 
-        # Mask to exclude self-interactions i=j
-        mask = 1.0 - tf.eye(N, dtype=tf.float32)  # [N,N]
-#        print(mask)
-        # ========================
-        # 1) Radial 2-body block
-        # ========================
-        # Phi_r[i,j,k] = r_ij^k * fc(r_ij), k=0..K_radial
-        phi_r = self.radial_basis(rij)                      # [N,N,K_radial+1]
-#        print(phi_r.shape, mask.shape)
-       # phi_r = tf.cast(phi_r, tf.float32)
-        phi_r *= tf.expand_dims(mask, -1)          # zero out j=i
+        alpha_max += "}"
+        atom_sigma_r += "}"
+        atom_sigma_t += "}"
+        atom_sigma_r_scaling += "}"
+        atom_sigma_t_scaling += "}"
+        amplitude_scaling += "}"
+        central_weight += "}"
 
-        # Sum over neighbors j to get per-atom radial features
-        # q_r[i,k] = Σ_j Phi_r[i,j,k]
-        q_r = tf.reduce_sum(phi_r, axis=1)         # [N, K_radial+1]
+        n_species = " n_species=" + str(self.num_types)
 
-        # =========================
-        # 2) Angular 3-body block
-        # =========================
-        # Use dr as neighbor vectors per central atom:
-        # for each i, neighbors j have vectors dr[i,j,:]
-        # angular_basis returns: [N, N, N, n_radial_ang, Lmax+1]
-        ang_feat = self.angular_basis(dr,
-                                 rij,
-                                      )  # [N,N,N,n_radial_ang,Lmax+1]
+        species_Z = " species_Z={"
+        for type in self.types:
+            species_Z += str(type) + " "
+        species_Z += "}"
 
-        # Build pair mask to exclude:
-        #  - j = i (no self neighbor)
-        #  - k = i (no self neighbor)
-        mask_ij = tf.expand_dims(mask, 2)          # [N,N,1]
-        mask_ik = tf.expand_dims(mask, 1)          # [N,1,N]
-        pair_mask = mask_ij * mask_ik              # [N,N,N] covers every i=j=k possibility?
+        base += species_Z + n_species + alpha_max + atom_sigma_r + atom_sigma_t + atom_sigma_r_scaling + atom_sigma_t_scaling + amplitude_scaling + central_weight
 
-        # Apply mask to angular features
-        ang_feat = ang_feat * tf.expand_dims(tf.expand_dims(pair_mask, -1), -1)
-        # shape still [N,N,N,n_radial_ang,Lmax+1]
-
-        # Sum over neighbor pairs (j,k) to get per-atom angular invariants
-        # q_ang[i, n, l] = Σ_j Σ_k ang_feat[i,j,k,n,l]
-        q_ang = tf.reduce_sum(ang_feat, axis=[1, 2])          # [N, n_radial_ang, Lmax+1]
-
-        # Flatten angular channels
-        q_ang = tf.reshape(q_ang, [N, -1])                    # [N, n_radial_ang*(Lmax+1)]
-
-        # =========================
-        # 3) Concatenate descriptors
-        # =========================
-        descriptors = tf.concat([q_r, q_ang], axis=-1)                  # [N, D]
-        return descriptors
-
-    # Neighbour List Function
-    ## Enforce PBC by choosing closest possible image
-    @tf.function(
-    input_signature=[
-        tf.TensorSpec(shape=[None, 3], dtype=tf.float32),
-        tf.TensorSpec(shape=[None, 3], dtype=tf.float32),
-        tf.TensorSpec(shape=[3, 3], dtype=tf.float32),
-    ]
-)
-    def _minimum_image_displacement(self, Ri, Rj, box):
-        """Return Rj - Ri wrapped by MIC for triclinic/orthorhombic cell.
-           Ri,Rj: [...,3], box: [3,3] (rows = lattice vectors)."""
-        box_inv = tf.linalg.inv(box)
- #       box_inv = tf.cast(box_inv, tf.float32)
-        si = tf.einsum('ij,bj->bi', box_inv, Ri)  # fractional
-        sj = tf.einsum('ij,bj->bi', box_inv, Rj)
-        ds = sj - si
-        ds -= tf.round(ds)  # wrap to [-0.5,0.5)
- #       ds = tf.cast(ds, tf.float32)
-        dr = tf.einsum('ij,bj->bi', box, ds)  # back to Cartesian
-        return dr
-
-    @tf.function(
-        input_signature=[
-            tf.TensorSpec(shape=[None, 3], dtype=tf.float32),
-            tf.TensorSpec(shape=[3, 3], dtype=tf.float32),
+        self._soap_strings = [
+            base + f" central_index={k}"
+            for k in (np.arange(self.num_types, dtype=int) + 1)
         ]
-    )
-    def pairwise_displacements(self, R, box):
-        """Return dr_ij [N,N,3], r_ij [N,N]."""
-        # Vectorize MIC across pairs
-        N = tf.shape(R)[0]
-        Ri_t = tf.reshape(tf.tile(R, [N, 1]), [N, N, 3])
-        Rj_t = tf.transpose(Ri_t, perm=[1, 0, 2])
-        dr_flat = self._minimum_image_displacement(tf.reshape(Ri_t, [-1, 3]),
-                                              tf.reshape(Rj_t, [-1, 3]),
-                                              box)
-        dr = tf.reshape(dr_flat, [N, N, 3])
-        rij = tf.linalg.norm(dr, axis=-1) #+ 1e-16
-        return dr, rij
+        self.builders = [Descriptor(s) for s in self._soap_strings]
 
-    @tf.function(
-        input_signature=[
-            tf.TensorSpec(shape=[None, None], dtype=tf.float32),
-        ]
-    )
-    def cutoff(self, rij):
-        x = tf.clip_by_value(rij / self.rc, 0.0, 1.0)
-        return 0.5 * (tf.cos(self.pi * x) + 1.0)
+        if cfg.num_descriptor_workers is None:
+            _slurm = os.environ.get('SLURM_CPUS_PER_TASK')
+            self._num_workers = int(_slurm) if _slurm else max(os.cpu_count() // 2, 1)
+        else:
+            self._num_workers = cfg.num_descriptor_workers
 
-    @tf.function(
-        input_signature=[
-            tf.TensorSpec(shape=[None, None], dtype=tf.float32),
-        ]
-    )
-    def radial_basis(self, rij):
-        """Polynomial-with-cutoff basis: phi_k(r)= r^k * fc(r), k = 0..K."""
-        feats = [tf.ones_like(rij)]
-        for k in range(1, self.K_radial + 1):
-            feats.append(tf.pow(rij, k))
-        phi = tf.stack(feats, axis=-1)  # [..., K+1]
-        fc = self.cutoff(rij)
-        return phi * tf.expand_dims(fc, -1)  # , Phi, fc
+    def build_descriptors(
+        self,
+        dataset: list[Atoms],
+        calc_gradients: bool = True,
+        batch_frames: int | None = 1,
+    ) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
+        """Compute SOAP descriptors and (optionally) their gradients.
 
-    ## Angular Basis
-    @tf.function(
-         input_signature=[
-            tf.TensorSpec(shape=[None, None, 3], dtype=tf.float32),
-            tf.TensorSpec(shape=[None, None], dtype=tf.float32),
-        ]
-    )
-    def angular_basis(self, dr, rij):
+        Runs each per-type quippy Descriptor with `grad=calc_gradients`, then
+        collects results per centre atom.
+
+        Args:
+            dataset        : list of ase.Atoms structures
+            calc_gradients : if False, gradients/grad_index are returned as
+                             empty per-atom lists (saves the quippy gradient
+                             calculation, which is the dominant cost).
+
+        Returns:
+            dataset_descriptors : list of tensors, one per structure [N, dim_q]
+            dataset_gradients   : per-structure list of N tensors
+                                  ([M_i, 3, dim_q] when calc_gradients=True,
+                                  [0, 3, dim_q] when False)
+            dataset_grad_index  : per-structure list of N lists of int neighbour
+                                  indices (empty when calc_gradients=False)
         """
-        R: [N, M, 3] neighbor vectors for each central atom
-        cutoff: scalar cutoff distance
-        Lmax: max angular degree (e.g., 2)
-        n_radial: number of radial basis functions
-        Returns: angular features [N, M, M, n_radial, Lmax+1]
+        dataset_descriptors = []
+        dataset_gradients   = []
+        dataset_grad_index  = []
+
+        if self._num_workers <= 1:
+            # Serial path
+            for structure in dataset:
+                cell = structure.cell.array
+                if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
+                    cell = 1000.0 * np.eye(3, dtype=np.float32)
+                    pbc = False
+                else:
+                    pbc = structure.pbc
+                structure = Atoms(
+                    numbers=structure.numbers,
+                    positions=structure.positions,
+                    cell=cell,
+                    pbc=pbc,
+                )
+                outs = [b.calc(structure, grad=calc_gradients) for b in self.builders]
+
+                N = len(structure)
+                descriptors  = [[] for _ in range(N)]
+                gradients    = [[] for _ in range(N)]
+                grad_indexes = [[] for _ in range(N)]
+
+                for out in outs:
+                    data = out.get("data")
+                    if data is None or data.size == 0 or data.shape[1] == 0:
+                        continue
+                    for k in range(len(out["ci"])):
+                        descriptors[out["ci"][k] - 1].append(out["data"][k])
+                    if calc_gradients and out.get("grad_index_0based") is not None:
+                        for j in range(len(out["grad_index_0based"])):
+                            center    = out["grad_index_0based"][j][0]
+                            neighbour = out["grad_index_0based"][j][1]
+                            gradients[center].append(out["grad_data"][j])
+                            grad_indexes[center].append(neighbour)
+
+                descriptors = tf.convert_to_tensor(descriptors, dtype=tf.float32)
+                descriptors = tf.squeeze(descriptors, axis=1)
+                dim_q = int(descriptors.shape[-1])
+                if calc_gradients:
+                    for i in range(len(gradients)):
+                        gradients[i] = tf.convert_to_tensor(gradients[i], dtype=tf.float32)
+                else:
+                    gradients = [tf.zeros((0, 3, dim_q), dtype=tf.float32) for _ in range(N)]
+                dataset_descriptors.append(descriptors)
+                dataset_gradients.append(gradients)
+                dataset_grad_index.append(grad_indexes)
+
+        else:
+            _total_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+            omp_per_worker = max(1, _total_cpus // self._num_workers)
+
+            # ThreadPoolExecutor avoids multiprocessing pickling entirely.
+            # quippy's Descriptor.calc() is a C extension that releases the GIL,
+            # so threads run in true parallel for the compute-heavy part.
+            # soap_strings is captured by closure — no serialisation needed.
+            soap_strings = self._soap_strings
+
+            def _thread_worker(structure):
+                return _describe_structure_worker((structure, soap_strings, calc_gradients))
+
+            # OMP_NUM_THREADS is process-wide; setting it before the pool starts
+            # means each thread's first quippy OMP context picks up omp_per_worker.
+            old_omp = os.environ.get('OMP_NUM_THREADS')
+            os.environ['OMP_NUM_THREADS'] = str(omp_per_worker)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=self._num_workers) as exe:
+                    results = list(exe.map(_thread_worker, dataset))
+            finally:
+                if old_omp is not None:
+                    os.environ['OMP_NUM_THREADS'] = old_omp
+                else:
+                    os.environ.pop('OMP_NUM_THREADS', None)
+
+            for descriptors_np, gradients_np, grad_indexes in results:
+                dataset_descriptors.append(tf.convert_to_tensor(descriptors_np, dtype=tf.float32))
+                dataset_gradients.append(
+                    [tf.convert_to_tensor(g, dtype=tf.float32) for g in gradients_np]
+                )
+                dataset_grad_index.append(grad_indexes)
+
+        return dataset_descriptors, dataset_gradients, dataset_grad_index
+
+    def build_descriptors_flat(
+        self,
+        dataset: list[Atoms],
+        calc_gradients: bool = True,
+        batch_frames: int | None = 1,
+        memory_budget_bytes: int | None = None,
+    ) -> list[tuple]:
+        """Compute SOAP descriptors and return flat per-frame COO arrays.
+
+        Args:
+            dataset             : list of ase.Atoms
+            calc_gradients      : when False, gradient outputs are zero-length
+                                  arrays (saves the quippy gradient
+                                  computation, the dominant cost).
+            batch_frames        : ignored (quippy is per-frame). Accepted for
+                                  signature parity with the TF GPU backend.
+            memory_budget_bytes : ignored (quippy is per-frame). Accepted for
+                                  signature parity with the TF GPU backend.
+
+        Returns:
+            list of (descriptors, grad_values, pair_atom, pair_gidx) tuples
+            per structure. All arrays are numpy:
+                descriptors : [N, dim_q]   float32
+                grad_values : [P, 3, dim_q] (or [0,3,dim_q]) float32
+                pair_atom   : [P] (or [0]) int32
+                pair_gidx   : [P] (or [0]) int32
         """
-        # 1. Compute pairwise distances and cutoff
-        # dr, rij = pairwise_displacements(R, box)
-        fc = self.cutoff(rij)
+        soap_strings = self._soap_strings
+        dim_q = self.cfg.dim_q
 
-        # 2. Compute cos(theta_ijk)
-        # Expand to compare every pair of neighbors j,k
-        Rj = tf.expand_dims(dr, 2)  # [N, M, 1, 3]
-        Rk = tf.expand_dims(dr, 1)  # [N, 1, M, 3]
-        dot = tf.reduce_sum(Rj * Rk, axis=-1)  # [N, M, M]
-        rij_mag = tf.expand_dims(rij, 2)
-        rik_mag = tf.expand_dims(rij, 1)
-        cos_theta = dot / (rij_mag * rik_mag + 1e-8)
-        cos_theta = tf.clip_by_value(cos_theta, -1.0, 1.0)  # Why clip?
+        if self._num_workers <= 1:
+            return [_describe_structure_worker_flat(s, soap_strings, dim_q,
+                                                     do_grad=calc_gradients)
+                    for s in dataset]
 
-        # 3. Compute Legendre polynomials up to Lmax
-        P = [tf.ones_like(cos_theta)]  # P0(x) = 1
-        if self.Lmax >= 1:
-            P.append(cos_theta)  # P1(x) = x
-        if self.Lmax >= 2:
-            P.append(0.5 * (3 * cos_theta ** 2 - 1))  # P2(x)
-        P = tf.stack(P, axis=-1)  # [N, M, M, Lmax+1]
+        _total_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+        omp_per_worker = max(1, _total_cpus // self._num_workers)
 
-        # 4. Compute radial terms
-        r_terms = [tf.pow(rij_mag, n) * tf.pow(rik_mag, n) for n in range(self.n_radial_ang)]  # verify
-        r_terms = tf.stack(r_terms, axis=-1)  # [N, M, M, n_radial]
+        def _thread_worker(structure):
+            return _describe_structure_worker_flat(structure, soap_strings, dim_q,
+                                                    do_grad=calc_gradients)
 
-        # 5. Multiply cutoff * radial * angular
-        fc_pair = tf.expand_dims(fc, 2) * tf.expand_dims(fc, 1)  # [N, M, M]
-        fc_pair = tf.expand_dims(fc_pair, -1)  # [N, M, M, 1]
-        fc_pair = tf.expand_dims(fc_pair, -1)  # [N, M, M, 1, 1]
-        features = fc_pair * tf.expand_dims(r_terms, -1) * tf.expand_dims(P, -2)  # verify
+        old_omp = os.environ.get('OMP_NUM_THREADS')
+        os.environ['OMP_NUM_THREADS'] = str(omp_per_worker)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self._num_workers) as exe:
+                return list(exe.map(_thread_worker, dataset))
+        finally:
+            if old_omp is not None:
+                os.environ['OMP_NUM_THREADS'] = old_omp
+            else:
+                os.environ.pop('OMP_NUM_THREADS', None)
 
-        # features shape: [N, M, M, n_radial, Lmax+1]
-        return features
+
+
+# =========================================================================
+# Backend dispatcher
+# =========================================================================
+
+
+def make_descriptor_builder(cfg: TNEPconfig, mode: int | None = None):
+    """Return the descriptor builder selected by `cfg.descriptor_mode` or `mode`.
+
+    Args:
+        cfg  : TNEPconfig instance (provides default mode + hyperparameters)
+        mode : optional override (None → use cfg.descriptor_mode)
+
+    Returns:
+        - mode 0 : DescriptorBuilder (quippy / Fortran, CPU)
+        - mode 1 : DescriptorBuilderGPUTF (TF / GPU, native port)
+
+    The GPU backend is imported lazily so quippy-only deployments don't pull
+    in TF on every import of this module.
+    """
+    selected = cfg.descriptor_mode if mode is None else int(mode)
+    if selected == 0:
+        return DescriptorBuilder(cfg)
+    if selected == 1:
+        # Local import to avoid circular dependency at module load time
+        from DescriptorBuilderGPU_tf import DescriptorBuilderGPUTF
+        return DescriptorBuilderGPUTF(cfg)
+    raise ValueError(
+        f"Unknown descriptor_mode={selected}. Use 0 (quippy) or 1 (GPU TF)."
+    )
