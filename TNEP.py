@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 from typing import Callable
 
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
+from Adam import AdamTrainer
 from TNEPconfig import TNEPconfig
 
 class TNEP(layers.Layer):
@@ -44,7 +46,6 @@ class TNEP(layers.Layer):
         self.num_neurons = cfg.num_neurons
         self.activation = tf.keras.activations.get(cfg.activation)
         self.builder = make_descriptor_builder(cfg)
-        self.optimizer = SNES(self)
 
         # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type
         self.W0 = self.add_weight(
@@ -105,6 +106,143 @@ class TNEP(layers.Layer):
                 trainable=True,
             )
 
+        # Optimizer dispatch (constructed last so it can capture
+        # references to the just-created weight tensors). SNES is the
+        # default canonical path; Adam runs first-order on analytical
+        # gradients via tf.GradientTape (GNEP-style).
+        # Optional descriptor-mixing layer (GPUMD c_nk analog).
+        # U_pair is shared across central atom types; one mixing
+        # square block per unordered neighbour-species pair. Block
+        # sizes are pair-dependent (trivial compression mixes radial
+        # channels across species pair boundaries), so U_pair is
+        # padded to max_block_size and we track each pair's active
+        # size separately.
+        #
+        # For efficient assembly of the full Q×Q mixing matrix, we
+        # also precompute per-pair "placement" matrices P_p ∈
+        # R^{bs × Q} that map the bs active features of pair p onto
+        # their non-contiguous q-indices in the flat descriptor.
+        # Then U_full = Σ_p P_p^T · U_pair[..., p, :bs, :bs] · P_p
+        # is a clean einsum that broadcasts over any leading batch
+        # dims (single-instance and per-candidate paths both work).
+        self.descriptor_mixing = bool(getattr(cfg, "descriptor_mixing", False))
+        self.descriptor_mixing_per_type = bool(
+            getattr(cfg, "descriptor_mixing_per_type", False))
+        if self.descriptor_mixing:
+            from DescriptorBuilderGPU import descriptor_block_layout
+            self._mix_layout = descriptor_block_layout(cfg)
+            self._mix_pair_keys = self._mix_layout["pair_keys"]
+            self._mix_num_pairs = len(self._mix_pair_keys)
+            self._mix_max_block_size = int(self._mix_layout["max_block_size"])
+            self._mix_block_sizes = [
+                self._mix_layout["block_sizes"][k] for k in self._mix_pair_keys]
+            self._mix_Q = int(self._mix_layout["dim_q"])
+            # Build per-pair placement matrices P[p] ∈ R^{bs × Q}.
+            mix_P = []
+            for p_idx, k in enumerate(self._mix_pair_keys):
+                qidx = self._mix_layout["pair_q_index"][k]   # np.int32 [bs]
+                bs = qidx.size
+                P = np.zeros((bs, self._mix_Q), dtype=np.float32)
+                P[np.arange(bs), qidx] = 1.0
+                mix_P.append(tf.constant(P))
+            self._mix_P = mix_P
+            # U_pair shape:
+            #   shared    : [num_pairs, max_bs, max_bs]
+            #   per-type  : [T, num_pairs, max_bs, max_bs]
+            # Identity init for each (t, p)'s [bs, bs] sub-block; padded
+            # rows/cols stay zero so they never contribute via P_p.
+            T = cfg.num_types
+            if self.descriptor_mixing_per_type:
+                shape = (T, self._mix_num_pairs,
+                         self._mix_max_block_size, self._mix_max_block_size)
+                U_init = np.zeros(shape, dtype=np.float32)
+                for t_idx in range(T):
+                    for p_idx, bs in enumerate(self._mix_block_sizes):
+                        U_init[t_idx, p_idx, :bs, :bs] = np.eye(bs, dtype=np.float32)
+            else:
+                shape = (self._mix_num_pairs,
+                         self._mix_max_block_size, self._mix_max_block_size)
+                U_init = np.zeros(shape, dtype=np.float32)
+                for p_idx, bs in enumerate(self._mix_block_sizes):
+                    U_init[p_idx, :bs, :bs] = np.eye(bs, dtype=np.float32)
+            self.U_pair = self.add_weight(
+                name="U_pair",
+                shape=shape,
+                initializer=tf.constant_initializer(U_init),
+                trainable=True,
+            )
+        else:
+            self.U_pair = None
+            self._mix_P = []
+            self._mix_block_sizes = []
+
+        opt_name = str(getattr(cfg, "optimizer", "snes")).lower()
+        if opt_name == "adam":
+            self.optimizer = AdamTrainer(self)
+        elif opt_name == "snes":
+            self.optimizer = SNES(self)
+        else:
+            raise ValueError(
+                f"cfg.optimizer={cfg.optimizer!r} not recognised "
+                f"(expected 'snes' or 'adam')")
+
+    # ---- descriptor mixing helpers ----------------------------------------
+
+    def _U_full(self, U_pair: tf.Tensor | None = None) -> tf.Tensor:
+        """Assemble the full block-diagonal mixing matrix
+        `U_full = Σ_p P_p^T · U_pair[..., p, :bs, :bs] · P_p`.
+
+        Broadcasts over leading batch dims (ellipsis handles every
+        combination of single / per-candidate × shared / per-type):
+            shared single       : [num_pairs, bs, bs]      → [Q, Q]
+            shared candidate    : [C, num_pairs, bs, bs]   → [C, Q, Q]
+            per-type single     : [T, num_pairs, bs, bs]   → [T, Q, Q]
+            per-type candidate  : [C, T, num_pairs, bs, bs]→ [C, T, Q, Q]
+
+        The num_pairs axis is always second-from-the-end-but-two,
+        which is what `U[..., p_idx, :bs, :bs]` selects.
+        """
+        U = self.U_pair if U_pair is None else U_pair
+        parts = []
+        for p_idx, (P, bs) in enumerate(zip(self._mix_P, self._mix_block_sizes)):
+            U_block = U[..., p_idx, :bs, :bs]                            # [..., bs, bs]
+            # P_p^T @ U_block @ P_p, broadcasting over leading dims.
+            placed = tf.einsum('ji,...jk,kl->...il', P, U_block, P)      # [..., Q, Q]
+            parts.append(placed)
+        return tf.add_n(parts)
+
+    def _W0_eff(self, W0: tf.Tensor, U_pair: tf.Tensor | None = None) -> tf.Tensor:
+        """Pre-multiply W0 by U_full^T along the Q axis. Equivalent
+        to mixing the descriptor (desc' = U_full · desc) but absorbs
+        the mixing into the weights so the rest of the forward / the
+        backprop / the dipole sum use raw descriptors and raw
+        grad_values unchanged.
+
+        Shapes (shared U_pair):
+            U_pair [num_pairs, bs, bs]       + W0 [T, Q, H]
+                                             → W0_eff [T, Q, H]
+            U_pair [C, num_pairs, bs, bs]    + W0 [C, T, Q, H]
+                                             → W0_eff [C, T, Q, H]
+        Shapes (per-central-type U_pair):
+            U_pair [T, num_pairs, bs, bs]    + W0 [T, Q, H]
+                                             → W0_eff [T, Q, H]
+            U_pair [C, T, num_pairs, bs, bs] + W0 [C, T, Q, H]
+                                             → W0_eff [C, T, Q, H]
+
+        Identity-init guarantees W0_eff == W0 at generation 0.
+        """
+        if not self.descriptor_mixing:
+            return W0
+        U_full = self._U_full(U_pair)
+        if self.descriptor_mixing_per_type:
+            # U_full has a leading T axis that matches W0's T axis;
+            # contract Q while keeping T tied 1:1.
+            #   '...tqp,...tqh->...tph'
+            return tf.einsum('...tqp,...tqh->...tph', U_full, W0)
+        # Shared U_full broadcasts across W0's T axis.
+        #   '...qp,...tqh->...tph'
+        return tf.einsum('...qp,...tqh->...tph', U_full, W0)
+
     def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,
                 positions: tf.Tensor, Z: tf.Tensor, box: tf.Tensor,
                 atom_mask: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:
@@ -125,8 +263,13 @@ class TNEP(layers.Layer):
             target_mode 1: [3]  dipole vector
             target_mode 2: [6]  polarizability tensor
         """
+        # Absorb U_pair^T into W0 (and W0_pol below) once per call so
+        # both the forward and calc_forces use the U-folded weights.
+        # When descriptor_mixing is disabled, _W0_eff is a no-op.
+        W0_eff = self._W0_eff(self.W0)
+
         # Gather per-type weights for each atom
-        W0_t = tf.gather(self.W0, Z)   # [A, dim_q, H]
+        W0_t = tf.gather(W0_eff, Z)    # [A, dim_q, H]
         b0_t = tf.gather(self.b0, Z)   # [A, H]
         W1_t = tf.gather(self.W1, Z)   # [A, H]
 
@@ -161,7 +304,8 @@ class TNEP(layers.Layer):
             dr_gathered, _ = self._neighbor_displacements_single(positions, box, grad_index)
 
             # --- Scalar ANN (isotropic) ---
-            W0p_t = tf.gather(self.W0_pol, Z)  # [A, dim_q, H]
+            W0_pol_eff = self._W0_eff(self.W0_pol)
+            W0p_t = tf.gather(W0_pol_eff, Z)   # [A, dim_q, H]
             b0p_t = tf.gather(self.b0_pol, Z)  # [A, H]
             W1p_t = tf.gather(self.W1_pol, Z)  # [A, H]
 
@@ -268,6 +412,14 @@ class TNEP(layers.Layer):
         S_test = test_data["num_atoms"].shape[0]
         chunk_sz = (self.cfg.batch_chunk_size
                     if self.cfg.batch_chunk_size is not None else S_test)
+        # Pre-fold U_pair^T into W0 (and W0_pol) once per score call
+        # so every chunk forward uses the same already-absorbed
+        # weights. No-op when descriptor mixing is disabled.
+        W0_eff = self._W0_eff(self.W0)
+        W0_pol_eff = (self._W0_eff(self.W0_pol)
+                      if (self.cfg.target_mode == 2
+                          and getattr(self, "W0_pol", None) is not None)
+                      else getattr(self, "W0_pol", None))
         ranges = [(s, min(s + chunk_sz, S_test)) for s in range(0, S_test, chunk_sz)]
         pred_parts: list = []
         for _, _, chunk in prefetched_chunks(
@@ -280,8 +432,8 @@ class TNEP(layers.Layer):
                 chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],
-                self.W0, self.b0, self.W1, self.b1,
-                getattr(self, 'W0_pol', None),
+                W0_eff, self.b0, self.W1, self.b1,
+                W0_pol_eff,
                 getattr(self, 'b0_pol', None),
                 getattr(self, 'W1_pol', None),
                 getattr(self, 'b1_pol', None),
@@ -383,6 +535,14 @@ class TNEP(layers.Layer):
         """
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
+        # predict_batch is a pure forward primitive: caller is
+        # responsible for whether W0 / W0_pol are raw or already
+        # U-absorbed (via _W0_eff). This keeps the function single-
+        # purpose and avoids double-mixing when callers (validate,
+        # predict_batch_candidates) have already folded U_pair^T in.
+        W0_use = W0
+        W0_pol_use = W0_pol
+
         b0_t = tf.gather(b0, Z)   # [B, A, H]
         W1_t = tf.gather(W1, Z)   # [B, A, H]
 
@@ -393,7 +553,7 @@ class TNEP(layers.Layer):
             for t in range(self.num_types)
         ]
         h = tf.add_n([
-            tf.einsum('baq,qh->bah', descriptors, W0[t]) * type_masks[t]
+            tf.einsum('baq,qh->bah', descriptors, W0_use[t]) * type_masks[t]
             for t in range(self.num_types)
         ]) + b0_t
         h = self.activation(h)
@@ -405,12 +565,13 @@ class TNEP(layers.Layer):
             E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
             return -E
 
-        # de_dq: energy derivative w.r.t. descriptor, one per atom per structure.
-        # Type loop keeps peak at [B, A, Q] rather than [B, A, Q, H].
+        # de_dq: energy derivative w.r.t. *raw* descriptor (because we
+        # absorbed U into W0). No pull-back needed — dipole/pol path
+        # below uses raw grad_values directly.
         dtanh = 1.0 - tf.square(h)
         de_da = dtanh * W1_t
         de_dq = tf.add_n([
-            tf.einsum('bah,qh->baq', de_da, W0[t]) * type_masks[t]
+            tf.einsum('bah,qh->baq', de_da, W0_use[t]) * type_masks[t]
             for t in range(self.num_types)
         ])
 
@@ -431,10 +592,14 @@ class TNEP(layers.Layer):
                                     positions, boxes, box_inv, B)
 
         elif self.cfg.target_mode == 2:
+            # Polarizability's scalar ANN gets the U-absorbed W0_pol_use
+            # so it operates in the same learned-feature space as the
+            # main ANN. Raw descriptors are passed; the algebra is
+            # equivalent to feeding desc_mixed into raw W0_pol.
             return self._polarizability_coo(
                 descriptors, forces_per_pair, pair_struct, pair_atom, pair_gidx,
                 positions, boxes, box_inv, Z, atom_mask,
-                W0_pol, b0_pol, W1_pol, b1_pol, B)
+                W0_pol_use, b0_pol, W1_pol, b1_pol, B)
 
         else:
             tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
@@ -446,7 +611,8 @@ class TNEP(layers.Layer):
                                   Z: tf.Tensor,
                                   atom_mask: tf.Tensor,
                                   W0: tf.Tensor, b0: tf.Tensor,
-                                  W1: tf.Tensor, b1: tf.Tensor) -> tf.Tensor:
+                                  W1: tf.Tensor, b1: tf.Tensor,
+                                  U_pair: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
         Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
@@ -484,6 +650,14 @@ class TNEP(layers.Layer):
             tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
             for t in range(T)
         ]
+
+        # Per-candidate descriptor mixing: absorb U_pair^T into W0 so
+        # the rest of the forward/backward uses raw descriptors and
+        # the de_dq we produce is already in raw-desc space (ready to
+        # combine with raw grad_values in the dipole sum). See _W0_eff
+        # for the algebraic identity.
+        if self.descriptor_mixing and U_pair is not None:
+            W0 = self._W0_eff(W0, U_pair)
 
         # ── Forward: input→hidden ─────────────────────────────────────────────
         # Per type: [B*A, Q] @ [Q, C*H] → [B*A, C*H] → [C, B, A, H]

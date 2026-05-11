@@ -157,6 +157,11 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             wg.create_dataset("b0_pol", data=model.b0_pol.numpy())
             wg.create_dataset("W1_pol", data=model.W1_pol.numpy())
             wg.create_dataset("b1_pol", data=model.b1_pol.numpy())
+        # Optional descriptor-mixing layer. Stored only when the model
+        # was trained with cfg.descriptor_mixing=True; loaders fall
+        # back to identity init when absent (so old models still load).
+        if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
+            wg.create_dataset("U_pair", data=model.U_pair.numpy())
 
         # Descriptor metadata
         dg = f.create_group("descriptor")
@@ -310,7 +315,8 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 
 
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
-                  W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None) -> None:
+                  W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
+                  U_pair=None) -> None:
     model.W0.assign(W0)
     model.b0.assign(b0)
     model.W1.assign(W1)
@@ -320,6 +326,19 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
         model.b0_pol.assign(b0_pol)
         model.W1_pol.assign(W1_pol)
         model.b1_pol.assign(b1_pol)
+    # Optional U_pair restore. When absent in the checkpoint (e.g.
+    # pre-mixing models, or mixing-disabled runs), the model keeps
+    # whatever U_pair its TNEP.__init__ produced (identity init) —
+    # which makes _W0_eff a no-op and reproduces the no-mixing path.
+    if (U_pair is not None
+            and getattr(model, "descriptor_mixing", False)
+            and model.U_pair is not None):
+        if tuple(U_pair.shape) != tuple(model.U_pair.shape):
+            print(f"  warning: saved U_pair shape {tuple(U_pair.shape)} "
+                  f"differs from model.U_pair shape {tuple(model.U_pair.shape)}; "
+                  f"keeping fresh identity init")
+        else:
+            model.U_pair.assign(U_pair)
 
 
 def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
@@ -351,6 +370,7 @@ def _load_model_h5(path: str) -> TNEP:
             "b0_pol": wg["b0_pol"][:] if "b0_pol" in wg else None,
             "W1_pol": wg["W1_pol"][:] if "W1_pol" in wg else None,
             "b1_pol": wg["b1_pol"][:] if "b1_pol" in wg else None,
+            "U_pair": wg["U_pair"][:] if "U_pair" in wg else None,
         }
 
     for k, v in config_dict.items():
@@ -408,6 +428,7 @@ def _load_model_npz(path: str) -> TNEP:
         data["W0"], data["b0"], data["W1"], data["b1"],
         data.get("W0_pol"), data.get("b0_pol"),
         data.get("W1_pol"), data.get("b1_pol"),
+        U_pair=(data["U_pair"] if "U_pair" in data.files else None),
     )
 
     _print_load_summary(path, cfg)

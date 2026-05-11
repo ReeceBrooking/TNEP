@@ -30,18 +30,25 @@ def _format_duration(seconds: float) -> str:
 def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight arrays directly into the TNEP model's tf.Variables.
 
-    For modes 0/1: (W0, b0, W1, b1)
-    For mode 2:    (W0, b0, W1, b1, W0_pol, b0_pol, W1_pol, b1_pol)
+    Tail conventions produced by SNES.reconstruct_params_tf:
+        mode 0/1, no mixing : (W0, b0, W1, b1)
+        mode 0/1, mixing    : (W0, b0, W1, b1, U_pair)
+        mode 2,  no mixing  : (W0, b0, W1, b1, W0_pol, b0_pol, W1_pol, b1_pol)
+        mode 2,  mixing     : (W0, b0, W1, b1, W0_pol, b0_pol, W1_pol, b1_pol, U_pair)
     """
     model.W0.assign(params[0])
     model.b0.assign(params[1])
     model.W1.assign(params[2])
     model.b1.assign(params[3])
-    if len(params) == 8:
+    has_pol = len(params) >= 8
+    if has_pol:
         model.W0_pol.assign(params[4])
         model.b0_pol.assign(params[5])
         model.W1_pol.assign(params[6])
         model.b1_pol.assign(params[7])
+    # The last element is U_pair if the model has descriptor mixing.
+    if getattr(model, "descriptor_mixing", False) and len(params) in (5, 9):
+        model.U_pair.assign(params[-1])
 
 class SNES:
     """Separable Natural Evolution Strategy optimizer for TNEP.
@@ -85,14 +92,60 @@ class SNES:
         self.n_primary = n_W0 + n_b0 + n_W1 + n_b1
         # Mode 2 (polarizability) adds a second ANN with identical shape
         if self.cfg.target_mode == 2:
-            self.dim = 2 * self.n_primary
+            self.n_anns_total = 2 * self.n_primary
         else:
-            self.dim = self.n_primary
+            self.n_anns_total = self.n_primary
+        # Optional U_pair tail (descriptor-mixing layer). Stored flat
+        # at the end of the parameter vector. Block layout is shared
+        # across central types (per Phase B): one [bs, bs] matrix per
+        # species pair, padded to max_block_size inside the model.
+        # SNES sees only the active entries — we pack them densely
+        # here and unpack via reconstruct_params_tf.
+        if getattr(self.cfg, "descriptor_mixing", False):
+            from DescriptorBuilderGPU import descriptor_block_layout
+            self._mix_layout = descriptor_block_layout(self.cfg)
+            self._mix_block_sizes = [
+                self._mix_layout["block_sizes"][k]
+                for k in self._mix_layout["pair_keys"]]
+            self._mix_per_type = bool(
+                getattr(self.cfg, "descriptor_mixing_per_type", False))
+            # n_U_pair packs only the ACTIVE entries (the [bs, bs]
+            # sub-blocks). Padded rows/cols don't take SNES degrees
+            # of freedom — they stay zero and are never read by the
+            # P_p · ... · P_p^T placement.
+            per_T_block = int(sum(bs * bs for bs in self._mix_block_sizes))
+            if self._mix_per_type:
+                self.n_U_pair = self.cfg.num_types * per_T_block
+            else:
+                self.n_U_pair = per_T_block
+        else:
+            self._mix_block_sizes = []
+            self._mix_per_type = False
+            self.n_U_pair = 0
+        self.dim = self.n_anns_total + self.n_U_pair
 
         # Search distribution parameters as tf.Variables (stay on GPU)
-        # GPUMD initialises mu in [-1, 1] (see snes.cu line 6709)
+        # GPUMD initialises mu in [-1, 1] (see snes.cu line 6709). The
+        # ANN portion gets the [-1,1] init; the U_pair tail starts at
+        # identity (delta_ij) so the model begins bit-identical to a
+        # mixing-disabled baseline. Sigma is uniform throughout — the
+        # per-element distribution then explores away from identity.
         rng = np.random.default_rng(self.cfg.seed)
         mu_init = rng.uniform(-1.0, 1.0, size=self.dim).astype(np.float32)
+        if self.n_U_pair > 0:
+            # One identity block per pair, repeated T times if per-type.
+            tail_per_T = np.zeros(
+                sum(bs * bs for bs in self._mix_block_sizes), dtype=np.float32)
+            off = 0
+            for bs in self._mix_block_sizes:
+                eye = np.eye(bs, dtype=np.float32).reshape(-1)
+                tail_per_T[off:off + bs * bs] = eye
+                off += bs * bs
+            if self._mix_per_type:
+                tail = np.tile(tail_per_T, self.cfg.num_types)
+            else:
+                tail = tail_per_T
+            mu_init[self.n_anns_total:] = tail
         self.mu = tf.Variable(mu_init, trainable=False, name="snes_mu")
         self.sigma = tf.Variable(
             tf.fill([self.dim], self.cfg.init_sigma),
@@ -247,8 +300,34 @@ class SNES:
             return tov
 
         if self.cfg.target_mode == 2:
-            return np.concatenate([_ann_types(), _ann_types()])
-        return _ann_types()
+            ann_tov = np.concatenate([_ann_types(), _ann_types()])
+        else:
+            ann_tov = _ann_types()
+
+        # U_pair entries route into the per-type ranking system:
+        #   - Shared U_pair: all entries get the global label (T),
+        #     same ranking signal as the b1 bias. The mixing is
+        #     shared across central types so a per-type ranking
+        #     wouldn't make physical sense.
+        #   - Per-type U_pair: each T-slab gets the corresponding
+        #     central type's label (0..T-1). The t-th slab is only
+        #     applied to atoms of type t in the forward pass, so it
+        #     should be driven by the same fitness signal as that
+        #     type's W0/b0/W1 (i.e. structures containing type t).
+        # Per-pair rankings (one fitness column per species pair)
+        # remain a Tier-2 extension that would require
+        # evaluate_population to emit pair-specific RMSE columns on
+        # top of the per-type columns.
+        if self.n_U_pair > 0:
+            if self._mix_per_type:
+                per_T = sum(bs * bs for bs in self._mix_block_sizes)
+                pair_labels = np.empty(self.n_U_pair, dtype=np.int32)
+                for t_idx in range(T):
+                    pair_labels[t_idx * per_T:(t_idx + 1) * per_T] = t_idx
+            else:
+                pair_labels = np.full(self.n_U_pair, T, dtype=np.int32)
+            return np.concatenate([ann_tov, pair_labels])
+        return ann_tov
 
     def _build_per_type_gradients(
         self,
@@ -368,13 +447,30 @@ class SNES:
     def ask(self) -> tuple[tf.Tensor, tf.Tensor]:
         """Sample pop_size candidate parameter vectors from N(mu, diag(sigma^2)).
 
+        Uses **mirrored (antithetic) sampling**: draws pop_size/2 independent
+        noise vectors ε_i and pairs each with its mirror −ε_i. The
+        first-order Taylor noise in the mean update Σ u_i s_i then
+        cancels per pair exactly when u_+ = −u_−, which is what
+        Hansen's zero-mean utility shaping produces by construction.
+        Net: same evaluation cost, ~1.5–2× lower mean-update variance
+        (Salimans et al. 2017; Brockhoff et al. 2010).
+
+        When pop_size is odd we use floor(pop_size/2) pairs plus one
+        standalone i.i.d. sample so the total population count is preserved.
+
         All operations run on GPU via TensorFlow.
 
         Returns:
             samples : [pop_size, dim] float32 tensor — candidate parameter vectors
             s       : [pop_size, dim] float32 tensor — standard normal noise used
         """
-        s = self.tf_rng.normal(shape=(self.pop_size, self.dim))
+        half = self.pop_size // 2
+        s_half = self.tf_rng.normal(shape=(half, self.dim))
+        if self.pop_size % 2 == 0:
+            s = tf.concat([s_half, -s_half], axis=0)
+        else:
+            s_extra = self.tf_rng.normal(shape=(1, self.dim))
+            s = tf.concat([s_half, -s_half, s_extra], axis=0)
         samples = self.mu + s * self.sigma
         return samples, s
 
@@ -388,13 +484,20 @@ class SNES:
             s         : [pop_size, dim] float32 tensor — noise vectors sorted by fitness
                         (s[0] = noise of best individual, s[-1] = worst)
 
-        Mutates self.mu and self.sigma tf.Variables in place.
+        Mutates self.mu and self.sigma tf.Variables in place. Sigma is
+        clamped to a small floor (cfg.sigma_floor, default 1e-5) after
+        the multiplicative update so a near-collapse of the search
+        distribution can't silently kill exploration on long runs.
         """
         grad_mu = tf.einsum('p,pd->d', utilities, s)
         grad_sigma = tf.einsum('p,pd->d', utilities, s ** 2 - 1.0)
 
         self.mu.assign_add(self.sigma * grad_mu)
-        self.sigma.assign(self.sigma * tf.exp(self.eta_sigma * grad_sigma))
+        floor = getattr(self.cfg, "sigma_floor", 1e-5)
+        new_sigma = self.sigma * tf.exp(self.eta_sigma * grad_sigma)
+        if floor is not None and floor > 0.0:
+            new_sigma = tf.maximum(new_sigma, float(floor))
+        self.sigma.assign(new_sigma)
 
     def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor], plot_callback: Callable | None = None, resume_state: dict | None = None) -> dict:
         """Run the SNES training loop using GPU-batched population evaluation.
@@ -476,6 +579,12 @@ class SNES:
             gens_without_improvement = 0
             start_gen = 0
             train_start = time.perf_counter()
+        # Plateau-driven sigma resets (IPOP-style restart, simplified):
+        # tracks how many resets have already been fired so we can cap
+        # via cfg.max_sigma_resets. Reset counter is per-run (not
+        # restored from checkpoint — a fresh attempt to escape any
+        # plateau seen so far is fine on resume).
+        n_sigma_resets = 0
 
         gen_l1, gen_l2 = 0.0, 0.0
         val_fitness = float('inf')
@@ -627,6 +736,66 @@ class SNES:
                 else:
                     gens_without_improvement += 1
 
+            # Plateau-triggered sigma re-broadening (soft restart).
+            # Checked only on val gens — gens_without_improvement
+            # increments per val tick, so the patience here is in
+            # units of val ticks, not raw gens.
+            #
+            # Two modes, controlled by cfg.sigma_reset_to_init:
+            #
+            # (A) "multiply" (default, sigma_reset_to_init=False):
+            #     σ ← σ · sigma_reset_factor   (elementwise on the
+            #     current sigma vector). Preserves the per-dimension
+            #     scale structure SNES has learned, just re-broadens
+            #     each dim uniformly. This is the better choice in
+            #     high dim because a uniform fresh sigma loses all
+            #     direction information.
+            #
+            # (B) "to_init" (sigma_reset_to_init=True):
+            #     σ ← init_sigma · sigma_reset_factor (uniform).
+            #     IPOP-style hard reset. Use only when you have a
+            #     specific reason to discard learned per-dim scales.
+            #
+            # μ restoration (plateau_restore_best_mu) is independent
+            # and defaults to False — leaving μ where the search has
+            # reached usually beats teleporting back to best_μ
+            # because the broadened σ around best_μ has no learned
+            # direction info to follow.
+            reset_patience = getattr(cfg, "plateau_reset_patience", None)
+            max_resets = getattr(cfg, "max_sigma_resets", None)
+            if (_do_val
+                    and reset_patience is not None
+                    and gens_without_improvement >= int(reset_patience)
+                    and (max_resets is None or n_sigma_resets < int(max_resets))):
+                factor = float(getattr(cfg, "sigma_reset_factor", 2.0))
+                to_init = bool(getattr(cfg, "sigma_reset_to_init", False))
+                if to_init:
+                    self.sigma.assign(
+                        tf.fill([self.dim], float(cfg.init_sigma) * factor))
+                    mode_str = f"σ ← init·{factor:.2f}"
+                else:
+                    self.sigma.assign(self.sigma * factor)
+                    mode_str = f"σ ← σ·{factor:.2f} (preserves per-dim scale)"
+                restore_mu = bool(getattr(cfg, "plateau_restore_best_mu", False))
+                if restore_mu:
+                    self.mu.assign(best_mu)
+                gens_without_improvement = 0
+                n_sigma_resets += 1
+                # Read back current sigma stats for the log line so
+                # the user can see what actually happened.
+                s_now = self.sigma.numpy()
+                s_min = float(np.min(s_now))
+                s_mean = float(np.mean(s_now))
+                s_max = float(np.max(s_now))
+                sys.stdout.write(
+                    f"\n  plateau detected at gen {gen + 1}: {mode_str}"
+                    f" (σ now min/mean/max = {s_min:.4f}/{s_mean:.4f}/{s_max:.4f})"
+                    f" — reset #{n_sigma_resets}"
+                    + (f"/{max_resets}" if max_resets is not None else "")
+                    + (", μ restored to best" if restore_mu else "")
+                    + f", best_val={best_val_loss:.6f}\n")
+                sys.stdout.flush()
+
             if cfg.patience is not None and gens_without_improvement >= cfg.patience:
                 print(f"\nEarly stopping at generation {gen + 1} "
                       f"(no improvement for {cfg.patience} generations)")
@@ -733,17 +902,39 @@ class SNES:
 
         if mu_tf is not None:
             params = self.reconstruct_params_tf(mu_tf)
+            # Tail of reconstruct_params_tf can be 4 (ANN-only), 5 (ANN + U_pair),
+            # 8 (ANN + pol ANN), or 9 (ANN + pol ANN + U_pair). U_pair is the
+            # last element when descriptor mixing is enabled.
+            has_U = self.n_U_pair > 0
+            U_pair_val = params[-1] if has_U else None
+            head = params[:-1] if has_U else params
             if self.cfg.target_mode == 2:
-                W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
+                W0, b0, W1, b1, W0p, b0p, W1p, b1p = head
             else:
-                W0, b0, W1, b1 = params
+                W0, b0, W1, b1 = head
                 W0p = b0p = W1p = b1p = None
+            # Absorb U_pair^T into W0 (and W0_pol) once. predict_batch
+            # is a pure forward over the supplied weights (it does not
+            # call _W0_eff itself), so callers are responsible for
+            # passing U-folded weights — done here for the mu_tf path
+            # and in TNEP.score / TNEP.predict for the model-weights
+            # path.
+            if U_pair_val is not None:
+                W0 = self.model._W0_eff(W0, U_pair_val)
+                if W0p is not None:
+                    W0p = self.model._W0_eff(W0p, U_pair_val)
         else:
             W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
             W0p = getattr(self.model, 'W0_pol', None)
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
             b1p = getattr(self.model, 'b1_pol', None)
+            # If the model itself has descriptor mixing, fold U_pair^T
+            # into the model's W0 / W0_pol for the validate forward.
+            if getattr(self.model, "descriptor_mixing", False):
+                W0 = self.model._W0_eff(W0)
+                if W0p is not None:
+                    W0p = self.model._W0_eff(W0p)
 
         # Streaming chunk loop honours batch_chunk_size so disk reads (when
         # cache_gradients_to_disk is set) and tensor materialisation stay
@@ -841,10 +1032,76 @@ class SNES:
         W0, b0, W1, b1, offset = _extract(param_vectors, 0)
 
         if self.cfg.target_mode == 2:
-            W0p, b0p, W1p, b1p, _ = _extract(param_vectors, offset)
-            return W0, b0, W1, b1, W0p, b0p, W1p, b1p
+            W0p, b0p, W1p, b1p, offset = _extract(param_vectors, offset)
+            tail = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
+        else:
+            tail = (W0, b0, W1, b1)
 
-        return W0, b0, W1, b1
+        if self.n_U_pair > 0:
+            # Unpack the descriptor-mixing tail into a dense tensor:
+            #   shared :   [num_pairs, max_bs, max_bs]
+            #   per-type:  [T, num_pairs, max_bs, max_bs]
+            # (with a leading P axis when input is batched). Each
+            # pair's active [bs, bs] sub-block is placed in the
+            # top-left corner; the remainder stays zero so it never
+            # affects the P_p · ... · P_p^T einsum in _W0_eff. For
+            # per-type, the flat layout is T contiguous copies of
+            # the shared-form blob, indexed in the same intra-pair
+            # order — so we extract them by reshaping the tail to a
+            # leading T axis once, then run the standard per-pair
+            # placement loop on each.
+            U_flat = param_vectors[..., offset:offset + self.n_U_pair]
+            num_pairs = len(self._mix_block_sizes)
+            max_bs = max(self._mix_block_sizes)
+            per_type = self._mix_per_type
+
+            # Build a [..., T?, num_pairs, max_bs, max_bs] output. We
+            # do this by looping over (t?, p_idx) and slicing the
+            # corresponding active [bs, bs] chunk from U_flat.
+            per_T_block = sum(bs * bs for bs in self._mix_block_sizes)
+
+            def _extract_t_block(t_idx: int):
+                """Build one [num_pairs, max_bs, max_bs] tensor from
+                the t-th chunk of U_flat (or the only chunk when
+                shared). Builds the num_pairs axis via tf.stack so
+                the heavy per-pair transpose+scatter dance from the
+                first version is avoided — each pair's block is
+                padded once and the list is stacked at the end.
+                """
+                start = t_idx * per_T_block
+                end = start + per_T_block
+                slab = U_flat[..., start:end]  # [..., per_T_block]
+                pair_blocks: list = []
+                inner_offset = 0
+                for bs in self._mix_block_sizes:
+                    block_flat = slab[..., inner_offset:inner_offset + bs * bs]
+                    inner_offset += bs * bs
+                    pad_r = max_bs - bs
+                    if is_batched:
+                        block = tf.reshape(block_flat, [-1, bs, bs])    # [P, bs, bs]
+                        block = tf.pad(block, [[0, 0], [0, pad_r], [0, pad_r]])
+                    else:
+                        block = tf.reshape(block_flat, [bs, bs])
+                        block = tf.pad(block, [[0, pad_r], [0, pad_r]])
+                    pair_blocks.append(block)
+                # Stack along the num_pairs axis: -3 (batched) or 0
+                # (unbatched). For batched: [P, max_bs, max_bs] →
+                # [P, num_pairs, max_bs, max_bs]; for unbatched:
+                # [max_bs, max_bs] → [num_pairs, max_bs, max_bs].
+                stack_axis = -3 if is_batched else 0
+                return tf.stack(pair_blocks, axis=stack_axis)
+
+            if per_type:
+                # Stack T per-pair tensors along axis 1 (or 0 unbatched)
+                # to yield [..., T, num_pairs, max_bs, max_bs].
+                per_t = [_extract_t_block(t_idx) for t_idx in range(T)]
+                stack_axis = 1 if is_batched else 0
+                U_pair = tf.stack(per_t, axis=stack_axis)
+            else:
+                U_pair = _extract_t_block(0)
+            tail = tail + (U_pair,)
+
+        return tail
 
     def compute_regularization_tf(self, param_vectors: tf.Tensor) -> tf.Tensor:
         """Compute L1+L2 regularization for batched parameter vectors.
@@ -1138,14 +1395,33 @@ class SNES:
             inv_num_atoms = 1.0 / tf.maximum(num_atoms, 1.0)  # [B]
             inv_num_atoms = inv_num_atoms[:, tf.newaxis]  # [B, 1]
 
-        # Reconstruct weights for all candidates in chunk
+        # Reconstruct weights for all candidates in chunk. Tail may
+        # include a U_pair tensor when cfg.descriptor_mixing=True.
         params = self.reconstruct_params_tf(chunk_samples)
+        if self.cfg.target_mode == 2:
+            if self.n_U_pair > 0:
+                W0, b0, W1, b1, W0p, b0p, W1p, b1p, U_pair_cand = params
+            else:
+                W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
+                U_pair_cand = None
+        else:
+            if self.n_U_pair > 0:
+                W0, b0, W1, b1, U_pair_cand = params
+            else:
+                W0, b0, W1, b1 = params
+                U_pair_cand = None
 
         _use_mae = self._use_mae
 
         if self.cfg.target_mode == 2:
-            W0, b0, W1, b1, W0p, b0p, W1p, b1p = params
             pol_weights = self._pol_weights  # [6] component weights
+            # Pre-absorb U_pair^T into W0 / W0_pol per candidate so the
+            # vectorized_map loop body uses raw descriptors and no
+            # gradient pull-back. Works because _W0_eff is linear and
+            # broadcasts over the leading candidate axis.
+            if U_pair_cand is not None:
+                W0 = self.model._W0_eff(W0, U_pair_cand)
+                W0p = self.model._W0_eff(W0p, U_pair_cand)
 
             def _forward_one_candidate(args):
                 w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
@@ -1164,7 +1440,6 @@ class SNES:
             return tf.vectorized_map(_forward_one_candidate, stacked)  # [C, B]
 
         else:
-            W0, b0, W1, b1 = params
 
             # Precompute W_atom [B, A, 3, Q] once — independent of all candidates.
             # Use static shapes when known (XLA needs compile-time dims for
@@ -1186,7 +1461,8 @@ class SNES:
             # predict_batch_candidates executes one GEMM per type in each direction
             # rather than C separate matmuls inside vectorized_map.
             preds = self.model.predict_batch_candidates(
-                desc, W_atom, Z, amask, W0, b0, W1, b1)  # [C, B, T_dim]
+                desc, W_atom, Z, amask, W0, b0, W1, b1,
+                U_pair=U_pair_cand)  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]

@@ -15,7 +15,7 @@ class TNEPconfig:
     test_data_path: str | None = "datasets/test.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
-    allowed_species: list[int | str] | None = [6, 1, 8, 7]
+    allowed_species: list[int | str] | None = [6, 1, 8]
     # Species filter mode: "subset" = keep structures with only allowed species,
     # "exact" = keep structures containing exactly all allowed species
     filter_mode: str = "subset"
@@ -23,11 +23,11 @@ class TNEPconfig:
     # zero-vector targets. Structures with missing targets are always
     # dropped regardless (they can't be trained against).
     filter_bad_data: bool = False
-    num_neurons: int = 30
+    num_neurons: int = 15
     # Number of structures used in each train step
     batch_size: int | None = None
     # Number of samples made in each train generation
-    pop_size: int | None = 80
+    pop_size: int | None = 100
     # Number of training generations (number of updates to the model)
     num_generations: int = 60000
     # Learning rate (None = auto)
@@ -54,7 +54,7 @@ class TNEPconfig:
     # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU when available).
     # The GPU path supports basis="poly3" and compress_mode="trivial" only;
     # falls back to a clear error if other settings are requested.
-    descriptor_mode: int = 1
+    descriptor_mode: int = 0
 
     # Internal precision for the GPU descriptor compute. The Fortran reference
     # uses double-precision throughout; "float64" mirrors that exactly. The
@@ -184,6 +184,58 @@ class TNEPconfig:
     # Early stopping patience (None = disabled)
     patience: int | None = None
 
+    # Plateau-triggered sigma reset (IPOP-CMA-ES style, simplified for
+    # SNES). When set to an int N, the search distribution's sigma is
+    # re-broadened back toward `init_sigma` after N consecutive val
+    # ticks without improvement on best_val_loss. This re-expands the
+    # local exploration radius without abandoning best_mu, giving the
+    # optimizer a chance to escape a shallow basin.
+    #
+    # Reference: Auger & Hansen (2005) "A Restart CMA Evolution
+    # Strategy With Increasing Population Size" (CEC 2005), which sets
+    # `tolstagnation = int(100 + 100·dim^1.5 / popsize)` as the
+    # canonical default. For your typical dim ≈ 12k, λ = 100 that's
+    # ~1.3M gens — too long to be useful. A more aggressive
+    # 200–500 val ticks is more practical on NN training problems
+    # where val_interval = 10. None = disabled.
+    plateau_reset_patience: int | None = None
+    # Multiplier applied to the **current** sigma vector at every
+    # plateau reset (default 2.0 — broadens each dimension's search
+    # width by 2×). This preserves the per-dimension scale structure
+    # that SNES has learned — dimensions where the optimizer
+    # tightened sigma stay tighter than dimensions where it didn't.
+    # Soft re-broadening like this works better than hard reset in
+    # high dimensions because a uniform fresh sigma loses all per-
+    # dim information; with dim ~ 20k, the search would just random-
+    # walk from best_mu before it could rediscover which directions
+    # mattered.
+    #
+    # Typical values: 1.5–5.0. Try 2.0 first; if the model is deep in
+    # a basin and not escaping, bump to 3.0 or 5.0.
+    sigma_reset_factor: float = 2.0
+    # When True, the multiplier above is applied to `init_sigma`
+    # uniformly (i.e. canonical hard reset like IPOP-CMA-ES) rather
+    # than to the current sigma. Loses all learned per-dim scale —
+    # only set True if you have a specific reason (e.g. you want
+    # IPOP-style behaviour or have determined empirically that the
+    # learned sigma is corrupted).
+    sigma_reset_to_init: bool = False
+    # When True, restore mu to best_mu at every sigma reset (warm
+    # restart around the best known position). When False (the
+    # better default in high dim — see comment on sigma_reset_factor),
+    # leave mu where it is so the broadened search continues from
+    # the current position. The combination of (mu = best_mu) +
+    # (broadened sigma) is the canonical IPOP form, but in our
+    # high-dim NN setting it tends to throw away the directional
+    # information that SNES has accumulated.
+    plateau_restore_best_mu: bool = False
+    # Cap on the number of plateau-triggered resets. None = unlimited.
+    # Useful with cfg.patience to bound total wall-time: first hits
+    # plateau_reset_patience trigger resets; once max_sigma_resets is
+    # reached, subsequent plateaus fall through to early stopping
+    # (or just continue if patience is None).
+    max_sigma_resets: int | None = None
+
     # Loss function: "mse" = root-mean-square error, "mae" = mean absolute error
     loss_type: str = "mse"
     # Inverse-magnitude weighting: upweight structures with small targets
@@ -195,8 +247,58 @@ class TNEPconfig:
     lambda_shear: float = 1.0
 
     activation: str = 'tanh'
+    # When True, insert a learnable per-species-pair linear mixing
+    # layer between the (fixed) SOAP-turbo descriptor and the ANN.
+    # `desc'[q in block_ab] = U_pair[a,b] @ desc[q in block_ab]` per
+    # unordered neighbour-species pair (a, b). Trivial compression
+    # makes the block sizes pair-dependent (20 / 35 at alpha_max=4,
+    # l_max=4, 3 species) and the q-indices non-contiguous; the
+    # implementation gathers/scatters accordingly. U_pair is shared
+    # across central atom types — the per-type ANN already
+    # differentiates downstream. Identity init so the model starts
+    # bit-identical to the no-mixing baseline. This is the closest
+    # direct analog to GPUMD/NEP's trainable radial-basis coefficients
+    # c_nk (which mix fixed Chebyshev primitives into learned radial
+    # functions per species pair).
+    descriptor_mixing: bool = True
+    # When True (and descriptor_mixing=True), U_pair becomes
+    # per-central-atom-type: shape [T, num_pairs, max_bs, max_bs]
+    # instead of [num_pairs, max_bs, max_bs]. Each central type t
+    # gets its own learned set of pair-mixing matrices, applied to
+    # atoms of that type. Captures central-type-specific feature
+    # selection on top of the pair-block decomposition — strictly
+    # more expressive than the shared variant (which is the T=1
+    # case of this). Cost: T× the U_pair param count
+    # (for your typical T=3, that's ~15k extra params on top of
+    # the shared 4.9k — bringing the descriptor-mixing layer to
+    # roughly 2× the size of the per-type ANN). Identity-init per
+    # (t, p) so the model still starts bit-identical to the
+    # mixing-disabled baseline.
+    descriptor_mixing_per_type: bool = True
+    # Which optimizer drives `TNEP.fit`. "snes" reproduces the
+    # canonical SNES black-box path (no gradient information, rank-
+    # based population update). "adam" runs first-order Adam on
+    # analytical gradients via tf.GradientTape — the same training
+    # regime as the GNEP paper (Huang et al. 2025), which reports
+    # ~10× fewer epochs at equal accuracy. Both paths share the same
+    # data pipeline, validation, early stopping, history dict, and
+    # plot outputs. Checkpointing only works for the SNES path at
+    # the moment (an Adam-side checkpoint is straightforward to add
+    # once the Adam path is validated end-to-end).
+    optimizer: str = "snes"
+    # Adam learning rate (only used when optimizer="adam"). Standard
+    # default for NN regression heads; reduce to ~1e-4 if loss diverges.
+    adam_learning_rate: float = 1e-3
     # Initial distribution standard deviation
     init_sigma: float = 0.1
+    # Lower bound on sigma after each SNES update. Without a floor,
+    # `σ ← σ · exp(η · grad_σ)` can drift toward zero on a long run
+    # (especially with the per-type ranking schedule), collapsing the
+    # search distribution to a point and silently killing exploration.
+    # 1e-5 keeps the search alive without distorting any normal
+    # adaptation (typical adapted σ is 1e-3 to 1e-1). Set to None or 0
+    # to disable the floor.
+    sigma_floor: float | None = 1e-5
     # Seed for randomisation
     seed: int | None = None
     # 0 : PES, 1 : Dipole, 2 : Polarizability
@@ -212,7 +314,7 @@ class TNEPconfig:
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)
-    val_interval: int = 10
+    val_interval: int = 1
     # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage).
     # None = no chunking (recommended for A100 at typical molecular sizes).
     # For very large systems (>50k edges per structure), start at 50 and reduce if OOM.
@@ -254,7 +356,7 @@ class TNEPconfig:
     # full history, RNG state, and last completed gen — enough to
     # resume identically via `train_model(checkpoint=path)`. Requires
     # `save_path` to be set; warned and skipped otherwise.
-    checkpoint_interval: int | None = 1000
+    checkpoint_interval: int | None = 2000
 
     # Save model after training (None = disabled; "auto" = auto-generate run directory)
     save_path: str | None = "models/auto"
@@ -266,11 +368,22 @@ class TNEPconfig:
     debug: bool = False
     # Scale dipole targets by atom count (per-atom dipole training)
     scale_targets: bool = True
-    # Input units of dipole targets in the dataset.
-    # "e*angstrom" = no conversion needed (already in e·Å)
-    # "e*bohr"     = convert from e·bohr to e·Å (multiply by 0.5292)
-    # "debye"      = convert from Debye to e·Å  (multiply by 0.2082)
+    # Native units of dipole targets in the dataset. Used (a) to derive
+    # the e·Å conversion factor when `convert_dipole_to_eangstrom=True`,
+    # and (b) as the plot-axis / stats unit label when conversion is
+    # off so the displayed numbers match the file.
+    # "e*angstrom" = e·Å
+    # "e*bohr"     = e·a₀   (× 0.5292 → e·Å)
+    # "debye"      = Debye  (× 0.2082 → e·Å)
     dipole_units: str = "e*bohr"
+    # When True (default), dipole targets are converted to e·Å on data
+    # load and training / plots / spectra all use e·Å. When False, the
+    # raw dataset values are passed through unchanged — the model
+    # trains in the dataset's native unit and plot axes label that
+    # unit instead. Useful when you want loss / RMSE / RRMSE numbers
+    # to be directly comparable with reference values quoted in
+    # e·a₀ or Debye.
+    convert_dipole_to_eangstrom: bool = False
 
     dim_q: int
     num_types: int

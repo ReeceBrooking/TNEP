@@ -368,7 +368,7 @@ def assemble_data_dict(
     """
     target_key = _resolve_target_key(cfg)
     targets = [_extract_target(s, target_key) for s in dataset]
-    if cfg.target_mode == 1:
+    if cfg.target_mode == 1 and getattr(cfg, "convert_dipole_to_eangstrom", True):
         factor = _dipole_conversion_factor(cfg.dipole_units)
         if factor != 1.0:
             targets = [t * factor for t in targets]
@@ -1770,10 +1770,14 @@ def print_dipole_statistics(dataset: list[Atoms], cfg: TNEPconfig,
         target_key : str key in Atoms.info holding the dipole vector
     """
     dipoles = np.array([_extract_target(s, target_key).numpy() for s in dataset])
-    factor = _dipole_conversion_factor(cfg.dipole_units)
+    convert = getattr(cfg, "convert_dipole_to_eangstrom", True)
+    factor = _dipole_conversion_factor(cfg.dipole_units) if convert else 1.0
     if factor != 1.0:
         dipoles = dipoles * factor
-    unit = f"e\u00b7\u00c5 (from {cfg.dipole_units})" if factor != 1.0 else "e\u00b7\u00c5"
+    if convert:
+        unit = f"e\u00b7\u00c5 (from {cfg.dipole_units})" if factor != 1.0 else "e\u00b7\u00c5"
+    else:
+        unit = f"{cfg.dipole_units} (no conversion)"
     norms = np.linalg.norm(dipoles, axis=1)
     print(f"=== Dipole Target Statistics ({unit}) ===")
     print(f"  N structures: {len(dipoles)}")

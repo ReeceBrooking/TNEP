@@ -24,15 +24,31 @@ from data import component_labels
 def unit_label(cfg: TNEPconfig) -> str:
     """Return the unit string for the current target mode.
 
-    Dipole targets are always in e·Å after conversion in the data pipeline.
+    Dipole label follows the chosen training space:
+      - `cfg.convert_dipole_to_eangstrom=True` (default) → "e·Å"
+      - `False` → the dataset's native unit derived from
+        `cfg.dipole_units` ("e·Å", "e·a₀", or "Debye").
 
     Args:
         cfg : TNEPconfig
 
     Returns:
-        str — "eV", "e·Å", or "ų"
+        str — "eV" (PES), dipole unit (mode 1), or "Å³" (polarisability).
     """
-    return {0: "eV", 1: "e\u00b7\u00c5", 2: "\u00c5\u00b3"}.get(cfg.target_mode, "")
+    if cfg.target_mode == 0:
+        return "eV"
+    if cfg.target_mode == 2:
+        return "\u00c5\u00b3"
+    if cfg.target_mode == 1:
+        if getattr(cfg, "convert_dipole_to_eangstrom", True):
+            return "e\u00b7\u00c5"
+        # Dataset-native dipole label when conversion is disabled.
+        return {
+            "e*angstrom": "e\u00b7\u00c5",
+            "e*bohr":     "e\u00b7a\u2080",   # e\u00b7a\u2080
+            "debye":      "Debye",
+        }.get(getattr(cfg, "dipole_units", "e*angstrom"), "")
+    return ""
 
 
 def _make_plot_filename(cfg: TNEPconfig, plot_name: str) -> str:
