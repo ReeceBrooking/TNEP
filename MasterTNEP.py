@@ -739,7 +739,7 @@ def process_trajectory(
 
 
 if __name__ == '__main__':
-    model = train_model()
+    model = train_model(checkpoint="models/n15_q165_pop100_20260512_094933/checkpoint.h5")
     #model = load_model("models/n30_q75_pop80_20260428_120216/train_waterbulk_O_H_dipole_best_val.npz")
     #dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=20, descriptor_mode=1, descriptor_batch_frames=5, pin_to_cpu=False, descriptor_precision="float64")
     

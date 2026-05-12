@@ -81,15 +81,23 @@ class AdamTrainer:
             self._opt = tf.optimizers.Adam(
                 learning_rate=float(self.cfg.adam_learning_rate))
 
-        self._trainables = [model.W0, model.b0, model.W1, model.b1]
+        # ANN trainables and (optional) U_pair are tracked separately
+        # so the regulariser dispatch can apply different priors to
+        # each. The full `_trainables` list is what tape.gradient and
+        # the Adam apply step use; `_ann_trainables` is what L1/L2
+        # iterates over when descriptor_mixing_regularizer != "shrinkage"
+        # (so V_pair isn't pulled toward zero unless the user opts in).
+        self._ann_trainables = [model.W0, model.b0, model.W1, model.b1]
         if self.cfg.target_mode == 2:
-            self._trainables.extend(
+            self._ann_trainables.extend(
                 [model.W0_pol, model.b0_pol, model.W1_pol, model.b1_pol])
-        # When descriptor mixing is enabled, U_pair joins the
-        # trainables list so tape.gradient produces a U_pair gradient
-        # alongside the ANN weight gradients. _forward_loss applies
-        # _W0_eff(W0, U_pair) so U_pair flows into the forward pass.
-        if getattr(model, "descriptor_mixing", False):
+        self._trainables = list(self._ann_trainables)
+        self._has_Upair = getattr(model, "descriptor_mixing", False)
+        if self._has_Upair:
+            # When descriptor mixing is enabled, U_pair joins the
+            # trainables list so tape.gradient produces a U_pair grad
+            # alongside the ANN weight gradients. _forward_loss applies
+            # _W0_eff(W0, U_pair) so U_pair flows into the forward pass.
             self._trainables.append(model.U_pair)
 
         # Surface a couple of fields that MasterTNEP / external tooling
@@ -109,15 +117,47 @@ class AdamTrainer:
         self._use_mae = (self.cfg.loss_type == "mae")
 
         # L1/L2 strengths — resolved the same way as SNES so reg has the same scale.
+        # Sentinels mirror SNES: None → auto, -1 → dynamic (adapted in fit loop).
+        # Stored as tf.Variable so per-step graph captures don't restage on update.
         T = self.cfg.num_types
         n_per_type = self.cfg.dim_q * self.cfg.num_neurons + 2 * self.cfg.num_neurons
         self._n_per_type = float(n_per_type)
-        auto_lambda = np.sqrt(
-            (T * n_per_type + 1) * 1e-6 / max(T, 1))
-        self.lambda_1 = (self.cfg.lambda_1
-                          if self.cfg.lambda_1 is not None else auto_lambda)
-        self.lambda_2 = (self.cfg.lambda_2
-                          if self.cfg.lambda_2 is not None else auto_lambda)
+        auto_lambda = float(np.sqrt(
+            (T * n_per_type + 1) * 1e-6 / max(T, 1)))
+        self._dyn_lambda_1 = (self.cfg.lambda_1 == -1)
+        self._dyn_lambda_2 = (self.cfg.lambda_2 == -1)
+        init_lambda_1 = (auto_lambda if (self.cfg.lambda_1 is None or self._dyn_lambda_1)
+                         else float(self.cfg.lambda_1))
+        init_lambda_2 = (auto_lambda if (self.cfg.lambda_2 is None or self._dyn_lambda_2)
+                         else float(self.cfg.lambda_2))
+        self.lambda_1 = tf.Variable(init_lambda_1, dtype=tf.float32,
+                                    trainable=False, name="lambda_1")
+        self.lambda_2 = tf.Variable(init_lambda_2, dtype=tf.float32,
+                                    trainable=False, name="lambda_2")
+
+        # V_pair regulariser mode (mirrors SNES):
+        #   "off"        : V_pair excluded from L1/L2.
+        #   "shrinkage"  : V_pair included in L1/L2 (legacy default).
+        #   "orthogonal" : V_pair penalised by ‖UᵀU - I‖² per block,
+        #                  scaled by lambda_orth (its own dynamic option).
+        self._mix_reg_mode = str(getattr(
+            self.cfg, "descriptor_mixing_regularizer", "off")).lower()
+        if self._mix_reg_mode not in ("off", "shrinkage", "orthogonal"):
+            raise ValueError(
+                f"descriptor_mixing_regularizer={self._mix_reg_mode!r} not "
+                "recognised (expected 'off', 'shrinkage', or 'orthogonal')")
+        if self._has_Upair:
+            n_U_pair = int(np.prod(model.U_pair.shape))
+            auto_lambda_orth = float(np.sqrt(
+                n_U_pair * 1e-6 / max(T, 1)))
+        else:
+            auto_lambda_orth = 0.0
+        cfg_lo = getattr(self.cfg, "lambda_orth", None)
+        self._dyn_lambda_orth = (cfg_lo == -1)
+        init_lambda_orth = (auto_lambda_orth if (cfg_lo is None or self._dyn_lambda_orth)
+                            else float(cfg_lo))
+        self._lambda_orth = tf.Variable(init_lambda_orth, dtype=tf.float32,
+                                        trainable=False, name="lambda_orth")
 
     # ----- forward + loss --------------------------------------------------
 
@@ -161,11 +201,53 @@ class AdamTrainer:
 
         loss = tf.reduce_mean(sq)
         if self.cfg.toggle_regularization:
-            l1 = sum(tf.reduce_sum(tf.abs(w)) for w in self._trainables)
+            # L1/L2 always cover the ANN trainables. U_pair (V) is
+            # included only when mode == "shrinkage". For mode ==
+            # "orthogonal", we add the Frobenius orthogonality penalty
+            # ‖UᵀU - I‖² instead (computed in residual form). For
+            # mode == "off", V_pair is unregularised.
+            if self._mix_reg_mode == "shrinkage" and self._has_Upair:
+                reg_weights = self._trainables
+            else:
+                reg_weights = self._ann_trainables
+            l1 = sum(tf.reduce_sum(tf.abs(w)) for w in reg_weights)
             l2 = tf.sqrt(tf.reduce_sum(
-                tf.stack([tf.reduce_sum(tf.square(w)) for w in self._trainables])))
+                tf.stack([tf.reduce_sum(tf.square(w)) for w in reg_weights])))
             loss = loss + self.lambda_1 * l1 + self.lambda_2 * l2
+            if self._mix_reg_mode == "orthogonal" and self._has_Upair:
+                loss = loss + self._lambda_orth * self._orth_penalty(m.U_pair)
         return loss, train_rmse
+
+    def _orth_penalty(self, U_pair: tf.Tensor) -> tf.Tensor:
+        """Frobenius orthogonality penalty in residual form.
+
+        U_pair stores V = U - I, so UᵀU - I = V + Vᵀ + VᵀV. We
+        compute that quantity per active [bs, bs] sub-block (the
+        padded rows/cols stay zero by construction and never see the
+        descriptor) and sum the squared Frobenius norms. Normalised
+        by total active entries so the value is on a comparable scale
+        to the L2 contribution.
+
+        U_pair shape:
+            shared    : [num_pairs, max_bs, max_bs]
+            per-type  : [T, num_pairs, max_bs, max_bs]
+        """
+        m = self.model
+        block_sizes = m._mix_block_sizes
+        n_total = sum(bs * bs for bs in block_sizes)
+        if m.descriptor_mixing_per_type:
+            n_total *= m.cfg.num_types
+            U_view = U_pair  # [T, P, bs_max, bs_max]
+        else:
+            U_view = U_pair[tf.newaxis, ...]  # [1, P, bs_max, bs_max]
+        pen = tf.constant(0.0)
+        for t in range(int(U_view.shape[0])):
+            for p_idx, bs in enumerate(block_sizes):
+                V = U_view[t, p_idx, :bs, :bs]               # [bs, bs]
+                VtV = tf.matmul(V, V, transpose_a=True)
+                M = V + tf.linalg.matrix_transpose(V) + VtV
+                pen = pen + tf.reduce_sum(tf.square(M))
+        return pen / float(n_total)
 
     def _train_step(self, chunk: dict) -> tuple[tf.Tensor, tf.Tensor]:
         """Forward + backward + Adam update.
@@ -184,6 +266,41 @@ class AdamTrainer:
         grads = tape.gradient(loss, self._trainables)
         self._opt.apply_gradients(zip(grads, self._trainables))
         return loss, train_rmse
+
+    # ----- dynamic-λ -------------------------------------------------------
+
+    def _maybe_adapt_lambda(self, gen: int, data_loss: float,
+                            l1: float, l2: float,
+                            l_orth: float = 0.0) -> None:
+        """Rescale λ_1 / λ_2 / λ_orth toward `target_ratio · data_loss`.
+
+        Mirrors the SNES adaptation rule so Adam and SNES runs with
+        the same cfg follow the same λ schedule. Only the lambdas set
+        to -1 in cfg are touched. See SNES._maybe_adapt_lambda for the
+        derivation of the multiplicative damped step.
+        """
+        if not (self._dyn_lambda_1 or self._dyn_lambda_2 or self._dyn_lambda_orth):
+            return
+        interval = max(1, int(getattr(self.cfg, "lambda_adapt_interval", 100)))
+        if gen % interval != 0:
+            return
+        target = float(getattr(self.cfg, "lambda_target_ratio", 0.05))
+        damping = float(getattr(self.cfg, "lambda_damping", 0.2))
+        lmin = float(getattr(self.cfg, "lambda_min", 1e-8))
+        lmax = float(getattr(self.cfg, "lambda_max", 1.0))
+        ref = max(float(data_loss), 1e-8)
+        if self._dyn_lambda_1 and l1 > 1e-12:
+            ratio = (target * ref) / float(l1)
+            new = float(self.lambda_1.numpy()) * (ratio ** damping)
+            self.lambda_1.assign(float(np.clip(new, lmin, lmax)))
+        if self._dyn_lambda_2 and l2 > 1e-12:
+            ratio = (target * ref) / float(l2)
+            new = float(self.lambda_2.numpy()) * (ratio ** damping)
+            self.lambda_2.assign(float(np.clip(new, lmin, lmax)))
+        if self._dyn_lambda_orth and l_orth > 1e-12:
+            ratio = (target * ref) / float(l_orth)
+            new = float(self._lambda_orth.numpy()) * (ratio ** damping)
+            self._lambda_orth.assign(float(np.clip(new, lmin, lmax)))
 
     # ----- validate --------------------------------------------------------
 
@@ -291,7 +408,7 @@ class AdamTrainer:
         best_weights = [tf.identity(w) for w in self._trainables]
         gens_without_improvement = 0
         val_fitness = float("inf")
-        gen_l1, gen_l2 = 0.0, 0.0
+        gen_l1, gen_l2, gen_lorth = 0.0, 0.0, 0.0
 
         # Cache the chunk objects so we don't re-stage every step (each
         # chunk is identical across steps when the data is GPU-resident,
@@ -331,16 +448,30 @@ class AdamTrainer:
             t4 = time.perf_counter()
 
             # Sample reg metrics every 100 steps to mirror SNES cadence
-            # (cheap here but stay consistent for plot scale).
+            # (cheap here but stay consistent for plot scale). The
+            # weights used for the L1/L2 sum match the dispatch in
+            # _forward_loss: shrinkage includes U_pair, otherwise just
+            # the ANN trainables.
             if cfg.toggle_regularization and gen % 100 == 0:
-                l1 = float(sum(tf.reduce_sum(tf.abs(w))
-                                for w in self._trainables))
+                reg_weights = (self._trainables
+                               if (self._mix_reg_mode == "shrinkage"
+                                   and self._has_Upair)
+                               else self._ann_trainables)
+                l1 = float(sum(tf.reduce_sum(tf.abs(w)) for w in reg_weights))
                 l2 = float(tf.sqrt(tf.reduce_sum(tf.stack(
-                    [tf.reduce_sum(tf.square(w)) for w in self._trainables]))))
-                gen_l1 = self.lambda_1 * l1 / self._n_per_type
-                gen_l2 = self.lambda_2 * l2 / np.sqrt(self._n_per_type)
+                    [tf.reduce_sum(tf.square(w)) for w in reg_weights]))))
+                gen_l1 = float(self.lambda_1.numpy()) * l1 / self._n_per_type
+                gen_l2 = float(self.lambda_2.numpy()) * l2 / np.sqrt(self._n_per_type)
+                if self._mix_reg_mode == "orthogonal" and self._has_Upair:
+                    gen_lorth = float(self._lambda_orth.numpy()) * float(
+                        self._orth_penalty(self.model.U_pair))
+                else:
+                    gen_lorth = 0.0
+                # Dynamic-λ adaptation (any λ set to -1 in cfg).
+                self._maybe_adapt_lambda(gen, float(train_rmse),
+                                         gen_l1, gen_l2, gen_lorth)
             elif not cfg.toggle_regularization:
-                gen_l1 = gen_l2 = 0.0
+                gen_l1 = gen_l2 = gen_lorth = 0.0
 
             if _do_val:
                 history["generation"].append(gen)
@@ -348,6 +479,7 @@ class AdamTrainer:
                 history["val_loss"].append(val_fitness)
                 history["L1"].append(gen_l1)
                 history["L2"].append(gen_l2)
+                history.setdefault("L_orth", []).append(gen_lorth)
                 # Adam has no population spread; report current loss
                 # in best/worst slots so the plot doesn't show NaNs.
                 history["best_rmse"].append(float(train_rmse))
@@ -368,6 +500,8 @@ class AdamTrainer:
                     f"ETA: {_format_duration(eta)}")
             if cfg.debug:
                 line += f"  L1: {gen_l1:.6f}  L2: {gen_l2:.6f}"
+                if self._mix_reg_mode == "orthogonal":
+                    line += f"  L_orth: {gen_lorth:.6f}"
             sys.stdout.write(line)
             sys.stdout.flush()
 

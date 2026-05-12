@@ -29,7 +29,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 100
     # Number of training generations (number of updates to the model)
-    num_generations: int = 60000
+    num_generations: int = 150000
     # Learning rate (None = auto)
     eta_sigma: float | None = None
 
@@ -171,10 +171,29 @@ class TNEPconfig:
     # cudart is not loadable (rare) or to bisect a regression.
     use_pinned_buffers: bool = True
 
-    # L1/L2 regularization strengths (None = auto: sqrt(dim * 1e-6))
+    # L1/L2 regularization strengths.
+    #   None  : auto = sqrt(dim * 1e-6 / num_types)
+    #   -1.0  : dynamic — adapt every `lambda_adapt_interval` gens so
+    #           the L1 (or L2) penalty stays at `lambda_target_ratio`
+    #           of the data RMSE. Starts from the auto value.
+    #   float : fixed scalar
     toggle_regularization: bool = True
     lambda_1: float | None = 0.03
     lambda_2: float | None = 0.03
+    # Dynamic-λ controls (only used when lambda_1 or lambda_2 == -1).
+    # `target_ratio`: target ratio of reg-penalty to data RMSE. 0.05
+    #   means "keep regularisation at ~5% of the data loss." GPUMD
+    #   NEP4 uses a similar target (~0.01–0.1 depending on data size).
+    # `damping`: multiplicative step exponent. λ_new = λ * (target/r)^d.
+    #   Smaller d → slower adaptation, less oscillation. 0.2 is gentle.
+    # `interval`: how often (in gens) to recompute and rescale λ.
+    #   Matches the existing per-100-gen reg-sampling cadence by default.
+    # `min/max`: safety clamp on adapted λ.
+    lambda_target_ratio: float = 0.05
+    lambda_damping: float = 0.2
+    lambda_adapt_interval: int = 100
+    lambda_min: float = 1e-8
+    lambda_max: float = 1.0
     # Per-type regularization and ranking (GPUMD NEP4 style)
     # Each type's params are regularized separately, creating per-type fitness
     # rankings that drive per-type natural gradient updates.
@@ -275,6 +294,28 @@ class TNEPconfig:
     # (t, p) so the model still starts bit-identical to the
     # mixing-disabled baseline.
     descriptor_mixing_per_type: bool = True
+    # Regulariser applied to the V_pair descriptor-mixing layer.
+    #   "off"        : V_pair is unregularised (default; relies on SNES
+    #                  sigma to bound exploration).
+    #   "shrinkage"  : L1+L2 on V_pair using cfg.lambda_1 / lambda_2.
+    #                  Pulls V → 0 ⇔ U → I — strong "no mixing" prior
+    #                  that empirically collapses any learned mixing
+    #                  back to the baseline. Useful for ablations only.
+    #   "orthogonal" : Frobenius penalty ‖UᵀU − I‖²_F per pair block
+    #                  (computed in residual form as ‖V + Vᵀ + VᵀV‖²).
+    #                  Minimum is the *orthogonal group*, not identity —
+    #                  every rotation/reflection of the descriptor basis
+    #                  is at zero penalty. Constrains U to be length-
+    #                  preserving (no scaling), preventing column
+    #                  collapse and rank deficiency without anchoring at
+    #                  no-mixing. Uses cfg.lambda_orth.
+    descriptor_mixing_regularizer: str = "off"
+    # Strength of the orthogonal-mixing regulariser (used when
+    # descriptor_mixing_regularizer == "orthogonal").
+    #   None : auto = sqrt(n_U_pair * 1e-6 / num_types)
+    #   -1   : dynamic adaptation (see SNES._maybe_adapt_lambda)
+    #   float: fixed scalar
+    lambda_orth: float | None = None
     # Which optimizer drives `TNEP.fit`. "snes" reproduces the
     # canonical SNES black-box path (no gradient information, rank-
     # based population update). "adam" runs first-order Adam on

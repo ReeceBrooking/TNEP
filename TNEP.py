@@ -146,29 +146,29 @@ class TNEP(layers.Layer):
                 P[np.arange(bs), qidx] = 1.0
                 mix_P.append(tf.constant(P))
             self._mix_P = mix_P
-            # U_pair shape:
+            # U_pair stores the RESIDUAL V = U - I (deviation from
+            # identity). The effective per-pair mixing matrix is
+            # U_block = I_bs + V_block, so V starts at zero and the
+            # model begins bit-identical to a mixing-disabled baseline.
+            # Optimization is cleaner: perturbations have a well-defined
+            # relative scale (off-diagonals move 0 → ±σ instead of
+            # being infinite-relative jumps from an identity prior).
+            # Regularising V toward zero == regularising U toward I.
+            #
+            # Shape:
             #   shared    : [num_pairs, max_bs, max_bs]
             #   per-type  : [T, num_pairs, max_bs, max_bs]
-            # Identity init for each (t, p)'s [bs, bs] sub-block; padded
-            # rows/cols stay zero so they never contribute via P_p.
             T = cfg.num_types
             if self.descriptor_mixing_per_type:
                 shape = (T, self._mix_num_pairs,
                          self._mix_max_block_size, self._mix_max_block_size)
-                U_init = np.zeros(shape, dtype=np.float32)
-                for t_idx in range(T):
-                    for p_idx, bs in enumerate(self._mix_block_sizes):
-                        U_init[t_idx, p_idx, :bs, :bs] = np.eye(bs, dtype=np.float32)
             else:
                 shape = (self._mix_num_pairs,
                          self._mix_max_block_size, self._mix_max_block_size)
-                U_init = np.zeros(shape, dtype=np.float32)
-                for p_idx, bs in enumerate(self._mix_block_sizes):
-                    U_init[p_idx, :bs, :bs] = np.eye(bs, dtype=np.float32)
             self.U_pair = self.add_weight(
                 name="U_pair",
                 shape=shape,
-                initializer=tf.constant_initializer(U_init),
+                initializer="zeros",
                 trainable=True,
             )
         else:
@@ -189,27 +189,29 @@ class TNEP(layers.Layer):
     # ---- descriptor mixing helpers ----------------------------------------
 
     def _U_full(self, U_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Assemble the full block-diagonal mixing matrix
-        `U_full = Σ_p P_p^T · U_pair[..., p, :bs, :bs] · P_p`.
+        """Assemble the full block-diagonal mixing matrix from the
+        residual parameterisation `V = U - I` stored in `U_pair`:
 
-        Broadcasts over leading batch dims (ellipsis handles every
-        combination of single / per-candidate × shared / per-type):
+            U_full = I_Q + Σ_p P_p^T · V_pair[..., p, :bs, :bs] · P_p
+
+        `tf.eye(Q)` broadcasts across all leading batch dims so the
+        same code handles single / per-candidate × shared / per-type:
             shared single       : [num_pairs, bs, bs]      → [Q, Q]
             shared candidate    : [C, num_pairs, bs, bs]   → [C, Q, Q]
             per-type single     : [T, num_pairs, bs, bs]   → [T, Q, Q]
             per-type candidate  : [C, T, num_pairs, bs, bs]→ [C, T, Q, Q]
 
-        The num_pairs axis is always second-from-the-end-but-two,
-        which is what `U[..., p_idx, :bs, :bs]` selects.
+        With V initialised at zero, U_full == I_Q at generation 0.
         """
-        U = self.U_pair if U_pair is None else U_pair
+        V = self.U_pair if U_pair is None else U_pair
         parts = []
         for p_idx, (P, bs) in enumerate(zip(self._mix_P, self._mix_block_sizes)):
-            U_block = U[..., p_idx, :bs, :bs]                            # [..., bs, bs]
-            # P_p^T @ U_block @ P_p, broadcasting over leading dims.
-            placed = tf.einsum('ji,...jk,kl->...il', P, U_block, P)      # [..., Q, Q]
+            V_block = V[..., p_idx, :bs, :bs]                            # [..., bs, bs]
+            # P_p^T @ V_block @ P_p, broadcasting over leading dims.
+            placed = tf.einsum('ji,...jk,kl->...il', P, V_block, P)      # [..., Q, Q]
             parts.append(placed)
-        return tf.add_n(parts)
+        V_full = tf.add_n(parts)
+        return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
 
     def _W0_eff(self, W0: tf.Tensor, U_pair: tf.Tensor | None = None) -> tf.Tensor:
         """Pre-multiply W0 by U_full^T along the Q axis. Equivalent
@@ -229,7 +231,8 @@ class TNEP(layers.Layer):
             U_pair [C, T, num_pairs, bs, bs] + W0 [C, T, Q, H]
                                              → W0_eff [C, T, Q, H]
 
-        Identity-init guarantees W0_eff == W0 at generation 0.
+        With the residual V parameterisation (V init = 0 ⇒ U_full = I),
+        W0_eff == W0 exactly at generation 0.
         """
         if not self.descriptor_mixing:
             return W0
