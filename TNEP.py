@@ -7,7 +7,6 @@ from typing import Callable
 
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
-from Adam import AdamTrainer
 from TNEPconfig import TNEPconfig
 
 class TNEP(layers.Layer):
@@ -106,10 +105,8 @@ class TNEP(layers.Layer):
                 trainable=True,
             )
 
-        # Optimizer dispatch (constructed last so it can capture
-        # references to the just-created weight tensors). SNES is the
-        # default canonical path; Adam runs first-order on analytical
-        # gradients via tf.GradientTape (GNEP-style).
+        # Optimizer constructed last so it can capture references to
+        # the just-created weight tensors.
         # Optional descriptor-mixing layer (GPUMD c_nk analog).
         # U_pair is shared across central atom types; one mixing
         # square block per unordered neighbour-species pair. Block
@@ -128,6 +125,12 @@ class TNEP(layers.Layer):
         self.descriptor_mixing = bool(getattr(cfg, "descriptor_mixing", False))
         self.descriptor_mixing_per_type = bool(
             getattr(cfg, "descriptor_mixing_per_type", False))
+        self.descriptor_mixing_arch = str(
+            getattr(cfg, "descriptor_mixing_arch", "linear")).lower()
+        if self.descriptor_mixing_arch not in ("linear", "l_aware", "cross_pair_l"):
+            raise ValueError(
+                f"descriptor_mixing_arch={self.descriptor_mixing_arch!r} not in "
+                "('linear', 'l_aware', 'cross_pair_l')")
         if self.descriptor_mixing:
             from DescriptorBuilderGPU import descriptor_block_layout
             self._mix_layout = descriptor_block_layout(cfg)
@@ -137,7 +140,10 @@ class TNEP(layers.Layer):
             self._mix_block_sizes = [
                 self._mix_layout["block_sizes"][k] for k in self._mix_pair_keys]
             self._mix_Q = int(self._mix_layout["dim_q"])
-            # Build per-pair placement matrices P[p] ∈ R^{bs × Q}.
+            T = cfg.num_types
+            # Build per-pair placement matrices P[p] ∈ R^{bs_p × Q}. Used
+            # by the "linear" arch; the "l_aware" arch builds finer
+            # per-(pair, l) placement matrices below in addition.
             mix_P = []
             for p_idx, k in enumerate(self._mix_pair_keys):
                 qidx = self._mix_layout["pair_q_index"][k]   # np.int32 [bs]
@@ -146,71 +152,230 @@ class TNEP(layers.Layer):
                 P[np.arange(bs), qidx] = 1.0
                 mix_P.append(tf.constant(P))
             self._mix_P = mix_P
-            # U_pair stores the RESIDUAL V = U - I (deviation from
-            # identity). The effective per-pair mixing matrix is
-            # U_block = I_bs + V_block, so V starts at zero and the
-            # model begins bit-identical to a mixing-disabled baseline.
-            # Optimization is cleaner: perturbations have a well-defined
-            # relative scale (off-diagonals move 0 → ±σ instead of
-            # being infinite-relative jumps from an identity prior).
-            # Regularising V toward zero == regularising U toward I.
-            #
-            # Shape:
-            #   shared    : [num_pairs, max_bs, max_bs]
-            #   per-type  : [T, num_pairs, max_bs, max_bs]
-            T = cfg.num_types
-            if self.descriptor_mixing_per_type:
-                shape = (T, self._mix_num_pairs,
-                         self._mix_max_block_size, self._mix_max_block_size)
+            # Stacked projector [num_pairs, bs, Q] for the linear-arch
+            # fast path. Available only when all pairs share the same bs
+            # (the common case for fixed alpha_max / l_max). Replaces
+            # num_pairs separate einsums with one batched einsum.
+            if len(set(self._mix_block_sizes)) == 1:
+                bs0 = self._mix_block_sizes[0]
+                P_lin_stack = np.zeros(
+                    (self._mix_num_pairs, bs0, self._mix_Q),
+                    dtype=np.float32)
+                for p_idx, k in enumerate(self._mix_pair_keys):
+                    qidx = self._mix_layout["pair_q_index"][k]
+                    P_lin_stack[p_idx, np.arange(bs0), qidx] = 1.0
+                self._mix_P_stack = tf.constant(P_lin_stack)
+                self._mix_P_uniform_bs = bs0
             else:
-                shape = (self._mix_num_pairs,
-                         self._mix_max_block_size, self._mix_max_block_size)
-            self.U_pair = self.add_weight(
-                name="U_pair",
-                shape=shape,
-                initializer="zeros",
-                trainable=True,
-            )
+                self._mix_P_stack = None
+                self._mix_P_uniform_bs = None
+
+            if self.descriptor_mixing_arch == "linear":
+                # U_pair stores the RESIDUAL V = U - I (deviation from
+                # identity). The effective per-pair mixing matrix is
+                # U_block = I_bs + V_block, so V starts at zero and the
+                # model begins bit-identical to a mixing-disabled baseline.
+                # Shape:
+                #   shared    : [num_pairs, max_bs, max_bs]
+                #   per-type  : [T, num_pairs, max_bs, max_bs]
+                if self.descriptor_mixing_per_type:
+                    shape = (T, self._mix_num_pairs,
+                             self._mix_max_block_size, self._mix_max_block_size)
+                else:
+                    shape = (self._mix_num_pairs,
+                             self._mix_max_block_size, self._mix_max_block_size)
+                self.U_pair = self.add_weight(
+                    name="U_pair",
+                    shape=shape,
+                    initializer="zeros",
+                    trainable=True,
+                )
+            elif self.descriptor_mixing_arch == "l_aware":
+                # Per-(pair, l) residual blocks. Within a pair, only
+                # radial channels at the same l mix; cross-l mixing is
+                # forbidden by construction. α_eff_per_pair from the
+                # descriptor layout gives the radial dimension; L =
+                # l_max + 1.
+                self._mix_alpha_per_pair = [
+                    int(self._mix_layout["alpha_eff_per_pair"][k])
+                    for k in self._mix_pair_keys]
+                self._mix_max_alpha = int(self._mix_layout["max_alpha_eff"])
+                self._mix_L = int(cfg.l_max) + 1
+                # Per-(pair, l) placement matrices P_{p,l} ∈ R^{α_p × Q}.
+                mix_P_ln: list[list[tf.Tensor]] = []
+                for k in self._mix_pair_keys:
+                    per_pair: list[tf.Tensor] = []
+                    for l in range(self._mix_L):
+                        qidx = self._mix_layout["pair_ln_index"][k][l]
+                        a = qidx.size
+                        P = np.zeros((a, self._mix_Q), dtype=np.float32)
+                        P[np.arange(a), qidx] = 1.0
+                        per_pair.append(tf.constant(P))
+                    mix_P_ln.append(per_pair)
+                self._mix_P_ln = mix_P_ln
+                # Stacked projector for the batched _U_full einsum fast
+                # path: one tensor [num_pairs * L, α, Q] when α is uniform
+                # across pairs (the common case). Replaces num_pairs × L
+                # individual einsum launches with a single batched einsum.
+                # See _U_full for the contraction.
+                if len(set(self._mix_alpha_per_pair)) == 1:
+                    alpha = self._mix_alpha_per_pair[0]
+                    PL = self._mix_num_pairs * self._mix_L
+                    P_stack = np.zeros((PL, alpha, self._mix_Q),
+                                       dtype=np.float32)
+                    for p_idx, k in enumerate(self._mix_pair_keys):
+                        for l in range(self._mix_L):
+                            qidx = self._mix_layout["pair_ln_index"][k][l]
+                            row = p_idx * self._mix_L + l
+                            P_stack[row, np.arange(alpha), qidx] = 1.0
+                    self._mix_P_ln_stack = tf.constant(P_stack)
+                    self._mix_P_ln_uniform_alpha = alpha
+                else:
+                    self._mix_P_ln_stack = None
+                    self._mix_P_ln_uniform_alpha = None
+                # V_pair_l shape:
+                #   shared    : [num_pairs, L, max_α, max_α]
+                #   per-type  : [T, num_pairs, L, max_α, max_α]
+                # Padded to max_α so the storage has uniform stride;
+                # padded rows/cols stay zero and never affect the math.
+                if self.descriptor_mixing_per_type:
+                    shape = (T, self._mix_num_pairs, self._mix_L,
+                             self._mix_max_alpha, self._mix_max_alpha)
+                else:
+                    shape = (self._mix_num_pairs, self._mix_L,
+                             self._mix_max_alpha, self._mix_max_alpha)
+                self.U_pair = self.add_weight(
+                    name="U_pair",  # name kept for save/load compatibility
+                    shape=shape,
+                    initializer="zeros",
+                    trainable=True,
+                )
+            else:  # cross_pair_l
+                # One [N_l × N_l] residual matrix per angular momentum,
+                # where N_l = Σ_p α_eff_p. Mixes radial channels at the
+                # same l across all species pairs; cross-l mixing is
+                # forbidden by construction. Strictly more expressive
+                # than l_aware (l_aware ⊂ cross_pair_l: block-diagonal
+                # cross_pair_l recovers l_aware).
+                self._mix_L = int(cfg.l_max) + 1
+                self._mix_N_per_l = int(self._mix_layout["N_per_l"])
+                # Per-l placement matrices P_l ∈ R^{N_l × Q}.
+                mix_P_l: list[tf.Tensor] = []
+                for l in range(self._mix_L):
+                    qidx = self._mix_layout["l_index"][l]   # [N_l]
+                    P = np.zeros((self._mix_N_per_l, self._mix_Q),
+                                 dtype=np.float32)
+                    P[np.arange(self._mix_N_per_l), qidx] = 1.0
+                    mix_P_l.append(tf.constant(P))
+                self._mix_P_l = mix_P_l
+                # Stacked projector [L, N_l, Q] — N_l is uniform across
+                # l by descriptor_block_layout's invariant, so the stack
+                # is always available for the batched _U_full fast path.
+                P_stack = np.stack([P.numpy() for P in mix_P_l], axis=0)
+                self._mix_P_l_stack = tf.constant(P_stack)
+                # V shape:
+                #   shared    : [L, N_l, N_l]
+                #   per-type  : [T, L, N_l, N_l]
+                # No padding needed — N_l is uniform across l.
+                if self.descriptor_mixing_per_type:
+                    shape = (T, self._mix_L,
+                             self._mix_N_per_l, self._mix_N_per_l)
+                else:
+                    shape = (self._mix_L,
+                             self._mix_N_per_l, self._mix_N_per_l)
+                self.U_pair = self.add_weight(
+                    name="U_pair",
+                    shape=shape,
+                    initializer="zeros",
+                    trainable=True,
+                )
         else:
             self.U_pair = None
             self._mix_P = []
             self._mix_block_sizes = []
 
-        opt_name = str(getattr(cfg, "optimizer", "snes")).lower()
-        if opt_name == "adam":
-            self.optimizer = AdamTrainer(self)
-        elif opt_name == "snes":
-            self.optimizer = SNES(self)
-        else:
-            raise ValueError(
-                f"cfg.optimizer={cfg.optimizer!r} not recognised "
-                f"(expected 'snes' or 'adam')")
+        self.optimizer = SNES(self)
 
     # ---- descriptor mixing helpers ----------------------------------------
 
     def _U_full(self, U_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Assemble the full block-diagonal mixing matrix from the
-        residual parameterisation `V = U - I` stored in `U_pair`:
+        """Assemble the full block-diagonal mixing matrix.
 
-            U_full = I_Q + Σ_p P_p^T · V_pair[..., p, :bs, :bs] · P_p
+        Dispatches on `descriptor_mixing_arch`:
+          - "linear" : one [bs_p × bs_p] block per pair, mixing all
+                       (n, l) channels of that pair.
+                  U_full = I_Q + Σ_p P_pᵀ · V_p · P_p
+          - "l_aware": (l_max+1) [α_p × α_p] sub-blocks per pair, one
+                       per angular momentum. Cross-l mixing forbidden.
+                  U_full = I_Q + Σ_p Σ_l P_{p,l}ᵀ · V_{p,l} · P_{p,l}
 
-        `tf.eye(Q)` broadcasts across all leading batch dims so the
-        same code handles single / per-candidate × shared / per-type:
-            shared single       : [num_pairs, bs, bs]      → [Q, Q]
-            shared candidate    : [C, num_pairs, bs, bs]   → [C, Q, Q]
-            per-type single     : [T, num_pairs, bs, bs]   → [T, Q, Q]
-            per-type candidate  : [C, T, num_pairs, bs, bs]→ [C, T, Q, Q]
-
-        With V initialised at zero, U_full == I_Q at generation 0.
+        In both cases `tf.eye(Q)` broadcasts across leading batch dims
+        so the same code handles single / per-candidate × shared /
+        per-type. With V initialised at zero, U_full == I_Q at gen 0.
         """
         V = self.U_pair if U_pair is None else U_pair
-        parts = []
-        for p_idx, (P, bs) in enumerate(zip(self._mix_P, self._mix_block_sizes)):
-            V_block = V[..., p_idx, :bs, :bs]                            # [..., bs, bs]
-            # P_p^T @ V_block @ P_p, broadcasting over leading dims.
-            placed = tf.einsum('ji,...jk,kl->...il', P, V_block, P)      # [..., Q, Q]
-            parts.append(placed)
-        V_full = tf.add_n(parts)
+        if self.descriptor_mixing_arch == "linear":
+            # Fast path: uniform bs across pairs. One batched einsum over
+            # P:[num_pairs, bs, Q], V:[..., num_pairs, bs, bs].
+            if self._mix_P_stack is not None:
+                bs = self._mix_P_uniform_bs
+                # Slice V to the active bs×bs (padding stays zero anyway,
+                # but the explicit slice avoids touching it).
+                V_active = V[..., :bs, :bs]
+                # Output q-axes labelled i, m. Contraction axes:
+                # p=pair, j=bs (first projector), k=bs (second projector).
+                V_full = tf.einsum(
+                    'pji,...pjk,pkm->...im',
+                    self._mix_P_stack, V_active, self._mix_P_stack)
+                return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
+            # Fallback: non-uniform bs.
+            parts = []
+            for p_idx, (P, bs) in enumerate(zip(self._mix_P, self._mix_block_sizes)):
+                V_block = V[..., p_idx, :bs, :bs]                            # [..., bs, bs]
+                placed = tf.einsum('ji,...jk,kl->...il', P, V_block, P)      # [..., Q, Q]
+                parts.append(placed)
+            V_full = tf.add_n(parts)
+            return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
+        if self.descriptor_mixing_arch == "l_aware":
+            # V shape: [..., (T?), num_pairs, L, max_α, max_α].
+            # Fast path: uniform α across pairs. Flatten (num_pairs, L)
+            # → PL and run one batched einsum over the stacked projector
+            # P:[PL, α, Q], V:[..., PL, α, α].
+            if self._mix_P_ln_stack is not None:
+                alpha = self._mix_P_ln_uniform_alpha
+                PL = self._mix_num_pairs * self._mix_L
+                # Slice off the (max_α − α) padding rows/cols.
+                V_active = V[..., :alpha, :alpha]
+                # Reshape (num_pairs, L) → PL. Preserve leading batch
+                # dims (which may include candidate axis C and/or type
+                # axis T) via dynamic-shape concat.
+                new_shape = tf.concat(
+                    [tf.shape(V_active)[:-4], [PL, alpha, alpha]], axis=0)
+                V_flat = tf.reshape(V_active, new_shape)
+                # Output q-axes labelled i, m. Contraction:
+                # p=PL (pair, l), j=α (first proj), k=α (second proj).
+                V_full = tf.einsum(
+                    'pji,...pjk,pkm->...im',
+                    self._mix_P_ln_stack, V_flat, self._mix_P_ln_stack)
+                return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
+            # Fallback: non-uniform α.
+            parts = []
+            for p_idx, alpha_p in enumerate(self._mix_alpha_per_pair):
+                for l in range(self._mix_L):
+                    V_block = V[..., p_idx, l, :alpha_p, :alpha_p]            # [..., α_p, α_p]
+                    P_pl = self._mix_P_ln[p_idx][l]                            # [α_p, Q]
+                    placed = tf.einsum('ji,...jk,kl->...il', P_pl, V_block, P_pl)
+                    parts.append(placed)
+            V_full = tf.add_n(parts)
+            return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
+        # cross_pair_l: V shape is [..., (T?), L, N_l, N_l]. N_l is
+        # uniform across l, so the stacked projector is always available
+        # — one batched einsum, no Python loop.
+        # Contraction: a=L, j=N_l (first proj), k=N_l (second proj);
+        # output q-axes labelled i, m.
+        V_full = tf.einsum(
+            'aji,...ajk,akm->...im',
+            self._mix_P_l_stack, V, self._mix_P_l_stack)
         return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
 
     def _W0_eff(self, W0: tf.Tensor, U_pair: tf.Tensor | None = None) -> tf.Tensor:

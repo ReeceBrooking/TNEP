@@ -74,11 +74,32 @@ def _generate_model_filename(cfg: TNEPconfig) -> str:
 
 
 def _serialize_config(cfg: TNEPconfig) -> dict:
-    """Convert TNEPconfig to a JSON-serialisable dict."""
+    """Convert TNEPconfig to a JSON-serialisable dict.
+
+    Walks `TNEPconfig.__annotations__` rather than `vars(cfg)` so that
+    fields whose value matches the class-level default are *also*
+    captured. Using `vars(cfg)` alone would miss any cfg field that
+    was never explicitly written to the instance — which is the common
+    case for fields that just use their default. Without this, a
+    checkpoint saved when the class default for e.g. `num_neurons`
+    was 30 would silently restore as whatever the current class
+    default is (e.g. 50), giving an architectural mismatch with the
+    saved μ.
+    """
+    # Annotated fields from TNEPconfig (class scope) + any extras the
+    # caller has stashed on the instance (runtime fields like
+    # `type_map`, `indices`, `dim_q`, etc., which are populated at
+    # data-load time and have no class-level default).
+    field_names = set(getattr(type(cfg), "__annotations__", {}).keys())
+    field_names.update(k for k in vars(cfg).keys() if not k.startswith("_"))
+
     config_dict = {}
-    for k, v in vars(cfg).items():
+    for k in sorted(field_names):
         if k.startswith('_'):
             continue
+        if not hasattr(cfg, k):
+            continue
+        v = getattr(cfg, k)
         if isinstance(v, np.ndarray):
             v = v.tolist()
         elif isinstance(v, (np.integer, np.bool_)):
@@ -114,6 +135,19 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         with h5py.File('model.h5', 'r') as f:
             W0 = f['weights/W0'][:]
             cfg_dict = json.loads(f['config'][()])
+
+    Note on Cayley parameterisation: when `cfg.descriptor_mixing_regularizer
+    == "cayley"`, the saved `/weights/U_pair` dataset holds the DENSE
+    reconstructed V (= U_cayley − I), NOT the upper-triangle skew-
+    symmetric A that SNES was searching over. Loading the model for
+    inference reuses the dense V directly — no Cayley re-derivation
+    occurs. Consequence: a Cayley-trained model file is essentially
+    a `linear`/`l_aware`/`cross_pair_l` model at inference time, and
+    further fine-tuning under Cayley is NOT possible from this file
+    alone (the upper-triangle A is unrecoverable from the dense V
+    without inverting the Cayley map). To continue Cayley training,
+    resume from the `.h5_checkpoint` instead, where the SNES μ vector
+    (which holds A) is persisted.
 
     Args:
         model : trained TNEP model
@@ -159,14 +193,31 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             wg.create_dataset("b1_pol", data=model.b1_pol.numpy())
         # Optional descriptor-mixing layer. Stored only when the model
         # was trained with cfg.descriptor_mixing=True. The dataset
-        # named "U_pair" actually holds the residual V = U - I (the
-        # internal parameterisation); loaders fall back to V=0 (so
-        # U_full=I, a no-op mixing) when absent.
+        # named "U_pair" holds the residual V = U - I (the internal
+        # parameterisation); loaders fall back to V=0 (so U_full=I,
+        # a no-op mixing) when absent. The `mixing_arch` attribute
+        # disambiguates the shape:
+        #   "linear"  : [num_pairs, max_bs, max_bs] (or +T leading)
+        #   "l_aware" : [num_pairs, L, max_α, max_α] (or +T leading)
         # NOTE: checkpoints from before the V-residual switch stored
-        # identity-init U_pair; reloading those will be interpreted as
-        # V=I → U_full=2I and produce wrong predictions.
+        # identity-init U_pair; reloading those will be interpreted
+        # as V=I → U_full=2I and produce wrong predictions.
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             wg.create_dataset("U_pair", data=model.U_pair.numpy())
+            wg.attrs["mixing_arch"] = getattr(
+                model, "descriptor_mixing_arch", "linear")
+
+        # Per-channel descriptor scaler (cfg.descriptor_scaling="q_scaler").
+        # Persisted alongside W0 etc. so inference scripts can replay
+        # the same scaling at descriptor-build time without recomputing.
+        # The scaler array is too long for the JSON config; store it as
+        # a dedicated float32 dataset.
+        if (str(getattr(cfg, "descriptor_scaling", "none")) != "none"
+                and getattr(cfg, "_q_scaler", None) is not None):
+            wg.create_dataset(
+                "q_scaler",
+                data=np.asarray(cfg._q_scaler, dtype=np.float32))
+            wg.attrs["descriptor_scaling"] = str(cfg.descriptor_scaling)
 
         # Descriptor metadata
         dg = f.create_group("descriptor")
@@ -181,30 +232,52 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
 def save_history(history: dict, cfg: TNEPconfig) -> None:
     """Write training history to history.csv in the run directory.
 
-    CSV format: load with pd.read_csv('history.csv') or
-    np.loadtxt('history.csv', delimiter=',', skiprows=1).
+    Always-on columns:
+        generation, train_loss, val_loss, L1, L2,
+        best_rmse, worst_rmse, sigma_min, sigma_max, sigma_mean, sigma_median.
 
-    Columns: generation, train_loss (RMSE + reg), val_loss, L1, L2,
-             best_rmse, worst_rmse, sigma_min, sigma_max, sigma_mean, sigma_median.
+    Optional columns (written when present in history):
+        best_rrmse, avg_rrmse, L_orth.
+
+    Columns shorter than `len(history["generation"])` are padded with
+    NaN so all rows have a value for every column (this happens after
+    a resume that loads an older checkpoint missing the new keys).
     """
     run_dir = os.path.dirname(cfg.save_path) if cfg.save_path else "."
     path = os.path.join(run_dir, "history.csv")
 
-    cols = [
+    base_cols = [
         "generation", "train_loss", "val_loss",
         "L1", "L2", "best_rmse", "worst_rmse",
         "sigma_min", "sigma_max", "sigma_mean", "sigma_median",
     ]
+    optional_cols = ["best_rrmse", "avg_rrmse", "L_orth"]
+    cols = base_cols + [c for c in optional_cols if c in history]
     int_cols = {"generation"}
+
+    n_rows = len(history["generation"])
+    # Pad short columns with NaN (resumed histories may have new keys
+    # that only started accumulating partway through).
+    padded = {}
+    for c in cols:
+        col = history.get(c, [])
+        if len(col) < n_rows:
+            col = [float("nan")] * (n_rows - len(col)) + list(col)
+        padded[c] = col
+
+    def _fmt(c: str, val) -> str:
+        if c in int_cols:
+            return str(int(val))
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return "nan"
+        return "nan" if f != f else f"{f:.6g}"  # NaN-safe
 
     with open(path, "w") as f:
         f.write(",".join(cols) + "\n")
-        for i in range(len(history["generation"])):
-            row = ",".join(
-                str(int(history[c][i])) if c in int_cols else f"{history[c][i]:.6g}"
-                for c in cols
-            )
-            f.write(row + "\n")
+        for i in range(n_rows):
+            f.write(",".join(_fmt(c, padded[c][i]) for c in cols) + "\n")
     print(f"History saved to {path}")
 
 
@@ -252,6 +325,14 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
         rng = state.get("tf_rng_state")
         if rng is not None:
             sg.create_dataset("rng_state", data=_np(rng))
+        # Per-channel descriptor scaler (frozen at training-set creation
+        # time). Persist into the SNES group so load_checkpoint can
+        # restore it BEFORE pad_and_stack runs again — preventing a
+        # silent recompute on resume that would shift the scaler.
+        if getattr(cfg, "_q_scaler", None) is not None:
+            sg.create_dataset(
+                "q_scaler",
+                data=np.asarray(cfg._q_scaler, dtype=np.float32))
         # History (so plots / early-stop continuity carry over)
         hg = f.create_group("history")
         for k, v in history.items():
@@ -307,6 +388,13 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
             "rng_state":  sg["rng_state"][:] if "rng_state" in sg else None,
             "last_gen":   last_gen,
         }
+        # Restore the per-channel descriptor scaler if the checkpoint
+        # carries one — sets cfg._q_scaler BEFORE pad_and_stack runs
+        # on resume, ensuring the scaler is reused (not recomputed)
+        # so the resumed run remains numerically consistent with the
+        # original.
+        if "q_scaler" in sg:
+            cfg._q_scaler = np.asarray(sg["q_scaler"][:], dtype=np.float32)
         hg = f["history"]
         history = {}
         for k in hg:
@@ -315,6 +403,18 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
                                       for tk in hg["timing"]}
             else:
                 history[k] = list(hg[k][:])
+    # Back-pad metric keys added since the checkpoint was written
+    # (best_rrmse, avg_rrmse, L_orth) with NaN to match the length of
+    # the generation column. Without this, downstream consumers that
+    # `zip(history["generation"], history["best_rrmse"])` silently
+    # truncate to the shorter list.
+    n_rows = len(history.get("generation", []))
+    for k in ("best_rrmse", "avg_rrmse", "L_orth"):
+        if k not in history:
+            history[k] = [float("nan")] * n_rows
+        elif len(history[k]) < n_rows:
+            history[k] = ([float("nan")] * (n_rows - len(history[k]))
+                          + list(history[k]))
     resume_state["history"] = history
     return cfg, resume_state
 
@@ -340,11 +440,19 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
             and getattr(model, "descriptor_mixing", False)
             and model.U_pair is not None):
         if tuple(U_pair.shape) != tuple(model.U_pair.shape):
-            print(f"  warning: saved U_pair shape {tuple(U_pair.shape)} "
-                  f"differs from model.U_pair shape {tuple(model.U_pair.shape)}; "
-                  f"keeping fresh V=0 init")
-        else:
-            model.U_pair.assign(U_pair)
+            # Hard fail rather than silently falling back to V=0
+            # (no mixing): a long restart that silently dropped the
+            # learned U_pair would look like training from scratch
+            # without warning anyone.
+            raise ValueError(
+                f"saved U_pair shape {tuple(U_pair.shape)} != "
+                f"model.U_pair shape {tuple(model.U_pair.shape)}. "
+                f"This usually means cfg.descriptor_mixing_arch was "
+                f"changed between save and load (e.g. linear → "
+                f"l_aware or vice versa). Re-train from scratch with "
+                f"the new arch, or rebuild the cfg to match the "
+                f"saved model's arch.")
+        model.U_pair.assign(U_pair)
 
 
 def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
@@ -355,6 +463,9 @@ def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
     print(f"  target_mode={cfg.target_mode}, dim_q={cfg.dim_q}, "
           f"num_types={cfg.num_types}")
     print(f"  Type mapping: {type_str}")
+    if getattr(cfg, "descriptor_mixing", False):
+        print(f"  Descriptor mixing: arch={cfg.descriptor_mixing_arch}, "
+              f"per_type={getattr(cfg, 'descriptor_mixing_per_type', False)}")
 
 
 def _load_model_h5(path: str) -> TNEP:
@@ -378,6 +489,22 @@ def _load_model_h5(path: str) -> TNEP:
             "b1_pol": wg["b1_pol"][:] if "b1_pol" in wg else None,
             "U_pair": wg["U_pair"][:] if "U_pair" in wg else None,
         }
+        # mixing_arch attribute is the authoritative record of which
+        # arch produced the U_pair tensor. Used below to validate
+        # against the cfg-restored arch — a mismatch here is the
+        # earliest reliable signal that the user changed the cfg
+        # mid-restart.
+        saved_mixing_arch = (str(wg.attrs["mixing_arch"])
+                             if "mixing_arch" in wg.attrs else None)
+        # Per-channel descriptor scaler: restore alongside weights so
+        # inference scripts (process_trajectory, etc.) can apply it
+        # consistently with training. cfg.descriptor_scaling carries
+        # the scheme name; cfg._q_scaler carries the array.
+        saved_q_scaler = (np.asarray(wg["q_scaler"][:], dtype=np.float32)
+                          if "q_scaler" in wg else None)
+        saved_descriptor_scaling = (
+            str(wg.attrs["descriptor_scaling"])
+            if "descriptor_scaling" in wg.attrs else None)
 
     for k, v in config_dict.items():
         if k == "descriptor_mean":
@@ -392,6 +519,36 @@ def _load_model_h5(path: str) -> TNEP:
             # overwrite it.
             continue
         setattr(cfg, k, v)
+
+    # Cross-check that the saved arch matches the cfg-restored arch.
+    # If they disagree, the TNEP constructor below would silently build
+    # a different shape and `_load_weights` would raise on shape
+    # mismatch — but the diagnostic message is more useful at this
+    # point where we can name the actual mismatch.
+    cfg_arch = str(getattr(cfg, "descriptor_mixing_arch", "linear"))
+    if (saved_mixing_arch is not None
+            and getattr(cfg, "descriptor_mixing", False)
+            and saved_mixing_arch != cfg_arch):
+        raise ValueError(
+            f"Checkpoint at {path!r} was saved with "
+            f"descriptor_mixing_arch={saved_mixing_arch!r} but the "
+            f"restored cfg specifies {cfg_arch!r}. The two must match "
+            f"to load weights correctly.")
+
+    # Restore the descriptor scaler. Authoritative source is the
+    # /weights/q_scaler dataset + descriptor_scaling attribute,
+    # falling back to the cfg JSON field if those weren't written.
+    if saved_descriptor_scaling is not None:
+        cfg.descriptor_scaling = saved_descriptor_scaling
+    if saved_q_scaler is not None:
+        cfg._q_scaler = saved_q_scaler
+    elif str(getattr(cfg, "descriptor_scaling", "none")) != "none":
+        raise ValueError(
+            f"Model at {path!r} has descriptor_scaling="
+            f"{cfg.descriptor_scaling!r} but no /weights/q_scaler "
+            f"dataset was saved. The scaler is required for consistent "
+            f"inference. Retrain the model or set "
+            f"cfg.descriptor_scaling='none'.")
 
     model = TNEP(cfg)
     _load_weights(model, cfg, **weights)

@@ -87,32 +87,91 @@ def _apply_csc_overrides(cfg: TNEPconfig) -> None:
 
 
 def train_model(cfg: TNEPconfig | None = None,
-                checkpoint: str | None = None) -> TNEP:
+                checkpoint: str | None = None,
+                extract_model: bool = False,
+                cfg_overrides: dict | None = None) -> TNEP:
     """Run full TNEP training pipeline: load, split, train, test, plot, save.
 
     Args:
-        cfg        : TNEPconfig or None (uses defaults). Ignored when
-                     `checkpoint` is set — the checkpoint embeds the
-                     full cfg used for the original run, including the
-                     train/val split (cfg.indices) and architecture
-                     fields. Continuing with a different cfg would
-                     break determinism or shape-match.
-        checkpoint : optional path to a `checkpoint.h5` written by a
-                     previous run via `cfg.checkpoint_interval`. When
-                     provided, the cfg is loaded from the file and
-                     training resumes from `last_gen + 1`. Default
-                     None starts a fresh run.
+        cfg          : TNEPconfig or None (uses defaults). Ignored when
+                       `checkpoint` is set — the checkpoint embeds the
+                       full cfg used for the original run, including the
+                       train/val split (cfg.indices) and architecture
+                       fields. Continuing with a different cfg would
+                       break determinism or shape-match.
+        checkpoint   : optional path to a `checkpoint.h5` written by a
+                       previous run via `cfg.checkpoint_interval`. When
+                       provided, the cfg is loaded from the file and
+                       training resumes from `last_gen + 1`. Default
+                       None starts a fresh run.
+        extract_model: when True, skip the SNES training loop entirely
+                       and treat the checkpoint as if it were the final
+                       generation — build final_model and best_val_model
+                       directly from the checkpoint's μ and best_μ,
+                       then run scoring / saving / plotting exactly as
+                       a completed training run would. Requires
+                       `checkpoint` to be set (raises otherwise).
+                       Default False.
+        cfg_overrides: optional dict of cfg field → value to apply
+                       after `load_checkpoint`, BEFORE the model is
+                       built. Use this to repair old checkpoints whose
+                       saved JSON is missing fields (e.g. legacy
+                       checkpoints saved before the
+                       `_serialize_config` fix, where class-default
+                       fields like `num_neurons` and
+                       `descriptor_mixing_arch` were not persisted).
+                       Without overrides, the current class defaults
+                       are used — which may not match the checkpoint's
+                       architecture, producing a μ-shape mismatch.
 
     Returns:
         model  : trained TNEP model (access config via model.cfg)
     """
+    if extract_model and checkpoint is None:
+        raise ValueError(
+            "extract_model=True requires a `checkpoint` path — there is "
+            "nothing to extract without a stored μ / best_μ.")
+    if cfg_overrides is not None and checkpoint is None:
+        raise ValueError(
+            "cfg_overrides is only meaningful with `checkpoint` — pass "
+            "the values directly via `cfg` when starting from scratch.")
     resume_state = None
     if checkpoint is not None:
         from model_io import load_checkpoint
         cfg, resume_state = load_checkpoint(checkpoint)
-        print(f"Resuming training from {checkpoint} "
-              f"(continuing at gen {resume_state['last_gen'] + 1} "
-              f"of {cfg.num_generations})")
+        if cfg_overrides:
+            print(f"  applying cfg_overrides: {cfg_overrides}")
+            # Validate keys against the TNEPconfig annotations. A
+            # typo would otherwise create a brand-new instance
+            # attribute via setattr() and the user's intended
+            # override would silently never apply — visible only at
+            # the eventual dim-mismatch crash. Hard fail with a list
+            # of the known fields to make the typo obvious.
+            valid_keys = set(getattr(TNEPconfig, "__annotations__", {}).keys())
+            unknown = [k for k in cfg_overrides if k not in valid_keys]
+            if unknown:
+                # Suggest near matches.
+                import difflib
+                hints = []
+                for bad in unknown:
+                    suggestions = difflib.get_close_matches(bad, valid_keys, n=3)
+                    if suggestions:
+                        hints.append(f"  {bad!r} → did you mean {suggestions}?")
+                    else:
+                        hints.append(f"  {bad!r} (no close match)")
+                raise ValueError(
+                    f"cfg_overrides contains unknown TNEPconfig field(s):\n"
+                    + "\n".join(hints))
+            for k, v in cfg_overrides.items():
+                setattr(cfg, k, v)
+        if extract_model:
+            print(f"Extracting models from {checkpoint} "
+                  f"(treating gen {resume_state['last_gen'] + 1} as final; "
+                  f"no further SNES generations will run).")
+        else:
+            print(f"Resuming training from {checkpoint} "
+                  f"(continuing at gen {resume_state['last_gen'] + 1} "
+                  f"of {cfg.num_generations})")
     elif cfg is None:
         cfg = TNEPconfig()
 
@@ -135,7 +194,8 @@ def train_model(cfg: TNEPconfig | None = None,
               f"{cfg._gradient_cache_path}")
 
     try:
-        return _train_model_inner(cfg, resume_state=resume_state)
+        return _train_model_inner(cfg, resume_state=resume_state,
+                                  extract_model=extract_model)
     finally:
         # Always remove the scratch directory, even on exceptions, so
         # repeated runs don't leak ~10 GB per attempt onto the disk.
@@ -316,7 +376,8 @@ def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> No
 
 
 def _train_model_inner(cfg: TNEPconfig,
-                        resume_state: dict | None = None) -> TNEP:
+                        resume_state: dict | None = None,
+                        extract_model: bool = False) -> TNEP:
     """Body of train_model, factored out so the outer try/finally can
     guarantee cleanup of the disk-backed gradient scratch directory.
 
@@ -324,6 +385,14 @@ def _train_model_inner(cfg: TNEPconfig,
     from the checkpoint's `cfg.indices` rather than re-shuffled, and
     the run directory setup is skipped so outputs land in the existing
     model dir.
+
+    When `extract_model=True` (only valid with `resume_state`), the
+    SNES training loop is skipped entirely. `final_model` and
+    `best_val_model` are reconstructed from the checkpoint's μ and
+    best_μ, and the existing history (loaded from the checkpoint) is
+    passed through to the post-fit scoring / saving / plotting path
+    unchanged. The function then returns as if training had just
+    finished naturally.
     """
     # Load dataset, filter by species, then filter bad data
     dataset, dataset_types_int = collect(cfg)
@@ -350,17 +419,69 @@ def _train_model_inner(cfg: TNEPconfig,
     # avoids a large test-set descriptor build delaying generation 0.
     train_data, test_pending, val_data = split(dataset, dataset_types_int, cfg)
 
+    # Resolve dim_q from cfg before any consumer (q_scaler, pad_and_stack)
+    # needs it. Cross-checked against built descriptor shape further down.
+    from DescriptorBuilderGPU import compute_dim_q
+    cfg.dim_q = compute_dim_q(cfg)
+
+    # Per-channel descriptor scaling. Computed ONCE over the training-
+    # set per-atom descriptors (before padding) and applied identically
+    # to train/val/test/trajectory inputs so the scaler is a frozen
+    # property of the trained model, persisted in /weights/q_scaler.
+    # On resume, cfg._q_scaler is restored by load_checkpoint BEFORE
+    # this point, so the guard below keeps it intact.
+    if str(getattr(cfg, "descriptor_scaling", "none")) == "q_scaler":
+        if getattr(cfg, "_q_scaler", None) is None:
+            granularity = str(getattr(
+                cfg, "q_scaler_granularity", "per_component")).lower()
+            n_atoms_total = sum(
+                int(d.shape[0]) for d in train_data["descriptors"])
+            if granularity == "per_component":
+                from data import _compute_q_scaler
+                cfg._q_scaler = _compute_q_scaler(
+                    train_data["descriptors"], cfg.dim_q)
+            elif granularity == "l_block":
+                from data import _compute_q_scaler_l_block
+                from DescriptorBuilderGPU import descriptor_block_layout
+                layout = descriptor_block_layout(cfg)
+                cfg._q_scaler = _compute_q_scaler_l_block(
+                    train_data["descriptors"], layout)
+            else:
+                raise ValueError(
+                    f"cfg.q_scaler_granularity={granularity!r} not "
+                    "recognised (expected 'per_component' or 'l_block').")
+            qs = cfg._q_scaler
+            n_unique = int(np.unique(qs).size)
+            print(f"  Computed q_scaler ({granularity}) over "
+                  f"{n_atoms_total} training atoms: {qs.size} q-channels, "
+                  f"{n_unique} unique multipliers:")
+            print(f"    multiplier distribution: "
+                  f"min={qs.min():.4f}  max={qs.max():.4f}  "
+                  f"mean={qs.mean():.4f}  std={qs.std():.4f}")
+            mid = qs.size // 2
+            print(f"    sample channels: s[0]={qs[0]:.4f}  "
+                  f"s[{mid}]={qs[mid]:.4f}  s[{qs.size - 1}]={qs[-1]:.4f}")
+        else:
+            print(f"  Reusing q_scaler from checkpoint (shape="
+                  f"{cfg._q_scaler.shape}, no recompute on resume).")
+    elif str(getattr(cfg, "descriptor_scaling", "none")) != "none":
+        raise ValueError(
+            f"cfg.descriptor_scaling={cfg.descriptor_scaling!r} "
+            "not recognised (expected 'none' or 'q_scaler').")
+
     # Convert to padded dense tensors for GPU-batched evaluation. test_data
     # is intentionally NOT padded here; it gets padded by materialize_test_data
     # the first time it's actually consumed.
     train_data = pad_and_stack(
         train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
-        cache_tag="train")
+        cache_tag="train",
+        q_scaler=getattr(cfg, "_q_scaler", None))
     val_data   = pad_and_stack(
         val_data,   num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
-        cache_tag="val")
+        cache_tag="val",
+        q_scaler=getattr(cfg, "_q_scaler", None))
 
     _setup_grad_staging(cfg, train_data, val_data)
 
@@ -371,12 +492,8 @@ def _train_model_inner(cfg: TNEPconfig,
                                      num_types=cfg.num_types,
                                      pin_to_cpu=cfg.pin_data_to_cpu)
 
-    # dim_q is determined by the SOAP descriptor size. It depends only on
-    # (alpha_max, l_max, num_types, compress_mode), so it can be resolved
-    # in closed form from cfg without instantiating a builder. Cross-check
-    # against the actual built shape so cfg / builder drift is caught.
-    from DescriptorBuilderGPU import compute_dim_q
-    cfg.dim_q = compute_dim_q(cfg)
+    # Cross-check: built descriptor shape must match cfg.dim_q resolved
+    # above. Catches cfg / builder drift before the SNES loop starts.
     built_dim_q = int(train_data["descriptors"][0].shape[-1])
     if built_dim_q != cfg.dim_q:
         raise RuntimeError(
@@ -421,11 +538,74 @@ def _train_model_inner(cfg: TNEPconfig,
         _plot_eval_set(cfg, test_data, preds, m,
                        "per_atom", "total", save_dir=gen_save)
 
-    # Train
-    history, final_model, best_val_model = model.fit(
-        train_data, val_data,
-        plot_callback=periodic_plot_callback if cfg.plot_interval else None,
-        resume_state=resume_state)
+    # Train — unless extract_model=True, in which case rebuild
+    # `final_model` and `best_val_model` straight from the
+    # checkpoint's μ / best_μ and reuse its history dict. The
+    # post-fit scoring + plotting code below runs unchanged.
+    if extract_model:
+        from SNES import _set_model_params
+        if resume_state is None:
+            # Outer train_model already enforced this, but guard the
+            # internal contract too so a future caller of
+            # _train_model_inner can't trip the same wire silently.
+            raise ValueError(
+                "_train_model_inner: extract_model=True requires "
+                "resume_state (μ / best_μ must come from a checkpoint).")
+        print(f"  extract_model: skipping SNES training loop; rebuilding "
+              f"models from checkpoint state at gen "
+              f"{resume_state['last_gen'] + 1}.")
+        snes = model.optimizer
+        ckpt_dim = int(np.asarray(resume_state["mu"]).size)
+        if ckpt_dim != int(snes.dim):
+            # Diagnose the most common cause: the saved cfg JSON is
+            # missing fields (legacy serializer bug or new fields
+            # introduced since save), so the model rebuilt from cfg
+            # has a different architecture than what produced the
+            # stored μ. Tell the user exactly what to do.
+            raise ValueError(
+                f"Checkpoint μ has dim {ckpt_dim} but the current model "
+                f"builds dim={snes.dim}. The cfg loaded from the "
+                f"checkpoint must disagree with the cfg used at save "
+                f"time on at least one architectural field "
+                f"(num_neurons, descriptor_mixing, "
+                f"descriptor_mixing_arch, descriptor_mixing_per_type, "
+                f"target_mode, num_types, alpha_max, l_max). The most "
+                f"likely cause is legacy checkpoints that pre-date the "
+                f"_serialize_config fix — class-default fields weren't "
+                f"saved, so the current class defaults are leaking in.\n"
+                f"Recovery: pass cfg_overrides={{...}} to train_model "
+                f"with the architectural fields restored to their "
+                f"original values. The run directory name "
+                f"({getattr(cfg, 'save_path', None)}) usually encodes "
+                f"num_neurons (n<H>_) and dim_q (q<Q>_)."
+            )
+        snes.mu.assign(tf.constant(resume_state["mu"], dtype=tf.float32))
+        snes.sigma.assign(tf.constant(resume_state["sigma"], dtype=tf.float32))
+        best_mu = tf.constant(resume_state["best_mu"], dtype=tf.float32)
+
+        final_params = snes.reconstruct_params_tf(snes.mu)
+        final_model = TNEP(cfg)
+        _set_model_params(final_model, *final_params)
+
+        best_val_params = snes.reconstruct_params_tf(best_mu)
+        best_val_model = TNEP(cfg)
+        _set_model_params(best_val_model, *best_val_params)
+
+        # Mirror SNES.fit's final restoration: keep the in-place
+        # `model` (and its optimizer) aligned with the best-val state
+        # so any downstream caller that re-uses `model` directly sees
+        # the best run-end configuration, matching post-fit behaviour.
+        snes.mu.assign(best_mu)
+        snes.sigma.assign(tf.constant(
+            resume_state["best_sigma"], dtype=tf.float32))
+        _set_model_params(model, *best_val_params)
+
+        history = resume_state["history"]
+    else:
+        history, final_model, best_val_model = model.fit(
+            train_data, val_data,
+            plot_callback=periodic_plot_callback if cfg.plot_interval else None,
+            resume_state=resume_state)
 
     # Build the test descriptors now (if not already built by a periodic
     # plot during training), then score final + best-val on it.
@@ -739,7 +919,7 @@ def process_trajectory(
 
 
 if __name__ == '__main__':
-    model = train_model(checkpoint="models/n15_q165_pop100_20260512_094933/checkpoint.h5")
+    model = train_model()
     #model = load_model("models/n30_q75_pop80_20260428_120216/train_waterbulk_O_H_dipole_best_val.npz")
     #dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=20, descriptor_mode=1, descriptor_batch_frames=5, pin_to_cpu=False, descriptor_precision="float64")
     

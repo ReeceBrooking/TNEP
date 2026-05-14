@@ -7,6 +7,8 @@ import numpy as np
 import tensorflow as tf
 from typing import TYPE_CHECKING, Callable
 
+from loss_functions import per_structure_error, squared_error_per_structure
+
 if TYPE_CHECKING:
     from TNEP import TNEP
 
@@ -109,32 +111,103 @@ class SNES:
                 for k in self._mix_layout["pair_keys"]]
             self._mix_per_type = bool(
                 getattr(self.cfg, "descriptor_mixing_per_type", False))
-            # n_U_pair packs only the ACTIVE entries (the [bs, bs]
-            # sub-blocks). Padded rows/cols don't take SNES degrees
-            # of freedom — they stay zero and are never read by the
-            # P_p · ... · P_p^T placement.
-            per_T_block = int(sum(bs * bs for bs in self._mix_block_sizes))
+            self._mix_arch = str(
+                getattr(self.cfg, "descriptor_mixing_arch", "linear")).lower()
+            # When the regulariser is "cayley", each [bs, bs] block is
+            # parameterised by the upper triangle of a skew-symmetric
+            # matrix A (bs(bs-1)/2 free params). The dense block V is
+            # then reconstructed via the Cayley transform inside
+            # reconstruct_params_tf; SNES sees only the upper-triangle
+            # storage. Halves (roughly) the search-space dimensionality
+            # and guarantees U lies on the rotation group regardless of
+            # any λ — see plan and TNEPconfig docs.
+            self._mix_cayley = (
+                str(getattr(self.cfg, "descriptor_mixing_regularizer",
+                            "off")).lower() == "cayley")
+            # `block_count(bs)` returns the per-block SNES dim for the
+            # current arch+regulariser combination.
+            def _block_count(bs: int) -> int:
+                return (bs * (bs - 1) // 2) if self._mix_cayley else bs * bs
+
+            # n_U_pair packs only the ACTIVE entries — padded rows/cols
+            # don't take SNES degrees of freedom. Layout depends on arch:
+            #   "linear"       : per pair, bs² entries (or bs(bs-1)/2 for cayley).
+            #   "l_aware"      : per pair × (l_max+1), α² (or α(α-1)/2).
+            #   "cross_pair_l" : per l, N_l² (or N_l(N_l-1)/2).
+            if self._mix_arch == "linear":
+                per_T_block = int(sum(_block_count(bs)
+                                       for bs in self._mix_block_sizes))
+            elif self._mix_arch == "l_aware":
+                self._mix_alpha_per_pair = [
+                    int(self._mix_layout["alpha_eff_per_pair"][k])
+                    for k in self._mix_layout["pair_keys"]]
+                L = int(self.cfg.l_max) + 1
+                self._mix_L = L
+                per_T_block = int(sum(L * _block_count(a)
+                                       for a in self._mix_alpha_per_pair))
+            elif self._mix_arch == "cross_pair_l":
+                L = int(self.cfg.l_max) + 1
+                self._mix_L = L
+                self._mix_N_per_l = int(self._mix_layout["N_per_l"])
+                per_T_block = L * _block_count(self._mix_N_per_l)
+            else:
+                raise ValueError(
+                    f"descriptor_mixing_arch={self._mix_arch!r} not in "
+                    "('linear', 'l_aware', 'cross_pair_l')")
             if self._mix_per_type:
                 self.n_U_pair = self.cfg.num_types * per_T_block
             else:
                 self.n_U_pair = per_T_block
+            # Pre-build the Cayley scatter matrices (one per unique block
+            # size used by this arch). Doing it at init keeps the
+            # construction out of the @tf.function-traced
+            # reconstruct_params_tf path — `tf.constant`s live in eager
+            # context and are simply captured into the graph at trace
+            # time. Without this, the first reconstruct call inside an
+            # `@tf.function` triggers a Python-side `hasattr` + dict-add
+            # that's at best benign and at worst confuses tracers under
+            # XLA recompilation. See review item H2.
+            self._cayley_scatter_cache = {}
+            if self._mix_cayley:
+                # Collect unique block sizes across arch variants.
+                if self._mix_arch == "linear":
+                    block_sizes = set(self._mix_block_sizes)
+                elif self._mix_arch == "l_aware":
+                    block_sizes = set(self._mix_alpha_per_pair)
+                else:                                              # cross_pair_l
+                    block_sizes = {self._mix_N_per_l}
+                for bs in block_sizes:
+                    if bs <= 1:
+                        continue   # 1×1 skew is trivially zero
+                    num_upper = bs * (bs - 1) // 2
+                    scat = np.zeros((bs, bs, num_upper), dtype=np.float32)
+                    k = 0
+                    for i in range(bs):
+                        for j in range(i + 1, bs):
+                            scat[i, j, k] = 1.0
+                            scat[j, i, k] = -1.0
+                            k += 1
+                    self._cayley_scatter_cache[bs] = tf.constant(scat)
         else:
             self._mix_block_sizes = []
             self._mix_per_type = False
+            self._mix_arch = "linear"
+            self._mix_cayley = False
+            self._cayley_scatter_cache = {}
             self.n_U_pair = 0
         self.dim = self.n_anns_total + self.n_U_pair
 
-        # Search distribution parameters as tf.Variables (stay on GPU)
-        # GPUMD initialises mu in [-1, 1] (see snes.cu line 6709). The
-        # ANN portion gets the [-1,1] init; the U_pair tail (residual
-        # V = U - I parameterisation in TNEP) starts at zero so the
-        # model begins bit-identical to a mixing-disabled baseline.
-        # Sigma is uniform throughout — the per-element distribution
-        # then explores away from the identity prior.
+        # Search distribution parameters as tf.Variables (stay on GPU).
+        # Initialisation scheme is configurable:
+        #   "uniform" (GPUMD default): all ANN entries U(-1, 1).
+        #   "glorot"                 : W0 / W1 scaled by sqrt(6 / (fan_in + fan_out)),
+        #                              biases zero.
+        # In both cases the U_pair tail (residual V = U - I parameterisation)
+        # stays at zero so the model begins bit-identical to a mixing-
+        # disabled baseline. Sigma is uniform throughout — exploration
+        # then expands away from this prior.
         rng = np.random.default_rng(self.cfg.seed)
-        mu_init = rng.uniform(-1.0, 1.0, size=self.dim).astype(np.float32)
-        if self.n_U_pair > 0:
-            mu_init[self.n_anns_total:] = 0.0
+        mu_init = self._build_mu_init(rng)
         self.mu = tf.Variable(mu_init, trainable=False, name="snes_mu")
         self.sigma = tf.Variable(
             tf.fill([self.dim], self.cfg.init_sigma),
@@ -167,10 +240,18 @@ class SNES:
         # dimensionality scaling). -1 sentinel enables dynamic adapt.
         self._mix_reg_mode = str(getattr(
             self.cfg, "descriptor_mixing_regularizer", "off")).lower()
-        if self._mix_reg_mode not in ("off", "shrinkage", "orthogonal"):
+        if self._mix_reg_mode not in ("off", "shrinkage", "orthogonal", "cayley"):
             raise ValueError(
                 f"descriptor_mixing_regularizer={self._mix_reg_mode!r} not "
-                "recognised (expected 'off', 'shrinkage', or 'orthogonal')")
+                "recognised (expected 'off', 'shrinkage', 'orthogonal', "
+                "or 'cayley')")
+        # The "cayley" mode is a *parameterisation*, not a soft penalty:
+        # U is reconstructed via the Cayley map from a skew-symmetric A,
+        # so it's structurally orthogonal regardless of any λ. The
+        # shrinkage / orthogonal soft-penalty paths must remain
+        # silent under cayley — the existing dispatches `reg_Vpair` /
+        # `reg_Vorth` already gate on the exact strings "shrinkage" /
+        # "orthogonal", so this just works.
         if self.n_U_pair > 0:
             auto_lambda_orth = float(np.sqrt(
                 self.n_U_pair * 1e-6 / max(self.cfg.num_types, 1)))
@@ -183,10 +264,11 @@ class SNES:
         self._lambda_orth = tf.Variable(init_lambda_orth, dtype=tf.float32,
                                         trainable=False, name="lambda_orth")
 
-        # Loss function flags (Python bools so tf.function traces correct branch)
-        self._use_mae = (cfg.loss_type == "mae")
-        self._use_inv_weight = (cfg.inverse_weight_eps is not None)
-        self._inv_weight_eps = cfg.inverse_weight_eps if self._use_inv_weight else 1.0
+        # Loss / weighting flags are read fresh from cfg in
+        # evaluate_population — no cached attrs (so live cfg edits
+        # work). loss_type ∈ {"mse", "mae", "huber"};
+        # inverse_weight_mode ∈ {"none", "vector_magnitude",
+        # "per_component"}. See cfg docs.
 
         # Polarizability shear weight: scale off-diagonal components [xy, yz, zx]
         # Targets are [xx, yy, zz, xy, yz, zx] — indices 3,4,5 are off-diagonal
@@ -264,11 +346,13 @@ class SNES:
             l1 = total_l1 / T + self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / n_typed_total
             l2 = total_l2 / T + self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed)) / n_typed_total)
         else:
-            # Single-type path: when ANY V_pair regularisation mode is
-            # active (shrinkage or orthogonal), keep V_pair out of the
-            # main L1/L2 sum so it isn't doubly counted (shrinkage adds
-            # it below; orthogonal uses a separate penalty).
-            v_handled = reg_Vpair or reg_Vorth
+            # Single-type path: when V_pair is handled separately (by
+            # shrinkage, orthogonal, OR Cayley parameterisation), keep
+            # it out of the main L1/L2 sum. Cayley is a structural
+            # constraint, not a soft penalty — its A entries are NOT
+            # to be regularised, since shrinking A toward 0 collapses
+            # U toward I and defeats the Cayley map's purpose.
+            v_handled = reg_Vpair or reg_Vorth or self._mix_cayley
             ann = pv[:self.n_anns_total] if v_handled else pv
             ann_n = self.n_anns_total if v_handled else self.dim
             l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann)) / ann_n
@@ -310,6 +394,53 @@ class SNES:
             l_orth = 0.0
 
         return float(l1), float(l2), float(l_orth)
+
+    def _build_mu_init(self, rng: np.random.Generator) -> np.ndarray:
+        """Initialise the μ vector according to cfg.mu_init_scheme.
+
+        Returns a [dim]-shaped float32 array. The V_pair tail (when
+        descriptor mixing is enabled) is always zeroed so U_full = I
+        at gen 0.
+        """
+        scheme = str(getattr(self.cfg, "mu_init_scheme", "uniform")).lower()
+        T = self.cfg.num_types
+        Q = self.dim_q
+        H = self.cfg.num_neurons
+        if scheme == "uniform":
+            mu = rng.uniform(-1.0, 1.0, size=self.dim).astype(np.float32)
+        elif scheme == "glorot":
+            mu = np.zeros(self.dim, dtype=np.float32)
+            c_W0 = float(np.sqrt(6.0 / (Q + H)))
+            c_W1 = float(np.sqrt(6.0 / (H + 1)))
+
+            def _fill_ann(off: int) -> int:
+                """Fill one ANN's worth of weights starting at `off`.
+                Layout: [W0(T,Q,H) | b0(T,H) | W1(T,H) | b1(1)].
+                """
+                n_W0 = T * Q * H
+                mu[off:off + n_W0] = rng.uniform(
+                    -c_W0, c_W0, size=n_W0).astype(np.float32)
+                off += n_W0
+                # b0 zero (T*H entries)
+                off += T * H
+                n_W1 = T * H
+                mu[off:off + n_W1] = rng.uniform(
+                    -c_W1, c_W1, size=n_W1).astype(np.float32)
+                off += n_W1
+                # b1 zero (1 entry)
+                off += 1
+                return off
+
+            off = _fill_ann(0)
+            if self.cfg.target_mode == 2:
+                off = _fill_ann(off)
+        else:
+            raise ValueError(
+                f"mu_init_scheme={scheme!r} not in ('uniform', 'glorot')")
+        # V_pair tail: always zero (residual mixing layer; U_full = I at init).
+        if self.n_U_pair > 0:
+            mu[self.n_anns_total:] = 0.0
+        return mu
 
     def _maybe_adapt_lambda(self, gen: int, data_loss: float,
                             l1: float, l2: float, l_orth: float = 0.0) -> None:
@@ -385,20 +516,40 @@ class SNES:
                        the number of entries in this slab so the value
                        scales like an averaged squared-residual.
         """
+        # Cayley parameterisation owns the orthogonality constraint
+        # structurally — the V_tail under Cayley contains upper-
+        # triangle entries of A (skew-symmetric), NOT the dense V
+        # blocks this penalty assumes. Indexing it as bs² per block
+        # would silently mis-slice. Hard-fail to catch any future
+        # code path that calls into this helper while cayley is on.
+        if self._mix_cayley:
+            raise RuntimeError(
+                "_orth_penalty_slab is not valid under "
+                "descriptor_mixing_regularizer='cayley': the V_tail "
+                "encodes the upper-triangle of skew-symmetric A, not "
+                "dense V blocks. Cayley provides orthogonality as a "
+                "structural constraint, so no soft penalty is needed.")
         per_T = (self.n_U_pair // self.cfg.num_types
                  if self._mix_per_type else self.n_U_pair)
         start = slab_idx * per_T
         pen = tf.zeros(tf.shape(V_tail)[:-1])
         offset = 0
-        for bs in self._mix_block_sizes:
-            n = bs * bs
+        if self._mix_arch == "linear":
+            iterator = [(bs,) for bs in self._mix_block_sizes]
+        elif self._mix_arch == "l_aware":
+            # Each pair contributes L sub-blocks of [α_p × α_p].
+            iterator = [(alpha,) for alpha in self._mix_alpha_per_pair
+                        for _ in range(self._mix_L)]
+        else:  # cross_pair_l: one [N_l × N_l] sub-block per angular momentum
+            iterator = [(self._mix_N_per_l,) for _ in range(self._mix_L)]
+        for (dim,) in iterator:
+            n = dim * dim
             block_flat = V_tail[..., start + offset:start + offset + n]
-            # Reshape last dim → [bs, bs], leading dims preserved.
             new_shape = tf.concat(
-                [tf.shape(block_flat)[:-1], [bs, bs]], axis=0)
-            V = tf.reshape(block_flat, new_shape)              # [..., bs, bs]
-            VtV = tf.matmul(V, V, transpose_a=True)            # [..., bs, bs]
-            M = V + tf.linalg.matrix_transpose(V) + VtV        # [..., bs, bs]
+                [tf.shape(block_flat)[:-1], [dim, dim]], axis=0)
+            V = tf.reshape(block_flat, new_shape)              # [..., dim, dim]
+            VtV = tf.matmul(V, V, transpose_a=True)            # [..., dim, dim]
+            M = V + tf.linalg.matrix_transpose(V) + VtV
             pen = pen + tf.reduce_sum(tf.square(M), axis=[-2, -1])
             offset += n
         return pen / float(per_T)
@@ -414,6 +565,64 @@ class SNES:
             slabs = [self._orth_penalty_slab(V_tail, t) for t in range(T)]
             return tf.add_n(slabs) / float(T)
         return self._orth_penalty_slab(V_tail, 0)
+
+    def _cayley_blocks_batched(self, A_upper_stacked: tf.Tensor,
+                                bs: int) -> tf.Tensor:
+        """Batched Cayley reconstruction across N blocks of size bs.
+
+        Replaces N individual `tf.linalg.solve` launches (one per block)
+        with a single batched solve — ~10× faster on consumer GPUs
+        because LU on tiny (≤8×8) matrices is launch-bound, not
+        arithmetic-bound.
+
+        For each entry in the N-batch:
+            A[i,j] = +A_upper[k]   for i < j (k = upper-tri index)
+            A[j,i] = −A_upper[k]
+            A[i,i] = 0             (scatter has no diagonal)
+            U      = (I + A) (I − A)⁻¹
+            V      = U − I
+
+        Kept in fp32 throughout: the small (≤8×8) blocks SNES uses keep
+        ‖A‖ in the regime where fp32 LU is accurate to a few ULP, and a
+        few-ULP departure from exact orthogonality is irrelevant for
+        training-time U.
+
+        Args:
+            A_upper_stacked : [..., N, bs·(bs-1)/2] flat upper-triangle
+                              entries. Leading ... is e.g. population [P].
+                              N is the number of blocks being reconstructed
+                              together (e.g. num_pairs × L for l_aware).
+            bs              : block size (uniform across the N blocks).
+
+        Returns:
+            V : [..., N, bs, bs] dense V = U − I, fp32.
+                Returns zeros for bs ≤ 1 (1×1 skew is identically 0).
+        """
+        if bs <= 1:
+            shape = tf.concat(
+                [tf.shape(A_upper_stacked)[:-1], [bs, bs]], axis=0)
+            return tf.zeros(shape, dtype=tf.float32)
+        # scatter: [bs, bs, payload] from __init__'s cache.
+        scatter = self._cayley_scatter_cache[bs]
+        # A[..., n, i, j] = Σ_k scatter[i, j, k] · A_upper[..., n, k]
+        A = tf.einsum('ijk,...nk->...nij', scatter, A_upper_stacked)
+        I = tf.eye(bs, dtype=A.dtype)
+        U = tf.linalg.solve(I - A, I + A)
+        return U - I
+
+    def _cayley_block(self, A_upper_flat: tf.Tensor, bs: int) -> tf.Tensor:
+        """Single-block Cayley helper. Thin wrapper over the batched
+        variant. Retained for callers that genuinely need one block
+        (e.g. the non-uniform `linear`-arch fallback). Hot paths should
+        use `_cayley_blocks_batched` directly.
+        """
+        if bs <= 1:
+            shape = tf.concat(
+                [tf.shape(A_upper_flat)[:-1], [bs, bs]], axis=0)
+            return tf.zeros(shape, dtype=tf.float32)
+        stacked = A_upper_flat[..., tf.newaxis, :]   # [..., 1, payload]
+        V = self._cayley_blocks_batched(stacked, bs)
+        return V[..., 0, :, :]
 
     def _extract_type_params(self, pv: tf.Tensor, t: int) -> tf.Tensor:
         """Extract parameters belonging to atom type t from flat vector.
@@ -501,7 +710,13 @@ class SNES:
         # top of the per-type columns.
         if self.n_U_pair > 0:
             if self._mix_per_type:
-                per_T = sum(bs * bs for bs in self._mix_block_sizes)
+                # Per-T slab size is the same across all arches: n_U_pair
+                # is by construction T · per_T. Using `n_U_pair // T`
+                # keeps this correct for linear, l_aware, and
+                # cross_pair_l. (Earlier `sum(bs² for bs in
+                # _mix_block_sizes)` was the linear-only formula and
+                # silently mis-labelled slabs for the other arches.)
+                per_T = self.n_U_pair // T
                 pair_labels = np.empty(self.n_U_pair, dtype=np.int32)
                 for t_idx in range(T):
                     pair_labels[t_idx * per_T:(t_idx + 1) * per_T] = t_idx
@@ -856,27 +1071,56 @@ class SNES:
             else:
                 fitness = self.evaluate_population(samples, batch_data)
 
-            # GPU→CPU sync. Stack the three reductions and pull them
-            # in one transfer — three separate `float(reduce_*)` calls
-            # would issue three independent device syncs every gen.
+            # GPU→CPU sync. Stack the reductions and pull them in one
+            # transfer — five separate `float(reduce_*)` calls would
+            # issue five independent device syncs every gen. fitness
+            # drives SNES ranking (depends on loss_type); the rmse/rrmse
+            # entries are ALWAYS computed from squared error so they're
+            # comparable across loss-function ablations.
+            rmse_pc = self._last_rmse_per_cand
+            rrmse_pc = self._last_rrmse_per_cand
             metrics_gpu = tf.stack([
                 tf.reduce_mean(fitness),
-                tf.reduce_min(fitness),
-                tf.reduce_max(fitness),
+                tf.reduce_min(rmse_pc),
+                tf.reduce_max(rmse_pc),
+                tf.reduce_min(rrmse_pc),
+                tf.reduce_mean(rrmse_pc),
             ])
-            avg_fitness, best_rmse, worst_rmse = (float(x) for x in metrics_gpu.numpy())
+            metrics_np = metrics_gpu.numpy()
+            avg_fitness = float(metrics_np[0])
+            best_rmse = float(metrics_np[1])
+            worst_rmse = float(metrics_np[2])
+            best_rrmse = float(metrics_np[3])
+            avg_rrmse = float(metrics_np[4])
 
             t2 = time.perf_counter()
 
-            # Regularization at current mean for reporting (sample every 100 gens to avoid GPU sync)
-            if cfg.toggle_regularization and gen % 100 == 0:
+            # Regularisation: matches GPUMD's behaviour. The per-candidate
+            # L1+L2 penalty is already computed every gen, in-graph, on
+            # the GPU as part of fitness (compute_regularization_tf, called
+            # from evaluate_population) — that's the training signal.
+            #
+            # This block is the *out-of-loop reporting / adaptation* pull,
+            # which forces a GPU→CPU sync. GPUMD doesn't pull eager values
+            # mid-training at all. We do it every 100 gens for the progress
+            # bar / history, and additionally at the user-configured
+            # `lambda_adapt_interval` cadence when any λ is in dynamic mode.
+            # Between samples the values carry over (history at val gens
+            # reads the most recent 100-gen sample).
+            need_adapt = (self._dyn_lambda_1 or self._dyn_lambda_2
+                          or self._dyn_lambda_orth)
+            adapt_cadence = max(
+                1, int(getattr(cfg, "lambda_adapt_interval", 100)))
+            do_adapt_now = need_adapt and (gen % adapt_cadence == 0)
+            do_report_now = (gen % 100 == 0)
+            if cfg.toggle_regularization and (do_adapt_now or do_report_now):
                 gen_l1, gen_l2, gen_lorth = self.compute_regularization(self.mu)
-                # Dynamic-λ adaptation. Adapts each λ for which the cfg
-                # value is -1; uses the best-RMSE in the current
-                # population as the data-loss reference, since the mean
-                # is dominated by the worst candidates early in training.
-                self._maybe_adapt_lambda(gen, best_rmse,
-                                         gen_l1, gen_l2, gen_lorth)
+                if do_adapt_now:
+                    # Uses best-RMSE in the current population as the
+                    # data-loss reference (the mean is dominated by the
+                    # worst candidates early in training).
+                    self._maybe_adapt_lambda(gen, best_rmse,
+                                             gen_l1, gen_l2, gen_lorth)
             elif not cfg.toggle_regularization:
                 gen_l1, gen_l2, gen_lorth = 0, 0, 0
 
@@ -920,6 +1164,9 @@ class SNES:
                 history.setdefault("L_orth", []).append(gen_lorth)
                 history["best_rmse"].append(best_rmse)
                 history["worst_rmse"].append(worst_rmse)
+                # RMSE / RRMSE always reported, independent of loss_type.
+                history.setdefault("best_rrmse", []).append(best_rrmse)
+                history.setdefault("avg_rrmse", []).append(avg_rrmse)
                 history["sigma_min"].append(sigma_min)
                 history["sigma_max"].append(sigma_max)
                 history["sigma_mean"].append(sigma_mean)
@@ -941,6 +1188,7 @@ class SNES:
                     f"elapsed: {elapsed_str}  ETA: {eta_str}")
             if cfg.debug:
                 line += f"  L1: {gen_l1:.6f}  L2: {gen_l2:.6f}"
+                line += f"  best_RMSE: {best_rmse:.6f}  best_RRMSE: {best_rrmse:.6f}"
                 if self._mix_reg_mode == "orthogonal":
                     line += f"  L_orth: {gen_lorth:.6f}"
             sys.stdout.write(line)
@@ -1027,8 +1275,14 @@ class SNES:
                         best_val_loss = val_fitness
                         best_mu = tf.identity(self.mu)
                         best_sigma = tf.identity(self.sigma)
-                self.mu.assign(best_mu)
-                self.sigma.assign(best_sigma)
+                # IMPORTANT: do NOT overwrite self.mu/sigma with best
+                # here. The post-loop code (after the for-loop) needs
+                # the genuine final-gen self.mu to build `final_model`
+                # distinct from `best_val_model`. Restoration to best
+                # happens AFTER both models are constructed, at the
+                # end of fit(). (Older code overwrote here, which made
+                # final_model == best_val_model whenever early-stop
+                # triggered.)
                 break
 
             t5 = time.perf_counter()
@@ -1258,67 +1512,202 @@ class SNES:
             tail = (W0, b0, W1, b1)
 
         if self.n_U_pair > 0:
-            # Unpack the descriptor-mixing tail into a dense tensor:
-            #   shared :   [num_pairs, max_bs, max_bs]
-            #   per-type:  [T, num_pairs, max_bs, max_bs]
-            # (with a leading P axis when input is batched). Each
-            # pair's active [bs, bs] sub-block is placed in the
-            # top-left corner; the remainder stays zero so it never
-            # affects the P_p · ... · P_p^T einsum in _W0_eff. For
-            # per-type, the flat layout is T contiguous copies of
-            # the shared-form blob, indexed in the same intra-pair
-            # order — so we extract them by reshaping the tail to a
-            # leading T axis once, then run the standard per-pair
-            # placement loop on each.
+            # Unpack the descriptor-mixing tail. Layout depends on
+            # `_mix_arch`. For both arches the per-type variant has T
+            # contiguous slabs in the flat tail (same convention as
+            # the ANN W0). Inside a slab, the inner layout differs:
+            #   "linear"  : [V_p=0 (bs²) | V_p=1 (bs²) | ... ]
+            #   "l_aware" : [V_{p=0,l=0} (α²) | V_{p=0,l=1} (α²) | ...
+            #                | V_{p=1,l=0} (α²) | ... ]
             U_flat = param_vectors[..., offset:offset + self.n_U_pair]
-            num_pairs = len(self._mix_block_sizes)
-            max_bs = max(self._mix_block_sizes)
             per_type = self._mix_per_type
 
-            # Build a [..., T?, num_pairs, max_bs, max_bs] output. We
-            # do this by looping over (t?, p_idx) and slicing the
-            # corresponding active [bs, bs] chunk from U_flat.
-            per_T_block = sum(bs * bs for bs in self._mix_block_sizes)
+            if self._mix_arch == "cross_pair_l":
+                N_l = self._mix_N_per_l
+                L = self._mix_L
+                # Per-block payload: dense N_l² entries normally, or
+                # only the skew-symmetric upper triangle (N_l(N_l-1)/2)
+                # under Cayley parameterisation. Cayley reconstructs
+                # the dense V = U_cayley − I inline.
+                block_payload = (N_l * (N_l - 1) // 2) if self._mix_cayley else N_l * N_l
+                per_T_block = L * block_payload
 
-            def _extract_t_block(t_idx: int):
-                """Build one [num_pairs, max_bs, max_bs] tensor from
-                the t-th chunk of U_flat (or the only chunk when
-                shared). Builds the num_pairs axis via tf.stack so
-                the heavy per-pair transpose+scatter dance from the
-                first version is avoided — each pair's block is
-                padded once and the list is stacked at the end.
-                """
-                start = t_idx * per_T_block
-                end = start + per_T_block
-                slab = U_flat[..., start:end]  # [..., per_T_block]
-                pair_blocks: list = []
-                inner_offset = 0
-                for bs in self._mix_block_sizes:
-                    block_flat = slab[..., inner_offset:inner_offset + bs * bs]
-                    inner_offset += bs * bs
-                    pad_r = max_bs - bs
+                def _extract_t_block_cross_pair_l(t_idx: int):
+                    """Build [L, N_l, N_l] from slab t. Optional leading
+                    batch axis [P] when input is batched.
+
+                    Cayley fast path: reshape the whole slab as
+                    [..., L, payload] and run ONE batched solve for all
+                    L blocks at once. With non-cayley parameterisation,
+                    a single reshape is enough.
+                    """
+                    start = t_idx * per_T_block
+                    slab = U_flat[..., start:start + per_T_block]
+                    if self._mix_cayley:
+                        # slab: [..., L * payload] → [..., L, payload]
+                        new_shape = tf.concat(
+                            [tf.shape(slab)[:-1], [L, block_payload]],
+                            axis=0)
+                        stacked = tf.reshape(slab, new_shape)
+                        # One batched solve over L blocks; output
+                        # [..., L, N_l, N_l].
+                        return self._cayley_blocks_batched(stacked, N_l)
                     if is_batched:
-                        block = tf.reshape(block_flat, [-1, bs, bs])    # [P, bs, bs]
-                        block = tf.pad(block, [[0, 0], [0, pad_r], [0, pad_r]])
-                    else:
-                        block = tf.reshape(block_flat, [bs, bs])
-                        block = tf.pad(block, [[0, pad_r], [0, pad_r]])
-                    pair_blocks.append(block)
-                # Stack along the num_pairs axis: -3 (batched) or 0
-                # (unbatched). For batched: [P, max_bs, max_bs] →
-                # [P, num_pairs, max_bs, max_bs]; for unbatched:
-                # [max_bs, max_bs] → [num_pairs, max_bs, max_bs].
-                stack_axis = -3 if is_batched else 0
-                return tf.stack(pair_blocks, axis=stack_axis)
+                        return tf.reshape(slab, [-1, L, N_l, N_l])
+                    return tf.reshape(slab, [L, N_l, N_l])
 
-            if per_type:
-                # Stack T per-pair tensors along axis 1 (or 0 unbatched)
-                # to yield [..., T, num_pairs, max_bs, max_bs].
-                per_t = [_extract_t_block(t_idx) for t_idx in range(T)]
-                stack_axis = 1 if is_batched else 0
-                U_pair = tf.stack(per_t, axis=stack_axis)
-            else:
-                U_pair = _extract_t_block(0)
+                if per_type:
+                    per_t = [_extract_t_block_cross_pair_l(t) for t in range(T)]
+                    stack_axis = 1 if is_batched else 0
+                    U_pair = tf.stack(per_t, axis=stack_axis)
+                else:
+                    U_pair = _extract_t_block_cross_pair_l(0)
+                tail = tail + (U_pair,)
+                return tail
+            if self._mix_arch == "linear":
+                max_bs = max(self._mix_block_sizes)
+                # Per-pair payload: bs² normally; bs(bs-1)/2 for Cayley.
+                bs_payloads = [
+                    (bs * (bs - 1) // 2) if self._mix_cayley else bs * bs
+                    for bs in self._mix_block_sizes
+                ]
+                per_T_block = sum(bs_payloads)
+
+                # Cayley fast path: when all pairs share the same bs,
+                # collapse the whole slab into ONE batched solve.
+                uniform_bs = (
+                    self._mix_cayley
+                    and len(set(self._mix_block_sizes)) == 1)
+
+                def _extract_t_block_linear(t_idx: int):
+                    start = t_idx * per_T_block
+                    slab = U_flat[..., start:start + per_T_block]
+
+                    if uniform_bs:
+                        bs0 = self._mix_block_sizes[0]
+                        payload = bs_payloads[0]
+                        n_pairs = len(self._mix_block_sizes)
+                        new_shape = tf.concat(
+                            [tf.shape(slab)[:-1], [n_pairs, payload]],
+                            axis=0)
+                        stacked = tf.reshape(slab, new_shape)
+                        V = self._cayley_blocks_batched(stacked, bs0)
+                        pad_r = max_bs - bs0
+                        if pad_r > 0:
+                            paddings = [[0, 0]] * (len(V.shape) - 2) + \
+                                       [[0, pad_r], [0, pad_r]]
+                            V = tf.pad(V, paddings)
+                        return V
+
+                    pair_blocks: list = []
+                    inner_offset = 0
+                    for bs, payload in zip(self._mix_block_sizes, bs_payloads):
+                        block_flat = slab[..., inner_offset:inner_offset + payload]
+                        inner_offset += payload
+                        pad_r = max_bs - bs
+                        if self._mix_cayley:
+                            block = self._cayley_block(block_flat, bs)
+                        elif is_batched:
+                            block = tf.reshape(block_flat, [-1, bs, bs])
+                        else:
+                            block = tf.reshape(block_flat, [bs, bs])
+                        # Pad to max_bs for uniform-stride U_pair storage.
+                        if is_batched:
+                            block = tf.pad(block, [[0, 0], [0, pad_r], [0, pad_r]])
+                        else:
+                            block = tf.pad(block, [[0, pad_r], [0, pad_r]])
+                        pair_blocks.append(block)
+                    stack_axis = -3 if is_batched else 0
+                    return tf.stack(pair_blocks, axis=stack_axis)
+
+                if per_type:
+                    per_t = [_extract_t_block_linear(t) for t in range(T)]
+                    stack_axis = 1 if is_batched else 0
+                    U_pair = tf.stack(per_t, axis=stack_axis)
+                else:
+                    U_pair = _extract_t_block_linear(0)
+            else:  # l_aware
+                max_alpha = max(self._mix_alpha_per_pair)
+                L = self._mix_L
+                # Per-(pair, l) payload: α² normally; α(α-1)/2 for Cayley.
+                alpha_payloads = [
+                    (a * (a - 1) // 2) if self._mix_cayley else a * a
+                    for a in self._mix_alpha_per_pair
+                ]
+                per_T_block = sum(L * p for p in alpha_payloads)
+
+                # Detect the common case: all pairs share the same α.
+                # Then the slab is a uniform [num_pairs, L, payload] grid
+                # and we can do ONE batched solve for all num_pairs*L
+                # Cayley blocks — ~10× faster than the per-block loop.
+                uniform_alpha = (
+                    self._mix_cayley
+                    and len(set(self._mix_alpha_per_pair)) == 1)
+
+                def _extract_t_block_l_aware(t_idx: int):
+                    """Build [num_pairs, L, max_α, max_α] from slab t."""
+                    start = t_idx * per_T_block
+                    slab = U_flat[..., start:start + per_T_block]
+
+                    if uniform_alpha:
+                        alpha_p = self._mix_alpha_per_pair[0]
+                        payload = alpha_payloads[0]
+                        n_pairs = len(self._mix_alpha_per_pair)
+                        n_blocks = n_pairs * L
+                        # slab: [..., n_pairs*L*payload]
+                        # → [..., n_blocks, payload]
+                        new_shape = tf.concat(
+                            [tf.shape(slab)[:-1], [n_blocks, payload]],
+                            axis=0)
+                        stacked = tf.reshape(slab, new_shape)
+                        V = self._cayley_blocks_batched(stacked, alpha_p)
+                        # V: [..., n_blocks, α, α] → [..., n_pairs, L, α, α]
+                        pad_r = max_alpha - alpha_p
+                        if pad_r > 0:
+                            paddings = [[0, 0]] * (len(V.shape) - 2) + \
+                                       [[0, pad_r], [0, pad_r]]
+                            V = tf.pad(V, paddings)
+                        out_shape = tf.concat(
+                            [tf.shape(V)[:-3], [n_pairs, L, max_alpha,
+                                                max_alpha]], axis=0)
+                        return tf.reshape(V, out_shape)
+
+                    # Fallback: non-uniform α across pairs. Group by α.
+                    pair_blocks: list = []
+                    inner_offset = 0
+                    for alpha_p, payload in zip(self._mix_alpha_per_pair,
+                                                  alpha_payloads):
+                        # For one pair: L sub-blocks each [α_p × α_p].
+                        pair_payload = L * payload
+                        sub = slab[..., inner_offset:inner_offset + pair_payload]
+                        inner_offset += pair_payload
+                        pad_r = max_alpha - alpha_p
+                        if self._mix_cayley:
+                            new_shape = tf.concat(
+                                [tf.shape(sub)[:-1], [L, payload]], axis=0)
+                            stacked = tf.reshape(sub, new_shape)
+                            l_block = self._cayley_blocks_batched(
+                                stacked, alpha_p)
+                        else:
+                            new_shape = tf.concat(
+                                [tf.shape(sub)[:-1],
+                                 [L, alpha_p, alpha_p]], axis=0)
+                            l_block = tf.reshape(sub, new_shape)
+                        if pad_r > 0:
+                            paddings = [[0, 0]] * (len(l_block.shape) - 2) + \
+                                       [[0, pad_r], [0, pad_r]]
+                            l_block = tf.pad(l_block, paddings)
+                        pair_blocks.append(l_block)
+                    # Stack pairs along the num_pairs axis.
+                    stack_axis_p = -4 if is_batched else 0
+                    return tf.stack(pair_blocks, axis=stack_axis_p)
+
+                if per_type:
+                    per_t = [_extract_t_block_l_aware(t) for t in range(T)]
+                    stack_axis = 1 if is_batched else 0
+                    U_pair = tf.stack(per_t, axis=stack_axis)
+                else:
+                    U_pair = _extract_t_block_l_aware(0)
             tail = tail + (U_pair,)
 
         return tail
@@ -1366,10 +1755,11 @@ class SNES:
 
             reg = total_l1 / T + global_l1 + total_l2 / T + global_l2
         else:
-            # Single-type path: when ANY V_pair regularisation mode is
-            # active, keep V_pair out of the main sum so it isn't
-            # double-counted by the shrinkage or orth contribution.
-            v_handled = reg_Vpair or reg_Vorth
+            # Single-type path: keep V_pair out of the main sum whenever
+            # it's handled separately (shrinkage, orth, OR Cayley).
+            # Cayley's A entries must NEVER be L1/L2-regularised — that
+            # would pull A → 0 → U → I and collapse the rotation.
+            v_handled = reg_Vpair or reg_Vorth or self._mix_cayley
             if v_handled:
                 ann = param_vectors[:, :self.n_anns_total]
                 ann_n = self.n_anns_total
@@ -1482,8 +1872,14 @@ class SNES:
         T = self.cfg.num_types
         T_dim_f = tf.cast(T_dim, tf.float32)
         B_f = tf.cast(B, tf.float32)
-        use_mae = self._use_mae
-        use_inv_weight = self._use_inv_weight
+        loss_type = self.cfg.loss_type
+        inv_mode = str(getattr(self.cfg, "inverse_weight_mode", "none")).lower()
+        if inv_mode not in ("none", "vector_magnitude", "per_component"):
+            raise ValueError(
+                f"inverse_weight_mode={inv_mode!r} not in "
+                "('none', 'vector_magnitude', 'per_component')")
+        use_struct_weight = (inv_mode == "vector_magnitude")
+        use_comp_weight = (inv_mode == "per_component")
 
         # Pick between the standard and XLA-compiled chunk evaluator.
         # XLA fuses the per-chunk eval into a single GPU kernel and is
@@ -1493,12 +1889,28 @@ class SNES:
                          if getattr(self.cfg, "eval_jit_compile", False)
                          else self._evaluate_chunk)
 
-        # Precompute inverse-magnitude weights once: w[b] = 1 / max(||target_b||^2, eps)
-        if use_inv_weight:
+        eps = float(getattr(self.cfg, "inverse_weight_eps", 1e-4) or 1e-4)
+        # Precompute inverse-magnitude weights. Applied to the *fitness*
+        # signal only — never to the squared-error accumulator used for
+        # RMSE / RRMSE reporting (so reporting metrics stay comparable
+        # across loss / weighting ablations).
+        inv_weights = None  # vector_magnitude: [B]
+        if use_struct_weight:
             tgt_norm_sq = tf.reduce_sum(tf.square(batch_data["targets"]), axis=1)  # [B]
-            inv_weights = 1.0 / tf.maximum(tgt_norm_sq, self._inv_weight_eps)      # [B]
-            # Normalise so weights sum to B (preserves RMSE scale)
+            inv_weights = 1.0 / tf.maximum(tgt_norm_sq, eps)
             inv_weights = inv_weights * (B_f / tf.reduce_sum(inv_weights))
+        if use_comp_weight:
+            tgt_sq = tf.square(batch_data["targets"])              # [B, T_dim]
+            w = 1.0 / tf.maximum(tgt_sq, eps)                       # [B, T_dim]
+            # Normalise so total weight = B * T_dim (preserves overall scale).
+            w = w * (B_f * T_dim_f / tf.reduce_sum(w))
+            # Stash into batch_data so _evaluate_chunk_impl can consume it.
+            batch_data["_inv_comp_weights"] = w
+
+        # SS_tot for RRMSE: total target magnitude squared over the whole batch.
+        # Independent of weighting choices and candidates; computed once.
+        ss_tot_batch = tf.reduce_sum(tf.square(batch_data["targets"]))
+        ss_tot_batch = tf.maximum(ss_tot_batch, 1e-12)
 
         all_fitness = []
 
@@ -1515,11 +1927,14 @@ class SNES:
             tc_full = batch_data["types_contained"]                     # [B, T]
             type_counts = tf.maximum(tf.reduce_sum(tc_full, axis=0), 1.0)  # [T]
 
-        # Running accumulators: total error per candidate (and per-type when
-        # return_per_type is set). Shape [P] or [P, T+1] (last column is
-        # global). Built by concatenating per-pop-chunk reductions across
-        # structure chunks.
+        # Running accumulators. Two parallel sums per pop-chunk:
+        #   total_acc_parts[k]    : [C] — training-loss contribution
+        #   sq_acc_parts[k]       : [C] — always-MSE squared-error sum
+        # The training loss drives SNES ranking; the sq sum drives the
+        # always-on RMSE / RRMSE reporting (stashed on self at the end
+        # of this function so the fit loop can pull them).
         total_acc_parts: list = [None] * ((P + pop_chunk - 1) // pop_chunk)
+        sq_acc_parts: list = [None] * len(total_acc_parts)
         per_type_acc_parts: list = [None] * len(total_acc_parts) if return_per_type else []
 
         ranges = [(s, min(s + struct_chunk, B)) for s in range(0, B, struct_chunk)]
@@ -1539,23 +1954,33 @@ class SNES:
             chunk_hi = s_end
 
             # Slice precomputed [B]-shaped quantities to this chunk's range.
-            inv_chunk = inv_weights[chunk_lo:chunk_hi] if use_inv_weight else None
+            inv_chunk = inv_weights[chunk_lo:chunk_hi] if use_struct_weight else None
             tc_chunk = tc_full[chunk_lo:chunk_hi] if return_per_type else None
+            # Slice per-component weights too so _evaluate_chunk reads
+            # only this chunk's rows. We mutate batch_data inside
+            # prefetched_chunks' yielded `chunk` dict (not the outer one).
+            if use_comp_weight:
+                chunk["_inv_comp_weights"] = batch_data["_inv_comp_weights"][chunk_lo:chunk_hi]
 
             for pop_idx, p_start in enumerate(range(0, P, pop_chunk)):
                 p_end      = min(p_start + pop_chunk, P)
                 candidates = samples_tf[p_start:p_end]                  # [C, dim]
-                chunk_err = eval_chunk_fn(candidates, chunk)             # [C, B_chunk]
+                chunk_err, chunk_sq = eval_chunk_fn(candidates, chunk)   # [C, B_chunk] each
 
-                if use_inv_weight:
+                if use_struct_weight:
                     chunk_err = chunk_err * inv_chunk[tf.newaxis, :]
+                # sq is INTENTIONALLY left unweighted — RMSE/RRMSE
+                # reporting must be comparable across weighting modes.
 
-                # Accumulate global sum over structures: [C]
+                # Accumulate global sums over structures: [C] each.
                 global_part = tf.reduce_sum(chunk_err, axis=1)
+                sq_part = tf.reduce_sum(chunk_sq, axis=1)
                 if total_acc_parts[pop_idx] is None:
                     total_acc_parts[pop_idx] = global_part
+                    sq_acc_parts[pop_idx] = sq_part
                 else:
                     total_acc_parts[pop_idx] = total_acc_parts[pop_idx] + global_part
+                    sq_acc_parts[pop_idx] = sq_acc_parts[pop_idx] + sq_part
 
                 if return_per_type:
                     # Per-type sums: einsum reduces both struct and m axes in
@@ -1566,7 +1991,7 @@ class SNES:
                     else:
                         per_type_acc_parts[pop_idx] = per_type_acc_parts[pop_idx] + per_type_chunk
 
-                del chunk_err
+                del chunk_err, chunk_sq
             # When the GPU LRU cache is active it owns the chunk's tensors
             # across generations; otherwise this `del` releases them so the
             # next chunk's stage starts with the freed VRAM. The prefetch
@@ -1574,31 +1999,33 @@ class SNES:
             # chunk's tensors — that's fine, those are *its* allocation.
             del chunk
 
-        # Convert accumulated sums of squared/abs errors → fitness (RMSE / MAE).
-        # The same reductions as the old code, just applied once after the
-        # streaming loop instead of per pop_chunk.
+        # Convert accumulated sums of per-structure errors → fitness.
+        # Aggregation depends on the loss family:
+        #   "mse"   : per-structure error is sum of squared residuals;
+        #             fitness = sqrt(mean) = RMSE (canonical).
+        #   "mae"   : per-structure error is sum of |residuals|;
+        #             fitness = mean (already in error units, no sqrt).
+        #   "huber" : per-structure error is sum of Huber per-component
+        #             values; fitness = mean (already in error units,
+        #             not squared — sqrt would scramble the scale).
+        sqrt_aggregate = (loss_type == "mse")
         for pop_idx in range(len(total_acc_parts)):
             global_err = total_acc_parts[pop_idx]                       # [C]
             if return_per_type:
                 per_type_err = per_type_acc_parts[pop_idx]              # [C, T]
                 per_type_parts = []
                 for t in range(T):
-                    if use_mae:
-                        per_type_parts.append(per_type_err[:, t] / (type_counts[t] * T_dim_f))
-                    else:
-                        per_type_parts.append(tf.sqrt(tf.maximum(
-                            per_type_err[:, t] / (type_counts[t] * T_dim_f), 0.0)))
-                # Global (index T)
-                if use_mae:
-                    per_type_parts.append(global_err / (B_f * T_dim_f))
-                else:
-                    per_type_parts.append(tf.sqrt(tf.maximum(global_err / (B_f * T_dim_f), 0.0)))
+                    raw = per_type_err[:, t] / (type_counts[t] * T_dim_f)
+                    per_type_parts.append(
+                        tf.sqrt(tf.maximum(raw, 0.0)) if sqrt_aggregate else raw)
+                raw_global = global_err / (B_f * T_dim_f)
+                per_type_parts.append(
+                    tf.sqrt(tf.maximum(raw_global, 0.0)) if sqrt_aggregate else raw_global)
                 all_fitness.append(tf.stack(per_type_parts, axis=1))    # [C, T+1]
             else:
-                if use_mae:
-                    chunk_fitness = global_err / (B_f * T_dim_f)
-                else:
-                    chunk_fitness = tf.sqrt(tf.maximum(global_err / (B_f * T_dim_f), 0.0))
+                raw_global = global_err / (B_f * T_dim_f)
+                chunk_fitness = (tf.sqrt(tf.maximum(raw_global, 0.0))
+                                 if sqrt_aggregate else raw_global)
                 all_fitness.append(chunk_fitness)
 
         if return_per_type:
@@ -1610,14 +2037,27 @@ class SNES:
             reg = self.compute_regularization_tf(samples_tf)
             fitness = fitness + reg
 
+        # Stash always-MSE reporting metrics for the fit loop. These
+        # are independent of `loss_type` / inverse weighting, so RMSE
+        # and RRMSE reported in history are comparable across runs.
+        sq_per_cand = tf.concat(sq_acc_parts, axis=0)                # [P]
+        # RMSE per candidate: sqrt(mean squared error per element).
+        # Denominator = B * T_dim so the result matches "RMSE over all
+        # vector components of all structures".
+        rmse_per_cand = tf.sqrt(tf.maximum(sq_per_cand / (B_f * T_dim_f), 0.0))
+        # RRMSE per candidate: sqrt(SS_res / SS_tot).
+        rrmse_per_cand = tf.sqrt(tf.maximum(sq_per_cand / ss_tot_batch, 0.0))
+        self._last_rmse_per_cand = rmse_per_cand
+        self._last_rrmse_per_cand = rrmse_per_cand
+
         return fitness
 
     @tf.function(reduce_retracing=True)
-    def _evaluate_chunk(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
+    def _evaluate_chunk(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tuple[tf.Tensor, tf.Tensor]:
         return self._evaluate_chunk_impl(chunk_samples, batch_data)
 
     @tf.function(reduce_retracing=True, jit_compile=True)
-    def _evaluate_chunk_xla(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
+    def _evaluate_chunk_xla(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tuple[tf.Tensor, tf.Tensor]:
         """XLA-compiled variant of _evaluate_chunk. The body is identical;
         only the @tf.function decorator differs. XLA fuses the dipole
         kernel pre-compute + per-type matmul + reduction into one GPU
@@ -1626,18 +2066,32 @@ class SNES:
         cost is amortised over the run."""
         return self._evaluate_chunk_impl(chunk_samples, batch_data)
 
-    def _evaluate_chunk_impl(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tf.Tensor:
+    def _evaluate_chunk_impl(self, chunk_samples: tf.Tensor, batch_data: dict[str, tf.Tensor]) -> tuple[tf.Tensor, tf.Tensor]:
         """Evaluate a chunk of C candidates on B structures.
 
-        Returns per-structure error (SSE or SAE depending on loss_type) so that
-        structure chunks can be aggregated correctly in evaluate_population.
+        Returns a *pair* of per-structure tensors:
+          - fitness_err: training-loss contribution (MSE / MAE / Huber,
+              optionally per-component-weighted) — used for SNES
+              ranking and the regularised total objective.
+          - sq_err: always-MSE squared-error contribution (unweighted
+              by the inverse-magnitude scheme) — used for RMSE and
+              RRMSE reporting so those metrics remain comparable
+              across loss-function ablations.
+
+        Per-component weights from `batch_data["_inv_comp_weights"]`
+        (set when `cfg.inverse_weight_mode == "per_component"`) are
+        applied to `fitness_err` only. The structure-level inverse
+        weighting from `vector_magnitude` mode is applied by the
+        caller (after this function returns) so the scaling of fitness
+        and reporting can be controlled independently there too.
 
         Args:
             chunk_samples : [C, dim]
             batch_data    : dict of [B, ...] tensors
 
         Returns:
-            err : [C, B] — per-structure sum of squared (or absolute) errors
+            fitness_err : [C, B]
+            sq_err      : [C, B]
         """
         desc        = batch_data["descriptors"]   # [B, A, Q]
         grad_values = batch_data["grad_values"]   # [P, 3, Q]
@@ -1673,7 +2127,12 @@ class SNES:
                 W0, b0, W1, b1 = params
                 U_pair_cand = None
 
-        _use_mae = self._use_mae
+        loss_type = self.cfg.loss_type
+        huber_delta = float(getattr(self.cfg, "huber_delta", 1e-3))
+        # Per-component inverse-magnitude weights (optional, applied to
+        # the training loss only — never to the squared-error reporting
+        # so RMSE stays comparable across weighting schemes).
+        comp_w = batch_data.get("_inv_comp_weights")  # [B, T_dim] or None
 
         if self.cfg.target_mode == 2:
             pol_weights = self._pol_weights  # [6] component weights
@@ -1685,6 +2144,18 @@ class SNES:
                 W0 = self.model._W0_eff(W0, U_pair_cand)
                 W0p = self.model._W0_eff(W0p, U_pair_cand)
 
+            # Combined per-component weights for the training loss:
+            # pol_weights × per-component inverse weights (if active).
+            # For MAE the legacy code used sqrt(pol_weights), preserved
+            # by using sqrt-weighted per_structure_error in mae path.
+            fitness_comp_w = pol_weights[tf.newaxis]  # [1, 6]
+            if comp_w is not None:
+                fitness_comp_w = fitness_comp_w * comp_w
+            # Squared-error reporting always uses pol_weights only
+            # (so the polarisability metric's shear emphasis is fixed
+            # but the per-component-inverse-weighting is ablated).
+            sq_comp_w = pol_weights[tf.newaxis]
+
             def _forward_one_candidate(args):
                 w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
                 preds = self.model.predict_batch(
@@ -1693,13 +2164,14 @@ class SNES:
                     w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
                 )
                 diff = preds - targets  # [B, 6]
-                if _use_mae:
-                    return tf.reduce_sum(tf.abs(diff) * tf.sqrt(pol_weights), axis=1)  # [B]
-                else:
-                    return tf.reduce_sum(tf.square(diff) * pol_weights, axis=1)  # [B]
+                fitness = per_structure_error(
+                    diff, loss_type, huber_delta, component_weights=fitness_comp_w)
+                sq = squared_error_per_structure(diff, component_weights=sq_comp_w)
+                return tf.stack([fitness, sq], axis=0)  # [2, B]
 
             stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
-            return tf.vectorized_map(_forward_one_candidate, stacked)  # [C, B]
+            both = tf.vectorized_map(_forward_one_candidate, stacked)  # [C, 2, B]
+            return both[:, 0, :], both[:, 1, :]
 
         else:
 
@@ -1730,7 +2202,8 @@ class SNES:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]
 
             diff = preds - targets[tf.newaxis]  # [C, B, T_dim]
-            if _use_mae:
-                return tf.reduce_sum(tf.abs(diff), axis=2)     # [C, B]
-            else:
-                return tf.reduce_sum(tf.square(diff), axis=2)  # [C, B]
+            fitness_comp_w = (comp_w[tf.newaxis] if comp_w is not None else None)
+            fitness = per_structure_error(
+                diff, loss_type, huber_delta, component_weights=fitness_comp_w)
+            sq = squared_error_per_structure(diff)  # unweighted, for RMSE/RRMSE
+            return fitness, sq

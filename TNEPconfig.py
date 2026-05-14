@@ -23,7 +23,7 @@ class TNEPconfig:
     # zero-vector targets. Structures with missing targets are always
     # dropped regardless (they can't be trained against).
     filter_bad_data: bool = False
-    num_neurons: int = 15
+    num_neurons: int = 100
     # Number of structures used in each train step
     batch_size: int | None = None
     # Number of samples made in each train generation
@@ -50,6 +50,31 @@ class TNEPconfig:
     atom_sigma_t_scaling: float = 0.0
     amplitude_scaling: float = 1.0
     central_weight: float = 1.0
+
+    # Per-channel descriptor scaling applied at data-pipeline level.
+    #   "none"     : no scaling (current default; preserves baseline).
+    #   "q_scaler" : GPUMD-style multiplicative range normalisation.
+    #                Each channel d gets s_d = 1 / (max_d - min_d) over
+    #                the training set; computed ONCE, frozen for the
+    #                run, persisted in /weights/q_scaler (and /snes/
+    #                q_scaler in checkpoints). Both `descriptors` and
+    #                `grad_values` are multiplied by s in pad_and_stack
+    #                so the entire model code is unchanged (option A
+    #                from the implementation plan — algebraically
+    #                identical to GPUMD's option B but cleaner to plumb).
+    descriptor_scaling: str = "none"
+
+    # Granularity of the q_scaler (only consulted when descriptor_scaling=="q_scaler"):
+    #   "per_component" : one multiplier per scalar descriptor entry (GPUMD-style).
+    #                     Maximises channel-level decorrelation but breaks the
+    #                     within-(pair, l)-block isotropy that l_aware /
+    #                     cross_pair_l mixing layers rotate over.
+    #   "l_block"       : one multiplier per (species-pair, l) block, shared
+    #                     across all α entries within that block. Equalises the
+    #                     dominant inter-l magnitude gap (l=0 ~O(1) vs l=l_max
+    #                     ~O(0.01)) while preserving intra-block axes. Use this
+    #                     when running descriptor_mixing with l_aware/cross_pair_l.
+    q_scaler_granularity: str = "l_block"
 
     # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU when available).
     # The GPU path supports basis="poly3" and compress_mode="trivial" only;
@@ -178,8 +203,8 @@ class TNEPconfig:
     #           of the data RMSE. Starts from the auto value.
     #   float : fixed scalar
     toggle_regularization: bool = True
-    lambda_1: float | None = 0.03
-    lambda_2: float | None = 0.03
+    lambda_1: float | None = 0.001
+    lambda_2: float | None = 0.001
     # Dynamic-λ controls (only used when lambda_1 or lambda_2 == -1).
     # `target_ratio`: target ratio of reg-penalty to data RMSE. 0.05
     #   means "keep regularisation at ~5% of the data loss." GPUMD
@@ -255,12 +280,36 @@ class TNEPconfig:
     # (or just continue if patience is None).
     max_sigma_resets: int | None = None
 
-    # Loss function: "mse" = root-mean-square error, "mae" = mean absolute error
+    # Training loss function (controls what SNES ranks against — NOT what
+    # is reported in history; RMSE / RRMSE are always computed alongside
+    # and recorded regardless of this setting).
+    #   "mse"   : Σ r_k²              standard squared error
+    #   "mae"   : Σ |r_k|             absolute error
+    #   "huber" : Σ huber(r_k; δ)     quadratic for |r| ≤ δ, linear beyond.
+    #             Robust to outlier structures with large residuals.
+    #             Does NOT specifically help small-target structures —
+    #             use inverse_weight_mode for that.
     loss_type: str = "mse"
-    # Inverse-magnitude weighting: upweight structures with small targets
-    # Each structure's error is scaled by 1 / max(||target||^2, eps).
-    # None = disabled (uniform weighting); float = epsilon floor (e.g. 0.01)
-    inverse_weight_eps: float | None = None
+    # Transition point between quadratic and linear regimes of Huber loss.
+    # Only used when loss_type == "huber". Sensible default ~ expected
+    # final RMSE for the dataset (run the loss-tuning sweep to confirm).
+    huber_delta: float = 1e-3
+
+    # Inverse-magnitude weighting: upweight small-target structures /
+    # components so they aren't dominated by large-target structures in
+    # the gradient.
+    #   "none"             : uniform (current default)
+    #   "vector_magnitude" : w_b ∝ 1 / max(||target_b||², eps)
+    #                         — one weight per structure (legacy path).
+    #   "per_component"    : w_{b,k} ∝ 1 / max(target_{b,k}², eps)
+    #                         — separate weight per (structure, component).
+    #                         Useful when individual axes of vector
+    #                         targets have systematically small magnitudes.
+    inverse_weight_mode: str = "none"
+    # Epsilon floor for the inverse-weight denominator. Smaller eps
+    # → stronger small-target emphasis but more numerical instability.
+    # Only used when inverse_weight_mode != "none".
+    inverse_weight_eps: float = 1e-4
     # Polarizability off-diagonal weight: loss for components [xy, yz, zx] scaled by lambda_shear^2
     # (GPUMD default 1.0 — equal weighting; <1.0 downweights off-diagonal)
     lambda_shear: float = 1.0
@@ -293,10 +342,35 @@ class TNEPconfig:
     # roughly 2× the size of the per-type ANN). Identity-init per
     # (t, p) so the model still starts bit-identical to the
     # mixing-disabled baseline.
-    descriptor_mixing_per_type: bool = True
-    # Regulariser applied to the V_pair descriptor-mixing layer.
+    descriptor_mixing_per_type: bool = False
+    # Linear-mixing architecture variant.
+    #   "linear"       : one [bs_p × bs_p] matrix per pair. Mixes all
+    #                    (n, l) channels within a pair (cross-l within
+    #                    a pair permitted, cross-pair forbidden).
+    #                    Block-diagonal in pair only.
+    #   "l_aware"      : (l_max+1) separate [α_p × α_p] matrices per
+    #                    pair, one per angular momentum. Mixes only
+    #                    radial channels at the same l within the
+    #                    same pair. Block-diagonal in (pair, l).
+    #                    Strictly fewer parameters than "linear" by
+    #                    a factor of (l_max+1).
+    #   "cross_pair_l" : (l_max+1) separate [N_l × N_l] matrices, one
+    #                    per angular momentum, where N_l = Σ_p α_eff_p.
+    #                    Mixes radial channels at the same l ACROSS
+    #                    species pairs (cross-pair within fixed l
+    #                    permitted; cross-l never permitted).
+    #                    Block-diagonal in l only.
+    #                    ⊃ l_aware (strict superset). Not comparable
+    #                    to "linear" — they restrict different axes
+    #                    at similar param count.
+    # All three use the same `_W0_eff = (I + V_full)ᵀ · W0` absorption.
+    # Only consulted when descriptor_mixing=True.
+    descriptor_mixing_arch: str = "l_aware"
+    # Regulariser / parameterisation applied to the V_pair descriptor-
+    # mixing layer.
     #   "off"        : V_pair is unregularised (default; relies on SNES
-    #                  sigma to bound exploration).
+    #                  sigma to bound exploration). Each block has bs²
+    #                  trainable parameters.
     #   "shrinkage"  : L1+L2 on V_pair using cfg.lambda_1 / lambda_2.
     #                  Pulls V → 0 ⇔ U → I — strong "no mixing" prior
     #                  that empirically collapses any learned mixing
@@ -305,31 +379,47 @@ class TNEPconfig:
     #                  (computed in residual form as ‖V + Vᵀ + VᵀV‖²).
     #                  Minimum is the *orthogonal group*, not identity —
     #                  every rotation/reflection of the descriptor basis
-    #                  is at zero penalty. Constrains U to be length-
-    #                  preserving (no scaling), preventing column
-    #                  collapse and rank deficiency without anchoring at
-    #                  no-mixing. Uses cfg.lambda_orth.
-    descriptor_mixing_regularizer: str = "off"
+    #                  is at zero penalty. Soft constraint, λ-tuned.
+    #                  Uses cfg.lambda_orth.
+    #   "cayley"     : STRUCTURAL constraint, not a soft penalty. Each
+    #                  block U_p is parameterised as-----------
+    #                      U_p = (I + A_p) (I − A_p)⁻¹
+    #                  with A_p skew-symmetric. U is GUARANTEED to be a
+    #                  rotation (det = +1, all singular values = 1)
+    #                  regardless of A_p. SNES sees only the upper
+    #                  triangle of A_p — bs·(bs−1)/2 free params per
+    #                  block, roughly half the count of the soft
+    #                  variants. Zero λ to tune; the "regularisation"
+    #                  is via the bijection between A's space and the
+    #                  rotation group. Reflections (det = −1) excluded.
+    descriptor_mixing_regularizer: str = "cayley"
     # Strength of the orthogonal-mixing regulariser (used when
     # descriptor_mixing_regularizer == "orthogonal").
     #   None : auto = sqrt(n_U_pair * 1e-6 / num_types)
     #   -1   : dynamic adaptation (see SNES._maybe_adapt_lambda)
     #   float: fixed scalar
-    lambda_orth: float | None = None
-    # Which optimizer drives `TNEP.fit`. "snes" reproduces the
-    # canonical SNES black-box path (no gradient information, rank-
-    # based population update). "adam" runs first-order Adam on
-    # analytical gradients via tf.GradientTape — the same training
-    # regime as the GNEP paper (Huang et al. 2025), which reports
-    # ~10× fewer epochs at equal accuracy. Both paths share the same
-    # data pipeline, validation, early stopping, history dict, and
-    # plot outputs. Checkpointing only works for the SNES path at
-    # the moment (an Adam-side checkpoint is straightforward to add
-    # once the Adam path is validated end-to-end).
-    optimizer: str = "snes"
-    # Adam learning rate (only used when optimizer="adam"). Standard
-    # default for NN regression heads; reduce to ~1e-4 if loss diverges.
-    adam_learning_rate: float = 1e-3
+    lambda_orth: float | None = -1
+    # SNES μ vector initialisation scheme.
+    #   "uniform" : each ANN entry drawn uniform[-1, 1] (GPUMD default;
+    #               see snes.cu line 6709). The biases come in at the
+    #               same scale as the weights, so b0 typically dominates
+    #               the pre-activation in the first generation — this
+    #               relies on SNES exploration to find a sensible
+    #               magnitude over the first ~100 gens.
+    #   "glorot"  : Glorot/Xavier uniform per weight group:
+    #                 W0   ~ U(-c_W0, c_W0),  c_W0 = √(6 / (Q + H))
+    #                 W1   ~ U(-c_W1, c_W1),  c_W1 = √(6 / (H + 1))
+    #                 b0   = 0
+    #                 b1   = 0
+    #               Preserves activation variance through tanh; the
+    #               initial forward pass produces well-scaled pre-
+    #               activations regardless of Q / H, so SNES doesn't
+    #               waste generations climbing out of a saturated-tanh
+    #               regime. Identical scheme applied to the
+    #               polarisability ANN's W0_pol / W1_pol when
+    #               target_mode == 2. The V_pair tail (residual mixing
+    #               layer) stays at zero in both schemes.
+    mu_init_scheme: str = "glorot"
     # Initial distribution standard deviation
     init_sigma: float = 0.1
     # Lower bound on sigma after each SNES update. Without a floor,
@@ -339,7 +429,7 @@ class TNEPconfig:
     # 1e-5 keeps the search alive without distorting any normal
     # adaptation (typical adapted σ is 1e-3 to 1e-1). Set to None or 0
     # to disable the floor.
-    sigma_floor: float | None = 1e-5
+    sigma_floor: float | None = 1e-6
     # Seed for randomisation
     seed: int | None = None
     # 0 : PES, 1 : Dipole, 2 : Polarizability

@@ -614,7 +614,8 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     test_data = pad_and_stack(
         test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
-        cache_tag="test")
+        cache_tag="test",
+        q_scaler=getattr(cfg, "_q_scaler", None))
     # Pre-stage per-chunk pair indices to GPU. Test eval doesn't go
     # through `_evaluate_chunk` (TNEP.score uses model.predict_batch),
     # so XLA padding isn't needed for test data.
@@ -664,11 +665,152 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     return test_data
 
 
+def _compute_q_scaler(descriptors_list, dim_q: int,
+                      eps: float = 1e-30) -> np.ndarray:
+    """Compute per-channel range scaler from training-set descriptors.
+
+    Mirrors GPUMD's `find_max_min` kernel (see GPUMD/src/main_nep/tnep.cu):
+
+        For each channel d:
+            range_d   = max over all atoms - min over all atoms
+            scaler_d  = 1 / max(range_d, eps)
+
+    The eps floor avoids divide-by-zero for channels that are
+    constant across the training set (uncommon but possible if SOAP
+    params are pathological; such channels carry no information and
+    will be killed by L1/L2 regularisation downstream anyway).
+
+    Computed via streaming min/max to avoid a 2x-memory concat —
+    important for large training sets.
+
+    Args:
+        descriptors_list : list of [N_i, Q] arrays / tensors (one per
+                           structure in the training set, pre-padding).
+        dim_q            : Q (number of descriptor channels).
+        eps              : floor on the range to avoid 1/0.
+
+    Returns:
+        scaler : [Q] float32 array of per-channel multipliers.
+    """
+    chan_min = None
+    chan_max = None
+    for d in descriptors_list:
+        arr = (d.numpy() if hasattr(d, "numpy") else np.asarray(d))
+        arr = arr.reshape(-1, dim_q)
+        m_min = arr.min(axis=0)
+        m_max = arr.max(axis=0)
+        if chan_min is None:
+            chan_min, chan_max = m_min, m_max
+        else:
+            chan_min = np.minimum(chan_min, m_min)
+            chan_max = np.maximum(chan_max, m_max)
+    chan_range = chan_max - chan_min
+    safe_range = np.maximum(chan_range, eps)
+    return (1.0 / safe_range).astype(np.float32)
+
+
+def _compute_q_scaler_l_block(descriptors_list, layout: dict,
+                              eps: float = 1e-30) -> np.ndarray:
+    """Compute per-(species-pair, l) block-pooled range scaler.
+
+    Same shape as `_compute_q_scaler` ([Q] float32) so the rest of the
+    pipeline (storage, application via `_apply_q_scaler_np`, save/load)
+    is unchanged. The difference is structural: all q-indices that
+    belong to the same (pair, l) angular block share one multiplier.
+
+    Rationale: equalises the dominant magnitude variation in SOAP —
+    which lives ACROSS l (l=0 components are O(1), l=l_max ~O(0.01))
+    — while preserving the WITHIN-block isotropy that the
+    descriptor-mixing rotations (l_aware / cross_pair_l with V_pair
+    parameterised by Cayley) assume. Per-α components within a
+    (pair, l) block are typically already on comparable scales and
+    do not need decorrelating.
+
+    Algorithm:
+        For each (pair, l) block B = layout["pair_ln_index"][pair][l]:
+            range_B   = max(q[atoms, B]) − min(q[atoms, B])    (scalar)
+            for each d in B: scaler[d] = 1 / max(range_B, eps)
+
+    Args:
+        descriptors_list : list of [N_i, Q] arrays / tensors (one per
+                           training structure, pre-padding).
+        layout           : dict from `descriptor_block_layout(cfg)` —
+                           supplies "pair_keys", "pair_ln_index", "dim_q".
+        eps              : floor on the range to avoid 1/0.
+
+    Returns:
+        scaler : [Q] float32 array. Entries within the same (pair, l)
+                 block are identical; entries across blocks differ.
+    """
+    dim_q = int(layout["dim_q"])
+    # Streaming per-element min/max, same as the per-component path —
+    # we then pool across each block's indices in a second pass. Keeping
+    # the streaming pass element-wise avoids a per-block reduce inside
+    # the loop over training structures, which would scale O(num_blocks).
+    chan_min = None
+    chan_max = None
+    for d in descriptors_list:
+        arr = (d.numpy() if hasattr(d, "numpy") else np.asarray(d))
+        arr = arr.reshape(-1, dim_q)
+        m_min = arr.min(axis=0)
+        m_max = arr.max(axis=0)
+        if chan_min is None:
+            chan_min, chan_max = m_min, m_max
+        else:
+            chan_min = np.minimum(chan_min, m_min)
+            chan_max = np.maximum(chan_max, m_max)
+    scaler = np.empty(dim_q, dtype=np.float32)
+    pair_keys = layout["pair_keys"]
+    pair_ln_index = layout["pair_ln_index"]
+    # Track covered indices to catch layout gaps (would indicate a
+    # mismatch between descriptor_block_layout and the actual descriptor
+    # build — same invariant the layout code asserts internally).
+    covered = np.zeros(dim_q, dtype=bool)
+    for pair in pair_keys:
+        for l, idx in pair_ln_index[pair].items():
+            block_min = float(chan_min[idx].min())
+            block_max = float(chan_max[idx].max())
+            block_range = max(block_max - block_min, eps)
+            scaler[idx] = np.float32(1.0 / block_range)
+            covered[idx] = True
+    if not covered.all():
+        missing = np.where(~covered)[0]
+        raise RuntimeError(
+            f"l_block q_scaler: {missing.size} q-indices not covered by "
+            f"pair_ln_index (first few: {missing[:5].tolist()}). "
+            f"descriptor_block_layout / dim_q mismatch.")
+    return scaler
+
+
+def _apply_q_scaler_np(desc_np: np.ndarray,
+                       grad_values_np: np.ndarray | None,
+                       scaler: np.ndarray) -> None:
+    """In-place per-channel scaling of `desc_np` and `grad_values_np`.
+
+    Both tensors are multiplied by the same `[Q]`-shape scaler along
+    their last axis. The dipole chain rule (∂U/∂r = ∂U/∂q' · diag(s)
+    · ∂q/∂r) is satisfied when BOTH descriptor and grad are scaled at
+    the data pipeline — see plan §"Why option (A)".
+
+    Args:
+        desc_np        : [S, A, Q] float32 padded descriptors.
+        grad_values_np : [P, 3, Q] float32 COO gradient values, or
+                         None (e.g. streaming path where grad is
+                         already on disk).
+        scaler         : [Q] float32 per-channel multiplier.
+    """
+    s = scaler.astype(np.float32)
+    desc_np *= s[None, None, :]
+    if grad_values_np is not None:
+        grad_values_np *= s[None, None, :]
+
+
 def pad_and_stack(data: dict, num_types: int | None = None,
                   pin_to_cpu: bool = True,
                   gradient_cache_path: str | None = None,
                   cache_tag: str = "data",
-                  prebuilt_gv: dict | None = None) -> dict[str, tf.Tensor]:
+                  prebuilt_gv: dict | None = None,
+                  q_scaler: np.ndarray | None = None) -> dict[str, tf.Tensor]:
     """Convert variable-length list-of-tensors data into COO + padded tensors.
 
     Gradient data is stored in COO (Coordinate) sparse format to avoid the
@@ -808,6 +950,22 @@ def pad_and_stack(data: dict, num_types: int | None = None,
                 pair_atom_np[pair_offset:k_end]   = i
                 pair_gidx_np[pair_offset:k_end]   = data["grad_index"][s][i]
                 pair_offset += n_nbrs
+
+    # Apply per-channel descriptor scaling (cfg.descriptor_scaling="q_scaler").
+    # Multiplying BOTH desc and grad_values by the same s[Q] is the
+    # data-pipeline equivalent of GPUMD's "scale q at ANN input + scale
+    # Fp at ANN backward" pattern — see plan section "Why scaling
+    # gradients is necessary". The streaming path (prebuilt_gv) has
+    # grad_values on disk already and is rejected here; rebuild the
+    # dataset without streaming if you need scaling.
+    if q_scaler is not None:
+        if prebuilt_gv is not None:
+            raise ValueError(
+                "q_scaler is not supported with the streaming "
+                "(prebuilt_gv) path because grad_values is already on "
+                "disk and cannot be modified in-place. Rebuild without "
+                "streaming, or pre-scale the .bin file offline.")
+        _apply_q_scaler_np(desc_np, grad_values_np, q_scaler)
 
     # Convert each numpy array to a TF tensor then immediately delete the numpy
     # copy so peak RAM stays at ~1x dataset size rather than ~2x.

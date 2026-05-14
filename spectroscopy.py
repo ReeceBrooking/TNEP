@@ -306,14 +306,39 @@ def _get_fused_predict(model: 'TNEP'):
         # Keras 3 Variables expose .value (a Tensor); fall back to convert.
         return tf.convert_to_tensor(v.value if hasattr(v, "value") else v)
 
-    W0_t  = _to_tensor(model.W0)
+    # Pre-absorb U_pairᵀ into W0 (and W0_pol) when descriptor mixing is
+    # active. `predict_batch` is a pure forward primitive that trusts
+    # the caller to do this; the SNES paths handle it explicitly, but
+    # the trajectory-inference fused graph previously passed raw W0,
+    # silently dropping the learned mixing. Mirrors the score() pattern
+    # in TNEP.py.
+    if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
+        W0_eff_var = model._W0_eff(model.W0)
+        W0p_eff_var = (model._W0_eff(model.W0_pol)
+                        if (cfg.target_mode == 2
+                            and getattr(model, "W0_pol", None) is not None)
+                        else getattr(model, "W0_pol", None))
+    else:
+        W0_eff_var = model.W0
+        W0p_eff_var = getattr(model, "W0_pol", None)
+    W0_t  = _to_tensor(W0_eff_var)
     b0_t  = _to_tensor(model.b0)
     W1_t  = _to_tensor(model.W1)
     b1_t  = _to_tensor(model.b1)
-    W0p_t = _to_tensor(getattr(model, "W0_pol", None))
+    W0p_t = _to_tensor(W0p_eff_var)
     b0p_t = _to_tensor(getattr(model, "b0_pol", None))
     W1p_t = _to_tensor(getattr(model, "W1_pol", None))
     b1p_t = _to_tensor(getattr(model, "b1_pol", None))
+
+    # Per-channel descriptor scaler (cfg._q_scaler). Captured into the
+    # fused graph as a constant tensor; multiplies BOTH soap_concat and
+    # grad_concat at the top of fused() so descriptors and gradients
+    # see the same training-time normalisation. None when scaling is
+    # off (descriptor_scaling="none").
+    q_scaler_const = (tf.constant(cfg._q_scaler, dtype=tf.float32)
+                      if (str(getattr(cfg, "descriptor_scaling", "none")) != "none"
+                          and getattr(cfg, "_q_scaler", None) is not None)
+                      else None)
 
     # NOTE: not jit_compile=True. The descriptor-side XLA path (locked
     # compute fns built with jit_compile=True for trajectory) handles the
@@ -325,6 +350,14 @@ def _get_fused_predict(model: 'TNEP'):
     def fused(soap_concat, grad_concat, pa_concat, pg_concat,
               atom_counts, pair_counts,
               positions, Z, boxes, atom_mask, num_atoms):
+        # Apply per-channel descriptor scaling (cfg._q_scaler) at the
+        # same point in the chain as training (pad_and_stack does it
+        # before packing). Both `soap_concat` [N, Q] and `grad_concat`
+        # [P, 3, Q] get the same `s[Q]` along their last axis — see
+        # data._apply_q_scaler_np for the equivalent training-time op.
+        if q_scaler_const is not None:
+            soap_concat = soap_concat * q_scaler_const[tf.newaxis, :]
+            grad_concat = grad_concat * q_scaler_const[tf.newaxis, tf.newaxis, :]
         S = tf.shape(num_atoms)[0]
         # Pad descriptors via scatter_nd. RaggedTensor.to_tensor is the
         # natural choice but the underlying RaggedTensorToTensor op has no
@@ -666,13 +699,33 @@ def predict_trajectory_batch(
                                            cfg.dim_q, pin_to_cpu=pin_to_cpu)
         del frame_results
 
+        # Apply per-channel scaling and mixing absorption in the same
+        # order as the fused path so the two backends produce identical
+        # predictions. Both transformations are pre-existing training-
+        # time operations whose absence at inference would silently
+        # corrupt trajectory dipoles.
+        if (str(getattr(cfg, "descriptor_scaling", "none")) != "none"
+                and getattr(cfg, "_q_scaler", None) is not None):
+            s = tf.constant(cfg._q_scaler, dtype=tf.float32)
+            batch["descriptors"] = batch["descriptors"] * s[tf.newaxis, tf.newaxis, :]
+            batch["grad_values"] = batch["grad_values"] * s[tf.newaxis, tf.newaxis, :]
+        if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
+            W0_pred = model._W0_eff(model.W0)
+            W0p_pred = (model._W0_eff(model.W0_pol)
+                         if (cfg.target_mode == 2
+                             and getattr(model, "W0_pol", None) is not None)
+                         else getattr(model, "W0_pol", None))
+        else:
+            W0_pred = model.W0
+            W0p_pred = getattr(model, "W0_pol", None)
+
         preds = model.predict_batch(
             batch["descriptors"], batch["grad_values"],
             batch["pair_atom"], batch["pair_gidx"], batch["pair_struct"],
             batch["positions"], batch["Z_int"], batch["boxes"],
             batch["atom_mask"],
-            model.W0, model.b0, model.W1, model.b1,
-            getattr(model, 'W0_pol', None),
+            W0_pred, model.b0, model.W1, model.b1,
+            W0p_pred,
             getattr(model, 'b0_pol', None),
             getattr(model, 'W1_pol', None),
             getattr(model, 'b1_pol', None),
