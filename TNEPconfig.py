@@ -23,7 +23,7 @@ class TNEPconfig:
     # zero-vector targets. Structures with missing targets are always
     # dropped regardless (they can't be trained against).
     filter_bad_data: bool = False
-    num_neurons: int = 100
+    num_neurons: int = 30
     # Number of structures used in each train step
     batch_size: int | None = None
     # Number of samples made in each train generation
@@ -42,8 +42,6 @@ class TNEPconfig:
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 1
     compress_mode: str = "trivial"
-    # Number of compressed radial channels (only used when compress_mode="linear"; None = quippy default)
-    compress_P: int | None = None
     atom_sigma_r: float = 0.5
     atom_sigma_t: float = 0.5
     atom_sigma_r_scaling: float = 0.0
@@ -75,6 +73,37 @@ class TNEPconfig:
     #                     ~O(0.01)) while preserving intra-block axes. Use this
     #                     when running descriptor_mixing with l_aware/cross_pair_l.
     q_scaler_granularity: str = "l_block"
+
+    # Per-component target centering. When True, the per-component mean
+    # of the training targets is computed once, subtracted from every
+    # train/val/test target so the network learns in zero-mean output
+    # space, and added back at the inference boundary (model.score,
+    # model.predict, trajectory inference) so user-facing predictions
+    # remain in the original units. Persisted in /weights/target_mean
+    # (and /snes/target_mean in checkpoints) — frozen for the run.
+    #
+    # The network architecture has only one scalar output bias (b1); it
+    # cannot place an independent per-component dipole/polarisability
+    # offset. With non-zero target means (e.g. anisotropic training
+    # data), this forces capacity into shifting the zero point through
+    # W0/W1 interactions, leaving less capacity for the genuine
+    # structure-dependent pattern. Centering decouples the two.
+    #
+    # Caveats:
+    #   - Rotational equivariance: the saved mean is a constant in the
+    #     dataset frame; it does NOT rotate with a rotated input. If the
+    #     mean is non-isotropic (norm ≫ 0 for vector / tensor outputs),
+    #     the network's centered-space predictions ARE equivariant but
+    #     the original-units output (after adding the mean back) is NOT.
+    #     Recommended use: only when the training-set mean is near zero
+    #     or nearly isotropic — e.g. after rotational augmentation. The
+    #     test_rotation_equivariance helper warns when this is violated.
+    #   - RRMSE definition shifts: SNES's RRMSE numerator is computed
+    #     against `sum(targets^2)` of the centered batch — i.e. it
+    #     becomes variance-normalised rather than mean+variance. RRMSE
+    #     values are not directly comparable between centered and
+    #     un-centered runs on the same dataset.
+    target_centering: bool = False
 
     # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU when available).
     # The GPU path supports basis="poly3" and compress_mode="trivial" only;
@@ -441,7 +470,7 @@ class TNEPconfig:
     # Test split ratio
     test_ratio: float = 0.3
     # None : uses entire dataset, int : defines maximum structures to use in training
-    total_N: int | None = 4000
+    total_N: int | None = None
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)

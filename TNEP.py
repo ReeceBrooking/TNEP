@@ -448,12 +448,34 @@ class TNEP(layers.Layer):
         # Mask out padded atoms
         h = h * atom_mask[:, tf.newaxis]                   # [A, H]
 
+        # Target-centering inverse: add the training-set mean back so
+        # `predict` returns predictions in original (un-centered) units.
+        # The shift depends only on the data-pipeline convention:
+        #   - target_mode==1 AND scale_targets : mean is per-atom space,
+        #                                        shift by mean * num_atoms
+        #   - otherwise (mode 0 energy, mode 2 polarisability, or
+        #     mode 1 without scale_targets)   : mean is total space,
+        #                                        shift by mean
+        # This matches assemble_data_dict's gating (data.py:375), which
+        # only divides by num_atoms when target_mode==1 AND scale_targets.
+        _do_uncenter = (bool(getattr(self.cfg, "target_centering", False))
+                        and getattr(self.cfg, "_target_mean", None) is not None)
+        if _do_uncenter:
+            _mean_arr = np.asarray(self.cfg._target_mean, dtype=np.float32)
+            _shift_per_atom = (self.cfg.target_mode == 1
+                               and bool(getattr(self.cfg, "scale_targets", False)))
+
         if self.cfg.target_mode == 0:
             # PES: E = -sum_i (h_i . W1[t_i] + b1)
             E_per_atom = tf.reduce_sum(h * W1_t, axis=1) + self.b1  # [A]
             E_per_atom = E_per_atom * atom_mask                       # zero padding
             E = tf.reduce_sum(E_per_atom)
-            return tf.expand_dims(-E, axis=0)  # [1]
+            out = tf.expand_dims(-E, axis=0)  # [1]
+            if _do_uncenter:
+                # Energy is always total-space (data pipeline never
+                # divides E targets by num_atoms), so shift by `mean`.
+                out = out + tf.constant(_mean_arr)
+            return out
 
         # Modes 1 and 2 need forces
         forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask)  # [A, M, 3]
@@ -465,6 +487,12 @@ class TNEP(layers.Layer):
             rij2 = tf.square(rij) * neighbor_mask                       # [A, M]
             dipole_contribs = rij2[:, :, tf.newaxis] * forces            # [A, M, 3]
             dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])       # [3]
+            if _do_uncenter:
+                if _shift_per_atom:
+                    num_atoms = tf.reduce_sum(atom_mask)
+                    dipole = dipole + tf.constant(_mean_arr) * num_atoms
+                else:
+                    dipole = dipole + tf.constant(_mean_arr)
             return dipole
 
         elif self.cfg.target_mode == 2:
@@ -503,6 +531,10 @@ class TNEP(layers.Layer):
             # Add scalar ANN to diagonal
             pol = pol + tf.stack([scalar_sum, scalar_sum, scalar_sum,
                                   0.0, 0.0, 0.0])
+            if _do_uncenter:
+                # Polarisability targets are total-space (no scale_targets
+                # path for mode=2), so the mean is total-space too.
+                pol = pol + tf.constant(_mean_arr)
             return pol
 
     def calc_forces(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
@@ -619,6 +651,20 @@ class TNEP(layers.Layer):
         else:
             preds = raw_preds
 
+        # Target centering inverse: add the frozen training-set mean
+        # back to BOTH preds and targets so all downstream metrics and
+        # the returned `preds` are in original (un-centered) units. RMSE
+        # and R² are invariant under this shift (both terms get the same
+        # offset), but cos_sim and the absolute prediction values are
+        # not — they MUST be restored to original units to be meaningful.
+        if (bool(getattr(self.cfg, "target_centering", False))
+                and getattr(self.cfg, "_target_mean", None) is not None):
+            mean_tf = tf.constant(
+                np.asarray(self.cfg._target_mean,
+                           dtype=np.float32).reshape(1, -1))
+            preds = preds + mean_tf
+            targets = targets + mean_tf
+
         diff = preds - targets
         mse = tf.reduce_mean(tf.square(diff))
         rmse = tf.sqrt(tf.maximum(mse, 0.0))
@@ -640,10 +686,21 @@ class TNEP(layers.Layer):
             "r2_components": r2_components,
         }
 
-        # Total (un-scaled) metrics when target scaling is active
+        # Total (un-scaled) metrics when target scaling is active. Both
+        # totals must be in ORIGINAL (un-centered) units: `targets` here
+        # is per-atom-original (mean added back above), so
+        # `targets * num_atoms` is the total-original. The raw network
+        # output `raw_preds` is in centered per-atom * num_atoms space —
+        # add back the corresponding offset (mean * num_atoms) per
+        # structure so total_diff compares two original-unit quantities.
         if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
             total_targets = targets * num_atoms_col
-            total_diff = raw_preds - total_targets
+            if (bool(getattr(self.cfg, "target_centering", False))
+                    and getattr(self.cfg, "_target_mean", None) is not None):
+                total_preds = raw_preds + mean_tf * num_atoms_col
+            else:
+                total_preds = raw_preds
+            total_diff = total_preds - total_targets
             total_rmse = tf.sqrt(tf.reduce_mean(tf.square(total_diff)))
             total_ss_res = tf.reduce_sum(tf.square(total_diff))
             total_ss_tot = tf.reduce_sum(tf.square(
@@ -667,6 +724,44 @@ class TNEP(layers.Layer):
             metrics["cos_sim_all"] = cos_sim
 
         return metrics, preds
+
+    def score_summary(self, test_data: dict[str, tf.Tensor]) -> dict:
+        """Print and return a labelled comparison-ready scoring summary.
+
+        Reports metrics in BOTH per-atom space (matches GPUMD's `loss.out`
+        `rmse_virial` convention) AND total-dipole space (matches the
+        convention used in TNEP / NEP papers like Xu et al for headline
+        RMSE / R² values). Use this to compare against published numbers
+        without space-convention confusion.
+
+        Also derives an RRMSE = √(1 − R²) for each space, which is the
+        centered definition (variance-normalised). Note: this differs from
+        the un-centered SNES training RRMSE (`best_rrmse` in history),
+        which uses `Σy²` rather than `Σ(y − ȳ)²` in the denominator —
+        the two are nearly equal when target means are small but not
+        identical.
+        """
+        metrics, preds = self.score(test_data)
+        m = {k: (float(v.numpy()) if hasattr(v, "numpy") else float(v))
+             for k, v in metrics.items()
+             if v is not None and getattr(v, "shape", ())  == ()}
+        # Per-atom (always populated):
+        rrmse_pa = (1.0 - m["r2"]) ** 0.5
+        print(f"  PER-ATOM space (matches GPUMD loss.out 'rmse_virial'):")
+        print(f"    RMSE  = {m['rmse']:.6f}  e·bohr / atom / component")
+        print(f"    R²    = {m['r2']:.6f}")
+        print(f"    RRMSE = √(1−R²) = {rrmse_pa:.4%}")
+        # Total (only when scale_targets active):
+        if "total_rmse" in m and "total_r2" in m:
+            rrmse_tot = (1.0 - m["total_r2"]) ** 0.5
+            print(f"  TOTAL-DIPOLE space (matches NEP paper headline RMSE / R²):")
+            print(f"    RMSE  = {m['total_rmse']:.6f}  e·bohr / structure / component")
+            print(f"    R²    = {m['total_r2']:.6f}")
+            print(f"    RRMSE = √(1−R²) = {rrmse_tot:.4%}")
+        if "cos_sim_mean" in m:
+            print(f"  Vector quality:")
+            print(f"    cos_sim_mean = {m['cos_sim_mean']:.6f}")
+        return metrics
 
     @tf.function(reduce_retracing=True)
     def predict_batch(self, descriptors: tf.Tensor, grad_values: tf.Tensor,

@@ -687,6 +687,7 @@ def predict_trajectory_batch(
         del fused_inputs
         out = preds.numpy()
         del preds
+        out = _restore_target_mean(out, batch_frames, cfg)
     else:
         # Legacy NumPy pack + eager predict_batch path (quippy and any
         # custom builder that doesn't return TF tensors).
@@ -737,7 +738,39 @@ def predict_trajectory_batch(
         # no per-atom→total rescaling is needed here.
         out = preds.numpy()
         del batch, preds
+        out = _restore_target_mean(out, batch_frames, cfg)
     return out
+
+
+def _restore_target_mean(out: np.ndarray, batch_frames: list,
+                         cfg) -> np.ndarray:
+    """Add the frozen training-set target mean back to trajectory
+    predictions so the returned array is in original (un-centered) units.
+
+    Mirrors the inverse done in TNEP.score / TNEP.predict. The shift
+    depends on whether the data pipeline scaled targets per-atom:
+      - target_mode=1, scale_targets=True : `out += mean * num_atoms_i`
+        per frame (the training shift was per-atom; raw_pred is total).
+      - target_mode=1, scale_targets=False: `out += mean`
+      - target_mode=2 (polarisability)    : `out += mean` (mode=2 has
+        no scale_targets path in assemble_data_dict, so the mean is
+        always in total-space).
+    Mode 0 (energy) does not enter this path — predict_trajectory_batch
+    is restricted to modes 1/2. No-op when target_centering is off.
+    """
+    if not (bool(getattr(cfg, "target_centering", False))
+            and getattr(cfg, "_target_mean", None) is not None):
+        return out
+    mean = np.asarray(cfg._target_mean, dtype=np.float32).reshape(1, -1)
+    # Mirror assemble_data_dict's gating exactly: per-atom rescaling
+    # applies ONLY when target_mode==1 AND cfg.scale_targets is True.
+    # Default for missing attr is False (matches data.py:375 semantics).
+    if cfg.target_mode == 1 and bool(getattr(cfg, "scale_targets", False)):
+        # Per-frame num_atoms scaling. batch_frames length equals out.shape[0].
+        n_atoms = np.asarray(
+            [len(f) for f in batch_frames], dtype=np.float32).reshape(-1, 1)
+        return out + mean * n_atoms
+    return out + mean
 
 
 def _scalar_acf_fft(signal: np.ndarray) -> np.ndarray:

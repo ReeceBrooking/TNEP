@@ -189,8 +189,6 @@ class DescriptorBuilder(layers.Layer):
             f"radial_enhancement={cfg.radial_enhancement} "
             f"compress_mode={cfg.compress_mode} "
         )
-        if cfg.compress_P is not None:
-            base += f"compress_P={cfg.compress_P} "
 
         alpha_max = " alpha_max={"
         atom_sigma_r = " atom_sigma_r={"

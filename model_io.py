@@ -219,6 +219,16 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
                 data=np.asarray(cfg._q_scaler, dtype=np.float32))
             wg.attrs["descriptor_scaling"] = str(cfg.descriptor_scaling)
 
+        # Per-component target mean (cfg.target_centering=True). Stored
+        # alongside the model so inference adds it back to predictions
+        # to restore original-unit values.
+        if (bool(getattr(cfg, "target_centering", False))
+                and getattr(cfg, "_target_mean", None) is not None):
+            wg.create_dataset(
+                "target_mean",
+                data=np.asarray(cfg._target_mean, dtype=np.float32))
+            wg.attrs["target_centering"] = True
+
         # Descriptor metadata
         dg = f.create_group("descriptor")
         dg.create_dataset("z_to_type_index", data=z_to_type_index)
@@ -333,6 +343,12 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
             sg.create_dataset(
                 "q_scaler",
                 data=np.asarray(cfg._q_scaler, dtype=np.float32))
+        # Per-component target mean (same restore-before-pad_and_stack
+        # rationale as q_scaler — keeps the resumed run consistent).
+        if getattr(cfg, "_target_mean", None) is not None:
+            sg.create_dataset(
+                "target_mean",
+                data=np.asarray(cfg._target_mean, dtype=np.float32))
         # History (so plots / early-stop continuity carry over)
         hg = f.create_group("history")
         for k, v in history.items():
@@ -395,6 +411,21 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
         # original.
         if "q_scaler" in sg:
             cfg._q_scaler = np.asarray(sg["q_scaler"][:], dtype=np.float32)
+        if "target_mean" in sg:
+            cfg._target_mean = np.asarray(
+                sg["target_mean"][:], dtype=np.float32)
+        # Consistency check: if the saved cfg has target_centering=True
+        # but no target_mean dataset was written, the resumed run would
+        # silently recompute the mean from a (potentially different)
+        # train split. That's a correctness hazard — refuse to load.
+        if (bool(getattr(cfg, "target_centering", False))
+                and getattr(cfg, "_target_mean", None) is None):
+            raise ValueError(
+                f"Checkpoint at {path!r} has cfg.target_centering=True "
+                f"but no /snes/target_mean dataset. Cannot safely resume "
+                f"— the mean would be recomputed from a different train "
+                f"split. Either restore the checkpoint that has the mean "
+                f"saved, or set cfg.target_centering=False to opt out.")
         hg = f["history"]
         history = {}
         for k in hg:
@@ -505,6 +536,11 @@ def _load_model_h5(path: str) -> TNEP:
         saved_descriptor_scaling = (
             str(wg.attrs["descriptor_scaling"])
             if "descriptor_scaling" in wg.attrs else None)
+        saved_target_mean = (np.asarray(wg["target_mean"][:], dtype=np.float32)
+                             if "target_mean" in wg else None)
+        saved_target_centering = (
+            bool(wg.attrs["target_centering"])
+            if "target_centering" in wg.attrs else False)
 
     for k, v in config_dict.items():
         if k == "descriptor_mean":
@@ -549,6 +585,20 @@ def _load_model_h5(path: str) -> TNEP:
             f"dataset was saved. The scaler is required for consistent "
             f"inference. Retrain the model or set "
             f"cfg.descriptor_scaling='none'.")
+
+    # Restore target centering. The mean is added back to predictions
+    # at the inference boundary; without it, predictions would emerge
+    # in the centered space the network was trained on.
+    if saved_target_centering:
+        cfg.target_centering = True
+    if saved_target_mean is not None:
+        cfg._target_mean = saved_target_mean
+    elif bool(getattr(cfg, "target_centering", False)):
+        raise ValueError(
+            f"Model at {path!r} has target_centering=True but no "
+            f"/weights/target_mean dataset was saved. The mean is "
+            f"required to map predictions back to original units. "
+            f"Retrain the model or set cfg.target_centering=False.")
 
     model = TNEP(cfg)
     _load_weights(model, cfg, **weights)

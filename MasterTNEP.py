@@ -469,6 +469,27 @@ def _train_model_inner(cfg: TNEPconfig,
             f"cfg.descriptor_scaling={cfg.descriptor_scaling!r} "
             "not recognised (expected 'none' or 'q_scaler').")
 
+    # Per-component target centering. Computed ONCE over the training
+    # targets, applied to train/val/test, persisted in /weights/
+    # target_mean. Restored from checkpoint on resume (preserves cfg
+    # value if already set).
+    if bool(getattr(cfg, "target_centering", False)):
+        if getattr(cfg, "_target_mean", None) is None:
+            from data import _compute_target_mean
+            target_dim = (1 if cfg.target_mode == 0
+                          else (3 if cfg.target_mode == 1 else 6))
+            cfg._target_mean = _compute_target_mean(
+                train_data["targets"], target_dim)
+            tm = cfg._target_mean
+            print(f"  Computed target_mean over {len(train_data['targets'])} "
+                  f"training structures (target_dim={tm.size}):")
+            print(f"    mean = {np.array2string(tm, precision=4, suppress_small=True)}")
+            print(f"    Targets will be shifted to zero-mean for training; "
+                  f"mean added back at inference.")
+        else:
+            print(f"  Reusing target_mean from checkpoint "
+                  f"(shape={cfg._target_mean.shape}, no recompute on resume).")
+
     # Convert to padded dense tensors for GPU-batched evaluation. test_data
     # is intentionally NOT padded here; it gets padded by materialize_test_data
     # the first time it's actually consumed.
@@ -476,12 +497,14 @@ def _train_model_inner(cfg: TNEPconfig,
         train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="train",
-        q_scaler=getattr(cfg, "_q_scaler", None))
+        q_scaler=getattr(cfg, "_q_scaler", None),
+        target_mean=getattr(cfg, "_target_mean", None))
     val_data   = pad_and_stack(
         val_data,   num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="val",
-        q_scaler=getattr(cfg, "_q_scaler", None))
+        q_scaler=getattr(cfg, "_q_scaler", None),
+        target_mean=getattr(cfg, "_target_mean", None))
 
     _setup_grad_staging(cfg, train_data, val_data)
 

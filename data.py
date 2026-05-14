@@ -415,7 +415,15 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     builder = make_descriptor_builder(cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(dataset)
     data = assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
-    return pad_and_stack(data)
+    # Thread q_scaler and target_mean from cfg so the eval dict is in
+    # the same scaled+centered space the model was trained on. Without
+    # this, downstream metrics that aren't shift-invariant (cos_sim,
+    # total_rmse) silently report wrong values when centering is on.
+    return pad_and_stack(
+        data,
+        num_types=cfg.num_types,
+        q_scaler=getattr(cfg, "_q_scaler", None),
+        target_mean=getattr(cfg, "_target_mean", None))
 
 
 def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> tuple[dict, dict, dict]:
@@ -615,7 +623,8 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
         test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="test",
-        q_scaler=getattr(cfg, "_q_scaler", None))
+        q_scaler=getattr(cfg, "_q_scaler", None),
+        target_mean=getattr(cfg, "_target_mean", None))
     # Pre-stage per-chunk pair indices to GPU. Test eval doesn't go
     # through `_evaluate_chunk` (TNEP.score uses model.predict_batch),
     # so XLA padding isn't needed for test data.
@@ -805,12 +814,61 @@ def _apply_q_scaler_np(desc_np: np.ndarray,
         grad_values_np *= s[None, None, :]
 
 
+def _compute_target_mean(targets_list, target_dim: int) -> np.ndarray:
+    """Compute per-component mean over the training-set targets.
+
+    The mean is a `[T_dim]` vector — one offset per output channel
+    (scalar for energy, [3] for dipole, [6] for polarisability). It's
+    subtracted from all targets at the data-pipeline level so the
+    network learns in a zero-mean output space (see
+    `cfg.target_centering` in TNEPconfig). The same mean is added back
+    to predictions at the inference boundary so user-facing values stay
+    in the original units.
+
+    Why centering matters: the ANN has one scalar output bias `b1`; it
+    cannot place an independent per-component offset on the dipole /
+    polarisability output. With a non-zero training target mean (e.g.
+    anisotropic dataset orientations), the model must encode the offset
+    through the W0/W1/SOAP-gradient pathway, consuming capacity that
+    should be going to genuine pattern-fitting. Centering moves the
+    offset into a frozen training-time constant.
+
+    Args:
+        targets_list : list of scalar / [T_dim] arrays / tensors,
+                       one per training structure.
+        target_dim   : T_dim (1, 3, or 6 for target_mode 0, 1, 2).
+
+    Returns:
+        mean : [T_dim] float32 — per-component mean.
+    """
+    if not targets_list:
+        return np.zeros(target_dim, dtype=np.float32)
+    acc = np.zeros(target_dim, dtype=np.float64)
+    for i, t in enumerate(targets_list):
+        arr = (t.numpy() if hasattr(t, "numpy") else np.asarray(t))
+        if arr.shape == ():
+            if target_dim != 1:
+                raise ValueError(
+                    f"_compute_target_mean: target[{i}] is scalar but "
+                    f"target_dim={target_dim}; cannot mix scalar and "
+                    f"vector targets in one list.")
+            acc[0] += float(arr)
+        else:
+            if arr.shape != (target_dim,):
+                raise ValueError(
+                    f"_compute_target_mean: target[{i}] has shape "
+                    f"{arr.shape} but expected ({target_dim},).")
+            acc += arr.astype(np.float64)
+    return (acc / len(targets_list)).astype(np.float32)
+
+
 def pad_and_stack(data: dict, num_types: int | None = None,
                   pin_to_cpu: bool = True,
                   gradient_cache_path: str | None = None,
                   cache_tag: str = "data",
                   prebuilt_gv: dict | None = None,
-                  q_scaler: np.ndarray | None = None) -> dict[str, tf.Tensor]:
+                  q_scaler: np.ndarray | None = None,
+                  target_mean: np.ndarray | None = None) -> dict[str, tf.Tensor]:
     """Convert variable-length list-of-tensors data into COO + padded tensors.
 
     Gradient data is stored in COO (Coordinate) sparse format to avoid the
@@ -966,6 +1024,19 @@ def pad_and_stack(data: dict, num_types: int | None = None,
                 "disk and cannot be modified in-place. Rebuild without "
                 "streaming, or pre-scale the .bin file offline.")
         _apply_q_scaler_np(desc_np, grad_values_np, q_scaler)
+
+    # Per-component target centering (cfg.target_centering=True). One
+    # broadcast subtraction along the T_dim axis. Same mean is used for
+    # train/val/test so the model sees a consistent zero point; the
+    # mean is added back to predictions at the inference boundary so
+    # user-facing values stay in the original units.
+    if target_mean is not None:
+        tm = np.asarray(target_mean, dtype=np.float32).reshape(-1)
+        if tm.shape[0] != tgt_np.shape[1]:
+            raise ValueError(
+                f"target_mean has {tm.shape[0]} components but targets "
+                f"have {tgt_np.shape[1]}; mismatch.")
+        tgt_np -= tm[np.newaxis, :]
 
     # Convert each numpy array to a TF tensor then immediately delete the numpy
     # copy so peak RAM stays at ~1x dataset size rather than ~2x.
