@@ -1,627 +1,371 @@
+"""TNEP — GAP (Gaussian Approximation Potential) model.
+
+This file replaces the previous NN-based TNEP. The class name and the
+file name are retained so all call sites (`from TNEP import TNEP`,
+`model.score(...)`, `model.predict_batch(...)`, etc.) continue to work
+unchanged. Internally the per-atom scalar U_i is now computed by a
+kernel expansion over a sparse set of training environments:
+
+    U_i = Σ_s α_s · K(q_i, q_s)
+
+with K = δ_t² · (q̂_i · q̂_s)^ζ (L2-normalised polynomial dot-product
+kernel; species-masked so atoms only see sparse points of their own
+type). The downstream dipole pathway (μ = -Σ r²·∂U/∂r) is identical to
+the NN — only ∂U/∂q changes from the NN tanh-Jacobian to the
+kernel-trick streaming form.
+
+Phase 1 constraints (lifted later):
+- `cfg.target_mode == 2` (polarisability) raises NotImplementedError —
+  Phase 3.
+- Dummy `W0/b0/W1/b1` (zero-initialised, untrainable) are kept on the
+  model so legacy call sites that read `model.W0` etc. continue to
+  work without crashing (e.g. `score()`, `spectroscopy._get_fused_predict`).
+"""
 from __future__ import annotations
 
+import sys
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
-from typing import Callable
+from tqdm import tqdm
 
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import TNEPconfig
 
+
 class TNEP(layers.Layer):
-    """Per-type single-hidden-layer ANN for predicting energy, dipole, or polarizability.
+    """GAP-style per-atom scalar predictor with the original TNEP I/O.
 
-    Forward pass per atom i with type t:
-        a_i  = q_i @ W0[t] + b0[t]           # [num_neurons]
-        h_i  = tanh(a_i)                      # [num_neurons]
-        U_i  = h_i · W1[t] + b1              # scalar
+    Forward (per atom i, type t = species(i)):
+        q̂_i = q_i / ||q_i||
+        K(q_i, q_s) = δ_t² · (q̂_i · q̂_s)^ζ · [species(i) == species(s)]
+        U_i = Σ_s α_s · K(q_i, q_s)
 
-    Weights:
-        W0 : [num_types, dim_q, num_neurons]  input -> hidden
-        b0 : [num_types, num_neurons]         hidden bias
-        W1 : [num_types, num_neurons]         hidden -> scalar
-        b1 : ()                               global scalar bias
+    Prediction (cfg.target_mode):
+        0 (PES)    : E = -Σ_i U_i                                   → scalar
+        1 (Dipole) : μ = -Σ_ij r_ij² · ∂U_i/∂r_ij                   → [3]
+        2 (Polar.) : Phase 3 — raises NotImplementedError in __init__.
 
-    Prediction modes (cfg.target_mode):
-        0 (PES)    : E = -sum_i U_i                                   -> scalar
-        1 (Dipole) : μ = -sum_i sum_j |r_ij|² * (dU_i/dr_ij_vec)     -> [3]
-        2 (Polar.) : α[6] via dual ANN (scalar + tensor)              -> [6]
-
-    For mode 2 (polarizability), a second "scalar ANN" is added:
-        W0_pol, b0_pol, W1_pol, b1_pol
-    The scalar ANN computes per-atom F_pol -> isotropic diagonal.
-    The tensor ANN (primary W0/b0/W1/b1) computes forces -> anisotropic virial.
-    Output: [xx, yy, zz, xy, yz, zx]
+    Persistent state (populated by `self.optimizer.fit`):
+        sparse_q          [M, Q]      L2-normalised sparse-point descriptors
+        sparse_q_norm     [M]         ||q_s|| (kept for diagnostics)
+        sparse_species    [M]  int32  species index of each sparse point
+        alpha             [M]         fitted coefficients
+        delta_per_species [T]         per-species kernel scale (default 1.0)
     """
 
-    def __init__(self,
-                 cfg: TNEPconfig,
-                 **kwargs) -> None:
+    def __init__(self, cfg: TNEPconfig, **kwargs) -> None:
         super().__init__(**kwargs)
         self.cfg = cfg
         self.dim_q = cfg.dim_q
         self.num_types = cfg.num_types
-        self.num_neurons = cfg.num_neurons
-        self.activation = tf.keras.activations.get(cfg.activation)
         self.builder = make_descriptor_builder(cfg)
 
-        # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type
-        self.W0 = self.add_weight(
-            name="W0",
-            shape=(cfg.num_types, cfg.dim_q, cfg.num_neurons),
-            initializer="glorot_uniform",
-            trainable=True,
-        )
-
-        # b0 : [num_types, num_neurons] — hidden bias per type
-        self.b0 = self.add_weight(
-            name="b0",
-            shape=(cfg.num_types, cfg.num_neurons),
-            initializer="zeros",
-            trainable=True,
-        )
-
-        # W1 : [num_types, num_neurons] — hidden-to-scalar weights per type
-        self.W1 = self.add_weight(
-            name="W1",
-            shape=(cfg.num_types, cfg.num_neurons),
-            initializer="glorot_uniform",
-            trainable=True,
-        )
-
-        # b1 : () — global scalar bias shared across all types
-        self.b1 = self.add_weight(
-            name="b1",
-            shape=(),
-            initializer="zeros",
-            trainable=True,
-        )
-
-        # Scalar ANN for polarizability mode (target_mode == 2)
+        # ───────────────────────────── Phase 1 mode gate
+        # target_mode==2 (polarisability) reuses NN-only attributes
+        # (W0_pol/b0_pol/W1_pol/b1_pol) and is not implemented under
+        # the GAP rewrite. Phase 3 lifts this.
         if cfg.target_mode == 2:
-            self.W0_pol = self.add_weight(
-                name="W0_pol",
-                shape=(cfg.num_types, cfg.dim_q, cfg.num_neurons),
-                initializer="glorot_uniform",
-                trainable=True,
-            )
-            self.b0_pol = self.add_weight(
-                name="b0_pol",
-                shape=(cfg.num_types, cfg.num_neurons),
-                initializer="zeros",
-                trainable=True,
-            )
-            self.W1_pol = self.add_weight(
-                name="W1_pol",
-                shape=(cfg.num_types, cfg.num_neurons),
-                initializer="glorot_uniform",
-                trainable=True,
-            )
-            self.b1_pol = self.add_weight(
-                name="b1_pol",
-                shape=(),
-                initializer="zeros",
-                trainable=True,
-            )
+            raise NotImplementedError(
+                "target_mode=2 (polarisability) is deferred to GAP Phase 3. "
+                "Use target_mode=1 (dipole) or target_mode=0 (energy) for now.")
 
-        # Optimizer constructed last so it can capture references to
-        # the just-created weight tensors.
-        # Optional descriptor-mixing layer (GPUMD c_nk analog).
-        # U_pair is shared across central atom types; one mixing
-        # square block per unordered neighbour-species pair. Block
-        # sizes are pair-dependent (trivial compression mixes radial
-        # channels across species pair boundaries), so U_pair is
-        # padded to max_block_size and we track each pair's active
-        # size separately.
-        #
-        # For efficient assembly of the full Q×Q mixing matrix, we
-        # also precompute per-pair "placement" matrices P_p ∈
-        # R^{bs × Q} that map the bs active features of pair p onto
-        # their non-contiguous q-indices in the flat descriptor.
-        # Then U_full = Σ_p P_p^T · U_pair[..., p, :bs, :bs] · P_p
-        # is a clean einsum that broadcasts over any leading batch
-        # dims (single-instance and per-candidate paths both work).
-        self.descriptor_mixing = bool(getattr(cfg, "descriptor_mixing", False))
-        self.descriptor_mixing_per_type = bool(
-            getattr(cfg, "descriptor_mixing_per_type", False))
-        self.descriptor_mixing_arch = str(
-            getattr(cfg, "descriptor_mixing_arch", "linear")).lower()
-        if self.descriptor_mixing_arch not in ("linear", "l_aware", "cross_pair_l"):
-            raise ValueError(
-                f"descriptor_mixing_arch={self.descriptor_mixing_arch!r} not in "
-                "('linear', 'l_aware', 'cross_pair_l')")
-        if self.descriptor_mixing:
-            from DescriptorBuilderGPU import descriptor_block_layout
-            self._mix_layout = descriptor_block_layout(cfg)
-            self._mix_pair_keys = self._mix_layout["pair_keys"]
-            self._mix_num_pairs = len(self._mix_pair_keys)
-            self._mix_max_block_size = int(self._mix_layout["max_block_size"])
-            self._mix_block_sizes = [
-                self._mix_layout["block_sizes"][k] for k in self._mix_pair_keys]
-            self._mix_Q = int(self._mix_layout["dim_q"])
-            T = cfg.num_types
-            # Build per-pair placement matrices P[p] ∈ R^{bs_p × Q}. Used
-            # by the "linear" arch; the "l_aware" arch builds finer
-            # per-(pair, l) placement matrices below in addition.
-            mix_P = []
-            for p_idx, k in enumerate(self._mix_pair_keys):
-                qidx = self._mix_layout["pair_q_index"][k]   # np.int32 [bs]
-                bs = qidx.size
-                P = np.zeros((bs, self._mix_Q), dtype=np.float32)
-                P[np.arange(bs), qidx] = 1.0
-                mix_P.append(tf.constant(P))
-            self._mix_P = mix_P
-            # Stacked projector [num_pairs, bs, Q] for the linear-arch
-            # fast path. Available only when all pairs share the same bs
-            # (the common case for fixed alpha_max / l_max). Replaces
-            # num_pairs separate einsums with one batched einsum.
-            if len(set(self._mix_block_sizes)) == 1:
-                bs0 = self._mix_block_sizes[0]
-                P_lin_stack = np.zeros(
-                    (self._mix_num_pairs, bs0, self._mix_Q),
-                    dtype=np.float32)
-                for p_idx, k in enumerate(self._mix_pair_keys):
-                    qidx = self._mix_layout["pair_q_index"][k]
-                    P_lin_stack[p_idx, np.arange(bs0), qidx] = 1.0
-                self._mix_P_stack = tf.constant(P_lin_stack)
-                self._mix_P_uniform_bs = bs0
-            else:
-                self._mix_P_stack = None
-                self._mix_P_uniform_bs = None
+        # ───────────────────────────── GAP weights (must be created BEFORE
+        # `self.optimizer = SNES(self)` below — the shim reads them).
+        M = int(getattr(cfg, "gap_n_sparse", 1000))
+        Q = int(cfg.dim_q)
+        T = int(cfg.num_types)
+        self.M = M
 
-            if self.descriptor_mixing_arch == "linear":
-                # U_pair stores the RESIDUAL V = U - I (deviation from
-                # identity). The effective per-pair mixing matrix is
-                # U_block = I_bs + V_block, so V starts at zero and the
-                # model begins bit-identical to a mixing-disabled baseline.
-                # Shape:
-                #   shared    : [num_pairs, max_bs, max_bs]
-                #   per-type  : [T, num_pairs, max_bs, max_bs]
-                if self.descriptor_mixing_per_type:
-                    shape = (T, self._mix_num_pairs,
-                             self._mix_max_block_size, self._mix_max_block_size)
-                else:
-                    shape = (self._mix_num_pairs,
-                             self._mix_max_block_size, self._mix_max_block_size)
-                self.U_pair = self.add_weight(
-                    name="U_pair",
-                    shape=shape,
-                    initializer="zeros",
-                    trainable=True,
-                )
-            elif self.descriptor_mixing_arch == "l_aware":
-                # Per-(pair, l) residual blocks. Within a pair, only
-                # radial channels at the same l mix; cross-l mixing is
-                # forbidden by construction. α_eff_per_pair from the
-                # descriptor layout gives the radial dimension; L =
-                # l_max + 1.
-                self._mix_alpha_per_pair = [
-                    int(self._mix_layout["alpha_eff_per_pair"][k])
-                    for k in self._mix_pair_keys]
-                self._mix_max_alpha = int(self._mix_layout["max_alpha_eff"])
-                self._mix_L = int(cfg.l_max) + 1
-                # Per-(pair, l) placement matrices P_{p,l} ∈ R^{α_p × Q}.
-                mix_P_ln: list[list[tf.Tensor]] = []
-                for k in self._mix_pair_keys:
-                    per_pair: list[tf.Tensor] = []
-                    for l in range(self._mix_L):
-                        qidx = self._mix_layout["pair_ln_index"][k][l]
-                        a = qidx.size
-                        P = np.zeros((a, self._mix_Q), dtype=np.float32)
-                        P[np.arange(a), qidx] = 1.0
-                        per_pair.append(tf.constant(P))
-                    mix_P_ln.append(per_pair)
-                self._mix_P_ln = mix_P_ln
-                # Stacked projector for the batched _U_full einsum fast
-                # path: one tensor [num_pairs * L, α, Q] when α is uniform
-                # across pairs (the common case). Replaces num_pairs × L
-                # individual einsum launches with a single batched einsum.
-                # See _U_full for the contraction.
-                if len(set(self._mix_alpha_per_pair)) == 1:
-                    alpha = self._mix_alpha_per_pair[0]
-                    PL = self._mix_num_pairs * self._mix_L
-                    P_stack = np.zeros((PL, alpha, self._mix_Q),
-                                       dtype=np.float32)
-                    for p_idx, k in enumerate(self._mix_pair_keys):
-                        for l in range(self._mix_L):
-                            qidx = self._mix_layout["pair_ln_index"][k][l]
-                            row = p_idx * self._mix_L + l
-                            P_stack[row, np.arange(alpha), qidx] = 1.0
-                    self._mix_P_ln_stack = tf.constant(P_stack)
-                    self._mix_P_ln_uniform_alpha = alpha
-                else:
-                    self._mix_P_ln_stack = None
-                    self._mix_P_ln_uniform_alpha = None
-                # V_pair_l shape:
-                #   shared    : [num_pairs, L, max_α, max_α]
-                #   per-type  : [T, num_pairs, L, max_α, max_α]
-                # Padded to max_α so the storage has uniform stride;
-                # padded rows/cols stay zero and never affect the math.
-                if self.descriptor_mixing_per_type:
-                    shape = (T, self._mix_num_pairs, self._mix_L,
-                             self._mix_max_alpha, self._mix_max_alpha)
-                else:
-                    shape = (self._mix_num_pairs, self._mix_L,
-                             self._mix_max_alpha, self._mix_max_alpha)
-                self.U_pair = self.add_weight(
-                    name="U_pair",  # name kept for save/load compatibility
-                    shape=shape,
-                    initializer="zeros",
-                    trainable=True,
-                )
-            else:  # cross_pair_l
-                # One [N_l × N_l] residual matrix per angular momentum,
-                # where N_l = Σ_p α_eff_p. Mixes radial channels at the
-                # same l across all species pairs; cross-l mixing is
-                # forbidden by construction. Strictly more expressive
-                # than l_aware (l_aware ⊂ cross_pair_l: block-diagonal
-                # cross_pair_l recovers l_aware).
-                self._mix_L = int(cfg.l_max) + 1
-                self._mix_N_per_l = int(self._mix_layout["N_per_l"])
-                # Per-l placement matrices P_l ∈ R^{N_l × Q}.
-                mix_P_l: list[tf.Tensor] = []
-                for l in range(self._mix_L):
-                    qidx = self._mix_layout["l_index"][l]   # [N_l]
-                    P = np.zeros((self._mix_N_per_l, self._mix_Q),
-                                 dtype=np.float32)
-                    P[np.arange(self._mix_N_per_l), qidx] = 1.0
-                    mix_P_l.append(tf.constant(P))
-                self._mix_P_l = mix_P_l
-                # Stacked projector [L, N_l, Q] — N_l is uniform across
-                # l by descriptor_block_layout's invariant, so the stack
-                # is always available for the batched _U_full fast path.
-                P_stack = np.stack([P.numpy() for P in mix_P_l], axis=0)
-                self._mix_P_l_stack = tf.constant(P_stack)
-                # V shape:
-                #   shared    : [L, N_l, N_l]
-                #   per-type  : [T, L, N_l, N_l]
-                # No padding needed — N_l is uniform across l.
-                if self.descriptor_mixing_per_type:
-                    shape = (T, self._mix_L,
-                             self._mix_N_per_l, self._mix_N_per_l)
-                else:
-                    shape = (self._mix_L,
-                             self._mix_N_per_l, self._mix_N_per_l)
-                self.U_pair = self.add_weight(
-                    name="U_pair",
-                    shape=shape,
-                    initializer="zeros",
-                    trainable=True,
-                )
-        else:
-            self.U_pair = None
-            self._mix_P = []
-            self._mix_block_sizes = []
+        self.sparse_q = self.add_weight(
+            name="sparse_q", shape=(M, Q),
+            initializer="zeros", trainable=False)
+        self.sparse_q_norm = self.add_weight(
+            name="sparse_q_norm", shape=(M,),
+            initializer="ones", trainable=False)
+        self.sparse_species = self.add_weight(
+            name="sparse_species", shape=(M,),
+            initializer="zeros", trainable=False, dtype=tf.int32)
+        self.alpha = self.add_weight(
+            name="alpha", shape=(M,),
+            initializer="zeros", trainable=False)
+        self.delta_per_species = self.add_weight(
+            name="delta_per_species", shape=(T,),
+            initializer="ones", trainable=False)
 
+        # Dummy NN-weight zeros, kept only because `spectroscopy.py`
+        # passes `model.W0` / `model.b0` / `model.W1` / `model.b1`
+        # through to `predict_batch` (which ignores them under GAP).
+        self.W0 = self.add_weight(
+            name="W0_compat", shape=(T, Q, 1),
+            initializer="zeros", trainable=False)
+        self.b0 = self.add_weight(
+            name="b0_compat", shape=(T, 1),
+            initializer="zeros", trainable=False)
+        self.W1 = self.add_weight(
+            name="W1_compat", shape=(T, 1),
+            initializer="zeros", trainable=False)
+        self.b1 = self.add_weight(
+            name="b1_compat", shape=(),
+            initializer="zeros", trainable=False)
+        self.W0_pol = None
+        self.b0_pol = None
+        self.W1_pol = None
+        self.b1_pol = None
+
+        # Descriptor-mixing compat stubs — spectroscopy.py guards
+        # `model._W0_eff(...)` calls with `model.descriptor_mixing`.
+        self.descriptor_mixing = False
+        self.U_pair = None
+
+        # ───────────────────────────── Optimizer shim
+        # Phase-1 SNES is a thin closed-form GAP fitter — see SNES.py.
+        # Constructed last so the shim can read the GAP weights above.
         self.optimizer = SNES(self)
 
-    # ---- descriptor mixing helpers ----------------------------------------
+    # ───────────────────────────────────── Compat helpers (no-ops)
 
-    def _U_full(self, U_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Assemble the full block-diagonal mixing matrix.
+    def _W0_eff(self, W0: tf.Tensor,
+                U_pair: tf.Tensor | None = None) -> tf.Tensor:
+        """Identity no-op. Retained for backwards-compat with callers
+        (`score()`, `spectroscopy._get_fused_predict`) that still
+        invoke `_W0_eff(model.W0)`. The GAP forward never uses W0; this
+        just keeps the call sites alive without modification."""
+        return W0
 
-        Dispatches on `descriptor_mixing_arch`:
-          - "linear" : one [bs_p × bs_p] block per pair, mixing all
-                       (n, l) channels of that pair.
-                  U_full = I_Q + Σ_p P_pᵀ · V_p · P_p
-          - "l_aware": (l_max+1) [α_p × α_p] sub-blocks per pair, one
-                       per angular momentum. Cross-l mixing forbidden.
-                  U_full = I_Q + Σ_p Σ_l P_{p,l}ᵀ · V_{p,l} · P_{p,l}
+    # ───────────────────────────────────── Kernel forward primitives
 
-        In both cases `tf.eye(Q)` broadcasts across leading batch dims
-        so the same code handles single / per-candidate × shared /
-        per-type. With V initialised at zero, U_full == I_Q at gen 0.
-        """
-        V = self.U_pair if U_pair is None else U_pair
-        if self.descriptor_mixing_arch == "linear":
-            # Fast path: uniform bs across pairs. One batched einsum over
-            # P:[num_pairs, bs, Q], V:[..., num_pairs, bs, bs].
-            if self._mix_P_stack is not None:
-                bs = self._mix_P_uniform_bs
-                # Slice V to the active bs×bs (padding stays zero anyway,
-                # but the explicit slice avoids touching it).
-                V_active = V[..., :bs, :bs]
-                # Output q-axes labelled i, m. Contraction axes:
-                # p=pair, j=bs (first projector), k=bs (second projector).
-                V_full = tf.einsum(
-                    'pji,...pjk,pkm->...im',
-                    self._mix_P_stack, V_active, self._mix_P_stack)
-                return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-            # Fallback: non-uniform bs.
-            parts = []
-            for p_idx, (P, bs) in enumerate(zip(self._mix_P, self._mix_block_sizes)):
-                V_block = V[..., p_idx, :bs, :bs]                            # [..., bs, bs]
-                placed = tf.einsum('ji,...jk,kl->...il', P, V_block, P)      # [..., Q, Q]
-                parts.append(placed)
-            V_full = tf.add_n(parts)
-            return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-        if self.descriptor_mixing_arch == "l_aware":
-            # V shape: [..., (T?), num_pairs, L, max_α, max_α].
-            # Fast path: uniform α across pairs. Flatten (num_pairs, L)
-            # → PL and run one batched einsum over the stacked projector
-            # P:[PL, α, Q], V:[..., PL, α, α].
-            if self._mix_P_ln_stack is not None:
-                alpha = self._mix_P_ln_uniform_alpha
-                PL = self._mix_num_pairs * self._mix_L
-                # Slice off the (max_α − α) padding rows/cols.
-                V_active = V[..., :alpha, :alpha]
-                # Reshape (num_pairs, L) → PL. Preserve leading batch
-                # dims (which may include candidate axis C and/or type
-                # axis T) via dynamic-shape concat.
-                new_shape = tf.concat(
-                    [tf.shape(V_active)[:-4], [PL, alpha, alpha]], axis=0)
-                V_flat = tf.reshape(V_active, new_shape)
-                # Output q-axes labelled i, m. Contraction:
-                # p=PL (pair, l), j=α (first proj), k=α (second proj).
-                V_full = tf.einsum(
-                    'pji,...pjk,pkm->...im',
-                    self._mix_P_ln_stack, V_flat, self._mix_P_ln_stack)
-                return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-            # Fallback: non-uniform α.
-            parts = []
-            for p_idx, alpha_p in enumerate(self._mix_alpha_per_pair):
-                for l in range(self._mix_L):
-                    V_block = V[..., p_idx, l, :alpha_p, :alpha_p]            # [..., α_p, α_p]
-                    P_pl = self._mix_P_ln[p_idx][l]                            # [α_p, Q]
-                    placed = tf.einsum('ji,...jk,kl->...il', P_pl, V_block, P_pl)
-                    parts.append(placed)
-            V_full = tf.add_n(parts)
-            return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-        # cross_pair_l: V shape is [..., (T?), L, N_l, N_l]. N_l is
-        # uniform across l, so the stacked projector is always available
-        # — one batched einsum, no Python loop.
-        # Contraction: a=L, j=N_l (first proj), k=N_l (second proj);
-        # output q-axes labelled i, m.
-        V_full = tf.einsum(
-            'aji,...ajk,akm->...im',
-            self._mix_P_l_stack, V, self._mix_P_l_stack)
-        return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
+    def _kernel_grad_de_dq(self,
+                            descriptors: tf.Tensor,
+                            Z_int: tf.Tensor,
+                            atom_mask: tf.Tensor) -> tf.Tensor:
+        """Compute ∂U_i/∂q_i for the gradient pathway.
 
-    def _W0_eff(self, W0: tf.Tensor, U_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Pre-multiply W0 by U_full^T along the Q axis. Equivalent
-        to mixing the descriptor (desc' = U_full · desc) but absorbs
-        the mixing into the weights so the rest of the forward / the
-        backprop / the dipole sum use raw descriptors and raw
-        grad_values unchanged.
+        Returns `[B, A, Q]`.
 
-        Shapes (shared U_pair):
-            U_pair [num_pairs, bs, bs]       + W0 [T, Q, H]
-                                             → W0_eff [T, Q, H]
-            U_pair [C, num_pairs, bs, bs]    + W0 [C, T, Q, H]
-                                             → W0_eff [C, T, Q, H]
-        Shapes (per-central-type U_pair):
-            U_pair [T, num_pairs, bs, bs]    + W0 [T, Q, H]
-                                             → W0_eff [T, Q, H]
-            U_pair [C, T, num_pairs, bs, bs] + W0 [C, T, Q, H]
-                                             → W0_eff [C, T, Q, H]
+        For polynomial dot-product kernel
+            K(q_i, q_s) = δ_t² · (q̂_i · q̂_s)^ζ      q̂ = q / ||q||
+        the gradient w.r.t. q_i is
+            ∂K/∂q_i = (δ_t² · ζ / ||q_i||) · (q̂_i · q̂_s)^(ζ-1) ·
+                       (q̂_s − (q̂_i · q̂_s) · q̂_i)
+        Contracting with α_s and summing over s (species-masked) gives
+            ∂U_i/∂q_i = (1/||q_i||) · ( Σ_s a_s · q̂_s
+                                       − (Σ_s a_s · cos_is) · q̂_i )
+        where a_s = α_s · δ_t(s)² · ζ · cos_is^(ζ-1) · mask(i, s).
 
-        With the residual V parameterisation (V init = 0 ⇒ U_full = I),
-        W0_eff == W0 exactly at generation 0.
-        """
-        if not self.descriptor_mixing:
-            return W0
-        U_full = self._U_full(U_pair)
-        if self.descriptor_mixing_per_type:
-            # U_full has a leading T axis that matches W0's T axis;
-            # contract Q while keeping T tied 1:1.
-            #   '...tqp,...tqh->...tph'
-            return tf.einsum('...tqp,...tqh->...tph', U_full, W0)
-        # Shared U_full broadcasts across W0's T axis.
-        #   '...qp,...tqh->...tph'
-        return tf.einsum('...qp,...tqh->...tph', U_full, W0)
-
-    def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,
-                positions: tf.Tensor, Z: tf.Tensor, box: tf.Tensor,
-                atom_mask: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:
-        """Run the forward pass for a single structure using padded tensors.
+        Streaming form avoids materialising any `[B, A, M, Q]` tensor.
 
         Args:
-            descriptors    : [A, dim_q]     padded per-atom SOAP descriptors
-            gradients      : [A, M, 3, dim_q]  padded descriptor gradients
-            grad_index     : [A, M]         padded neighbor indices
-            positions      : [A, 3]         padded atom positions
-            Z              : [A]            padded integer type indices
-            box            : [3, 3]         lattice vectors
-            atom_mask      : [A]            1.0 for real atoms, 0.0 for padding
-            neighbor_mask  : [A, M]         1.0 for real neighbors, 0.0 for padding
+            descriptors : [B, A, Q]
+            Z_int       : [B, A]    int32 type indices
+            atom_mask   : [B, A]    1.0 for real atoms, 0.0 for padding
 
         Returns:
-            target_mode 0: [1]  total energy
-            target_mode 1: [3]  dipole vector
-            target_mode 2: [6]  polarizability tensor
+            de_dq : [B, A, Q]
         """
-        # Absorb U_pair^T into W0 (and W0_pol below) once per call so
-        # both the forward and calc_forces use the U-folded weights.
-        # When descriptor_mixing is disabled, _W0_eff is a no-op.
-        W0_eff = self._W0_eff(self.W0)
+        cfg = self.cfg
+        zeta = int(getattr(cfg, "gap_zeta", 4))
+        eps = 1e-12
 
-        # Gather per-type weights for each atom
-        W0_t = tf.gather(W0_eff, Z)    # [A, dim_q, H]
-        b0_t = tf.gather(self.b0, Z)   # [A, H]
-        W1_t = tf.gather(self.W1, Z)   # [A, H]
+        # ────── normalise q_i
+        q = descriptors                                      # [B, A, Q]
+        q_norm = tf.linalg.norm(q, axis=-1)                  # [B, A]
+        q_norm_safe = tf.maximum(q_norm, eps)                # [B, A]
+        q_hat = q / q_norm_safe[..., tf.newaxis]             # [B, A, Q]
 
-        # Hidden layer: h_i = activation(q_i @ W0[t_i] + b0[t_i])
-        h = tf.einsum('nd,ndh->nh', descriptors, W0_t)  # [A, H]
-        h = h + b0_t                                      # [A, H]
-        h = self.activation(h)                             # [A, H]
-        # Mask out padded atoms
-        h = h * atom_mask[:, tf.newaxis]                   # [A, H]
+        # ────── kernel cos_is = q̂_i · q̂_s (sparse_q is pre-normalised
+        # at fit-time, so we use it directly)
+        sparse_q = self.sparse_q                             # [M, Q]
+        cos_is = tf.einsum('baq,mq->bam', q_hat, sparse_q)   # [B, A, M]
 
-        # Target-centering inverse: add the training-set mean back so
-        # `predict` returns predictions in original (un-centered) units.
-        # The shift depends only on the data-pipeline convention:
-        #   - target_mode==1 AND scale_targets : mean is per-atom space,
-        #                                        shift by mean * num_atoms
-        #   - otherwise (mode 0 energy, mode 2 polarisability, or
-        #     mode 1 without scale_targets)   : mean is total space,
-        #                                        shift by mean
-        # This matches assemble_data_dict's gating (data.py:375), which
-        # only divides by num_atoms when target_mode==1 AND scale_targets.
-        _do_uncenter = (bool(getattr(self.cfg, "target_centering", False))
-                        and getattr(self.cfg, "_target_mean", None) is not None)
-        if _do_uncenter:
-            _mean_arr = np.asarray(self.cfg._target_mean, dtype=np.float32)
-            _shift_per_atom = (self.cfg.target_mode == 1
-                               and bool(getattr(self.cfg, "scale_targets", False)))
+        # ────── species mask
+        Z_b = Z_int[..., tf.newaxis]                         # [B, A, 1]
+        sp = self.sparse_species[tf.newaxis, tf.newaxis, :]  # [1, 1, M]
+        species_mask = tf.cast(tf.equal(Z_b, sp), tf.float32)  # [B, A, M]
+        cos_is = cos_is * species_mask
 
-        if self.cfg.target_mode == 0:
-            # PES: E = -sum_i (h_i . W1[t_i] + b1)
-            E_per_atom = tf.reduce_sum(h * W1_t, axis=1) + self.b1  # [A]
-            E_per_atom = E_per_atom * atom_mask                       # zero padding
-            E = tf.reduce_sum(E_per_atom)
-            out = tf.expand_dims(-E, axis=0)  # [1]
-            if _do_uncenter:
-                # Energy is always total-space (data pipeline never
-                # divides E targets by num_atoms), so shift by `mean`.
-                out = out + tf.constant(_mean_arr)
-            return out
+        # ────── δ_t(s)² per sparse point [M] (broadcast from [T]).
+        # `sparse_species` may contain -1 for padded slots (mask kills
+        # them downstream); tf.gather with -1 would either wrap or
+        # error. Clamp to [0, T-1] for the gather only — masked rows
+        # are zeroed by the species_mask above.
+        delta_sq_M = tf.square(
+            tf.gather(self.delta_per_species,
+                      tf.maximum(self.sparse_species, 0)))  # [M]
 
-        # Modes 1 and 2 need forces
-        forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask)  # [A, M, 3]
+        # ────── a_s = α_s · δ_t(s)² · ζ · cos^(ζ-1) · species_mask
+        # cos^(ζ-1) is safe at cos=0 because we use floats and ζ≥1.
+        cos_pow = tf.pow(cos_is, zeta - 1)                   # [B, A, M]
+        # Mask AGAIN (pow can be ill-defined at cos=0 for ζ=1; the
+        # explicit re-mask zeroes any leak):
+        cos_pow = cos_pow * species_mask
+        a_s_coeff = self.alpha * delta_sq_M * float(zeta)    # [M]
+        a_s = cos_pow * a_s_coeff[tf.newaxis, tf.newaxis, :]  # [B, A, M]
 
-        if self.cfg.target_mode == 1:
-            # Dipole: μ = -sum_i sum_j |r_ij|^2 * force_ij
-            _, rij = self._neighbor_displacements_single(positions, box, grad_index)
+        # ────── ∂U/∂q via two contractions over M:
+        #   term1[..., q] = Σ_s a_s · q̂_s[q]   = a_s @ sparse_q
+        #   term2[...]    = Σ_s a_s · cos_is   (scalar per atom)
+        term1 = tf.einsum('bam,mq->baq', a_s, sparse_q)      # [B, A, Q]
+        term2 = tf.einsum('bam,bam->ba', a_s, cos_is)        # [B, A]
 
-            rij2 = tf.square(rij) * neighbor_mask                       # [A, M]
-            dipole_contribs = rij2[:, :, tf.newaxis] * forces            # [A, M, 3]
-            dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])       # [3]
-            if _do_uncenter:
-                if _shift_per_atom:
-                    num_atoms = tf.reduce_sum(atom_mask)
-                    dipole = dipole + tf.constant(_mean_arr) * num_atoms
-                else:
-                    dipole = dipole + tf.constant(_mean_arr)
-            return dipole
+        # ∂U_i/∂q_i = (1/||q_i||) · ( term1 − term2 · q̂_i )
+        de_dq = (term1 - term2[..., tf.newaxis] * q_hat) / q_norm_safe[..., tf.newaxis]
 
-        elif self.cfg.target_mode == 2:
-            # Polarizability via dual ANN (GPUMD approach)
-            dr_gathered, _ = self._neighbor_displacements_single(positions, box, grad_index)
+        # Zero padded atoms.
+        de_dq = de_dq * atom_mask[..., tf.newaxis]
+        return de_dq
 
-            # --- Scalar ANN (isotropic) ---
-            W0_pol_eff = self._W0_eff(self.W0_pol)
-            W0p_t = tf.gather(W0_pol_eff, Z)   # [A, dim_q, H]
-            b0p_t = tf.gather(self.b0_pol, Z)  # [A, H]
-            W1p_t = tf.gather(self.W1_pol, Z)  # [A, H]
+    def _kernel_grad_per_sparse_block(self,
+                                       descriptors: tf.Tensor,
+                                       Z_int: tf.Tensor,
+                                       atom_mask: tf.Tensor,
+                                       s_lo: int, s_hi: int) -> tf.Tensor:
+        """Per-sparse-point kernel-grad contributions for use in Φ build.
 
-            h_pol = tf.einsum('nd,ndh->nh', descriptors, W0p_t)  # [A, H]
-            h_pol = h_pol + b0p_t
-            h_pol = self.activation(h_pol)
-            h_pol = h_pol * atom_mask[:, tf.newaxis]
-            F_pol = tf.reduce_sum(h_pol * W1p_t, axis=1) + self.b1_pol  # [A]
-            F_pol = F_pol * atom_mask
-            scalar_sum = tf.reduce_sum(F_pol)
+        For each atom i and each sparse point s in [s_lo, s_hi), returns
+        the **un-contracted** kernel-gradient column:
 
-            # --- Tensor ANN (anisotropic virial) ---
-            pol_outer = -tf.einsum('nma,nmb->nmab', dr_gathered, forces)  # [A, M, 3, 3]
-            pol_outer = pol_outer * neighbor_mask[:, :, tf.newaxis, tf.newaxis]
-            pol_matrix = tf.reduce_sum(pol_outer, axis=[0, 1])  # [3, 3]
+            de_dq_per_s[k, i, s, q] = (1/||q_i||) · g_is ·
+                                       (q̂_s[q] − cos_is · q̂_i[q])
+            g_is = δ_t(s)² · ζ · cos_is^(ζ-1) · species_mask(i, s)
 
-            # Extract 6 unique components: [xx, yy, zz, xy, yz, zx]
-            pol = tf.stack([
-                pol_matrix[0, 0],
-                pol_matrix[1, 1],
-                pol_matrix[2, 2],
-                pol_matrix[0, 1],
-                pol_matrix[1, 2],
-                pol_matrix[2, 0],
-            ])
-
-            # Add scalar ANN to diagonal
-            pol = pol + tf.stack([scalar_sum, scalar_sum, scalar_sum,
-                                  0.0, 0.0, 0.0])
-            if _do_uncenter:
-                # Polarisability targets are total-space (no scale_targets
-                # path for mode=2), so the mean is total-space too.
-                pol = pol + tf.constant(_mean_arr)
-            return pol
-
-    def calc_forces(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
-                    W0_t: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:
-        """Compute dU_i/dR_j for every atom i and its neighbours j via chain rule.
-
-        Vectorized version — no Python loops. Uses padded gradient tensors.
+        That is: the contribution to ∂U_i/∂q_i if α_s were a one-hot at
+        each s in the block. Used by SNES._build_phi to construct the
+        design tensor in O(M / M_sub) blocks rather than O(M) full
+        forward passes.
 
         Args:
-            h              : [N, H]              hidden activations tanh(a)
-            gradients      : [N, M, 3, dim_q]   padded descriptor gradients
-            W1_t           : [N, H]              per-atom output weights
-            W0_t           : [N, dim_q, H]       per-atom input weights
-            neighbor_mask  : [N, M]              1.0 for real neighbors, 0.0 for padding
+            descriptors : [B, A, Q]
+            Z_int       : [B, A]
+            atom_mask   : [B, A]
+            s_lo, s_hi  : sparse-point index range [s_lo, s_hi)
 
         Returns:
-            forces : [N, M, 3]  dU_i/dR_j per atom per neighbor
+            [B, A, s_hi - s_lo, Q]   float32 (padded atoms zeroed)
         """
-        # dU/dh * dh/da = W1 * (1 - tanh^2(a))
-        dtanh = 1.0 - tf.square(h)                               # [N, H]
-        de_da = dtanh * W1_t                                      # [N, H]
-        # dU/dq = dU/da @ W0^T  ->  [N, dim_q]
-        de_dq = tf.einsum('nh,nqh->nq', de_da, W0_t)             # [N, dim_q]
-        # Contract dU/dq with dq/dR_j: sum over dim_q
-        forces = tf.einsum('nq,nmcq->nmc', de_dq, gradients)     # [N, M, 3]
-        # Zero out padded neighbors
-        forces = forces * neighbor_mask[:, :, tf.newaxis]
-        return forces
+        cfg = self.cfg
+        zeta = int(getattr(cfg, "gap_zeta", 4))
+        eps = 1e-12
 
-    def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor],
-            plot_callback: Callable | None = None,
-            resume_state: dict | None = None) -> dict:
-        """Train the model using the SNES evolutionary optimizer.
+        q = descriptors
+        q_norm = tf.linalg.norm(q, axis=-1)
+        q_norm_safe = tf.maximum(q_norm, eps)
+        q_hat = q / q_norm_safe[..., tf.newaxis]                # [B, A, Q]
+
+        sparse_q_block = self.sparse_q[s_lo:s_hi]               # [bs, Q]
+        cos_is = tf.einsum('baq,sq->bas', q_hat, sparse_q_block)  # [B, A, bs]
+        Z_b = Z_int[..., tf.newaxis]
+        sp = self.sparse_species[s_lo:s_hi][tf.newaxis, tf.newaxis, :]
+        species_mask = tf.cast(tf.equal(Z_b, sp), tf.float32)   # [B, A, bs]
+        cos_is = cos_is * species_mask
+
+        delta_sq_block = tf.square(
+            tf.gather(self.delta_per_species,
+                      tf.maximum(self.sparse_species[s_lo:s_hi], 0)))  # [bs]
+        cos_pow = tf.pow(cos_is, zeta - 1) * species_mask        # [B, A, bs]
+        g = cos_pow * (delta_sq_block * float(zeta))[tf.newaxis, tf.newaxis, :]
+        # g[B, A, bs]
+
+        # de_dq[..., q] = (1/||q_i||) · g · (q̂_s[q] − cos · q̂_i[q])
+        # First term:  g[B, A, bs] · q̂_s[bs, Q] → [B, A, bs, Q]
+        term1 = g[..., tf.newaxis] * sparse_q_block[tf.newaxis, tf.newaxis, :, :]
+        # Second term: g · cos[B, A, bs] · q̂_i[B, A, Q] → [B, A, bs, Q]
+        term2 = (g * cos_is)[..., tf.newaxis] * q_hat[..., tf.newaxis, :]
+        de_dq_per_s = (term1 - term2) / q_norm_safe[..., tf.newaxis, tf.newaxis]
+        # Zero padded atoms.
+        de_dq_per_s = de_dq_per_s * atom_mask[..., tf.newaxis, tf.newaxis]
+        return de_dq_per_s
+
+    def _kernel_U(self,
+                   descriptors: tf.Tensor,
+                   Z_int: tf.Tensor,
+                   atom_mask: tf.Tensor) -> tf.Tensor:
+        """Compute per-atom U_i = Σ_s α_s K(q_i, q_s) for energy mode.
 
         Args:
-            train_data    : dict with keys descriptors, gradients, grad_index,
-                            positions, Z_int, targets, boxes (lists over structures)
-            val_data      : same structure, used for validation each generation
-            plot_callback : optional callable(history, gen) for periodic plotting
-            resume_state  : optional dict from `model_io.load_checkpoint`,
-                            carries SNES distribution + best-val + history +
-                            RNG state. When provided, training continues from
-                            `resume_state['last_gen'] + 1`.
-
+            descriptors : [B, A, Q]
+            Z_int       : [B, A]
+            atom_mask   : [B, A]
         Returns:
-            history         : dict with keys generation, train_loss, val_loss (lists)
-            final_model     : TNEP model with weights from the last generation
-            best_val_model  : TNEP model with weights from the best validation generation
+            U : [B, A]   per-atom scalar; padded atoms zero.
         """
-        history, final_model, best_val_model = self.optimizer.fit(
-            train_data, val_data, plot_callback=plot_callback,
-            resume_state=resume_state)
-        return history, final_model, best_val_model
+        cfg = self.cfg
+        zeta = int(getattr(cfg, "gap_zeta", 4))
+        eps = 1e-12
+        q = descriptors
+        q_norm = tf.maximum(tf.linalg.norm(q, axis=-1), eps)
+        q_hat = q / q_norm[..., tf.newaxis]
+        cos_is = tf.einsum('baq,mq->bam', q_hat, self.sparse_q)
+        Z_b = Z_int[..., tf.newaxis]
+        sp = self.sparse_species[tf.newaxis, tf.newaxis, :]
+        species_mask = tf.cast(tf.equal(Z_b, sp), tf.float32)
+        cos_is = cos_is * species_mask
+        delta_sq_M = tf.square(
+            tf.gather(self.delta_per_species,
+                      tf.maximum(self.sparse_species, 0)))
+        K = (cos_is ** zeta) * delta_sq_M[tf.newaxis, tf.newaxis, :]
+        # U_i = Σ_s α_s · K_is
+        U = tf.einsum('bam,m->ba', K, self.alpha)
+        return U * atom_mask
 
-    def score(self, test_data: dict[str, tf.Tensor]) -> tuple[dict[str, tf.Tensor], tf.Tensor]:
+    # ───────────────────────────────────── Public forward (batched)
+
+    # ───────────────────────────────────── fit shim (delegates to optimizer)
+
+    def fit(self, train_data: dict, val_data: dict) -> tuple:
+        """Run training via the optimizer shim.
+
+        Returns `(history, final_model, best_val_model)`. For the
+        closed-form GAP solve, `final_model` and `best_val_model` are
+        the same object (no iteration distinguishes them).
+        """
+        return self.optimizer.fit(train_data, val_data)
+
+    # ───────────────────────────────────── score / score_summary (unchanged)
+
+    def score(self, test_data: dict[str, tf.Tensor]) -> tuple[dict, tf.Tensor]:
         """Evaluate RMSE, R², per-component R², and cosine similarity.
 
-        Args:
-            test_data : dict with COO tensors from pad_and_stack()
-
-        Returns:
-            metrics : dict with keys:
-                rmse          : scalar float — overall RMSE
-                r2            : scalar float — overall R²
-                r2_components : [T] tensor — per-component R²
-                cos_sim_mean  : scalar float — mean cosine similarity (modes 1,2 only)
-                cos_sim_all   : [S] tensor — per-structure cosine similarity (modes 1,2)
-            preds : [S, T] tensor of predictions
+        Streams predictions chunk-by-chunk to bound memory. The chunk
+        loop calls `model.predict_batch(...)` — the body of which now
+        runs the GAP kernel forward but signature is unchanged.
         """
-        # Streaming chunked scoring. Bounds peak memory to one chunk's
-        # gradient slice — and is the only sensible mode when grad_values
-        # is disk-backed. With cfg.chunk_prefetch the disk-pipe of chunk N+1
-        # overlaps the model forward of chunk N.
         from data import prefetched_chunks
         S_test = test_data["num_atoms"].shape[0]
-        chunk_sz = (self.cfg.batch_chunk_size
-                    if self.cfg.batch_chunk_size is not None else S_test)
-        # Pre-fold U_pair^T into W0 (and W0_pol) once per score call
-        # so every chunk forward uses the same already-absorbed
-        # weights. No-op when descriptor mixing is disabled.
+        # Score chunk size: if the user hasn't set batch_chunk_size, cap
+        # automatically so we don't try to stage the full grad_values
+        # `[P, 3, Q]` cache onto the GPU at once. Even modest l_max/Q
+        # combos (Q≳200) at S≳500 push this past 5 GB.
+        if self.cfg.batch_chunk_size is not None:
+            chunk_sz = self.cfg.batch_chunk_size
+        else:
+            # Estimate per-struct grad_values bytes: avg_pairs_per_struct
+            # × 3 × Q × dtype_size. Aim for ≤1 GB transient per chunk.
+            grad = test_data.get("grad_values", None)
+            if grad is not None and getattr(grad, "shape", None) is not None \
+                    and grad.shape[0] is not None and grad.shape[0] > 0:
+                P_total = int(grad.shape[0])
+                Q = int(grad.shape[-1]) if grad.shape[-1] is not None else 1
+                dtype_size = 4  # fp32 (or int32) — both 4 bytes
+                bytes_per_struct = max(
+                    1, (P_total // max(1, S_test)) * 3 * Q * dtype_size)
+                target_bytes = 1 << 30  # 1 GiB
+                chunk_sz = max(1, min(S_test, target_bytes // bytes_per_struct))
+            else:
+                chunk_sz = S_test
+        # _W0_eff is a no-op identity stub under GAP, so passing
+        # `self.W0` (zero tensor) through it is harmless — the new
+        # `predict_batch` ignores W0/b0/W1/b1 anyway.
         W0_eff = self._W0_eff(self.W0)
-        W0_pol_eff = (self._W0_eff(self.W0_pol)
-                      if (self.cfg.target_mode == 2
-                          and getattr(self, "W0_pol", None) is not None)
-                      else getattr(self, "W0_pol", None))
+        W0_pol_eff = None  # Phase 1: mode-2 raised in __init__
         ranges = [(s, min(s + chunk_sz, S_test)) for s in range(0, S_test, chunk_sz)]
         pred_parts: list = []
+        # Per-chunk progress bar. Each unit = one struct-chunk forward
+        # pass through predict_batch. Matches Φ-build bar styling.
+        pbar = tqdm(total=len(ranges), desc="  score", unit="chunk",
+                    leave=False, mininterval=0.1,
+                    file=sys.stdout, dynamic_ncols=True)
         for _, _, chunk in prefetched_chunks(
                 test_data, ranges,
                 pin_to_cpu=self.cfg.pin_data_to_cpu,
@@ -639,24 +383,21 @@ class TNEP(layers.Layer):
                 getattr(self, 'b1_pol', None),
             ))
             del chunk
+            pbar.update(1)
+        pbar.close()
         raw_preds = tf.concat(pred_parts, axis=0)
         del pred_parts
         targets = test_data["targets"]
 
-        # Normalize predictions to per-atom space when target scaling is active
         if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
-            num_atoms = tf.cast(test_data["num_atoms"], tf.float32)  # [S]
-            num_atoms_col = tf.maximum(num_atoms, 1.0)[:, tf.newaxis]  # [S, 1]
+            num_atoms = tf.cast(test_data["num_atoms"], tf.float32)
+            num_atoms_col = tf.maximum(num_atoms, 1.0)[:, tf.newaxis]
             preds = raw_preds / num_atoms_col
         else:
             preds = raw_preds
 
-        # Target centering inverse: add the frozen training-set mean
-        # back to BOTH preds and targets so all downstream metrics and
-        # the returned `preds` are in original (un-centered) units. RMSE
-        # and R² are invariant under this shift (both terms get the same
-        # offset), but cos_sim and the absolute prediction values are
-        # not — they MUST be restored to original units to be meaningful.
+        # Target-centering inverse (identical to NN version).
+        mean_tf = None
         if (bool(getattr(self.cfg, "target_centering", False))
                 and getattr(self.cfg, "_target_mean", None) is not None):
             mean_tf = tf.constant(
@@ -669,15 +410,13 @@ class TNEP(layers.Layer):
         mse = tf.reduce_mean(tf.square(diff))
         rmse = tf.sqrt(tf.maximum(mse, 0.0))
 
-        # Overall R² = 1 - SS_res / SS_tot
         ss_res = tf.reduce_sum(tf.square(diff))
         ss_tot = tf.reduce_sum(tf.square(targets - tf.reduce_mean(targets, axis=0)))
         r2 = 1.0 - ss_res / ss_tot
 
-        # Per-component R²
-        ss_res_comp = tf.reduce_sum(tf.square(diff), axis=0)       # [T]
+        ss_res_comp = tf.reduce_sum(tf.square(diff), axis=0)
         ss_tot_comp = tf.reduce_sum(
-            tf.square(targets - tf.reduce_mean(targets, axis=0)), axis=0)  # [T]
+            tf.square(targets - tf.reduce_mean(targets, axis=0)), axis=0)
         r2_components = 1.0 - ss_res_comp / tf.maximum(ss_tot_comp, 1e-12)
 
         metrics = {
@@ -686,17 +425,10 @@ class TNEP(layers.Layer):
             "r2_components": r2_components,
         }
 
-        # Total (un-scaled) metrics when target scaling is active. Both
-        # totals must be in ORIGINAL (un-centered) units: `targets` here
-        # is per-atom-original (mean added back above), so
-        # `targets * num_atoms` is the total-original. The raw network
-        # output `raw_preds` is in centered per-atom * num_atoms space —
-        # add back the corresponding offset (mean * num_atoms) per
-        # structure so total_diff compares two original-unit quantities.
+        # Total-space metrics when scale_targets is active.
         if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
             total_targets = targets * num_atoms_col
-            if (bool(getattr(self.cfg, "target_centering", False))
-                    and getattr(self.cfg, "_target_mean", None) is not None):
+            if mean_tf is not None:
                 total_preds = raw_preds + mean_tf * num_atoms_col
             else:
                 total_preds = raw_preds
@@ -714,48 +446,33 @@ class TNEP(layers.Layer):
             metrics["total_r2"] = total_r2
             metrics["total_r2_components"] = total_r2_comp
 
-        # Cosine similarity for vector targets (modes 1 and 2)
         if self.cfg.target_mode >= 1:
-            dot = tf.reduce_sum(preds * targets, axis=1)          # [S]
-            norm_p = tf.linalg.norm(preds, axis=1)                # [S]
-            norm_t = tf.linalg.norm(targets, axis=1)              # [S]
-            cos_sim = dot / tf.maximum(norm_p * norm_t, 1e-12)    # [S]
+            dot = tf.reduce_sum(preds * targets, axis=1)
+            norm_p = tf.linalg.norm(preds, axis=1)
+            norm_t = tf.linalg.norm(targets, axis=1)
+            cos_sim = dot / tf.maximum(norm_p * norm_t, 1e-12)
             metrics["cos_sim_mean"] = tf.reduce_mean(cos_sim)
             metrics["cos_sim_all"] = cos_sim
 
         return metrics, preds
 
     def score_summary(self, test_data: dict[str, tf.Tensor]) -> dict:
-        """Print and return a labelled comparison-ready scoring summary.
-
-        Reports metrics in BOTH per-atom space (matches GPUMD's `loss.out`
-        `rmse_virial` convention) AND total-dipole space (matches the
-        convention used in TNEP / NEP papers like Xu et al for headline
-        RMSE / R² values). Use this to compare against published numbers
-        without space-convention confusion.
-
-        Also derives an RRMSE = √(1 − R²) for each space, which is the
-        centered definition (variance-normalised). Note: this differs from
-        the un-centered SNES training RRMSE (`best_rrmse` in history),
-        which uses `Σy²` rather than `Σ(y − ȳ)²` in the denominator —
-        the two are nearly equal when target means are small but not
-        identical.
-        """
-        metrics, preds = self.score(test_data)
+        """Print labelled per-atom + total-space metrics (matches GPUMD
+        loss.out and NEP-paper conventions). Unchanged from the NN
+        version."""
+        metrics, _ = self.score(test_data)
         m = {k: (float(v.numpy()) if hasattr(v, "numpy") else float(v))
              for k, v in metrics.items()
-             if v is not None and getattr(v, "shape", ())  == ()}
-        # Per-atom (always populated):
+             if v is not None and getattr(v, "shape", ()) == ()}
         rrmse_pa = (1.0 - m["r2"]) ** 0.5
         print(f"  PER-ATOM space (matches GPUMD loss.out 'rmse_virial'):")
-        print(f"    RMSE  = {m['rmse']:.6f}  e·bohr / atom / component")
+        print(f"    RMSE  = {m['rmse']:.6f}")
         print(f"    R²    = {m['r2']:.6f}")
         print(f"    RRMSE = √(1−R²) = {rrmse_pa:.4%}")
-        # Total (only when scale_targets active):
         if "total_rmse" in m and "total_r2" in m:
             rrmse_tot = (1.0 - m["total_r2"]) ** 0.5
             print(f"  TOTAL-DIPOLE space (matches NEP paper headline RMSE / R²):")
-            print(f"    RMSE  = {m['total_rmse']:.6f}  e·bohr / structure / component")
+            print(f"    RMSE  = {m['total_rmse']:.6f}")
             print(f"    R²    = {m['total_r2']:.6f}")
             print(f"    RRMSE = √(1−R²) = {rrmse_tot:.4%}")
         if "cos_sim_mean" in m:
@@ -765,408 +482,105 @@ class TNEP(layers.Layer):
 
     @tf.function(reduce_retracing=True)
     def predict_batch(self, descriptors: tf.Tensor, grad_values: tf.Tensor,
-                      pair_atom: tf.Tensor, pair_gidx: tf.Tensor, pair_struct: tf.Tensor,
-                      positions: tf.Tensor, Z: tf.Tensor,
-                      boxes: tf.Tensor, atom_mask: tf.Tensor,
-                      W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor, b1: tf.Tensor,
-                      W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
-                      W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
-                      W_atom: tf.Tensor | None = None) -> tf.Tensor:
+                       pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
+                       pair_struct: tf.Tensor,
+                       positions: tf.Tensor, Z: tf.Tensor,
+                       boxes: tf.Tensor, atom_mask: tf.Tensor,
+                       W0: tf.Tensor, b0: tf.Tensor,
+                       W1: tf.Tensor, b1: tf.Tensor,
+                       W0_pol: tf.Tensor | None = None,
+                       b0_pol: tf.Tensor | None = None,
+                       W1_pol: tf.Tensor | None = None,
+                       b1_pol: tf.Tensor | None = None,
+                       W_atom: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
-        Weights are passed explicitly (not read from self) so this method can
-        be used for SNES population evaluation with different candidate weights.
-
-        Args:
-            descriptors : [B, A, Q]    padded descriptors
-            grad_values : [P, 3, Q]    COO gradient blocks (P = total pairs in batch)
-            pair_atom   : [P]          center atom index for each pair
-            pair_gidx   : [P]         neighbor atom index for each pair
-            pair_struct : [P]          batch-relative structure index for each pair
-            positions   : [B, A, 3]   padded positions
-            Z           : [B, A]      padded type indices
-            boxes       : [B, 3, 3]   lattice vectors
-            atom_mask   : [B, A]      atom mask (1.0 real, 0.0 padding)
-            W0          : [T, Q, H]   input weights
-            b0          : [T, H]      hidden bias
-            W1          : [T, H]      output weights
-            b1          : ()          scalar bias
-            W0_pol..b1_pol : same shapes, for mode 2 only (None otherwise)
+        Signature preserved from the NN version so all call sites
+        (`score`, `spectroscopy.predict_trajectory_batch`,
+        `_get_fused_predict`) continue to work without edits. The
+        positional NN-weight args (`W0..b1_pol, W_atom`) are
+        **deliberately unused** — GAP reads its state from `self.*`.
 
         Returns:
-            predictions : [B, T_dim]  where T_dim = 1 (PES), 3 (dipole), 6 (pol)
+            predictions : [B, T_dim]
         """
-        box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
-
-        # predict_batch is a pure forward primitive: caller is
-        # responsible for whether W0 / W0_pol are raw or already
-        # U-absorbed (via _W0_eff). This keeps the function single-
-        # purpose and avoids double-mixing when callers (validate,
-        # predict_batch_candidates) have already folded U_pair^T in.
-        W0_use = W0
-        W0_pol_use = W0_pol
-
-        b0_t = tf.gather(b0, Z)   # [B, A, H]
-        W1_t = tf.gather(W1, Z)   # [B, A, H]
-
-        # Per-type loop for W0: avoids materialising [B, A, Q, H] (dominant memory cost).
-        # b0/W1 only have [B, A, H] so their gathers are fine.
-        type_masks = [
-            tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
-            for t in range(self.num_types)
-        ]
-        h = tf.add_n([
-            tf.einsum('baq,qh->bah', descriptors, W0_use[t]) * type_masks[t]
-            for t in range(self.num_types)
-        ]) + b0_t
-        h = self.activation(h)
-        h = h * atom_mask[:, :, tf.newaxis]
-
+        # Phase 1: target_mode == 2 raised in __init__, so we only
+        # handle modes 0 and 1 here.
         if self.cfg.target_mode == 0:
-            E = tf.reduce_sum(h * W1_t, axis=2) + b1  # [B, A]
-            E = E * atom_mask
-            E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
+            U = self._kernel_U(descriptors, Z, atom_mask)   # [B, A]
+            E = tf.reduce_sum(U, axis=1, keepdims=True)     # [B, 1]
             return -E
 
-        # de_dq: energy derivative w.r.t. *raw* descriptor (because we
-        # absorbed U into W0). No pull-back needed — dipole/pol path
-        # below uses raw grad_values directly.
-        dtanh = 1.0 - tf.square(h)
-        de_da = dtanh * W1_t
-        de_dq = tf.add_n([
-            tf.einsum('bah,qh->baq', de_da, W0_use[t]) * type_masks[t]
-            for t in range(self.num_types)
-        ])
-
+        # Mode 1: dipole via gradient pathway.
+        de_dq = self._kernel_grad_de_dq(descriptors, Z, atom_mask)  # [B, A, Q]
         B = tf.shape(descriptors)[0]
-
-        if self.cfg.target_mode == 1 and W_atom is not None:
-            # Precomputed-kernel path: avoids [C, P, Q] inside vectorized_map.
-            # Mathematically: dipole[b,s] = -Σ_{a,q} de_dq[b,a,q] * W_atom[b,a,s,q]
-            #   = -Σ_p rij²[p] * Σ_q de_dq[struct[p],atom[p],q] * grad_values[p,s,q]
-            # (identical to the COO forces path, proven by substituting W_atom definition)
-            return -tf.einsum('baq,basq->bs', de_dq, W_atom)  # [B, 3]
-
-        # Standard COO path (used when W_atom is not precomputed: score(), predict())
-        forces_per_pair = self._calc_forces_coo(de_dq, grad_values, pair_struct, pair_atom)
-
-        if self.cfg.target_mode == 1:
-            return self._dipole_coo(forces_per_pair, pair_struct, pair_atom, pair_gidx,
-                                    positions, boxes, box_inv, B)
-
-        elif self.cfg.target_mode == 2:
-            # Polarizability's scalar ANN gets the U-absorbed W0_pol_use
-            # so it operates in the same learned-feature space as the
-            # main ANN. Raw descriptors are passed; the algebra is
-            # equivalent to feeding desc_mixed into raw W0_pol.
-            return self._polarizability_coo(
-                descriptors, forces_per_pair, pair_struct, pair_atom, pair_gidx,
-                positions, boxes, box_inv, Z, atom_mask,
-                W0_pol_use, b0_pol, W1_pol, b1_pol, B)
-
-        else:
-            tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
-
-    @tf.function(reduce_retracing=True)
-    def predict_batch_candidates(self,
-                                  descriptors: tf.Tensor,
-                                  W_atom: tf.Tensor | None,
-                                  Z: tf.Tensor,
-                                  atom_mask: tf.Tensor,
-                                  W0: tf.Tensor, b0: tf.Tensor,
-                                  W1: tf.Tensor, b1: tf.Tensor,
-                                  U_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Forward pass for C candidates × B structures using explicit batched GEMMs.
-
-        Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
-        Both the input→hidden and hidden→descriptor matmuls are executed as
-        single large GEMMs over all C candidates simultaneously:
-
-            Forward:  [B*A, Q] @ [Q, C*H]    → [B*A, C*H] → [C, B, A, H]
-            Backward: [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]  (batched GEMM)
-
-        Descriptors are assumed pre-scaled by the caller.
-
-        Args:
-            descriptors : [B, A, Q]
-            W_atom      : [B, A, 3, Q]  precomputed dipole kernel (mode 1 only)
-            Z           : [B, A]        type indices
-            atom_mask   : [B, A]        1.0 real, 0.0 pad
-            W0          : [C, T, Q, H]
-            b0          : [C, T, H]
-            W1          : [C, T, H]
-            b1          : [C]
-
-        Returns:
-            predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
-        """
-        Q = self.dim_q
-        H = self.num_neurons
-        T = self.num_types
-
-        B = tf.shape(descriptors)[0]
-        A = tf.shape(descriptors)[1]
-        C = tf.shape(W0)[0]
-
-        # Type masks [B, A, 1] — independent of C, reused for both matmul directions
-        type_masks = [
-            tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
-            for t in range(T)
-        ]
-
-        # Per-candidate descriptor mixing: absorb U_pair^T into W0 so
-        # the rest of the forward/backward uses raw descriptors and
-        # the de_dq we produce is already in raw-desc space (ready to
-        # combine with raw grad_values in the dipole sum). See _W0_eff
-        # for the algebraic identity.
-        if self.descriptor_mixing and U_pair is not None:
-            W0 = self._W0_eff(W0, U_pair)
-
-        # ── Forward: input→hidden ─────────────────────────────────────────────
-        # Per type: [B*A, Q] @ [Q, C*H] → [B*A, C*H] → [C, B, A, H]
-        # One GEMM per type instead of C separate GEMMs inside pfor.
-        desc_flat = tf.reshape(descriptors, [B * A, Q])
-        pre_h_terms = []
-        for t in range(T):
-            W0_t     = W0[:, t, :, :]                                              # [C, Q, H]
-            W0_t_mat = tf.reshape(tf.transpose(W0_t, [1, 0, 2]), [Q, C * H])      # [Q, C*H]
-            ph_flat  = tf.matmul(desc_flat, W0_t_mat)                             # [B*A, C*H]
-            ph       = tf.transpose(tf.reshape(ph_flat, [B, A, C, H]), [2, 0, 1, 3])  # [C,B,A,H]
-            pre_h_terms.append(ph * type_masks[t][tf.newaxis])
-        pre_h = tf.add_n(pre_h_terms)  # [C, B, A, H]
-
-        # ── Bias / output-weight gathers ──────────────────────────────────────
-        # tf.gather along T axis: b0[C,T,H] gathered by Z_flat[B*A] → [C,B*A,H]
-        Z_flat   = tf.reshape(Z, [B * A])
-        b0_t_all = tf.reshape(tf.gather(b0, Z_flat, axis=1), [C, B, A, H])
-        W1_t_all = tf.reshape(tf.gather(W1, Z_flat, axis=1), [C, B, A, H])
-
-        # ── Activation ────────────────────────────────────────────────────────
-        h = self.activation(pre_h + b0_t_all)
-        h = h * atom_mask[tf.newaxis, :, :, tf.newaxis]
-
-        # ── PES ───────────────────────────────────────────────────────────────
-        if self.cfg.target_mode == 0:
-            E = tf.reduce_sum(h * W1_t_all, axis=3) + b1[:, tf.newaxis, tf.newaxis]
-            E = E * atom_mask[tf.newaxis]
-            return -tf.reduce_sum(E, axis=2, keepdims=True)  # [C, B, 1]
-
-        # ── Dipole: backward matmul ───────────────────────────────────────────
-        dtanh    = 1.0 - tf.square(h)
-        de_da    = dtanh * W1_t_all                           # [C, B, A, H]
-        de_da_flat = tf.reshape(de_da, [C, B * A, H])         # [C, B*A, H]
-
-        # Per type: [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]  (batched GEMM over C)
-        de_dq_terms = []
-        for t in range(T):
-            W0_t_T  = tf.transpose(W0[:, t, :, :], [0, 2, 1])    # [C, H, Q]
-            dq_flat = tf.matmul(de_da_flat, W0_t_T)               # [C, B*A, Q]
-            dq      = tf.reshape(dq_flat, [C, B, A, Q])
-            de_dq_terms.append(dq * type_masks[t][tf.newaxis])
-        de_dq = tf.add_n(de_dq_terms)  # [C, B, A, Q]
-
-        # W_atom [B, A, 3, Q]: dipole[c,b,s] = -Σ_{a,q} de_dq[c,b,a,q]*W_atom[b,a,s,q]
-        return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
-
-    def _calc_forces_coo(self, de_dq: tf.Tensor, grad_values: tf.Tensor,
-                         pair_struct: tf.Tensor, pair_atom: tf.Tensor) -> tf.Tensor:
-        """Compute per-pair forces via COO gather + einsum.
-
-        Args:
-            de_dq       : [B, A, Q]   energy derivative w.r.t. descriptor
-            grad_values : [P, 3, Q]   COO gradient blocks
-            pair_struct : [P]         batch-relative structure index
-            pair_atom   : [P]         center atom index
-
-        Returns:
-            forces_per_pair : [P, 3]
-        """
-        ba = tf.stack([pair_struct, pair_atom], axis=1)          # [P, 2]
-        de_dq_per_pair = tf.gather_nd(de_dq, ba)                 # [P, Q]
-        return tf.einsum('kq,kcq->kc', de_dq_per_pair, grad_values)  # [P, 3]
-
-    def _neighbor_displacements_single(self, positions: tf.Tensor,
-                                       box: tf.Tensor,
-                                       grad_index: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute neighbor displacements for a single structure (padded interface).
-
-        Used by the single-structure predict() path (e.g. spectroscopy).
-
-        Args:
-            positions  : [A, 3]
-            box        : [3, 3]
-            grad_index : [A, M]
-
-        Returns:
-            dr  : [A, M, 3]  displacement vectors to neighbors
-            rij : [A, M]     scalar distances to neighbors
-        """
-        box_inv = tf.linalg.inv(box)
-        s = tf.einsum('ij,nj->ni', box_inv, positions)       # [A, 3]
-        s_j = tf.gather(s, grad_index)                        # [A, M, 3]
-        s_i = s[:, tf.newaxis, :]                             # [A, 1, 3]
-        ds = s_j - s_i
-        ds = ds - tf.round(ds)
-        dr = tf.einsum('ij,nmj->nmi', box, ds)                # [A, M, 3]
-        rij = tf.linalg.norm(dr, axis=-1)                     # [A, M]
-        return dr, rij
-
-    def _precompute_dipole_kernel(self, grad_values: tf.Tensor,
-                                  pair_struct: tf.Tensor, pair_atom: tf.Tensor,
-                                  pair_gidx: tf.Tensor, positions: tf.Tensor,
-                                  boxes: tf.Tensor, B: tf.Tensor,
-                                  A: tf.Tensor) -> tf.Tensor:
-        """Aggregate rij²-weighted gradients per (structure, atom) — independent of candidates.
-
-        W_atom[b,a,s,q] = Σ_{p: struct[p]=b, atom[p]=a} rij²[p] × grad_values[p,s,q]
-
-        Dipole is then -einsum('baq,basq->bs', de_dq, W_atom) with no P dimension
-        inside vectorized_map, eliminating the [C, P, Q] intermediate.
-
-        Args:
-            grad_values : [P, 3, Q]  (already scaled if descriptor scaling is active)
-            pair_struct : [P]
-            pair_atom   : [P]
-            pair_gidx   : [P]
-            positions   : [B, A, 3]
-            boxes       : [B, 3, 3]
-            B           : number of structures
-            A           : max atoms (padded)
-
-        Returns:
-            W_atom : [B, A, 3, Q]
-        """
         box_inv = tf.linalg.inv(boxes)
+
+        if W_atom is not None:
+            # Precomputed-kernel path: dipole[b,s] = -Σ_{a,q} de_dq · W_atom
+            # The NN's W_atom encoded `Σ_p rij²[p] · grad_values[p,s,q]`
+            # aggregated to [B, A, 3, Q]. Reused verbatim here.
+            return -tf.einsum('baq,basq->bs', de_dq, W_atom)
+
+        # Standard COO path with pair-axis chunking via tf.while_loop.
+        # Peak transient is `[P, Q]` (gather_nd output, ~2.4 GB at
+        # P=2.97M, Q=216, fp32) plus `[P, 3]` forces. Without chunking
+        # this can OOM at score time even when the struct-axis chunk is
+        # bounded by `cfg.batch_chunk_size`. Chunking along the pair
+        # axis bounds it to `[P_sub, Q]` regardless. tf.while_loop is
+        # required because `predict_batch` runs inside @tf.function.
+        P_total = tf.shape(grad_values)[0]
+        P_sub = tf.constant(
+            int(getattr(self.cfg, "gap_pair_chunk_size", 100_000)),
+            dtype=tf.int32)
         _, rij2 = self._neighbor_displacements_coo(
-            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)  # rij2: [P]
+            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
 
-        P = tf.shape(grad_values)[0]
-        Q = tf.shape(grad_values)[2]
-        W = rij2[:, tf.newaxis, tf.newaxis] * grad_values   # [P, 3, Q]
-        W_flat = tf.reshape(W, [P, 3 * Q])                  # [P, 3*Q]
-        ba_linear = pair_struct * A + pair_atom              # [P] linear index into [B*A]
-        W_atom_flat = tf.math.unsorted_segment_sum(
-            W_flat, ba_linear, num_segments=B * A)           # [B*A, 3*Q]
-        return tf.reshape(W_atom_flat, [B, A, 3, Q])         # [B, A, 3, Q]
+        def cond(p_lo, _dipole):
+            return p_lo < P_total
 
-    def _neighbor_displacements_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
-                                    box_inv: tf.Tensor, pair_struct: tf.Tensor,
-                                    pair_atom: tf.Tensor,
-                                    pair_gidx: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute per-pair displacements in COO format with MIC wrapping.
+        def body(p_lo, dipole_acc):
+            p_hi = tf.minimum(p_lo + P_sub, P_total)
+            ps_sub = pair_struct[p_lo:p_hi]
+            pa_sub = pair_atom[p_lo:p_hi]
+            ba_sub = tf.stack([ps_sub, pa_sub], axis=1)
+            de_dq_pair = tf.gather_nd(de_dq, ba_sub)            # [p_sub, Q]
+            gv_sub = grad_values[p_lo:p_hi]                      # [p_sub, 3, Q]
+            forces = tf.einsum('kq,kcq->kc', de_dq_pair, gv_sub) # [p_sub, 3]
+            contrib = -rij2[p_lo:p_hi, tf.newaxis] * forces
+            dipole_acc = dipole_acc + tf.math.unsorted_segment_sum(
+                contrib, ps_sub, num_segments=B)
+            return p_hi, dipole_acc
 
-        Args:
-            positions  : [B, A, 3]
-            boxes      : [B, 3, 3]
-            box_inv    : [B, 3, 3]
-            pair_struct: [P]  batch-relative structure index
-            pair_atom  : [P]  center atom index
-            pair_gidx  : [P]  neighbor atom index
-
-        Returns:
-            dr   : [P, 3]  displacement vectors (neighbor - center)
-            rij2 : [P]     squared distances
-        """
-        ba_c = tf.stack([pair_struct, pair_atom], axis=1)   # [P, 2]
-        ba_n = tf.stack([pair_struct, pair_gidx], axis=1)   # [P, 2]
-        pos_c   = tf.gather_nd(positions, ba_c)              # [P, 3]
-        pos_n   = tf.gather_nd(positions, ba_n)              # [P, 3]
-        box_k   = tf.gather(boxes,   pair_struct)            # [P, 3, 3]
-        binv_k  = tf.gather(box_inv, pair_struct)            # [P, 3, 3]
-        s_c = tf.einsum('kij,kj->ki', binv_k, pos_c)        # [P, 3] fractional
-        s_n = tf.einsum('kij,kj->ki', binv_k, pos_n)
-        ds  = s_n - s_c
-        ds  = ds - tf.round(ds)                              # MIC wrap
-        dr  = tf.einsum('kij,kj->ki', box_k, ds)            # [P, 3] Cartesian
-        rij2 = tf.reduce_sum(tf.square(dr), axis=-1)         # [P]
-        return dr, rij2
-
-    def _dipole_coo(self, forces_per_pair: tf.Tensor, pair_struct: tf.Tensor,
-                    pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
-                    positions: tf.Tensor, boxes: tf.Tensor,
-                    box_inv: tf.Tensor, B: tf.Tensor) -> tf.Tensor:
-        """Batched dipole prediction using COO forces.
-
-        Args:
-            forces_per_pair : [P, 3]
-            pair_struct     : [P]
-            pair_atom       : [P]
-            pair_gidx       : [P]
-            positions       : [B, A, 3]
-            boxes           : [B, 3, 3]
-            box_inv         : [B, 3, 3]
-            B               : int scalar — number of structures
-
-        Returns:
-            dipole : [B, 3]
-        """
-        _, rij2 = self._neighbor_displacements_coo(positions, boxes, box_inv,
-                                                    pair_struct, pair_atom, pair_gidx)
-        dipole_contrib = rij2[:, tf.newaxis] * forces_per_pair           # [P, 3]
-        dipole = -tf.math.unsorted_segment_sum(
-            dipole_contrib, pair_struct, num_segments=B)                  # [B, 3]
+        dipole_init = tf.zeros([B, 3], dtype=tf.float32)
+        _, dipole = tf.while_loop(
+            cond, body,
+            loop_vars=[tf.constant(0, dtype=tf.int32), dipole_init],
+            parallel_iterations=1,
+            shape_invariants=[
+                tf.TensorShape([]),
+                tf.TensorShape([None, 3]),
+            ],
+        )
         return dipole
 
-    def _polarizability_coo(self, descriptors: tf.Tensor, forces_per_pair: tf.Tensor,
-                            pair_struct: tf.Tensor, pair_atom: tf.Tensor,
-                            pair_gidx: tf.Tensor, positions: tf.Tensor,
-                            boxes: tf.Tensor, box_inv: tf.Tensor,
-                            Z: tf.Tensor, atom_mask: tf.Tensor,
-                            W0_pol: tf.Tensor, b0_pol: tf.Tensor,
-                            W1_pol: tf.Tensor, b1_pol: tf.Tensor,
-                            B: tf.Tensor) -> tf.Tensor:
-        """Batched polarizability via dual ANN using COO forces.
+    # ───────────────────────────────────── COO helpers
 
-        Args:
-            descriptors     : [B, A, Q]
-            forces_per_pair : [P, 3]
-            pair_struct     : [P]
-            pair_atom       : [P]
-            pair_gidx       : [P]
-            positions       : [B, A, 3]
-            boxes           : [B, 3, 3]
-            box_inv         : [B, 3, 3]
-            Z               : [B, A]
-            atom_mask       : [B, A]
-            W0_pol..b1_pol  : scalar ANN weights
-
-        Returns:
-            pol : [B, 6]  — [xx, yy, zz, xy, yz, zx]
-        """
-        dr, _ = self._neighbor_displacements_coo(positions, boxes, box_inv,
-                                                  pair_struct, pair_atom, pair_gidx)
-
-        # Scalar ANN (isotropic contribution) — same type-loop pattern as main ANN
-        b0p_t = tf.gather(b0_pol, Z)   # [B, A, H]
-        W1p_t = tf.gather(W1_pol, Z)   # [B, A, H]
-        type_masks_p = [
-            tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
-            for t in range(self.num_types)
-        ]
-        h_pol = tf.add_n([
-            tf.einsum('baq,qh->bah', descriptors, W0_pol[t]) * type_masks_p[t]
-            for t in range(self.num_types)
-        ]) + b0p_t
-        h_pol = self.activation(h_pol)
-        h_pol = h_pol * atom_mask[:, :, tf.newaxis]
-        F_pol = tf.reduce_sum(h_pol * W1p_t, axis=2) + b1_pol  # [B, A]
-        F_pol = F_pol * atom_mask
-        scalar_sum = tf.reduce_sum(F_pol, axis=1)               # [B]
-
-        # Tensor part: per-pair outer product, then segment-sum per structure
-        pol_outer = -tf.einsum('ki,kj->kij', dr, forces_per_pair)  # [P, 3, 3]
-        pol_flat  = tf.reshape(pol_outer, [-1, 9])                  # [P, 9]
-        pol_mat_flat = tf.math.unsorted_segment_sum(
-            pol_flat, pair_struct, num_segments=B)                  # [B, 9]
-        pol_matrix = tf.reshape(pol_mat_flat, [B, 3, 3])
-
-        pol = tf.stack([
-            pol_matrix[:, 0, 0], pol_matrix[:, 1, 1], pol_matrix[:, 2, 2],
-            pol_matrix[:, 0, 1], pol_matrix[:, 1, 2], pol_matrix[:, 2, 0],
-        ], axis=1)  # [B, 6]
-
-        diag_add = tf.stack([scalar_sum, scalar_sum, scalar_sum,
-                             tf.zeros_like(scalar_sum),
-                             tf.zeros_like(scalar_sum),
-                             tf.zeros_like(scalar_sum)], axis=1)
-        return pol + diag_add
+    def _neighbor_displacements_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
+                                     box_inv: tf.Tensor, pair_struct: tf.Tensor,
+                                     pair_atom: tf.Tensor,
+                                     pair_gidx: tf.Tensor) -> tuple:
+        """COO per-pair displacements with minimum-image convention."""
+        ba_c = tf.stack([pair_struct, pair_atom], axis=1)
+        ba_n = tf.stack([pair_struct, pair_gidx], axis=1)
+        pos_c = tf.gather_nd(positions, ba_c)
+        pos_n = tf.gather_nd(positions, ba_n)
+        box_k = tf.gather(boxes, pair_struct)
+        binv_k = tf.gather(box_inv, pair_struct)
+        s_c = tf.einsum('kij,kj->ki', binv_k, pos_c)
+        s_n = tf.einsum('kij,kj->ki', binv_k, pos_n)
+        ds = s_n - s_c
+        ds = ds - tf.round(ds)
+        dr = tf.einsum('kij,kj->ki', box_k, ds)
+        rij2 = tf.reduce_sum(tf.square(dr), axis=-1)
+        return dr, rij2

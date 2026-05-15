@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 
 import numpy as np
 
@@ -54,18 +53,18 @@ def unit_label(cfg: TNEPconfig) -> str:
 def _make_plot_filename(cfg: TNEPconfig, plot_name: str) -> str:
     """Generate an automatic filename for a plot based on config and plot name.
 
-    Format: {plot_name}_mode{target_mode}_pop{pop_size}_n{num_neurons}_l{l_max}.png
+    Format (GAP): {plot_name}_{mode}_M{n_sparse}_z{zeta}_l{l_max}.png
 
     Args:
         cfg       : TNEPconfig
         plot_name : str — short identifier for the plot type
 
     Returns:
-        filename : str — e.g. "snes_fitness_mode1_pop80_n30_l4.png"
+        filename : str — e.g. "correlation_dipole_M1000_z4_l4.png"
     """
     mode_names = {0: "pes", 1: "dipole", 2: "polar"}
     mode = mode_names.get(cfg.target_mode, f"mode{cfg.target_mode}")
-    return (f"{plot_name}_{mode}_pop{cfg.pop_size}_n{cfg.num_neurons}"
+    return (f"{plot_name}_{mode}_M{cfg.gap_n_sparse}_z{cfg.gap_zeta}"
             f"_l{cfg.l_max}.png")
 
 
@@ -105,170 +104,28 @@ def _finish_fig(fig: plt.Figure, cfg: TNEPconfig, plot_name: str,
         plt.close(fig)
 
 
-def plot_snes_history(history: dict, cfg: TNEPconfig,
-                      save_plots: str | None = None, show_plots: bool = True) -> None:
-    """Plot train and validation RMSE vs generation with best/worst band."""
-    g = np.asarray(history["generation"])
-
-    fig = plt.figure()
-    plt.plot(g, history["train_loss"], label="Train RMSE")
-    plt.plot(g, history["val_loss"], label="Val RMSE")
-
-    if history.get("best_rmse") and history.get("worst_rmse"):
-        plt.fill_between(g, history["best_rmse"], history["worst_rmse"],
-                         alpha=0.2, label="Best\u2013Worst range")
-
-    units = unit_label(cfg)
-    plt.xlabel("Generation")
-    plt.ylabel(f"Fitness RMSE ({units})")
-    plt.legend()
-    plt.title("SNES fitness vs generation")
-    _finish_fig(fig, cfg, "snes_fitness", save_plots, show_plots)
-
-
-def plot_log_val_fitness(history: dict, cfg: TNEPconfig,
-                         save_plots: str | None = None, show_plots: bool = True) -> None:
-    """Plot natural log of validation fitness vs generation."""
-    g = np.asarray(history["generation"]) + 1  # shift so gen 0 → 1 (avoids log(0))
-    val = np.asarray(history["val_loss"])
-    ln_val = np.log(val)
-    ln_g = np.log(g)
-
-    fig = plt.figure()
-    plt.plot(ln_g, ln_val, label="ln(Val RMSE)")
-    units = unit_label(cfg)
-    plt.xlabel("ln(Generation)")
-    plt.ylabel(f"ln(Validation RMSE / {units})")
-    plt.legend()
-    plt.title("Log validation fitness vs generation")
-    _finish_fig(fig, cfg, "log_val_fitness", save_plots, show_plots)
-
-
-def plot_sigma_history(history: dict, cfg: TNEPconfig,
-                       save_plots: str | None = None, show_plots: bool = True) -> None:
-    """Plot sigma min/max/mean vs generation on log-y scale with reset markers."""
-    g = np.asarray(history["generation"])
-    if not history.get("sigma_mean"):
-        return
-
-    fig = plt.figure()
-    plt.plot(g, history["sigma_mean"], label="Sigma mean")
-    plt.plot(g, history["sigma_median"], label="Sigma median", linestyle="--")
-    plt.plot(g, history["sigma_min"], label="Sigma min", alpha=0.6)
-    plt.plot(g, history["sigma_max"], label="Sigma max", alpha=0.6)
-    plt.fill_between(g, history["sigma_min"], history["sigma_max"],
-                     alpha=0.15, color="blue")
-
-    plt.xlabel("Generation")
-    plt.ylabel("\u03c3")
-    plt.yscale("log")
-    plt.legend()
-    plt.title("SNES sigma evolution")
-    _finish_fig(fig, cfg, "sigma_evolution", save_plots, show_plots)
-
-
-def plot_loss_breakdown(history: dict, cfg: TNEPconfig,
-                        save_plots: str | None = None,
-                        show_plots: bool = True) -> None:
-    """Plot total loss with L1, L2 regularization and mean train RMSE on log-x scale."""
-    g = np.asarray(history["generation"], dtype=np.float64) + 1  # shift so gen 0 → 1 (avoids log(0))
-    train = np.asarray(history["train_loss"])
-    val = np.asarray(history["val_loss"])
-    l1 = np.maximum(np.asarray(history["L1"]), 0.0)
-    l2 = np.maximum(np.asarray(history["L2"]), 0.0)
-    total = train + l1 + l2
-
-    units = unit_label(cfg)
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(g, train, label=f"Train RMSE ({units})", color="#e74c3c", linewidth=1, alpha=0.8)
-    ax.plot(g, val, label=f"Val RMSE ({units})", color="#9b59b6", linewidth=1, alpha=0.8)
-    ax.plot(g, total, label="Total loss (RMSE + L1 + L2)", color="#2c3e50", linewidth=1.5,
-            linestyle="--")
-    ax.plot(g, l1, label="L1 (dimensionless)", color="#3498db", linewidth=1, alpha=0.8)
-    ax.plot(g, l2, label="L2 (dimensionless)", color="#2ecc71", linewidth=1, alpha=0.8)
-
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Generation")
-    ax.set_ylabel("Loss")
-    ax.legend()
-    ax.set_title("Loss breakdown")
-    plt.tight_layout()
-    _finish_fig(fig, cfg, "loss_breakdown", save_plots, show_plots)
-
-
-def plot_timing(history: dict, cfg: TNEPconfig,
-                save_plots: str | None = None, show_plots: bool = True) -> None:
-    """Plot per-generation timing breakdown and aggregate summary."""
-    timing = history.get("timing")
-    if not timing or not timing.get("evaluate"):
-        return
-
-    # Use actual generation indices so the x-axis is correct under any
-    # val_interval. Falls back to record index only if generation
-    # wasn't recorded (older history dicts).
-    n = len(timing["evaluate"])
-    gens_recorded = history.get("generation", [])
-    g = (np.asarray(gens_recorded[:n])
-         if len(gens_recorded) >= n else np.arange(n))
-    phases = ["evaluate", "validate", "rank_update", "sample_batch", "overhead"]
-    colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#95a5a6"]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Left: stacked area chart per generation
-    data = [np.array(timing[p]) for p in phases]
-    ax1.stackplot(g, *data, labels=phases, colors=colors, alpha=0.8)
-    ax1.set_xlabel("Generation")
-    ax1.set_ylabel("Time (s)")
-    ax1.legend(loc="upper left")
-    ax1.set_title("Per-generation timing breakdown")
-    # Cap y-axis at 99th percentile to prevent TF warmup outliers from hiding data
-    totals_per_gen = sum(data)
-    if len(totals_per_gen) > 1:
-        ax1.set_ylim(bottom=0, top=np.percentile(totals_per_gen, 99) * 1.1)
-
-    # Right: horizontal bar chart of totals
-    totals = [sum(timing[p]) for p in phases]
-    grand_total = max(sum(totals), 1e-9)
-    bars = ax2.barh(phases, totals, color=colors)
-    ax2.set_xlabel("Total time (s)")
-    ax2.set_title(f"Aggregate timing ({grand_total:.2f}s total)")
-    for bar, total in zip(bars, totals):
-        pct = 100 * total / grand_total
-        ax2.text(bar.get_width(), bar.get_y() + bar.get_height() / 2,
-                 f" {total:.3f}s ({pct:.1f}%)", va='center')
-
-    plt.tight_layout()
-    _finish_fig(fig, cfg, "timing", save_plots, show_plots)
-
-
 def _build_suptitle(cfg: TNEPconfig, suffix: str | None,
                     rmse: float, rrmse: float, r2: float) -> str:
-    """Build a suptitle string with mode, suffix label, and metrics."""
+    """Build a suptitle string with mode, suffix label, and metrics.
+
+    Callers in MasterTNEP._plot_eval_set pass suffixes of the form
+    `{train,val,test}_{per_atom,total}` or just `{per_atom,total}`.
+    """
     mode_names = {0: "PES", 1: "Dipole", 2: "Polarizability"}
     mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
     if suffix:
-        label_parts = []
-        if "best" in suffix:
-            label_parts.append("Best Val")
-        elif "final" in suffix:
-            label_parts.append("Final Gen")
+        parts = []
+        if "train" in suffix:
+            parts.append("Train")
+        elif "val" in suffix:
+            parts.append("Validation")
+        elif "test" in suffix:
+            parts.append("Test")
         if "per_atom" in suffix:
-            label_parts.append("Per Atom")
+            parts.append("Per Atom")
         elif "total" in suffix:
-            label_parts.append("Total")
-        # Detect validation set: "_val_" or trailing "_val" beyond "best_val"
-        stripped = suffix.replace("best_val", "", 1)
-        if "val" in stripped:
-            label_parts.append("Validation")
-        elif "test" in stripped:
-            label_parts.append("Test")
-        gen_match = re.search(r'gen(\d+)', suffix)
-        if gen_match:
-            label_parts.append(f"Gen {gen_match.group(1)}")
-        label = f" ({' '.join(label_parts)})" if label_parts else f" ({suffix})"
+            parts.append("Total")
+        label = f" ({' '.join(parts)})" if parts else f" ({suffix})"
     else:
         label = ""
     units = unit_label(cfg)

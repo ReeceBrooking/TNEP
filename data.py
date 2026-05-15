@@ -634,7 +634,7 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     prestage_chunk_indices(test_data, test_ranges)
     if (getattr(cfg, "use_pinned_buffers", True)
             and test_data.get("_gv_disk_backed", False)):
-        n_buffers = max(int(getattr(cfg, "pinned_pool_size", 4)),
+        n_buffers = max(int(getattr(cfg, "pinned_pool_size", 2)),
                         int(getattr(cfg, "prefetch_depth", 1)) + 1)
         pool = make_pinned_pool_for(
             test_data, batch_chunk_size=cfg.batch_chunk_size,
@@ -654,7 +654,7 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
             if cuFile_available():
                 gv = test_data.get("grad_values")
                 if hasattr(gv, "filename"):
-                    n_cf = max(int(getattr(cfg, "cufile_pool_size", 4)),
+                    n_cf = max(int(getattr(cfg, "cufile_pool_size", 2)),
                                int(getattr(cfg, "prefetch_depth", 1)) + 1)
                     pool = make_cufile_pool_for(
                         test_data, batch_chunk_size=cfg.batch_chunk_size,
@@ -1721,22 +1721,34 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
             is_contig = (flat_pair_idx_np.size > 0
                          and int(flat_pair_idx_np[-1]) - int(flat_pair_idx_np[0]) + 1
                              == flat_pair_idx_np.size)
-            if is_contig:
-                lo = int(flat_pair_idx_np[0])
-                hi = int(flat_pair_idx_np[-1]) + 1
-                gv = raw["_passthrough_grad_values"]
-                chunk["grad_values"] = gv[lo:hi]
-                if pair_idx_entry is not None:
-                    chunk["pair_atom"] = pair_idx_entry["pair_atom"]
-                    chunk["pair_gidx"] = pair_idx_entry["pair_gidx"]
+            # When grad_values is CPU-resident (pin_to_cpu=True),
+            # both the slice/gather AND the resulting chunk must stay
+            # on CPU until the consumer explicitly moves them — TF's
+            # default-device placement otherwise tries to materialise
+            # the entire CPU tensor on GPU before slicing, producing
+            # a massive D2H→H2D round-trip and OOM at large grad_values.
+            gv_dev = raw["_passthrough_grad_values"].device
+            slice_dev = '/CPU:0' if pin_to_cpu else (gv_dev or '/GPU:0')
+            with tf.device(slice_dev):
+                if is_contig:
+                    lo = int(flat_pair_idx_np[0])
+                    hi = int(flat_pair_idx_np[-1]) + 1
+                    gv = raw["_passthrough_grad_values"]
+                    chunk["grad_values"] = gv[lo:hi]
+                    if pair_idx_entry is not None:
+                        chunk["pair_atom"] = pair_idx_entry["pair_atom"]
+                        chunk["pair_gidx"] = pair_idx_entry["pair_gidx"]
+                    else:
+                        chunk["pair_atom"] = raw["_passthrough_pair_atom"][lo:hi]
+                        chunk["pair_gidx"] = raw["_passthrough_pair_gidx"][lo:hi]
                 else:
-                    chunk["pair_atom"] = raw["_passthrough_pair_atom"][lo:hi]
-                    chunk["pair_gidx"] = raw["_passthrough_pair_gidx"][lo:hi]
-            else:
-                flat_pair_idx_tf = tf.constant(flat_pair_idx_np)
-                chunk["grad_values"] = tf.gather(raw["_passthrough_grad_values"], flat_pair_idx_tf)
-                chunk["pair_atom"]   = tf.gather(raw["_passthrough_pair_atom"],   flat_pair_idx_tf)
-                chunk["pair_gidx"]   = tf.gather(raw["_passthrough_pair_gidx"],   flat_pair_idx_tf)
+                    flat_pair_idx_tf = tf.constant(flat_pair_idx_np)
+                    chunk["grad_values"] = tf.gather(
+                        raw["_passthrough_grad_values"], flat_pair_idx_tf)
+                    chunk["pair_atom"] = tf.gather(
+                        raw["_passthrough_pair_atom"], flat_pair_idx_tf)
+                    chunk["pair_gidx"] = tf.gather(
+                        raw["_passthrough_pair_gidx"], flat_pair_idx_tf)
 
         # Optional pad of all four pair-aligned tensors to a fixed size
         # so XLA-compiled `_evaluate_chunk` sees one (B, P) shape across

@@ -341,11 +341,10 @@ def _get_fused_predict(model: 'TNEP'):
                       else None)
 
     # NOTE: not jit_compile=True. The descriptor-side XLA path (locked
-    # compute fns built with jit_compile=True for trajectory) handles the
-    # heavy SOAP work. predict_batch internally has shape-dependent stacks
-    # in _calc_forces_coo that XLA can't lower (varying P per call), so
-    # we keep this graph as a regular @tf.function trace. Per-op launch
-    # overhead at this stage is dwarfed by the fused descriptor compute.
+    # compute fns built with jit_compile=True for trajectory) handles
+    # the heavy SOAP work. predict_batch has a shape-dependent
+    # tf.while_loop over the pair axis (varying P per call) that XLA
+    # can't lower, so we keep this graph as a regular @tf.function trace.
     @tf.function(input_signature=sig, reduce_retracing=False)
     def fused(soap_concat, grad_concat, pa_concat, pg_concat,
               atom_counts, pair_counts,
