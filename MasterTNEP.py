@@ -28,7 +28,7 @@ from data import (collect, split, pad_and_stack,
                   _resolve_target_key, materialize_test_data)
 from plotting import (plot_correlation, plot_cosine_similarity,
                       plot_error_vs_magnitude)
-from model_io import save_model, save_history, setup_run_directory
+from model_io import save_model, save_history, setup_run_directory, load_model
 from spectroscopy import (predict_trajectory_batch,
                            compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
                            compute_raman_spectrum, plot_raman_spectrum)
@@ -793,7 +793,7 @@ def process_trajectory(
 
 
 if __name__ == '__main__':
-    model = train_model()
-    #model = load_model("models/n50_q165_pop100_20260513_161930_CHO_best_r2/train_C_O_H_dipole_best_val.h5")
-    #dipoles = process_trajectory(model, "datasets/ethanol mlatom set/ethanol_traj_mlatom.xyz", batch_size=2000, descriptor_mode=1, descriptor_batch_frames=200, pin_to_cpu=False, descriptor_precision="float64", dt_fs=0.5)
+    #model = train_model()
+    model = load_model("models/gap_M4000_q216_z4_20260515_171706/train_waterbulk_O_H_dipole.h5")
+    dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=20, descriptor_mode=1, descriptor_batch_frames=10, pin_to_cpu=False, descriptor_precision="float32", dt_fs=1.0, descriptor_pair_tile_size=128)
     
