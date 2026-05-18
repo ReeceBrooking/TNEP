@@ -87,8 +87,12 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     dipoles = dipoles - dipoles.mean(axis=0)
     acf_full = compute_dipole_acf(dipoles)
 
-    # Truncate ACF — only the first acf_ratio fraction has good statistics
-    Nmax = len(acf_full) // int(1.0 / acf_ratio)
+    # Truncate ACF — only the first acf_ratio fraction has good statistics.
+    # Use multiplicative form so non-reciprocal ratios (e.g. 0.3) and small
+    # ratios (e.g. 0.05) work correctly. Guard against acf_ratio<=0.
+    if acf_ratio <= 0.0:
+        raise ValueError(f"acf_ratio must be > 0, got {acf_ratio}")
+    Nmax = max(1, int(len(acf_full) * acf_ratio))
     acf = acf_full[:Nmax]
 
     # Kronecker doubling: one-sided ACF -> two-sided via factor of 2 (except lag 0)

@@ -202,9 +202,11 @@ class CuFileGPUBuffer:
         if err != 0:
             raise RuntimeError(f"cudaMalloc({self.nbytes}) failed: code {err}")
         # Buf-register is optional but improves throughput; failure is
-        # non-fatal (cuFile falls back to internal staging).
-        cf.cuFileBufRegister(self._p, ctypes.c_size_t(self.nbytes), 0)
-        self._registered = True
+        # non-fatal (cuFile falls back to internal staging). Track the
+        # success status so __del__ does not Deregister an unregistered
+        # pointer (which is undefined behaviour).
+        reg_err = cf.cuFileBufRegister(self._p, ctypes.c_size_t(self.nbytes), 0)
+        self._registered = (reg_err == 0)
 
     @property
     def devptr(self) -> int:
@@ -397,8 +399,6 @@ def cufile_read_chunk_as_tf_tensor(
     for d in shape:
         nelems *= int(d)
     nbytes = nelems * int(np.dtype(dtype).itemsize)
-    if buf is not buf:
-        pass  # placeholder
     if nbytes > buf.nbytes:
         pool.release(buf)
         raise ValueError(f"cufile chunk needs {nbytes} > buffer {buf.nbytes}")

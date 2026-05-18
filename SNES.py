@@ -1363,7 +1363,6 @@ class SNES:
         Returns:
             fitness : float — mean RMSE
         """
-        from data import slice_and_complete_chunk
         S_val = val_data["num_atoms"].shape[0]
 
         # Resolve subsample indices once. None = full val set.

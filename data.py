@@ -1058,7 +1058,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             result["_gv_disk_backed"] = True
             print(f"  pad_and_stack: grad_values streamed at {gv_path} "
                   f"(shape={gv_shape}, "
-                  f"{np.prod(gv_shape) * np.dtype(gv_dtype).itemsize / 1e9:.2f} GB)")
+                  f"{int(np.prod(gv_shape, dtype=np.int64)) * np.dtype(gv_dtype).itemsize / 1e9:.2f} GB)")
         elif gradient_cache_path is not None:
             import os as _os
             _os.makedirs(gradient_cache_path, exist_ok=True)
@@ -1066,7 +1066,18 @@ def pad_and_stack(data: dict, num_types: int | None = None,
                 gradient_cache_path, f"grad_values_{cache_tag}.bin")
             gv_shape = grad_values_np.shape
             gv_dtype = grad_values_np.dtype
-            grad_values_np.tofile(gv_path)
+            # Atomic write: tmp file + os.replace. A SIGINT or disk-full
+            # mid-write would otherwise leave a partial .bin that the
+            # next memmap.open silently accepts, feeding garbage tail
+            # bytes into training.
+            tmp_path = gv_path + ".tmp"
+            try:
+                grad_values_np.tofile(tmp_path)
+                _os.replace(tmp_path, gv_path)
+            except BaseException:
+                if _os.path.exists(tmp_path):
+                    _os.remove(tmp_path)
+                raise
             del grad_values_np
             # Memory-map view: scattered fancy-index reads serve per-chunk
             # slices at NVMe sequential bandwidth. The OS page cache
@@ -1076,7 +1087,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             result["_gv_disk_backed"] = True
             print(f"  pad_and_stack: grad_values cached at {gv_path} "
                   f"(shape={gv_shape}, "
-                  f"{np.prod(gv_shape) * np.dtype(gv_dtype).itemsize / 1e9:.2f} GB)")
+                  f"{int(np.prod(gv_shape, dtype=np.int64)) * np.dtype(gv_dtype).itemsize / 1e9:.2f} GB)")
         else:
             result["grad_values"] = tf.constant(grad_values_np); del grad_values_np
         result["pair_struct"] = tf.constant(pair_struct_np); del pair_struct_np
@@ -1172,6 +1183,20 @@ def pack_chunk_from_flat(frame_results: list, dim_q: int,
     }
 
 
+def _is_contiguous_range(arr: np.ndarray) -> bool:
+    """True iff `arr` is a strictly monotonic +1 sequence (i.e. a true slice).
+
+    Stronger than checking `arr[-1] - arr[0] + 1 == arr.size`, which falsely
+    accepts any permutation whose first/last elements happen to bracket a
+    contiguous range. A real contiguous slice has every diff == 1.
+    """
+    if arr.size == 0:
+        return False
+    if arr.size == 1:
+        return True
+    return bool(np.all(np.diff(arr) == 1))
+
+
 def slice_and_complete_chunk(data: dict, indices,
                               precomputed: dict | None = None) -> dict:
     """Build a chunk dict by slicing per-structure fields from `data`.
@@ -1241,9 +1266,7 @@ def slice_and_complete_chunk(data: dict, indices,
         # the fancy-index path.
         if flat_pair_idx_np is None:
             flat_pair_idx_np = flat_pair_idx_tf.numpy()
-        is_contig = (flat_pair_idx_np.size > 0
-                     and int(flat_pair_idx_np[-1]) - int(flat_pair_idx_np[0]) + 1
-                         == flat_pair_idx_np.size)
+        is_contig = _is_contiguous_range(flat_pair_idx_np)
         if is_contig:
             lo = int(flat_pair_idx_np[0])
             hi = int(flat_pair_idx_np[-1]) + 1
@@ -1586,9 +1609,7 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     # compat-mode (saturates PCIe Gen4 once warm).
     gv = data["grad_values"]
     if data.get("_gv_disk_backed", False):
-        is_contig = (flat_pair_idx_np.size > 0
-                     and int(flat_pair_idx_np[-1]) - int(flat_pair_idx_np[0]) + 1
-                         == flat_pair_idx_np.size)
+        is_contig = _is_contiguous_range(flat_pair_idx_np)
         if is_contig:
             lo = int(flat_pair_idx_np[0])
             hi = int(flat_pair_idx_np[-1]) + 1
@@ -1718,9 +1739,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
             # slice, no D2D gather of the full chunk. Otherwise (random
             # sub-sampling) fall back to tf.gather.
             flat_pair_idx_np = raw["_precomputed"]["flat_pair_idx_np"]
-            is_contig = (flat_pair_idx_np.size > 0
-                         and int(flat_pair_idx_np[-1]) - int(flat_pair_idx_np[0]) + 1
-                             == flat_pair_idx_np.size)
+            is_contig = _is_contiguous_range(flat_pair_idx_np)
             if is_contig:
                 lo = int(flat_pair_idx_np[0])
                 hi = int(flat_pair_idx_np[-1]) + 1

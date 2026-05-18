@@ -170,7 +170,13 @@ def plot_sigma_history(history: dict, cfg: TNEPconfig,
 def plot_loss_breakdown(history: dict, cfg: TNEPconfig,
                         save_plots: str | None = None,
                         show_plots: bool = True) -> None:
-    """Plot total loss with L1, L2 regularization and mean train RMSE on log-x scale."""
+    """Plot total loss with L1, L2 regularization and mean train RMSE on log-x scale.
+
+    Bails silently when L1/L2 history columns are missing (non-regularised
+    runs, older checkpoints, GAP history dicts).
+    """
+    if "L1" not in history or "L2" not in history:
+        return
     g = np.asarray(history["generation"], dtype=np.float64) + 1  # shift so gen 0 → 1 (avoids log(0))
     train = np.asarray(history["train_loss"])
     val = np.asarray(history["val_loss"])
