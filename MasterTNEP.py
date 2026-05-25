@@ -32,10 +32,10 @@ from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_histor
 from model_io import save_model, save_history, setup_run_directory, load_model
 from spectroscopy import (predict_trajectory_batch,
                            compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
-                           compute_raman_spectrum, plot_raman_spectrum)
+                           compute_raman_spectrum, plot_raman_spectrum, ir_spectrum_from_file)
 from DescriptorBuilder import make_descriptor_builder
 from tqdm import tqdm
-from ase.io import read, iread
+from ase.io import read, iread, write
 
 
 def _resolve_scratch_dir(cfg: TNEPconfig) -> str:
@@ -231,6 +231,11 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
     # and shown identically on both per-atom and total plots — RRMSE is
     # a model-vs-dataset property that shouldn't depend on which scale
     # the correlation panel happens to be drawn in.
+    #
+    # Definition: RRMSE = RMSE / std(ref). Algebraically equivalent to
+    # sqrt(1 - R²) and consistent with the SNES per-candidate form
+    # (SNES.py:2046). Per-component uses per-component std; overall
+    # uses std of the flattened target array.
     has_total = "total_rmse" in metrics
     if has_total:
         scale = data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
@@ -244,12 +249,12 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
         total_rmse_scalar = float(metrics["rmse"])
 
     total_diff = total_targets - total_preds
-    target_abs_mean = max(float(np.mean(np.abs(total_targets))), 1e-12)
-    target_abs_mean_comp = np.maximum(np.mean(np.abs(total_targets), axis=0), 1e-12)
+    target_std_overall = max(float(total_targets.std()), 1e-12)
+    target_std_comp = np.maximum(total_targets.std(axis=0), 1e-12)
     rmse_comp_total = np.sqrt(np.mean(total_diff ** 2, axis=0))
     rrmse_payload = {
-        "rrmse": total_rmse_scalar / target_abs_mean,
-        "rrmse_components": rmse_comp_total / target_abs_mean_comp,
+        "rrmse": total_rmse_scalar / target_std_overall,
+        "rrmse_components": rmse_comp_total / target_std_comp,
     }
 
     plot_correlation(targets, preds_np, {**metrics, **rrmse_payload},
@@ -723,26 +728,47 @@ def test_model(
 
 
 def _count_xyz_frames(path: str) -> int:
-    """Count frames in an XYZ trajectory by walking only the atom-count headers.
+    """Count frames in a trajectory file. Format-aware:
 
-    Each frame is: <N> line, comment line, then N atom lines. We read the N
-    integer and skip N+1 lines per frame — no parsing, just counting.
+    - XYZ / extXYZ : walk only the atom-count headers (no parsing).
+        Each frame is: <N> line, comment line, then N atom lines.
+        Read N, skip N+1 lines per frame.
+    - ASE binary .traj : use ase.io.trajectory.Trajectory which
+        supports len() directly without loading frames.
+    - Anything else : fall back to ase.io.iread (slower; streams the
+        file but discards each frame after counting).
+
+    Function name kept for back-compat.
     """
-    n_frames = 0
-    with open(path) as f:
-        while True:
-            line = f.readline()
-            if not line:
-                break
-            try:
-                n_atoms = int(line.strip())
-            except ValueError:
-                break
-            for _ in range(n_atoms + 1):
-                if not f.readline():
-                    return n_frames
-            n_frames += 1
-    return n_frames
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".traj":
+        from ase.io.trajectory import Trajectory
+        with Trajectory(path, "r") as traj:
+            return len(traj)
+
+    if ext in (".xyz", ".extxyz"):
+        n_frames = 0
+        with open(path) as f:
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    n_atoms = int(line.strip())
+                except ValueError:
+                    break
+                for _ in range(n_atoms + 1):
+                    if not f.readline():
+                        return n_frames
+                n_frames += 1
+        return n_frames
+
+    # Unknown extension — fall back to ASE's iterator. Streams the file
+    # without keeping frames; slower than the xyz/traj fast paths but
+    # works for any format ASE understands (e.g. .lammpstrj, .pdb).
+    from ase.io import iread
+    return sum(1 for _ in iread(path, index=":"))
 
 
 def process_trajectory(
@@ -758,6 +784,12 @@ def process_trajectory(
     descriptor_memory_budget_bytes: int | None = None,
     descriptor_precision: str | None = None,
     descriptor_pair_tile_size: int | None = None,
+    ir_split_at_cm: float | None = None,
+    ir_smooth: int = 10,
+    ir_smooth_kind: str = "gaussian",
+    ir_power_dc_cutoff_cm: float = 100.0,
+    ir_transmittance_mode: str = "beer_lambert",
+    ir_transmittance_scale: float = 1.0,
 ) -> dict:
     """Predict properties along an MD trajectory and compute spectra.
 
@@ -919,9 +951,25 @@ def process_trajectory(
         np.savetxt(txt_path, dipoles, fmt="%.8e",
                    header="dipole_x  dipole_y  dipole_z  (e*Angstrom)")
         print(f"Dipoles saved to {npy_path} (binary) and {txt_path} (text)")
-        freq_cm, intensity, power, acf = compute_ir_spectrum(dipoles, dt_fs=dt_fs)
-        plot_ir_spectrum(freq_cm, intensity, cfg, save_plots, show_plots)
-        plot_power_spectrum(freq_cm, power, cfg, save_plots, show_plots)
+        freq_cm, intensity, power, acf = compute_ir_spectrum(
+            dipoles, dt_fs=dt_fs,
+            smooth_k=ir_smooth, smooth_kind=ir_smooth_kind,
+            power_dc_cutoff_cm=ir_power_dc_cutoff_cm)
+        # Build a descriptive plot label: <trajectory_stem>_<model_stem>
+        # so multiple runs against different models or different
+        # trajectories don't overwrite each other.
+        model_label = os.path.splitext(os.path.basename(
+            getattr(cfg, "save_path", "") or "model"))[0]
+        plot_ir_spectrum(freq_cm, intensity, cfg, save_plots, show_plots,
+                         trajectory_path=trajectory_path,
+                         model_label=model_label,
+                         split_at_cm=ir_split_at_cm,
+                         transmittance_mode=ir_transmittance_mode,
+                         transmittance_scale=ir_transmittance_scale)
+        plot_power_spectrum(freq_cm, power, cfg, save_plots, show_plots,
+                            trajectory_path=trajectory_path,
+                            model_label=model_label,
+                            low_cm_cutoff=ir_power_dc_cutoff_cm)
         return {"dipoles": dipoles, "freq_cm": freq_cm, "intensity": intensity,
                 "power": power, "acf": acf}
 
@@ -940,9 +988,127 @@ def process_trajectory(
                 "I_VV": I_VV, "I_VH": I_VH, "I_total": I_total,
                 "acf_iso": acf_iso, "acf_aniso": acf_aniso}
 
+def filter_dataset_by_species(input_xyz: str,
+                                output_xyz: str,
+                                allowed_species: list[int | str],
+                                mode: str = "subset") -> int:
+    """Filter an .xyz dataset to structures whose species satisfy `allowed_species`.
+
+    Args:
+        input_xyz       : path to input .xyz file
+        output_xyz      : path to write the filtered .xyz
+        allowed_species : list of atomic numbers (e.g. [6, 1, 8]) or
+                          chemical symbols (e.g. ["C", "H", "O"])
+        mode            : "subset" — keep structures whose species are
+                                     a subset of `allowed_species` (default).
+                          "exact"  — keep structures containing exactly
+                                     the same set as `allowed_species`.
+
+    Returns:
+        n_kept : int — number of structures written to `output_xyz`.
+    """
+    from ase.data import atomic_numbers, chemical_symbols
+    allowed_Z = set(atomic_numbers[z] if isinstance(z, str) else int(z)
+                    for z in allowed_species)
+    allowed_str = ", ".join(f"{chemical_symbols[z]}(Z={z})" for z in sorted(allowed_Z))
+
+    dataset = read(input_xyz, index=":")
+    n_in = len(dataset)
+    kept = []
+    seen_outside = set()
+    for s in dataset:
+        species = set(int(z) for z in s.numbers)
+        if mode == "exact":
+            keep = species == allowed_Z
+        else:
+            keep = species.issubset(allowed_Z)
+        if keep:
+            kept.append(s)
+        else:
+            seen_outside.update(species - allowed_Z)
+
+    n_out = len(kept)
+    print(f"Filter ({mode}) → {{ {allowed_str} }}")
+    print(f"  read    {n_in:6d} structures from {input_xyz}")
+    print(f"  kept    {n_out:6d}")
+    print(f"  dropped {n_in - n_out:6d}", end="")
+    if seen_outside:
+        sym = ", ".join(f"{chemical_symbols[z]}(Z={z})" for z in sorted(seen_outside))
+        print(f"  (offending species: {sym})")
+    else:
+        print()
+
+    if n_out == 0:
+        raise ValueError(
+            f"No structures match filter — refusing to write empty {output_xyz}.")
+
+    os.makedirs(os.path.dirname(output_xyz) or ".", exist_ok=True)
+    write(output_xyz, kept)
+    print(f"  wrote   {n_out:6d} structures → {output_xyz}")
+    return n_out
+
+
+def dump_dipole_predictions(model_path: str,
+                             test_xyz: str,
+                             out_path: str = "datasets/dipole_test.out") -> None:
+    """Score `model_path` on `test_xyz` and write per-atom dipoles to disk.
+
+    Output columns: pred_xyz | ref_xyz | N_atoms (whitespace-separated).
+    Targets and predictions are in per-atom space when cfg.scale_targets=True
+    (the default for dipole models).
+
+    Structures whose species are not a subset of the model's `cfg.types`
+    are silently dropped (with a summary line) — otherwise the model
+    would crash on the first unknown Z in `assign_type_indices`.
+    """
+    model = load_model(model_path)
+    cfg = model.cfg
+
+    dataset = read(test_xyz, index=":")
+    print(f"Loaded {len(dataset)} structures from {test_xyz}")
+
+    # Drop frames containing species the model doesn't know.
+    known_Z = set(int(z) for z in cfg.types)
+    kept = [s for s in dataset
+            if set(int(z) for z in s.numbers).issubset(known_Z)]
+    dropped = len(dataset) - len(kept)
+    if dropped:
+        from ase.data import chemical_symbols
+        offending = set()
+        for s in dataset:
+            extra = set(int(z) for z in s.numbers) - known_Z
+            offending.update(extra)
+        sym = ", ".join(f"{chemical_symbols[z]}(Z={z})" for z in sorted(offending))
+        print(f"  Dropped {dropped}/{len(dataset)} structures containing species "
+              f"outside model types {sorted(known_Z)}: {sym}")
+    if not kept:
+        raise ValueError(
+            f"No structures in {test_xyz} match model species "
+            f"{sorted(known_Z)} — all {dropped} were dropped.")
+    dataset = kept
+
+    data = prepare_eval_data(dataset, cfg)
+    metrics, preds = model.score(data)            # [S, 3] per-atom dipoles
+    print_score_summary(metrics, cfg, prefix=f"Test ({test_xyz})")
+
+    preds_np  = preds.numpy() if hasattr(preds, "numpy") else np.asarray(preds)
+    refs_np   = (data["targets"].numpy() if hasattr(data["targets"], "numpy")
+                 else np.asarray(data["targets"]))
+    natoms_np = (data["num_atoms"].numpy() if hasattr(data["num_atoms"], "numpy")
+                 else np.asarray(data["num_atoms"]))
+
+    table = np.column_stack([preds_np, refs_np, natoms_np.astype(np.int32)])
+    header = ("pred_x pred_y pred_z   ref_x ref_y ref_z   N_atoms  "
+              f"(units: {model.cfg.dipole_units if not getattr(cfg, 'convert_dipole_to_eangstrom', True) else 'e*angstrom'}, per-atom)")
+    fmt = ["%.8e"] * 6 + ["%d"]
+    np.savetxt(out_path, table, fmt=fmt, header=header)
+    print(f"Wrote {out_path}  ({len(dataset)} rows)")
+
 
 if __name__ == '__main__':
     model = train_model()
-    #model = load_model("models/n30_q75_pop80_20260428_120216/train_waterbulk_O_H_dipole_best_val.npz")
-    #dipoles = process_trajectory(model, "datasets/water_bulk_traj.xyz", batch_size=20, descriptor_mode=1, descriptor_batch_frames=5, pin_to_cpu=False, descriptor_precision="float64")
-    
+    #model = load_model("models/n50_q165_pop100_20260513_161930_CHO_best_r2/train_C_O_H_dipole_best_val.h5")
+    #dipoles = process_trajectory(model, "plots/Ethanol/Ethanol_mace/10_MOL/nve.traj", dt_fs = 1.0, batch_size=50, descriptor_mode=1, descriptor_batch_frames=20, pin_to_cpu=False, descriptor_precision="float32", descriptor_pair_tile_size=8000)
+    #dump_dipole_predictions(model_path="models/n50_q165_pop100_20260513_161930_CHO_best_r2/train_C_O_H_dipole_best_val.h5", test_xyz="datasets/test.xyz", out_path="datasets/dipole_test_tnep.out")
+    #filter_dataset_by_species(input_xyz="datasets/test.xyz", output_xyz="datasets/cho_filter_test.xyz", allowed_species=[6, 1, 8])
+    #ir_spectrum_from_file(dipole_path="plots/Ethanol/Ethanol_mace/nve_dipoles.txt", dt_fs = 1, save_dir=None, acf_ratio=0.1, smooth_k=20, quantum_correction="harmonic")

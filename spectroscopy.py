@@ -25,19 +25,35 @@ def compute_dipole_acf(dipoles: np.ndarray) -> np.ndarray:
     """Compute the dipole autocorrelation function via the Wiener-Khinchin theorem.
 
     Uses FFT for O(N log N) efficiency instead of direct O(N²) summation.
-    Averages over x, y, z components (isotropic).
+    Sums (not averages) over x, y, z components — i.e. computes the dot-
+    product ACF ⟨μ(0)·μ(τ)⟩ exactly as in Xu et al., J. Chem. Theory
+    Comput. 2024, 20, 3273-3284, Eq. 9.
 
-    Ref: Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284, Eq. 9
+    Estimator: **biased**. Each lag is normalised by the full trajectory
+    length T (not by (T-τ)). This matches GPUMD and Xu's reference
+    implementation. The biased form lets the ACF decay smoothly toward
+    zero at large τ — the unbiased 1/(T-τ) form would amplify the noisy
+    tail (few overlapping pairs at high lag) and leak that noise into
+    the spectrum.
 
     Args:
         dipoles : [T, 3] ndarray — dipole moment trajectory (one per MD frame)
 
     Returns:
-        acf : [T] ndarray — normalised dipole autocorrelation function C(τ)/C(0)
+        acf : [T] ndarray — dipole autocorrelation function (e²·Å² units
+              if dipoles are in e·Å). NOT normalised to acf[0] = 1.
     """
     T = dipoles.shape[0]
-    # Zero-pad to avoid circular correlation artefacts
-    n_fft = 2 * T
+    # Zero-pad to ≥ 2T-1 for linear (non-circular) correlation. Round up
+    # to a fast FFT length so NumPy/scipy can hit their O(N log N) paths
+    # cleanly instead of a slow prime-factor decomposition. `next_fast_len`
+    # lives in scipy.fft on modern releases; fall back to plain 2*T when
+    # scipy isn't available.
+    try:
+        from scipy.fft import next_fast_len as _nfl
+        n_fft = int(_nfl(2 * T - 1))
+    except ImportError:
+        n_fft = 2 * T
     acf = np.zeros(T)
     for dim in range(3):
         d = dipoles[:, dim]
@@ -46,41 +62,75 @@ def compute_dipole_acf(dipoles: np.ndarray) -> np.ndarray:
         power = np.real(fd * np.conj(fd))
         full_acf = np.fft.irfft(power, n=n_fft)[:T]
         acf += full_acf
-    # Normalise by number of overlapping pairs at each lag
-    counts = np.arange(T, 0, -1, dtype=np.float64)
-    acf /= counts
-    # Average over 3 spatial dimensions
-    acf /= 3.0
+    # Biased estimator: divide by T (constant), not (T-τ). Sums (not
+    # averages) over the three spatial components per Xu Eq. 9.
+    acf /= float(T)
     return acf
 
 
 def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | None = 'hann',
                          max_freq_cm: float = 4000.0, acf_ratio: float = 0.1,
-                         smooth_k: int = 10) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                         smooth_k: int = 10,
+                         smooth_kind: str = "gaussian",
+                         temperature: float = 300.0,
+                         quantum_correction: str = "harmonic",
+                         power_dc_cutoff_cm: float = 100.0,
+                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute IR absorption spectrum from a dipole moment trajectory.
 
-    Follows the reference GPUMD/NEP notebook (Dr. Nan Xu) and
-    Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284:
+    Follows GPUMD / Xu et al., J. Chem. Theory Comput. 2024, 20, 3273–3284:
         1. Subtract mean dipole to remove DC component
         2. Compute dipole autocorrelation function C(τ) = <μ(0)·μ(τ)>
         3. Truncate ACF to first acf_ratio of the trajectory (default 10%)
         4. Apply Hann window and Kronecker doubling factor
         5. Cosine transform to obtain line shape M(ω) (guaranteed non-negative)
-        6. IR absorption: σ(ω) ∝ ω² · M(ω)  (Eq. 1)
+        6. IR absorption: σ(ω) ∝ ω · (1 − e^(−ℏω/kT)) · M(ω)
+           — the "harmonic" quantum correction. Reduces to ω² · M(ω) only
+           in the classical limit ℏω ≪ kT (i.e. ν̃ ≪ 210 cm⁻¹ at 300 K).
+           At ν̃ ≈ 3000 cm⁻¹ at 300 K, the classical ω² form overweights
+           by a factor of ℏω/kT ≈ 14, masking lower-frequency modes —
+           hence the OH/CH stretch always dominates an ω²-weighted plot.
         7. Smooth with a moving average of width smooth_k
 
     Args:
-        dipoles      : [T, 3] ndarray — dipole trajectory (e/Å or Debye, one per frame)
-        dt_fs        : float — timestep between frames in femtoseconds
-        window       : str or None — window function ('hann', 'blackman', or None)
-        max_freq_cm  : float — maximum frequency to return in cm⁻¹
-        acf_ratio    : float — fraction of trajectory to use as max ACF lag (default 0.1)
-        smooth_k     : int — moving-average smoothing width (default 10, 0 to disable)
-
+        dipoles            : [T, 3] ndarray — dipole trajectory (e·Å, one per frame)
+        dt_fs              : float — timestep between frames in femtoseconds
+        window             : str or None — window function ('hann', 'blackman', or None)
+        max_freq_cm        : float — maximum frequency to return in cm⁻¹
+        acf_ratio          : float — fraction of trajectory to use as max ACF lag (default 0.1)
+        smooth_k           : int — smoothing strength. Higher = smoother
+                              spectrum (broader peaks, less noise). For the
+                              default smooth_kind="gaussian" this is the
+                              FWHM of the Gaussian kernel **in frequency bins**;
+                              for smooth_kind="box" it is the moving-average
+                              window width in bins. 0 = disable.
+                              Typical FWHM: 5-30 cm⁻¹ for clean spectra at
+                              dt_fs=0.25 fs (bin width ≈ 0.4-2 cm⁻¹), so
+                              smooth_k=10-50 covers most cases.
+        smooth_kind        : str — "gaussian" (default; no spectral ringing,
+                              recommended) or "box" (moving average; matches
+                              GPUMD notebook but has sinc-like sidelobes
+                              around sharp peaks).
+        temperature        : float — simulation temperature in K (only used when
+                              quantum_correction != "classical"). Default 300 K.
+        quantum_correction : str — IR absorption weighting:
+                              "harmonic"  : ω · (1 − e^(−ℏω/kT)) · M(ω)  — GPUMD default
+                              "classical" : ω² · M(ω)                    — Xu Eq. 1 original
+                              "quadratic" : alias for "classical" (ω²·M(ω))
+                              "linear"    : ω · M(ω)                     — high-freq limit
+                              "none"      : M(ω) (power spectrum only)
+        power_dc_cutoff_cm : float — frequencies below this are excluded
+                              from the power-spectrum peak-normaliser.
+                              The raw M(ω) has a huge DC peak that would
+                              otherwise crush all vibrational features to
+                              ~1 % of full scale. Set 0 to keep the DC
+                              bin in the normaliser (matches the IR
+                              intensity normaliser, which is naturally
+                              ω-suppressed at DC). Default 100 cm⁻¹.
     Returns:
         freq_cm   : [N] ndarray — frequencies in cm⁻¹
-        intensity : [N] ndarray — IR absorption intensity (arb. units, ω²·M(ω))
-        power     : [N] ndarray — power spectrum (arb. units, M(ω) before ω² weighting)
+        intensity : [N] ndarray — IR absorption intensity (arb. units)
+        power     : [N] ndarray — power spectrum (arb. units, M(ω) before ω weighting)
         acf       : [Nmax] ndarray — dipole autocorrelation function
     """
     # Subtract mean to remove DC component before computing ACF
@@ -119,8 +169,29 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     c_cm_per_fs = 2.99792458e-5  # speed of light in cm/fs
     freq_cm = np.arange(Nmax) / ((2 * Nmax - 1) * dt_fs * c_cm_per_fs)
 
-    # IR absorption: σ(ω) ∝ ω² · M(ω)  (Xu et al. JCTC 2024, Eq. 1)
-    intensity = freq_cm**2 * M_omega
+    # IR absorption weighting. The "harmonic" form ω·(1-e^(-ℏω/kT))·M(ω)
+    # is what GPUMD uses; the classical ω²·M(ω) form is only valid for
+    # ν̃ ≪ kT/ℏ (~210 cm⁻¹ at 300 K) and dramatically overweights high-
+    # frequency modes when applied beyond that regime.
+    qc = str(quantum_correction).lower()
+    hbar_c_eV_cm = 1.23984e-4              # ℏc in eV·cm  (so ℏω [eV] = ℏc · ν̃ [cm⁻¹])
+    kT_eV = 8.617333e-5 * float(temperature)
+    if qc in ("classical", "quadratic"):    # "quadratic" alias = ω²·M(ω)
+        prefactor = freq_cm ** 2
+    elif qc == "linear":
+        prefactor = freq_cm
+    elif qc == "none":
+        prefactor = np.ones_like(freq_cm)
+    elif qc == "harmonic":
+        x = hbar_c_eV_cm * freq_cm / max(kT_eV, 1e-30)   # ℏω/kT  (dimensionless)
+        # (1 - e^{-x}) for x→0 is x (gives classical ω² limit); for large
+        # x saturates to 1 (gives ω scaling, the high-freq quantum limit).
+        prefactor = freq_cm * (1.0 - np.exp(-x))
+    else:
+        raise ValueError(
+            f"quantum_correction must be 'harmonic', 'classical' (alias 'quadratic'), "
+            f"'linear', or 'none', got {quantum_correction!r}")
+    intensity = prefactor * M_omega
     power = M_omega.copy()
 
     # Truncate to requested frequency range
@@ -129,137 +200,523 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     intensity = intensity[mask]
     power = power[mask]
 
-    # Smooth with moving average
+    # Smooth. Higher `smooth_k` → smoother spectrum.
+    #   smooth_kind="gaussian" (default): no spectral ringing. Treated as
+    #     FWHM in bins; σ = smooth_k / 2.355. Preserves freq_cm length.
+    #   smooth_kind="box": moving average of width smooth_k bins. Matches
+    #     GPUMD-notebook behaviour but produces sinc-like sidelobes around
+    #     sharp peaks. Uses mode='valid' which shortens freq_cm.
     if smooth_k > 1 and len(intensity) > smooth_k:
-        kernel = np.ones(smooth_k) / smooth_k
-        intensity = np.convolve(intensity, kernel, mode='valid')
-        power = np.convolve(power, kernel, mode='valid')
-        # mode='valid' output[i] averages input[i:i+smooth_k], centred at i+(smooth_k-1)/2.
-        # freq_cm is linear, so compute exact fractional-centre frequencies directly.
-        d_freq = freq_cm[1] - freq_cm[0]
-        freq_start = freq_cm[0] + (smooth_k - 1) / 2.0 * d_freq
-        freq_cm = freq_start + np.arange(len(intensity)) * d_freq
+        sk = str(smooth_kind).lower()
+        if sk == "gaussian":
+            try:
+                from scipy.ndimage import gaussian_filter1d
+            except ImportError:                              # graceful fallback
+                gaussian_filter1d = None
+            if gaussian_filter1d is not None:
+                sigma_bins = smooth_k / 2.355                # FWHM → σ
+                intensity = gaussian_filter1d(intensity, sigma=sigma_bins,
+                                              mode="nearest")
+                power     = gaussian_filter1d(power,     sigma=sigma_bins,
+                                              mode="nearest")
+                # freq_cm unchanged — Gaussian filter preserves alignment.
+            else:
+                sk = "box"                                   # fall back below
+        if sk == "box":
+            kernel = np.ones(smooth_k) / smooth_k
+            intensity = np.convolve(intensity, kernel, mode='valid')
+            power     = np.convolve(power,     kernel, mode='valid')
+            # mode='valid' output[i] averages input[i:i+smooth_k], centred at i+(smooth_k-1)/2.
+            d_freq = freq_cm[1] - freq_cm[0]
+            freq_start = freq_cm[0] + (smooth_k - 1) / 2.0 * d_freq
+            freq_cm = freq_start + np.arange(len(intensity)) * d_freq
+        elif sk not in ("gaussian", "box"):
+            raise ValueError(
+                f"smooth_kind must be 'gaussian' or 'box', got {smooth_kind!r}")
 
-    # Normalise both to peak = 1
+    # Normalise both to peak = 1.
     peak = np.max(np.abs(intensity))
     if peak > 0:
         intensity /= peak
-    peak = np.max(np.abs(power))
-    if peak > 0:
-        power /= peak
+
+    # For the raw power spectrum M(ω), the global max sits at ω ≈ 0
+    # (since the ACF C(τ) is largest at τ=0 and the cosine transform of
+    # a one-sided decaying function peaks at ω=0). Dividing by that DC
+    # peak collapses every vibrational feature to <1 % of full scale —
+    # the spectrum looks "empty" on a linear plot. Exclude bins below
+    # `power_dc_cutoff_cm` from the normaliser so vibrational peaks are
+    # visible. Set to 0 to disable (keeps the original DC-dominated
+    # behaviour for users who want raw M(ω) magnitudes).
+    if power_dc_cutoff_cm > 0:
+        mask_vib = freq_cm >= float(power_dc_cutoff_cm)
+    else:
+        mask_vib = np.ones_like(freq_cm, dtype=bool)
+    peak_vib = float(np.max(np.abs(power[mask_vib]))) if mask_vib.any() else 0.0
+    if peak_vib > 0:
+        power = power / peak_vib
 
     return freq_cm, intensity, power, acf
 
 
+def _ir_plot_basename(trajectory_path: str | None,
+                       model_label: str | None) -> str:
+    """Build a descriptive plot stem from trajectory + model names.
+
+    e.g. trajectory_path = "datasets/ethanol_nve.traj"
+         model_label    = "n50_q165_pop100_CHO"
+         → "ethanol_nve_n50_q165_pop100_CHO"
+
+    Any None or empty parts are skipped. Falls back to "ir_spectrum" if
+    both are None.
+    """
+    parts = []
+    if trajectory_path:
+        parts.append(os.path.splitext(os.path.basename(trajectory_path))[0])
+    if model_label:
+        parts.append(str(model_label))
+    return "_".join(parts) if parts else "ir_spectrum"
+
+
+def _plot_one_ir_panel(ax_lo, ax_hi, freq_cm: np.ndarray, y: np.ndarray,
+                        split_at_cm: float | None,
+                        ylabel: str, title: str,
+                        invert_y: bool = False) -> None:
+    """Plot one IR trace into either a single axis (`ax_hi`, `ax_lo=None`)
+    or a broken-axis pair (low/high regions normalised independently).
+
+    When `split_at_cm` is None: plot full range into `ax_hi` only.
+    When `split_at_cm` is a float: plot ν̃ ≤ split into `ax_lo` and
+    ν̃ > split into `ax_hi`. Each side is renormalised to peak = 1 within
+    its window so that high-freq structure isn't crushed by low-freq peaks.
+    Diagonal break marks are drawn between the two halves.
+    """
+    if split_at_cm is None:
+        ax_hi.plot(freq_cm, y, color='black', linewidth=0.8)
+        ax_hi.set_xlabel("Wavenumber (cm⁻¹)")
+        ax_hi.set_ylabel(ylabel)
+        ax_hi.set_title(title)
+        ax_hi.set_xlim(freq_cm[0], freq_cm[-1])
+        ax_hi.invert_xaxis()
+        ax_hi.set_ylim(0, 1.05)
+        ax_hi.grid(alpha=0.3)
+        return
+
+    # Split-region rendering. Two adjacent axes (ax_lo for the lower
+    # wavenumber band, ax_hi for the higher) each with independent
+    # peak-normalisation; visual "broken-axis" cue between them.
+    mask_lo = freq_cm <= split_at_cm
+    mask_hi = freq_cm >  split_at_cm
+    if not mask_lo.any() or not mask_hi.any():
+        # Fall back to single-axis if the split lands outside the data
+        _plot_one_ir_panel(None, ax_hi, freq_cm, y, None, ylabel, title)
+        return
+
+    f_lo, y_lo = freq_cm[mask_lo], y[mask_lo]
+    f_hi, y_hi = freq_cm[mask_hi], y[mask_hi]
+
+    if invert_y:
+        # `y` is transmittance built from the GLOBAL-peak absorbance. To
+        # renormalise per region, recover the absorbance, peak-normalise
+        # it within each region, then re-apply the chosen T(A) mapping.
+        a_lo = _transmittance_to_absorbance(y_lo)
+        a_hi = _transmittance_to_absorbance(y_hi)
+        peak_lo = float(np.max(a_lo)) if a_lo.size else 0.0
+        peak_hi = float(np.max(a_hi)) if a_hi.size else 0.0
+        if peak_lo > 0:
+            a_lo = a_lo / peak_lo
+        if peak_hi > 0:
+            a_hi = a_hi / peak_hi
+        y_lo = _absorbance_to_transmittance(a_lo)
+        y_hi = _absorbance_to_transmittance(a_hi)
+    else:
+        peak_lo = float(np.max(y_lo)) if y_lo.size else 0.0
+        peak_hi = float(np.max(y_hi)) if y_hi.size else 0.0
+        if peak_lo > 0:
+            y_lo = y_lo / peak_lo
+        if peak_hi > 0:
+            y_hi = y_hi / peak_hi
+
+    # IR convention: high wavenumber on the left. So ax_hi is on the
+    # LEFT of the pair, ax_lo on the RIGHT.
+    ax_hi.plot(f_hi, y_hi, color='black', linewidth=0.8)
+    ax_lo.plot(f_lo, y_lo, color='black', linewidth=0.8)
+    ax_hi.set_xlim(f_hi.max(), f_hi.min())     # invert
+    ax_lo.set_xlim(f_lo.max(), f_lo.min())
+    ax_hi.set_ylim(0, 1.05); ax_lo.set_ylim(0, 1.05)
+    ax_hi.set_title(title); ax_hi.set_ylabel(ylabel)
+    ax_hi.grid(alpha=0.3); ax_lo.grid(alpha=0.3)
+    # Hide the inner spines so the panels look joined.
+    ax_hi.spines['right'].set_visible(False)
+    ax_lo.spines['left'].set_visible(False)
+    ax_lo.tick_params(left=False, labelleft=False)
+    # Diagonal break marks (matplotlib broken-axis idiom).
+    d = .015
+    kwargs = dict(transform=ax_hi.transAxes, color='k', clip_on=False)
+    ax_hi.plot((1 - d, 1 + d), (-d, +d), **kwargs)
+    ax_hi.plot((1 - d, 1 + d), (1 - d, 1 + d), **kwargs)
+    kwargs.update(transform=ax_lo.transAxes)
+    ax_lo.plot((-d, +d), (-d, +d), **kwargs)
+    ax_lo.plot((-d, +d), (1 - d, 1 + d), **kwargs)
+    # Shared x-label spans both, centred on the pair.
+    ax_hi.set_xlabel("")
+    ax_lo.set_xlabel("")
+    # Use the figure-level annotation for the combined x-label below.
+
+
+def _emit_single_ir_figure(freq_cm: np.ndarray, y: np.ndarray,
+                            label: str, ylabel: str,
+                            title: str, split_at_cm: float | None,
+                            stem: str, cfg: TNEPconfig,
+                            save_plots: str | None, show_plots: bool,
+                            invert_y: bool) -> None:
+    """Emit ONE labelled figure (absorbance OR transmittance), saved
+    separately so the two are not crammed into one image.
+    """
+    from plotting import _save_fig
+    if split_at_cm is None:
+        fig, ax = plt.subplots(figsize=(14, 6))
+        _plot_one_ir_panel(None, ax, freq_cm, y, None,
+                           ylabel=ylabel, title=title)
+    else:
+        # Broken-axis pair: [hi | lo] for a single quantity.
+        # Width ratios are set in PROPORTION to the wavenumber range each
+        # side covers, so the cm⁻¹-per-pixel scale is identical on both
+        # halves (i.e. a 50 cm⁻¹ feature has the same on-screen width
+        # regardless of which side of the break it sits on).
+        f_max = float(freq_cm.max())
+        f_min = float(freq_cm.min())
+        f_split = float(split_at_cm)
+        # Clamp so we never get zero/negative widths from a split outside
+        # the data range; fall back to 1:1 in that pathological case.
+        hi_extent = max(f_max - f_split, 1.0)
+        lo_extent = max(f_split - f_min, 1.0)
+        fig, axes = plt.subplots(
+            1, 2, figsize=(15, 6),
+            gridspec_kw={"width_ratios": [hi_extent, lo_extent],
+                         "wspace": 0.06})
+        ax_hi, ax_lo = axes
+        _plot_one_ir_panel(ax_lo, ax_hi, freq_cm, y, f_split,
+                            ylabel=ylabel,
+                            title=f"{title}  (split at {int(split_at_cm)} cm⁻¹)",
+                            invert_y=invert_y)
+    fig.suptitle(label, fontsize=14)
+    plt.tight_layout(rect=(0, 0.06 if split_at_cm is not None else 0,
+                            1, 0.95))
+    if split_at_cm is not None:
+        from matplotlib.transforms import Bbox
+        bbox = Bbox.union([axes[0].get_position(), axes[1].get_position()])
+        fig.text(0.5 * (bbox.x0 + bbox.x1), 0.02,
+                 "Wavenumber (cm⁻¹)", ha='center', va='bottom', fontsize=11)
+    _save_fig(fig, cfg, stem, save_plots)
+    if show_plots:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+# Module-level state set by `plot_ir_spectrum` and consumed by
+# `_plot_one_ir_panel` for per-region transmittance reconstruction.
+# Keeps the panel-helper signature stable while letting the outer
+# plotter dictate the T(A) convention.
+_TRANSMITTANCE_MODE: str = "beer_lambert"
+_TRANSMITTANCE_SCALE: float = 1.0
+
+
+def _absorbance_to_transmittance(A: np.ndarray) -> np.ndarray:
+    """A → T using the currently-configured convention.
+
+    "beer_lambert" : T = 10^(−scale·A)   — proper Beer-Lambert form;
+                     T=10^(−1) ≈ 0.1 at A=1 with default scale=1.
+    "linear"       : T = 1 − A           — visual mirror of absorbance,
+                     used by most computational-IR pipelines for display.
+    """
+    A = np.asarray(A)
+    if _TRANSMITTANCE_MODE == "beer_lambert":
+        return 10.0 ** (-_TRANSMITTANCE_SCALE * A)
+    if _TRANSMITTANCE_MODE == "linear":
+        return 1.0 - A
+    raise ValueError(f"Unknown transmittance_mode {_TRANSMITTANCE_MODE!r}")
+
+
+def _transmittance_to_absorbance(T: np.ndarray) -> np.ndarray:
+    """T → A, inverse of `_absorbance_to_transmittance` under the
+    currently-configured convention. Clipped to keep log/inverse stable
+    against FFT round-off producing T slightly above 1 or below 0."""
+    T = np.clip(np.asarray(T), 1e-30, 1.0)
+    if _TRANSMITTANCE_MODE == "beer_lambert":
+        return -np.log10(T) / max(_TRANSMITTANCE_SCALE, 1e-30)
+    if _TRANSMITTANCE_MODE == "linear":
+        return 1.0 - T
+    raise ValueError(f"Unknown transmittance_mode {_TRANSMITTANCE_MODE!r}")
+
+
 def plot_ir_spectrum(freq_cm: np.ndarray, intensity: np.ndarray, cfg: TNEPconfig,
                      save_plots: str | None = None, show_plots: bool = True,
-                     title: str = "IR Spectrum") -> None:
-    """Plot IR absorption spectrum.
+                     title: str = "IR Spectrum",
+                     trajectory_path: str | None = None,
+                     model_label: str | None = None,
+                     split_at_cm: float | None = None,
+                     transmittance_mode: str = "beer_lambert",
+                     transmittance_scale: float = 1.0) -> None:
+    """Plot IR spectrum as TWO separate, labelled figures.
+
+    Emits the absorbance and transmittance plots as **independent files**
+    so neither is cramped. Filename suffixes distinguish them:
+        <stem>_absorbance.png
+        <stem>_transmittance.png
+    (or `_absorbance_split500.png` etc. when `split_at_cm` is set).
+
+    Y-axes both ascend normally:
+        - Absorbance     : peaks point UP from a flat 0 baseline.
+        - Transmittance  : peaks dip DOWN from a flat 1 baseline.
 
     Args:
-        freq_cm    : [N] ndarray — frequencies in cm⁻¹
-        intensity  : [N] ndarray — normalised IR intensity
-        cfg        : TNEPconfig — used for filename generation
-        save_plots : str or None — directory to save into
-        show_plots : bool — True to display interactively
-        title      : str — plot title
+        freq_cm             : [N] ndarray — frequencies in cm⁻¹
+        intensity           : [N] ndarray — normalised IR intensity (peak=1)
+        cfg                 : TNEPconfig — used for save-directory resolution
+        save_plots          : str or None — directory to save into
+        show_plots          : bool — True to display interactively
+        title               : str — figure title prefix
+        trajectory_path     : str or None — appears in filename
+        model_label         : str or None — appears in filename
+        split_at_cm         : float or None — broken-axis split (per-region
+                              peak-normalisation). Default None = full range.
+        transmittance_mode  : str — A → T conversion:
+                              "beer_lambert" (default): T = 10^(−scale·A).
+                                  Physically meaningful Beer-Lambert form.
+                                  Peak A=1 maps to T=0.1 with default scale.
+                              "linear" : T = 1 − A. Visual mirror only;
+                                  not Beer-Lambert correct but used in
+                                  many computational-IR pipelines.
+        transmittance_scale : float — multiplier on A for Beer-Lambert
+                              mode (effective path-length·concentration
+                              product). Higher → deeper transmittance
+                              dips. Default 1.0 gives ~10 % minimum
+                              transmission at the strongest peak.
     """
-    from plotting import _finish_fig
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(freq_cm, intensity, color='black', linewidth=0.8)
-    ax.set_xlabel("Wavenumber (cm⁻¹)")
-    ax.set_ylabel("IR Intensity (arb. units)")
-    ax.set_title(title)
-    ax.set_xlim(freq_cm[0], freq_cm[-1])
-    ax.invert_xaxis()  # IR convention: high to low wavenumber
-    ax.set_ylim(1, 0)  # intensity descends from 1 at top to 0 at bottom
-    plt.tight_layout()
-    _finish_fig(fig, cfg, "ir_spectrum", save_plots, show_plots)
+    # Stash the chosen mode on module state so the per-region renormaliser
+    # in `_plot_one_ir_panel` (used by the split-axis layout) can apply
+    # the same A↔T mapping when recomputing transmittance per region.
+    global _TRANSMITTANCE_MODE, _TRANSMITTANCE_SCALE
+    _TRANSMITTANCE_MODE = str(transmittance_mode).lower()
+    _TRANSMITTANCE_SCALE = float(transmittance_scale)
+    if _TRANSMITTANCE_MODE not in ("beer_lambert", "linear"):
+        raise ValueError(
+            f"transmittance_mode must be 'beer_lambert' or 'linear', "
+            f"got {transmittance_mode!r}")
+
+    absorbance    = intensity
+    transmittance = _absorbance_to_transmittance(absorbance)
+
+    base_stem = _ir_plot_basename(trajectory_path, model_label)
+    split_tag = f"_split{int(split_at_cm)}" if split_at_cm is not None else ""
+
+    # 1. Absorbance
+    _emit_single_ir_figure(
+        freq_cm, absorbance,
+        label=f"{title} — Absorbance",
+        ylabel=("Absorbance (per-region peak-normalised)"
+                if split_at_cm is not None
+                else "Absorbance (arb. units, peak-normalised)"),
+        title="Absorbance",
+        split_at_cm=split_at_cm,
+        stem=f"{base_stem}_absorbance{split_tag}",
+        cfg=cfg, save_plots=save_plots, show_plots=show_plots,
+        invert_y=False,
+    )
+
+    # 2. Transmittance — y-axis label reflects the chosen mode.
+    if _TRANSMITTANCE_MODE == "beer_lambert":
+        t_label = (f"Transmittance  T = 10^(−{_TRANSMITTANCE_SCALE:g}·A)"
+                   if not split_at_cm
+                   else f"Transmittance  (per-region 10^(−{_TRANSMITTANCE_SCALE:g}·A))")
+    else:  # "linear"
+        t_label = ("Transmittance  (1 − A)"
+                   if not split_at_cm
+                   else "Transmittance  (per-region 1 − A)")
+    _emit_single_ir_figure(
+        freq_cm, transmittance,
+        label=f"{title} — Transmittance",
+        ylabel=t_label,
+        title="Transmittance",
+        split_at_cm=split_at_cm,
+        stem=f"{base_stem}_transmittance{split_tag}",
+        cfg=cfg, save_plots=save_plots, show_plots=show_plots,
+        invert_y=True,
+    )
 
 
 def ir_spectrum_from_file(
     dipole_path: str,
     dt_fs: float = 1.0,
-    save_path: str | None = None,
+    save_dir: str | None = None,
     show: bool = True,
     title: str | None = None,
+    model_label: str | None = None,
+    plot_power: bool = True,
+    split_at_cm: float | None = None,
+    cfg: TNEPconfig | None = None,
+    # ── compute_ir_spectrum knobs promoted to first-class kwargs ────
+    window: str | None = 'hann',
+    max_freq_cm: float = 4000.0,
+    acf_ratio: float = 0.1,
+    smooth_k: int = 10,
+    smooth_kind: str = "gaussian",
+    temperature: float = 300.0,
+    quantum_correction: str = "harmonic",
+    power_dc_cutoff_cm: float = 100.0,
+    # ── transmittance display options ───────────────────────────────
+    transmittance_mode: str = "beer_lambert",
+    transmittance_scale: float = 1.0,
     **ir_kwargs,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Load a saved dipole trajectory and plot its IR spectrum.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load a saved dipole trajectory and plot its IR + power spectra.
 
-    Convenience wrapper around `np.load`/`np.loadtxt` + `compute_ir_spectrum`
-    + a minimal matplotlib plot — no TNEPconfig required. Accepts either the
-    binary .npy or the human-readable .txt file written by
-    `process_trajectory`.
+    Convenience wrapper around `np.load`/`np.loadtxt` + `compute_ir_spectrum`.
+    Accepts either the binary `.npy` or the text `.txt` file written by
+    `process_trajectory`. Emits the absorbance + transmittance plots as
+    separate, labelled files, plus the companion power-spectrum plot.
 
     Args:
-        dipole_path : path to the dipole file (.npy or .txt). Shape [T, 3].
-        dt_fs       : MD timestep in femtoseconds.
-        save_path   : if given, save the plot here (e.g. "ir.png"). None = do
-                      not save.
-        show        : True to call plt.show() interactively.
-        title       : optional plot title (defaults to the file's basename).
-        **ir_kwargs : forwarded to `compute_ir_spectrum`
-                      (window, max_freq_cm, acf_ratio, smooth_k).
+        dipole_path        : path to the dipole file (.npy or .txt). Shape [T, 3].
+        dt_fs              : timestep between frames in femtoseconds.
+        save_dir           : directory to save plots into. None = don't save.
+        show               : True to display interactively.
+        title              : optional plot title (defaults to the file basename).
+        model_label        : optional model identifier baked into the saved
+                             filename (e.g. "n50_q165_CHO"). None = none.
+        plot_power         : also produce the companion power-spectrum plot.
+        split_at_cm        : if set, the absorbance + transmittance plots
+                             are rendered as broken-axis pairs split at
+                             this wavenumber (e.g. 500.0). Each side is
+                             independently peak-normalised. None = full
+                             range.
+        cfg                : optional TNEPconfig used by the plotters for unit
+                             labels. A minimal default is created if None.
+
+        window             : ACF window — 'hann' (default), 'blackman', or None.
+        max_freq_cm        : maximum wavenumber kept on the spectrum (cm⁻¹).
+        acf_ratio          : fraction of the trajectory used as max ACF lag.
+        smooth_k           : smoothing strength. Higher = smoother spectrum.
+                             For Gaussian smoothing this is the FWHM in
+                             frequency bins; for box it is the moving-average
+                             window. 0 disables.
+        smooth_kind        : "gaussian" (default; no ringing) or "box".
+        temperature        : simulation T in K. Used by the harmonic quantum
+                             correction.
+        quantum_correction : IR weighting:
+                              "harmonic"  : ω·(1 − e^(−ℏω/kT))·M(ω) (GPUMD)
+                              "classical" : ω²·M(ω) (Xu Eq. 1 original)
+                              "quadratic" : alias for "classical"
+                              "linear"    : ω·M(ω)
+                              "none"      : M(ω)
+        power_dc_cutoff_cm : exclude bins below this from the power-spectrum
+                             peak-normaliser (and from the visible plot
+                             range). Set 0 to disable.
+        **ir_kwargs        : any additional kwargs forwarded to
+                             `compute_ir_spectrum` (future-proofing).
 
     Returns:
-        (freq_cm, intensity) — 1-D arrays. The autocorrelation and power
-        spectrum returned by `compute_ir_spectrum` are computed but not
-        returned here; call that function directly if you need them.
+        (freq_cm, intensity, power) — 1-D arrays.
     """
-    import os
     if dipole_path.lower().endswith(".npy"):
         dipoles = np.load(dipole_path)
     else:
         dipoles = np.loadtxt(dipole_path)
     if dipoles.ndim != 2 or dipoles.shape[1] != 3:
         raise ValueError(
-            f"expected dipoles of shape [T, 3], got {dipoles.shape}"
-        )
-    freq_cm, intensity, _power, _acf = compute_ir_spectrum(
-        dipoles, dt_fs=dt_fs, **ir_kwargs)
+            f"expected dipoles of shape [T, 3], got {dipoles.shape}")
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(freq_cm, intensity, color="black", linewidth=0.8)
-    ax.set_xlabel("Wavenumber (cm⁻¹)")
-    ax.set_ylabel("IR Intensity (arb. units)")
-    ax.set_title(title or f"IR spectrum — {os.path.basename(dipole_path)}")
-    ax.set_xlim(freq_cm[0], freq_cm[-1])
-    ax.invert_xaxis()
-    ax.set_ylim(1, 0)
-    plt.tight_layout()
-    if save_path:
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        fig.savefig(save_path, dpi=150)
-    if show:
-        plt.show()
-    plt.close(fig)
-    return freq_cm, intensity
+    freq_cm, intensity, power, _acf = compute_ir_spectrum(
+        dipoles, dt_fs=dt_fs,
+        window=window, max_freq_cm=max_freq_cm, acf_ratio=acf_ratio,
+        smooth_k=smooth_k, smooth_kind=smooth_kind,
+        temperature=temperature, quantum_correction=quantum_correction,
+        power_dc_cutoff_cm=power_dc_cutoff_cm,
+        **ir_kwargs,
+    )
+
+    # The plotters consult cfg only for unit labels; a fresh TNEPconfig
+    # with the default e·Å unit is fine when one isn't supplied.
+    if cfg is None:
+        cfg = TNEPconfig()
+
+    plot_ir_spectrum(
+        freq_cm, intensity, cfg,
+        save_plots=save_dir, show_plots=show,
+        title=title or f"IR spectrum — {os.path.basename(dipole_path)}",
+        trajectory_path=dipole_path, model_label=model_label,
+        split_at_cm=split_at_cm,
+        transmittance_mode=transmittance_mode,
+        transmittance_scale=transmittance_scale,
+    )
+    if plot_power:
+        # Same DC cutoff for the visible plot range as the normaliser,
+        # so the two stay consistent.
+        plot_power_spectrum(
+            freq_cm, power, cfg,
+            save_plots=save_dir, show_plots=show,
+            title="Power Spectrum  M(ω)",
+            trajectory_path=dipole_path, model_label=model_label,
+            low_cm_cutoff=power_dc_cutoff_cm,
+        )
+    return freq_cm, intensity, power
 
 
 def plot_power_spectrum(freq_cm: np.ndarray, power: np.ndarray, cfg: TNEPconfig,
                         save_plots: str | None = "plots", show_plots: bool = False,
-                        title: str = "Power Spectrum") -> None:
-    """Plot the dipole power spectrum M(ω) (before ω² weighting).
+                        title: str = "Power Spectrum",
+                        low_cm_cutoff: float = 100.0,
+                        use_log: bool = True,
+                        trajectory_path: str | None = None,
+                        model_label: str | None = None) -> None:
+    """Plot the dipole power spectrum M(ω) (no ω weighting).
+
+    M(ω) has a strong DC peak (ω≈0) that dwarfs all vibrational features;
+    this plot crops the visible range to ν̃ ≥ `low_cm_cutoff` cm⁻¹ (default
+    100) and defaults to a log y-axis so the 2-4 orders of magnitude of
+    dynamic range across vibrational modes are visible.
 
     Args:
-        freq_cm    : [N] ndarray — frequencies in cm⁻¹
-        power      : [N] ndarray — normalised power spectrum M(ω)
-        cfg        : TNEPconfig — used for filename generation
-        save_plots : str or None — directory to save into
-        show_plots : bool — True to display interactively
-        title      : str — plot title
+        freq_cm         : [N] ndarray — frequencies in cm⁻¹
+        power           : [N] ndarray — normalised power spectrum M(ω)
+        cfg             : TNEPconfig — used for save-directory resolution
+        save_plots      : str or None — directory to save into (None = don't save)
+        show_plots      : bool — True to display interactively
+        title           : str — plot title
+        low_cm_cutoff   : float — drop frequencies below this from the plot
+                          (default 100 cm⁻¹). 0 = keep full range.
+        use_log         : bool — log y-axis (default True)
+        trajectory_path : str or None — used in the saved filename
+        model_label     : str or None — used in the saved filename
     """
-    from plotting import _finish_fig
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(freq_cm, power, color='black', linewidth=0.8)
+    from plotting import _save_fig
+
+    mask = freq_cm >= float(low_cm_cutoff)
+    f_plot = freq_cm[mask]
+    p_plot = power[mask]
+    # Guard against zeros / negatives ruining log scale.
+    if use_log:
+        p_plot = np.maximum(p_plot, 1e-8)
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(f_plot, p_plot, color='black', linewidth=0.8)
     ax.set_xlabel("Wavenumber (cm⁻¹)")
-    ax.set_ylabel("Power (arb. units)")
+    ax.set_ylabel("Power M(ω) (peak-normalised over ν̃ ≥ "
+                  f"{int(low_cm_cutoff)} cm⁻¹)")
     ax.set_title(title)
-    ax.set_xlim(freq_cm[0], freq_cm[-1])
+    ax.set_xlim(f_plot[0], f_plot[-1])
     ax.invert_xaxis()
+    if use_log:
+        ax.set_yscale("log")
+    ax.grid(alpha=0.3, which="both")
     plt.tight_layout()
-    _finish_fig(fig, cfg, "power_spectrum", save_plots, show_plots)
+    stem = _ir_plot_basename(trajectory_path, model_label) + "_power"
+    _save_fig(fig, cfg, stem, save_plots)
+    if show_plots:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 # --------------------------------------------------------------------------

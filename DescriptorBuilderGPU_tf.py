@@ -2284,6 +2284,19 @@ class DescriptorBuilderGPUTF:
             pair_neigh = np.asarray(
                 [z_to_idx[int(numbers[int(j)])] for j in pg], dtype=np.int32
             )
+            # Optional H-center skip: drop pairs whose CENTER atom is H.
+            # H atoms remain in the neighbour list (pair_gidx still
+            # carries them), so non-H centers still see H in their
+            # species-pair blocks. The descriptor row for any H atom
+            # will be zero in the output (no contributing pairs).
+            if bool(getattr(self.cfg, "skip_h_centers", False)):
+                keep = numbers[pa] != 1
+                if not keep.all():
+                    pa = pa[keep]; pg = pg[keep]
+                    rjs = rjs[keep]; thetas = thetas[keep]; phis = phis[keep]
+                    pair_is_central = pair_is_central[keep]
+                    pair_active = pair_active[keep]
+                    pair_neigh = pair_neigh[keep]
             all_rjs.append(rjs)
             all_thetas.append(thetas)
             all_phis.append(phis)
@@ -2501,10 +2514,17 @@ class DescriptorBuilderGPUTF:
                         i = int(pa[p])
                         grads_per_atom[i].append(grad[p])
                         idx_per_atom[i].append(int(pg[p]))
-                    grads_tf = [
-                        tf.convert_to_tensor(np.asarray(g, dtype=np.float32), dtype=tf.float32)
-                        for g in grads_per_atom
-                    ]
+                    # Empty per-atom gradient lists must keep the [0,3,Q]
+                    # shape (a bare np.asarray([]) gives (0,) which breaks
+                    # downstream concat with non-empty entries).
+                    grads_tf = []
+                    for g in grads_per_atom:
+                        if len(g) > 0:
+                            grads_tf.append(tf.convert_to_tensor(
+                                np.asarray(g, dtype=np.float32), dtype=tf.float32))
+                        else:
+                            grads_tf.append(tf.zeros(
+                                (0, 3, soap.shape[1]), dtype=tf.float32))
                     dataset_gradients.append(grads_tf)
                     dataset_grad_index.append(idx_per_atom)
                 else:

@@ -78,6 +78,27 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
+        # Validate dipole contraction power (mode 1 only). Caught here
+        # so configuration errors surface at model construction rather
+        # than at first forward pass.
+        if cfg.target_mode == 1:
+            _N = int(getattr(cfg, "dipole_rij_power", 2))
+            if _N < 0:
+                raise ValueError(
+                    f"cfg.dipole_rij_power must be an integer ≥ 0, got {_N}. "
+                    f"0 = ΣF only (experimental — no radial weight), "
+                    f"1 = |r|·F (first radial moment), "
+                    f"2 = |r|²·F (Xu et al. JCTC 2024 default), "
+                    f"≥3 = higher radial moments."
+                )
+            if _N == 0:
+                print(
+                    "[EXPERIMENTAL] cfg.dipole_rij_power=0: dipole computed as "
+                    "μ = -Σ F_ij (pure sum of partial forces, no |r_ij| weight). "
+                    "This is an ablation/diagnostic path — results not directly "
+                    "comparable to N≥1 models."
+                )
+
         # Scalar ANN for polarizability mode (target_mode == 2)
         if cfg.target_mode == 2:
             self.W0_pol = self.add_weight(
@@ -469,6 +490,11 @@ class TNEP(layers.Layer):
             # PES: E = -sum_i (h_i . W1[t_i] + b1)
             E_per_atom = tf.reduce_sum(h * W1_t, axis=1) + self.b1  # [A]
             E_per_atom = E_per_atom * atom_mask                       # zero padding
+            # H-center skip: exclude H atoms from the energy sum. Their
+            # descriptor is zero (no builder was called for them) so the
+            # bias-driven U_H would otherwise contaminate the total.
+            if bool(getattr(self.cfg, "skip_h_centers", False)):
+                E_per_atom = E_per_atom * tf.cast(Z != 1, tf.float32)
             E = tf.reduce_sum(E_per_atom)
             out = tf.expand_dims(-E, axis=0)  # [1]
             if _do_uncenter:
@@ -481,12 +507,18 @@ class TNEP(layers.Layer):
         forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask)  # [A, M, 3]
 
         if self.cfg.target_mode == 1:
-            # Dipole: μ = -sum_i sum_j |r_ij|^2 * force_ij
-            _, rij = self._neighbor_displacements_single(positions, box, grad_index)
-
-            rij2 = tf.square(rij) * neighbor_mask                       # [A, M]
-            dipole_contribs = rij2[:, :, tf.newaxis] * forces            # [A, M, 3]
-            dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])       # [3]
+            # Dipole contraction. `cfg.dipole_rij_power` selects the
+            # radial-weight exponent N in:
+            #   μ = -Σ |r_ij|^N · F_ij   (scalar weight × force vector)
+            # All N ≥ 1 use the same algebraic shape — each output
+            # component μ_α uses the matching F_α with a positive
+            # scalar weight, so there is no signed-cancellation issue
+            # at any N.
+            _, rij = self._neighbor_displacements_single(
+                positions, box, grad_index)
+            rij_n = self._scalar_rij_pow(tf.square(rij)) * neighbor_mask  # [A, M]
+            dipole_contribs = rij_n[:, :, tf.newaxis] * forces            # [A, M, 3]
+            dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])         # [3]
             if _do_uncenter:
                 if _shift_per_atom:
                     num_atoms = tf.reduce_sum(atom_mask)
@@ -511,6 +543,10 @@ class TNEP(layers.Layer):
             h_pol = h_pol * atom_mask[:, tf.newaxis]
             F_pol = tf.reduce_sum(h_pol * W1p_t, axis=1) + self.b1_pol  # [A]
             F_pol = F_pol * atom_mask
+            # H-center skip: zero F_pol for H atoms (their descriptor is
+            # zero so F_pol would otherwise be bias-driven garbage).
+            if bool(getattr(self.cfg, "skip_h_centers", False)):
+                F_pol = F_pol * tf.cast(Z != 1, tf.float32)
             scalar_sum = tf.reduce_sum(F_pol)
 
             # --- Tensor ANN (anisotropic virial) ---
@@ -825,6 +861,9 @@ class TNEP(layers.Layer):
         if self.cfg.target_mode == 0:
             E = tf.reduce_sum(h * W1_t, axis=2) + b1  # [B, A]
             E = E * atom_mask
+            # H-center skip (see comment in predict): exclude H atoms.
+            if bool(getattr(self.cfg, "skip_h_centers", False)):
+                E = E * tf.cast(Z != 1, tf.float32)
             E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
             return -E
 
@@ -968,6 +1007,33 @@ class TNEP(layers.Layer):
         # W_atom [B, A, 3, Q]: dipole[c,b,s] = -Σ_{a,q} de_dq[c,b,a,q]*W_atom[b,a,s,q]
         return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
 
+    def _scalar_rij_pow(self, rij2: tf.Tensor) -> tf.Tensor:
+        """|r_ij|^N as a scalar per-pair weight (N ≥ 0).
+
+        Derived from the rij² primitive without a fresh sqrt for even N:
+            N = 0      → ones (experimental — drops the radial weight,
+                         so dipole becomes pure -Σ F_ij)
+            N = 1      → sqrt(rij²)
+            N = 2      → rij² unchanged (zero ops; default path)
+            N even ≥ 4 → tf.pow(rij², N/2)
+            N odd  ≥ 3 → tf.pow(rij², (N-1)/2) · sqrt(rij²)
+
+        All N produce a scalar weight that broadcasts across the
+        Cartesian axis of the force vector — there is no per-axis
+        component variant.
+        """
+        N = int(getattr(self.cfg, "dipole_rij_power", 2))
+        if N == 0:
+            return tf.ones_like(rij2)
+        if N == 1:
+            return tf.sqrt(rij2)
+        if N == 2:
+            return rij2
+        if N % 2 == 0:
+            return tf.pow(rij2, N // 2)
+        # Odd N ≥ 3
+        return tf.pow(rij2, (N - 1) // 2) * tf.sqrt(rij2)
+
     def _calc_forces_coo(self, de_dq: tf.Tensor, grad_values: tf.Tensor,
                          pair_struct: tf.Tensor, pair_atom: tf.Tensor) -> tf.Tensor:
         """Compute per-pair forces via COO gather + einsum.
@@ -1037,12 +1103,16 @@ class TNEP(layers.Layer):
             W_atom : [B, A, 3, Q]
         """
         box_inv = tf.linalg.inv(boxes)
+        # Match the contraction used in `_dipole_coo` / single-frame
+        # path so the XLA-fused trajectory shortcut stays bit-equivalent.
+        # All N ≥ 1: scalar |r|^N weight × full grad_values vector.
         _, rij2 = self._neighbor_displacements_coo(
-            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)  # rij2: [P]
+            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
 
         P = tf.shape(grad_values)[0]
         Q = tf.shape(grad_values)[2]
-        W = rij2[:, tf.newaxis, tf.newaxis] * grad_values   # [P, 3, Q]
+        weight = self._scalar_rij_pow(rij2)                   # [P]
+        W = weight[:, tf.newaxis, tf.newaxis] * grad_values   # [P, 3, Q]
         W_flat = tf.reshape(W, [P, 3 * Q])                  # [P, 3*Q]
         ba_linear = pair_struct * A + pair_atom              # [P] linear index into [B*A]
         W_atom_flat = tf.math.unsorted_segment_sum(
@@ -1100,9 +1170,12 @@ class TNEP(layers.Layer):
         Returns:
             dipole : [B, 3]
         """
-        _, rij2 = self._neighbor_displacements_coo(positions, boxes, box_inv,
-                                                    pair_struct, pair_atom, pair_gidx)
-        dipole_contrib = rij2[:, tf.newaxis] * forces_per_pair           # [P, 3]
+        # Dipole contraction. Uniform algebraic form for all N ≥ 1:
+        #   μ = -Σ |r_ij|^N · F_ij  (scalar weight × force vector)
+        _, rij2 = self._neighbor_displacements_coo(
+            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
+        weight = self._scalar_rij_pow(rij2)                              # [P]
+        dipole_contrib = weight[:, tf.newaxis] * forces_per_pair         # [P, 3]
         dipole = -tf.math.unsorted_segment_sum(
             dipole_contrib, pair_struct, num_segments=B)                  # [B, 3]
         return dipole
@@ -1151,6 +1224,11 @@ class TNEP(layers.Layer):
         h_pol = h_pol * atom_mask[:, :, tf.newaxis]
         F_pol = tf.reduce_sum(h_pol * W1p_t, axis=2) + b1_pol  # [B, A]
         F_pol = F_pol * atom_mask
+        # H-center skip: zero F_pol for H atoms (descriptor is zero,
+        # so F_pol would be bias-driven). The tensor (virial) part
+        # below is automatically H-free because no pairs have center=H.
+        if bool(getattr(self.cfg, "skip_h_centers", False)):
+            F_pol = F_pol * tf.cast(Z != 1, tf.float32)
         scalar_sum = tf.reduce_sum(F_pol, axis=1)               # [B]
 
         # Tensor part: per-pair outer product, then segment-sum per structure

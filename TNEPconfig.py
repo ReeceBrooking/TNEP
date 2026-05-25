@@ -74,6 +74,50 @@ class TNEPconfig:
     # — equal weighting; <1.0 downweights off-diagonal.
     lambda_shear: float = 1.0
 
+    # Power of |r_ij| applied to per-pair forces in the dipole contraction
+    # (target_mode=1 only):
+    #   N = 0   →  μ = − Σ F_ij                (EXPERIMENTAL — no radial
+    #             weight; pure sum of partial forces. Drops the |r_ij|^N
+    #             scalar entirely. Useful as a diagnostic for whether the
+    #             radial weight is doing useful work, and as an ablation
+    #             baseline. A runtime warning is printed when this is used.)
+    #   N = 1   →  μ = − Σ |r_ij|   · F_ij     (first radial moment;
+    #             Schofield-style virial-like weight)
+    #   N = 2   →  μ = − Σ |r_ij|²  · F_ij     (Xu et al. JCTC 2024 / GPUMD
+    #             default — what the dipole pathway has used to date)
+    #   N ≥ 3  →   μ = − Σ |r_ij|^N · F_ij     (higher moments; mostly
+    #             diagnostic / sensitivity studies)
+    # All N ≥ 1 use the SAME algebraic shape: a scalar |r_ij|^N weight
+    # applied to the force vector F_ij. Each output component μ_α depends
+    # only on the matching component of F_α, with the positive-definite
+    # scalar weight ensuring no per-axis signed cancellation. N = 0 keeps
+    # the same shape with a unit scalar weight.
+    # Default 2 keeps existing-model behaviour bit-for-bit identical.
+    # Models saved with one N MUST be re-trained if N is changed — the
+    # contraction defines what the network's per-atom scalar is mapped to.
+    dipole_rij_power: int = 1
+
+    # Skip H atoms as DESCRIPTOR CENTERS:
+    #   False (default) — every atom (including H) gets its own SOAP
+    #     descriptor and contributes to the predicted total via U_i.
+    #   True            — H atoms are NOT used as descriptor centers,
+    #     so the quippy / TF descriptor builders are never called for
+    #     H-centered windows. H atoms remain in the structure as
+    #     NEIGHBOUR species, so their positions still appear in the
+    #     species-pair blocks of every non-H center's descriptor.
+    # Performance: ~2–3× faster SOAP build and forward pass on typical
+    # organic systems (H is 50-70 % of atoms). Memory similar.
+    # Caveats:
+    #   - Models trained with True are NOT compatible with False
+    #     (the network learns a heavy-atom-only scalar that produces
+    #     the total μ / E / α — switching back changes the meaning).
+    #   - target_mode=0 (energy) loses physical per-H-atom U_i
+    #     interpretation; the model still predicts the right TOTAL E.
+    #   - target_mode=1 (dipole) is the most natural fit — total μ is
+    #     reproduced because non-H atoms' descriptors already encode
+    #     H neighbour info via SOAP species-pair blocks.
+    skip_h_centers: bool = False
+
     # ═══════════════════════════════════════════════════════════════════
     # 2. DESCRIPTOR (SOAP-turbo)
     # ═══════════════════════════════════════════════════════════════════
@@ -360,7 +404,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 100
     # Number of training generations (number of updates to the model)
-    num_generations: int = 150000
+    num_generations: int = 60000
     # Number of structures used in each train step (None = full batch)
     batch_size: int | None = None
     # Learning rate for sigma (None = auto from canonical SNES heuristic)
