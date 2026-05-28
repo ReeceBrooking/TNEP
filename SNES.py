@@ -980,6 +980,7 @@ class SNES:
             best_sigma = tf.constant(resume_state["best_sigma"], dtype=tf.float32)
             best_val_loss = float(resume_state["best_val_loss"])
             gens_without_improvement = int(resume_state["gens_without_improvement"])
+            phase_gwi = 0   # phase-local plateau counter (hybrid FSM); resets on resume
             rng = resume_state.get("rng_state")
             if rng is not None:
                 try:
@@ -1025,6 +1026,7 @@ class SNES:
             best_mu = tf.identity(self.mu)
             best_sigma = tf.identity(self.sigma)
             gens_without_improvement = 0
+            phase_gwi = 0   # phase-local plateau counter (hybrid FSM)
             start_gen = 0
             train_start = time.perf_counter()
         # Plateau-driven sigma resets (IPOP-style restart, simplified):
@@ -1040,8 +1042,6 @@ class SNES:
 
         for gen in range(start_gen, cfg.num_generations):
             t0 = time.perf_counter()
-
-            samples, s = self.ask()
 
             # Select batch: None = full train set, int = random subset.
             if cfg.batch_size is None:
@@ -1084,38 +1084,60 @@ class SNES:
 
             t1 = time.perf_counter()
 
-            # Evaluate entire population on GPU
-            if self._per_type:
-                # Per-type mode: get per-type RMSE [P, T+1], then build composite gradients
-                fitness_per_type_rmse = self.evaluate_population(
-                    samples, batch_data, return_per_type=True)
-                fitness = fitness_per_type_rmse[:, -1]  # global RMSE for reporting
+            # Hybrid phase selection. In pure-SNES (legacy/default) mode
+            # `phase` is forced to "snes" WITHOUT calling _advance_schedule,
+            # so the SNES path below runs byte-identically. `phase_gwi` is
+            # the phase-local plateau counter that drives the FSM swaps.
+            phase = (self._advance_schedule(phase_gwi)
+                     if self._opt_mode != "snes" else "snes")
+
+            if phase == "adam":
+                adam_loss = self._adam_step(batch_data)
+                # _adam_step returns MSE-scale loss when loss_type=="mse";
+                # sqrt for an RMSE-comparable progress-bar scalar.
+                avg_fitness = (adam_loss ** 0.5
+                               if self.cfg.loss_type == "mse" else float(adam_loss))
+                best_rmse = worst_rmse = avg_fitness
+                best_rrmse = avg_rrmse = float("nan")
+                self._last_phase = "adam"
+                t2 = time.perf_counter()
             else:
-                fitness = self.evaluate_population(samples, batch_data)
+                # ===== existing SNES path EXACTLY AS-IS =====
+                samples, s = self.ask()
 
-            # GPU→CPU sync. Stack the reductions and pull them in one
-            # transfer — five separate `float(reduce_*)` calls would
-            # issue five independent device syncs every gen. fitness
-            # drives SNES ranking (depends on loss_type); the rmse/rrmse
-            # entries are ALWAYS computed from squared error so they're
-            # comparable across loss-function ablations.
-            rmse_pc = self._last_rmse_per_cand
-            rrmse_pc = self._last_rrmse_per_cand
-            metrics_gpu = tf.stack([
-                tf.reduce_mean(fitness),
-                tf.reduce_min(rmse_pc),
-                tf.reduce_max(rmse_pc),
-                tf.reduce_min(rrmse_pc),
-                tf.reduce_mean(rrmse_pc),
-            ])
-            metrics_np = metrics_gpu.numpy()
-            avg_fitness = float(metrics_np[0])
-            best_rmse = float(metrics_np[1])
-            worst_rmse = float(metrics_np[2])
-            best_rrmse = float(metrics_np[3])
-            avg_rrmse = float(metrics_np[4])
+                # Evaluate entire population on GPU
+                if self._per_type:
+                    # Per-type mode: get per-type RMSE [P, T+1], then build composite gradients
+                    fitness_per_type_rmse = self.evaluate_population(
+                        samples, batch_data, return_per_type=True)
+                    fitness = fitness_per_type_rmse[:, -1]  # global RMSE for reporting
+                else:
+                    fitness = self.evaluate_population(samples, batch_data)
 
-            t2 = time.perf_counter()
+                # GPU→CPU sync. Stack the reductions and pull them in one
+                # transfer — five separate `float(reduce_*)` calls would
+                # issue five independent device syncs every gen. fitness
+                # drives SNES ranking (depends on loss_type); the rmse/rrmse
+                # entries are ALWAYS computed from squared error so they're
+                # comparable across loss-function ablations.
+                rmse_pc = self._last_rmse_per_cand
+                rrmse_pc = self._last_rrmse_per_cand
+                metrics_gpu = tf.stack([
+                    tf.reduce_mean(fitness),
+                    tf.reduce_min(rmse_pc),
+                    tf.reduce_max(rmse_pc),
+                    tf.reduce_min(rrmse_pc),
+                    tf.reduce_mean(rrmse_pc),
+                ])
+                metrics_np = metrics_gpu.numpy()
+                avg_fitness = float(metrics_np[0])
+                best_rmse = float(metrics_np[1])
+                worst_rmse = float(metrics_np[2])
+                best_rrmse = float(metrics_np[3])
+                avg_rrmse = float(metrics_np[4])
+                self._last_phase = "snes"
+
+                t2 = time.perf_counter()
 
             # Regularisation: matches GPUMD's behaviour. The per-candidate
             # L1+L2 penalty is already computed every gen, in-graph, on
@@ -1146,13 +1168,16 @@ class SNES:
             elif not cfg.toggle_regularization:
                 gen_l1, gen_l2, gen_lorth = 0, 0, 0
 
-            # Rank and update (GPU)
-            if self._per_type:
-                s_sorted = self._build_per_type_gradients(s, fitness_per_type_rmse, samples)
-            else:
-                ranks = tf.argsort(fitness)
-                s_sorted = tf.gather(s, ranks)
-            self.update(self.utilities, s_sorted)
+            # Rank and update (GPU) — SNES phase only. In an Adam gen there
+            # is no population (`samples`/`s`/`fitness` are undefined), and
+            # the mu/sigma step was already taken inside _adam_step.
+            if phase == "snes":
+                if self._per_type:
+                    s_sorted = self._build_per_type_gradients(s, fitness_per_type_rmse, samples)
+                else:
+                    ranks = tf.argsort(fitness)
+                    s_sorted = tf.gather(s, ranks)
+                self.update(self.utilities, s_sorted)
 
             t3 = time.perf_counter()
 
@@ -1218,6 +1243,13 @@ class SNES:
 
             # Early stopping (only update on val generations)
             if _do_val:
+                # phase-local plateau (drives the hybrid swap)
+                if val_fitness < self._phase_best - 1e-12:
+                    self._phase_best = val_fitness
+                    phase_gwi = 0
+                else:
+                    phase_gwi += 1
+                # global best (UNCHANGED) drives best_mu / early stop
                 if val_fitness < best_val_loss:
                     best_val_loss = val_fitness
                     best_mu = tf.identity(self.mu)
@@ -1500,6 +1532,45 @@ class SNES:
             loss = loss + reg
 
         return loss, grad
+
+    def _advance_schedule(self, gwi: int) -> str:
+        """Hybrid FSM. `gwi` = PHASE-LOCAL generations-without-improvement.
+        Returns the phase to run this gen ("adam"|"snes"); mutates
+        self._opt_phase + handoff state on a swap. snes/adam-only modes
+        short-circuit.
+        """
+        if self._opt_mode != "hybrid":
+            return "adam" if self._opt_mode == "adam" else "snes"
+        max_cycles = getattr(self.cfg, "hybrid_max_cycles", None)
+        if self._opt_phase == "adam":
+            if gwi >= int(self.cfg.adam_plateau_patience):
+                self._enter_snes_phase()
+                return "snes"
+            return "adam"
+        else:  # snes phase
+            if gwi >= int(self.cfg.snes_plateau_patience):
+                self._hybrid_cycles += 1
+                if max_cycles is not None and self._hybrid_cycles >= int(max_cycles):
+                    return "snes"   # locked into SNES for the tail
+                self._enter_adam_phase()
+                return "adam"
+            return "snes"
+
+    def _enter_snes_phase(self) -> None:
+        self._opt_phase = "snes"
+        handoff = getattr(self.cfg, "hybrid_handoff_sigma", None)
+        sig = float(handoff) if handoff is not None else float(self.cfg.init_sigma)
+        self.sigma.assign(tf.fill([self.dim], sig))
+        self._phase_best = float("inf")
+
+    def _enter_adam_phase(self) -> None:
+        self._opt_phase = "adam"
+        self._ensure_adam_state()
+        if bool(getattr(self.cfg, "adam_reset_moments_on_entry", True)):
+            self.adam_m.assign(tf.zeros([self.dim]))
+            self.adam_v.assign(tf.zeros([self.dim]))
+            self.adam_t.assign(0)
+        self._phase_best = float("inf")
 
     def _adam_step(self, batch_data: dict) -> float:
         """One Adam update on self.mu (in place). Returns the pre-step loss."""

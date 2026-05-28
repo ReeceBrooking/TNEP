@@ -133,6 +133,86 @@ def test_adam_steps_reduce_loss(tiny_model):
         snes.adam_t.assign(0)
 
 
+def test_schedule_fsm_transitions(tiny_model):
+    model, _, _ = tiny_model
+    snes = model.optimizer
+    snes._opt_mode = "hybrid"; snes.cfg.optimizer_mode = "hybrid"
+    snes.cfg.adam_plateau_patience = 3
+    snes.cfg.snes_plateau_patience = 5
+    snes._opt_phase = "adam"; snes._phase_best = float("inf"); snes._hybrid_cycles = 0
+    assert snes._advance_schedule(gwi=2) == "adam"
+    assert snes._advance_schedule(gwi=3) == "snes"   # Adam->SNES swap
+    assert snes._opt_phase == "snes"
+    assert snes._advance_schedule(gwi=4) == "snes"
+    assert snes._advance_schedule(gwi=5) == "adam"   # SNES->Adam swap
+    assert snes._opt_phase == "adam"
+    assert snes._hybrid_cycles == 1
+    # restore module-scoped fixture state
+    snes._opt_mode = "snes"; snes.cfg.optimizer_mode = "snes"; snes._opt_phase = "adam"
+
+
+def test_hybrid_run_end_to_end(tiny_model):
+    model, train, val = tiny_model
+    snes = model.optimizer
+    snes.cfg.optimizer_mode = "hybrid"; snes._opt_mode = "hybrid"
+    snes.cfg.hybrid_start = "adam"; snes._opt_phase = "adam"
+    snes.cfg.adam_plateau_patience = 5
+    snes.cfg.snes_plateau_patience = 10
+    snes.cfg.num_generations = 40
+    snes.cfg.adam_lr = 5e-3
+    snes.cfg.patience = None
+    try:
+        hist = snes.fit(train, val)
+        if isinstance(hist, tuple): hist = hist[0]
+        tl = hist["train_loss"] if isinstance(hist, dict) else hist
+        assert tl[-1] <= tl[0] + 1e-6
+    finally:
+        # restore fixture
+        snes.cfg.optimizer_mode = "snes"; snes._opt_mode = "snes"; snes._opt_phase = "adam"
+        snes.cfg.num_generations = 1; snes.cfg.patience = None
+        if snes.adam_m is not None:
+            snes.adam_m.assign(np.zeros(snes.dim, dtype=np.float32))
+            snes.adam_v.assign(np.zeros(snes.dim, dtype=np.float32))
+            snes.adam_t.assign(0)
+
+
+def test_snes_mode_unchanged():
+    # Fresh model so adam_m is guaranteed unallocated (module fixture may
+    # have been touched by earlier Adam tests).
+    from TNEPconfig import TNEPconfig
+    from data import collect, split, pad_and_stack
+    from DescriptorBuilderGPU import compute_dim_q
+    from TNEP import TNEP
+    cfg = TNEPconfig()
+    cfg.data_path = 'datasets/test.xyz'; cfg.test_data_path = None
+    cfg.allowed_species = [6, 1, 7, 8]; cfg.filter_mode = 'subset'
+    cfg.target_mode = 1; cfg.dipole_units = 'e*bohr'; cfg.scale_targets = True
+    cfg.convert_dipole_to_eangstrom = False
+    cfg.total_N = 16; cfg.test_ratio = 0.25; cfg.skip_h_centers = False
+    cfg.num_neurons = 8; cfg.descriptor_mode = 0; cfg.descriptor_mixing = False
+    cfg.pop_size = 8; cfg.num_generations = 3
+    cfg.population_chunk_size = None; cfg.batch_chunk_size = None
+    cfg.pin_data_to_cpu = True; cfg.cache_gradients_to_disk = False
+    cfg.chunk_prefetch = False; cfg.use_pinned_buffers = False; cfg.use_cufile = False
+    cfg.save_path = None; cfg.checkpoint_interval = None
+    cfg.lambda_1 = 0.0; cfg.lambda_2 = 0.0
+    cfg.seed = 0; cfg.eval_jit_compile = False
+    cfg.val_interval = 1; cfg.val_size = None
+    cfg.toggle_regularization = False; cfg.per_type_regularization = False
+    cfg.dipole_rij_power = 2; cfg.patience = None
+    dataset, ti = collect(cfg)
+    cfg.randomise(dataset); cfg.dim_q = compute_dim_q(cfg)
+    td, _, vd = split(dataset, ti, cfg)
+    train = pad_and_stack(td, num_types=cfg.num_types, pin_to_cpu=True)
+    val = pad_and_stack(vd, num_types=cfg.num_types, pin_to_cpu=True)
+    model = TNEP(cfg)
+    snes = model.optimizer
+    assert snes._opt_mode == "snes"
+    assert snes.adam_m is None          # Adam state never allocated in pure SNES
+    snes.fit(train, val)                # must run without touching Adam paths
+    assert snes.adam_m is None
+
+
 def test_hybrid_early_stop_guard():
     import pytest
     from TNEPconfig import TNEPconfig
