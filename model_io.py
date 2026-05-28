@@ -335,6 +335,15 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
         rng = state.get("tf_rng_state")
         if rng is not None:
             sg.create_dataset("rng_state", data=_np(rng))
+        # Hybrid Adam/SNES optimizer state (guarded — only present for
+        # hybrid runs, so pure-SNES checkpoints are byte-identical).
+        if state.get("adam_m") is not None:
+            sg.create_dataset("adam_m", data=_np(state["adam_m"]))
+            sg.create_dataset("adam_v", data=_np(state["adam_v"]))
+            sg.attrs["adam_t"] = int(state["adam_t"])
+            sg.attrs["opt_phase"] = str(state["opt_phase"])
+            sg.attrs["phase_best"] = float(state["phase_best"])
+            sg.attrs["hybrid_cycles"] = int(state["hybrid_cycles"])
         # Per-channel descriptor scaler (frozen at training-set creation
         # time). Persist into the SNES group so load_checkpoint can
         # restore it BEFORE pad_and_stack runs again — preventing a
@@ -404,6 +413,15 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
             "rng_state":  sg["rng_state"][:] if "rng_state" in sg else None,
             "last_gen":   last_gen,
         }
+        # Hybrid Adam/SNES optimizer state (guarded — absent for
+        # pure-SNES checkpoints, so they resume exactly as before).
+        if "adam_m" in sg:
+            resume_state["adam_m"] = sg["adam_m"][:]
+            resume_state["adam_v"] = sg["adam_v"][:]
+            resume_state["adam_t"] = int(sg.attrs["adam_t"])
+            resume_state["opt_phase"] = str(sg.attrs["opt_phase"])
+            resume_state["phase_best"] = float(sg.attrs["phase_best"])
+            resume_state["hybrid_cycles"] = int(sg.attrs["hybrid_cycles"])
         # Restore the per-channel descriptor scaler if the checkpoint
         # carries one — sets cfg._q_scaler BEFORE pad_and_stack runs
         # on resume, ensuring the scaler is reused (not recomputed)

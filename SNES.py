@@ -996,6 +996,18 @@ class SNES:
                     # fall back to keeping the freshly-seeded generator
                     # rather than aborting the resume.
                     pass
+            # Restore hybrid Adam/SNES schedule state when the checkpoint
+            # carries it, so a resumed hybrid run continues its Adam/SNES
+            # schedule instead of restarting cold. Guarded — pure-SNES
+            # checkpoints omit these keys and resume exactly as before.
+            if resume_state.get("adam_m") is not None:
+                self._ensure_adam_state()
+                self.adam_m.assign(resume_state["adam_m"])
+                self.adam_v.assign(resume_state["adam_v"])
+                self.adam_t.assign(int(resume_state["adam_t"]))
+                self._opt_phase = str(resume_state["opt_phase"])
+                self._phase_best = float(resume_state["phase_best"])
+                self._hybrid_cycles = int(resume_state["hybrid_cycles"])
             start_gen = int(resume_state["last_gen"]) + 1
             # Offset train_start so the displayed elapsed continues from
             # the checkpointed wall-time rather than restarting at zero.
@@ -1397,13 +1409,24 @@ class SNES:
                 run_dir = os.path.dirname(cfg.save_path) or "."
                 os.makedirs(run_dir, exist_ok=True)
                 ckpt_path = os.path.join(run_dir, "checkpoint.h5")
-                save_checkpoint(ckpt_path, cfg, {
+                ckpt_state = {
                     "mu": self.mu, "sigma": self.sigma,
                     "best_mu": best_mu, "best_sigma": best_sigma,
                     "best_val_loss": best_val_loss,
                     "gens_without_improvement": gens_without_improvement,
                     "tf_rng_state": self.tf_rng.state,
-                }, history, gen)
+                }
+                # Persist hybrid Adam/SNES state when allocated, so a
+                # resumed hybrid run continues its schedule. Guarded so
+                # pure-SNES checkpoints are unchanged.
+                if self.adam_m is not None:
+                    ckpt_state["adam_m"] = self.adam_m
+                    ckpt_state["adam_v"] = self.adam_v
+                    ckpt_state["adam_t"] = int(self.adam_t.numpy())
+                    ckpt_state["opt_phase"] = self._opt_phase
+                    ckpt_state["phase_best"] = self._phase_best
+                    ckpt_state["hybrid_cycles"] = self._hybrid_cycles
+                save_checkpoint(ckpt_path, cfg, ckpt_state, history, gen)
                 # Print a one-line note above the in-place progress bar.
                 sys.stdout.write(
                     f"\n  checkpoint saved at gen {gen + 1} → {ckpt_path}\n")

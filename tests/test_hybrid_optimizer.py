@@ -231,6 +231,43 @@ def test_hybrid_ends_on_snes(tiny_model):
     snes.cfg.optimizer_mode = "snes"; snes._opt_mode = "snes"; snes._opt_phase = "adam"
 
 
+def test_hybrid_state_checkpoint_roundtrip(tiny_model, tmp_path):
+    import numpy as np
+    from model_io import save_checkpoint, load_checkpoint
+    model, _, _ = tiny_model
+    snes = model.optimizer
+    snes._ensure_adam_state()
+    snes.adam_m.assign(np.full(snes.dim, 0.123, dtype=np.float32))
+    snes.adam_v.assign(np.full(snes.dim, 0.456, dtype=np.float32))
+    snes.adam_t.assign(7)
+    snes._opt_phase = "snes"
+    snes._phase_best = 0.0042
+    snes._hybrid_cycles = 3
+    state = {
+        "mu": snes.mu, "sigma": snes.sigma,
+        "best_mu": snes.mu, "best_sigma": snes.sigma,
+        "best_val_loss": 0.01, "gens_without_improvement": 0,
+        "tf_rng_state": snes.tf_rng.state,
+        "adam_m": snes.adam_m, "adam_v": snes.adam_v, "adam_t": int(snes.adam_t.numpy()),
+        "opt_phase": snes._opt_phase, "phase_best": snes._phase_best,
+        "hybrid_cycles": snes._hybrid_cycles,
+    }
+    ckpt = str(tmp_path / "checkpoint.h5")
+    save_checkpoint(ckpt, snes.cfg, state, {"train_loss": [0.1], "val_loss": [0.1]}, last_gen=5)
+    cfg2, rs = load_checkpoint(ckpt)
+    assert np.allclose(rs["adam_m"], 0.123)
+    assert np.allclose(rs["adam_v"], 0.456)
+    assert int(rs["adam_t"]) == 7
+    assert rs["opt_phase"] == "snes"
+    assert abs(rs["phase_best"] - 0.0042) < 1e-9
+    assert int(rs["hybrid_cycles"]) == 3
+    # restore module-scoped fixture state
+    snes._opt_phase = "adam"; snes._phase_best = float("inf"); snes._hybrid_cycles = 0
+    snes.adam_m.assign(np.zeros(snes.dim, dtype=np.float32))
+    snes.adam_v.assign(np.zeros(snes.dim, dtype=np.float32))
+    snes.adam_t.assign(0)
+
+
 def test_hybrid_early_stop_guard():
     import pytest
     from TNEPconfig import TNEPconfig
