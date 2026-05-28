@@ -1460,47 +1460,96 @@ class SNES:
             self.adam_t = tf.Variable(0, dtype=tf.int64, trainable=False, name="adam_t")
 
     def _reg_scalar_tf(self, mu: tf.Tensor) -> tf.Tensor:
-        """Differentiable global L1+L2 regularisation penalty on the typed ANN params.
+        """Differentiable L1+L2 regularisation scalar matching SNES exactly.
 
-        Mirrors the formula in compute_regularization exactly, but returns a
-        differentiable scalar tensor (for use in GradientTape). The orthogonal
-        V_pair penalty is omitted — Adam minimises the plain global L1+L2 scalar
-        only. Cayley / shrinkage tails are not differentiated here (Adam operates
-        on the raw mu vector and reg is only applied to ANN params).
+        Reproduces, as a single differentiable scalar, the SAME L1+L2 penalty
+        that SNES ranks/validates on — i.e. the (l1 + l2) total returned by
+        ``compute_regularization`` (eager, lines ~322-424) and added to fitness
+        by ``compute_regularization_tf`` (lines ~2021-2058). Previously this
+        returned only the GLOBAL typed term, so for ``num_types > 1`` (the CHO
+        dipole use-case) Adam descended a strictly smaller reg than SNES ranked.
 
-        For T > 1 (multi-type):
-            global term only: lambda_1 * sum(|typed|) / n_typed_total
-                             + lambda_2 * sqrt(sum(typed^2) / n_typed_total)
-            (per-type loop term is omitted — it duplicates info; Adam needs a
-             single scalar that rises with weight magnitude. The global typed
-             term is the primary regulariser in GPUMD and is sufficient here.)
+        Formula reproduced (T = num_types, n_per_type = Q*H + H + H):
+          T > 1:  reg = (Σ_t λ1·Σ|type_params_t|/n_per_type)/T            (per-type L1)
+                      + λ1·Σ|typed|/n_typed_total                          (global  L1)
+                      + (Σ_t λ2·sqrt(Σ type_params_t²/n_per_type))/T       (per-type L2)
+                      + λ2·sqrt(Σ typed²/n_typed_total)                    (global  L2)
+          T == 1: reg = λ1·Σ|ann|/ann_n + λ2·sqrt(Σ ann²/ann_n)
+          (+ V_pair shrinkage tail when reg_Vpair, mirroring compute_regularization)
 
-        For T == 1 (single-type):
-            Same formula over pv[:n_anns_total] (V_pair tail excluded when
-            descriptor_mixing is on, matching compute_regularization's
-            v_handled path; here n_U_pair == 0 in typical usage so it's pv).
+        ``typed`` excludes b1; for target_mode==2 it includes both ANNs' typed
+        params (n_typed doubled), exactly as compute_regularization does.
+
+        DELIBERATELY OMITTED: the orthogonal-mixing penalty (l_orth, the third
+        element of compute_regularization's return). It is reported/optimised by
+        SNES as a SEPARATE signal driving an independent dynamic-λ schedule, and
+        replicating ‖UᵀU - I‖² differentiably for Adam here is out of scope. The
+        TNEP CHO dipole fixture has descriptor_mixing=False, so n_U_pair == 0 and
+        l_orth == 0 anyway (and both V_pair paths below are inert).
+
+        Stays fully differentiable w.r.t. mu (pure TF ops, no .numpy(), no
+        python branching on tensor values).
 
         Returns:
             reg : scalar tf.Tensor — L1 + L2 regularisation penalty.
         """
         T = self.cfg.num_types
+        Q = self.dim_q
+        H = self.cfg.num_neurons
+        n_per_type = Q * H + H + H  # W0_t + b0_t + W1_t
+
+        reg_Vpair = (self.n_U_pair > 0 and self._mix_reg_mode == "shrinkage")
+        reg_Vorth = (self.n_U_pair > 0 and self._mix_reg_mode == "orthogonal")
+
         if T > 1:
-            # Global typed term (excludes b1, matching compute_regularization).
+            # Per-type term: λ1/2 over each type's params, averaged across T.
+            total_l1 = tf.constant(0.0, tf.float32)
+            total_l2 = tf.constant(0.0, tf.float32)
+            for t in range(T):
+                type_params = self._extract_type_params(mu, t)
+                total_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(type_params)) / n_per_type
+                total_l2 += self.lambda_2 * tf.sqrt(
+                    tf.reduce_sum(tf.square(type_params)) / n_per_type)
+
+            # Global term over typed params only (excludes b1).
             typed = mu[:self.n_typed]
             n_typed_total = self.n_typed
             if self.cfg.target_mode == 2:
                 typed = tf.concat(
                     [typed, mu[self.n_primary:self.n_primary + self.n_typed]], axis=0)
                 n_typed_total = 2 * self.n_typed
-            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / float(n_typed_total)
-            l2 = self.lambda_2 * tf.sqrt(
-                tf.reduce_sum(tf.square(typed)) / float(n_typed_total))
+            l1 = total_l1 / T + self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / n_typed_total
+            l2 = total_l2 / T + self.lambda_2 * tf.sqrt(
+                tf.reduce_sum(tf.square(typed)) / n_typed_total)
         else:
-            # Single-type: reg over ANN params only (exclude U_pair tail).
-            ann_n = float(self.n_anns_total if self.n_U_pair > 0 else self.dim)
-            ann = mu[:self.n_anns_total] if self.n_U_pair > 0 else mu
+            # Single-type: reg over ANN params only when V_pair is handled
+            # separately (shrinkage / orthogonal / Cayley), else all of mu.
+            v_handled = reg_Vpair or reg_Vorth or self._mix_cayley
+            ann = mu[:self.n_anns_total] if v_handled else mu
+            ann_n = float(self.n_anns_total if v_handled else self.dim)
             l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann)) / ann_n
             l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(ann)) / ann_n)
+
+        # V_pair shrinkage tail (mode == "shrinkage"), mirroring
+        # compute_regularization. Differentiable. Inert when n_U_pair == 0.
+        if reg_Vpair:
+            tail = mu[self.n_anns_total:]
+            if self._mix_per_type and T > 1:
+                per_T = self.n_U_pair // T
+                vp_l1 = tf.constant(0.0, tf.float32)
+                vp_l2 = tf.constant(0.0, tf.float32)
+                for t in range(T):
+                    slab = tail[t * per_T:(t + 1) * per_T]
+                    vp_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(slab)) / per_T
+                    vp_l2 += self.lambda_2 * tf.sqrt(
+                        tf.reduce_sum(tf.square(slab)) / per_T)
+                l1 = l1 + vp_l1 / T
+                l2 = l2 + vp_l2 / T
+            else:
+                l1 = l1 + self.lambda_1 * tf.reduce_sum(tf.abs(tail)) / self.n_U_pair
+                l2 = l2 + self.lambda_2 * tf.sqrt(
+                    tf.reduce_sum(tf.square(tail)) / self.n_U_pair)
+
         return l1 + l2
 
     def _loss_and_grad(self, batch_data: dict) -> tuple[tf.Tensor, tf.Tensor]:
@@ -1555,14 +1604,21 @@ class SNES:
                     preds = preds / tf.maximum(na, 1.0)[:, tf.newaxis]
                 diff = preds - chunk["targets"]
                 if self.cfg.loss_type == "mae":
-                    chunk_loss = tf.reduce_sum(tf.abs(diff))
+                    per_comp = tf.abs(diff)
                 elif self.cfg.loss_type == "huber":
                     d = float(self.cfg.huber_delta)
                     a = tf.abs(diff)
-                    chunk_loss = tf.reduce_sum(
-                        tf.where(a <= d, 0.5 * tf.square(diff), d * (a - 0.5 * d)))
+                    per_comp = tf.where(a <= d, 0.5 * tf.square(diff), d * (a - 0.5 * d))
                 else:  # mse
-                    chunk_loss = tf.reduce_sum(tf.square(diff))
+                    per_comp = tf.square(diff)
+                # target_mode==2 polarisability shear emphasis: weight each
+                # component exactly as validate()/evaluate_population's fitness
+                # do (per_structure_error multiplies per_comp by pol_weights).
+                # _pol_weights is None for target_mode==1, so this is inert
+                # there and the target_mode==1 FD test is unchanged.
+                if self._pol_weights is not None:
+                    per_comp = per_comp * self._pol_weights
+                chunk_loss = tf.reduce_sum(per_comp)
             grad_accum += tape.gradient(chunk_loss, self.mu)
             loss_sum += chunk_loss
             cnt += tf.cast(tf.size(diff), tf.float32)

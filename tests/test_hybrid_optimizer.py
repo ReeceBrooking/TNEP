@@ -112,6 +112,27 @@ def test_loss_grad_includes_regularisation(tiny_model):
     snes.lambda_1.assign(0.0); snes.lambda_2.assign(0.0)
 
 
+def test_reg_scalar_matches_snes(tiny_model):
+    import tensorflow as tf
+    model, _, _ = tiny_model
+    snes = model.optimizer
+    snes.cfg.toggle_regularization = True
+    snes.lambda_1.assign(0.01); snes.lambda_2.assign(0.01)
+    mu = snes.mu
+    adam_reg = float(snes._reg_scalar_tf(mu))
+    # compute_regularization returns (l1, l2, l_orth); SNES adds l1+l2 to
+    # fitness. l_orth (orthogonal-mixing penalty) is a separate signal and is
+    # deliberately NOT reproduced by Adam; the fixture has descriptor_mixing
+    # =False so l_orth == 0 anyway (asserted below).
+    l1, l2, l_orth = snes.compute_regularization(mu)
+    assert float(l_orth) == 0.0, "fixture should have no orthogonal mixing penalty"
+    snes_reg = float(l1) + float(l2)
+    assert abs(adam_reg - snes_reg) < 1e-5, f"adam reg {adam_reg} != snes reg {snes_reg}"
+    # restore fixture state for other tests (module-scoped fixture!)
+    snes.cfg.toggle_regularization = False
+    snes.lambda_1.assign(0.0); snes.lambda_2.assign(0.0)
+
+
 def test_adam_steps_reduce_loss(tiny_model):
     import numpy as np
     model, train, _ = tiny_model
