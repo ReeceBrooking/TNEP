@@ -1039,6 +1039,9 @@ class SNES:
         gen_l1, gen_l2, gen_lorth = 0.0, 0.0, 0.0
         val_fitness = float('inf')
         sigma_min = sigma_max = sigma_mean = sigma_median = float(cfg.init_sigma)
+        # Last finite RRMSE values, carried into Adam gens (which don't compute
+        # a population RRMSE) so the history series stays finite for plotting.
+        last_best_rrmse = last_avg_rrmse = 0.0
 
         for gen in range(start_gen, cfg.num_generations):
             t0 = time.perf_counter()
@@ -1098,7 +1101,9 @@ class SNES:
                 avg_fitness = (adam_loss ** 0.5
                                if self.cfg.loss_type == "mse" else float(adam_loss))
                 best_rmse = worst_rmse = avg_fitness
-                best_rrmse = avg_rrmse = float("nan")
+                # Adam computes no population RRMSE; carry the last finite
+                # SNES value so history["best_rrmse"]/["avg_rrmse"] stay finite.
+                best_rrmse, avg_rrmse = last_best_rrmse, last_avg_rrmse
                 self._last_phase = "adam"
                 t2 = time.perf_counter()
             else:
@@ -1135,6 +1140,7 @@ class SNES:
                 worst_rmse = float(metrics_np[2])
                 best_rrmse = float(metrics_np[3])
                 avg_rrmse = float(metrics_np[4])
+                last_best_rrmse, last_avg_rrmse = best_rrmse, avg_rrmse
                 self._last_phase = "snes"
 
                 t2 = time.perf_counter()
@@ -1285,7 +1291,11 @@ class SNES:
             # direction info to follow.
             reset_patience = getattr(cfg, "plateau_reset_patience", None)
             max_resets = getattr(cfg, "max_sigma_resets", None)
+            # Plateau sigma-reset only meaningful in SNES phases; Adam ignores
+            # sigma, and a reset landing in an Adam phase would be overwritten
+            # by _enter_snes_phase's handoff on the next swap.
             if (_do_val
+                    and self._last_phase == "snes"
                     and reset_patience is not None
                     and gens_without_improvement >= int(reset_patience)
                     and (max_resets is None or n_sigma_resets < int(max_resets))):
