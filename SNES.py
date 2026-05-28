@@ -291,6 +291,16 @@ class SNES:
         self.eta_sigma = self.cfg.eta_sigma if self.cfg.eta_sigma is not None else self.compute_eta_sigma()
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
+        # Hybrid-optimizer state (lazy — Adam moments only materialised when used).
+        self._opt_mode = str(getattr(cfg, "optimizer_mode", "snes")).lower()
+        self.adam_m = None
+        self.adam_v = None
+        self.adam_t = None
+        self._opt_phase = str(getattr(cfg, "hybrid_start", "adam")).lower()
+        self._last_phase = self._opt_phase
+        self._phase_best = float("inf")
+        self._hybrid_cycles = 0
+
         # Hybrid mode: a too-tight early-stop patience would terminate the
         # run before SNES ever plateaus and hands back to Adam, silently
         # defeating the schedule. Fail loudly.
@@ -1363,16 +1373,70 @@ class SNES:
 
         return history, final_model, best_val_model
 
+    def _ensure_adam_state(self) -> None:
+        """Lazily materialise the Adam moment Variables (only when Adam is used)."""
+        if self.adam_m is None:
+            self.adam_m = tf.Variable(tf.zeros([self.dim]), trainable=False, name="adam_m")
+            self.adam_v = tf.Variable(tf.zeros([self.dim]), trainable=False, name="adam_v")
+            self.adam_t = tf.Variable(0, dtype=tf.int64, trainable=False, name="adam_t")
+
+    def _reg_scalar_tf(self, mu: tf.Tensor) -> tf.Tensor:
+        """Differentiable global L1+L2 regularisation penalty on the typed ANN params.
+
+        Mirrors the formula in compute_regularization exactly, but returns a
+        differentiable scalar tensor (for use in GradientTape). The orthogonal
+        V_pair penalty is omitted — Adam minimises the plain global L1+L2 scalar
+        only. Cayley / shrinkage tails are not differentiated here (Adam operates
+        on the raw mu vector and reg is only applied to ANN params).
+
+        For T > 1 (multi-type):
+            global term only: lambda_1 * sum(|typed|) / n_typed_total
+                             + lambda_2 * sqrt(sum(typed^2) / n_typed_total)
+            (per-type loop term is omitted — it duplicates info; Adam needs a
+             single scalar that rises with weight magnitude. The global typed
+             term is the primary regulariser in GPUMD and is sufficient here.)
+
+        For T == 1 (single-type):
+            Same formula over pv[:n_anns_total] (V_pair tail excluded when
+            descriptor_mixing is on, matching compute_regularization's
+            v_handled path; here n_U_pair == 0 in typical usage so it's pv).
+
+        Returns:
+            reg : scalar tf.Tensor — L1 + L2 regularisation penalty.
+        """
+        T = self.cfg.num_types
+        if T > 1:
+            # Global typed term (excludes b1, matching compute_regularization).
+            typed = mu[:self.n_typed]
+            n_typed_total = self.n_typed
+            if self.cfg.target_mode == 2:
+                typed = tf.concat(
+                    [typed, mu[self.n_primary:self.n_primary + self.n_typed]], axis=0)
+                n_typed_total = 2 * self.n_typed
+            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / float(n_typed_total)
+            l2 = self.lambda_2 * tf.sqrt(
+                tf.reduce_sum(tf.square(typed)) / float(n_typed_total))
+        else:
+            # Single-type: reg over ANN params only (exclude U_pair tail).
+            ann_n = float(self.n_anns_total if self.n_U_pair > 0 else self.dim)
+            ann = mu[:self.n_anns_total] if self.n_U_pair > 0 else mu
+            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann)) / ann_n
+            l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(ann)) / ann_n)
+        return l1 + l2
+
     def _loss_and_grad(self, batch_data: dict) -> tuple[tf.Tensor, tf.Tensor]:
         """Differentiable (loss, dloss/dmu) for the CURRENT self.mu on batch_data.
 
         Mirrors validate()'s weight reconstruction + chunk forward, but on
         training data and wrapped in a per-chunk GradientTape. Per-chunk
-        gradient accumulation bounds tape memory; summing the squared error
-        and the gradient then dividing both by the element count yields the
-        correct mean-loss gradient. grad_values is a constant, so this is a
-        single backprop (no nested tape). MSE only for now; loss_type and
-        regularisation are added in a later task.
+        gradient accumulation bounds tape memory; summing the element-wise
+        loss and the gradient then dividing both by the element count yields
+        the correct mean-loss gradient. grad_values is a constant, so this
+        is a single backprop (no nested tape).
+
+        Respects cfg.loss_type ("mse" | "mae" | "huber") and, when
+        cfg.toggle_regularization is True, folds in the differentiable
+        L1+L2 penalty from _reg_scalar_tf.
         """
         from data import prefetched_chunks
         S = batch_data["num_atoms"].shape[0]
@@ -1381,7 +1445,7 @@ class SNES:
         ranges = [(s, min(s + struct_chunk, S)) for s in range(0, S, struct_chunk)]
 
         grad_accum = tf.zeros_like(self.mu)
-        sq_sum = tf.constant(0.0, tf.float32)
+        loss_sum = tf.constant(0.0, tf.float32)
         cnt = tf.constant(0.0, tf.float32)
 
         for _, _, chunk in prefetched_chunks(
@@ -1411,14 +1475,30 @@ class SNES:
                     na = tf.reduce_sum(chunk["atom_mask"], axis=1)
                     preds = preds / tf.maximum(na, 1.0)[:, tf.newaxis]
                 diff = preds - chunk["targets"]
-                chunk_sq = tf.reduce_sum(tf.square(diff))
-            grad_accum += tape.gradient(chunk_sq, self.mu)
-            sq_sum += chunk_sq
+                if self.cfg.loss_type == "mae":
+                    chunk_loss = tf.reduce_sum(tf.abs(diff))
+                elif self.cfg.loss_type == "huber":
+                    d = float(self.cfg.huber_delta)
+                    a = tf.abs(diff)
+                    chunk_loss = tf.reduce_sum(
+                        tf.where(a <= d, 0.5 * tf.square(diff), d * (a - 0.5 * d)))
+                else:  # mse
+                    chunk_loss = tf.reduce_sum(tf.square(diff))
+            grad_accum += tape.gradient(chunk_loss, self.mu)
+            loss_sum += chunk_loss
             cnt += tf.cast(tf.size(diff), tf.float32)
             del chunk
 
-        loss = sq_sum / tf.maximum(cnt, 1.0)
+        loss = loss_sum / tf.maximum(cnt, 1.0)
         grad = grad_accum / tf.maximum(cnt, 1.0)
+
+        if self.cfg.toggle_regularization:
+            with tf.GradientTape() as rtape:
+                rtape.watch(self.mu)
+                reg = self._reg_scalar_tf(self.mu)
+            grad = grad + rtape.gradient(reg, self.mu)
+            loss = loss + reg
+
         return loss, grad
 
     def validate(self, val_data: dict[str, tf.Tensor], mu_tf: tf.Tensor | None = None) -> float:

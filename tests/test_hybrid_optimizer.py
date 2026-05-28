@@ -73,6 +73,16 @@ def test_loss_grad_matches_finite_difference(tiny_model):
             f"param {i}: analytic {grad[i]:.4e} vs FD {fd:.4e}"
 
 
+def test_adam_state_allocated(tiny_model):
+    model, train, _ = tiny_model
+    snes = model.optimizer
+    snes._ensure_adam_state()
+    assert snes.adam_m.shape == (snes.dim,)
+    assert float(tf.reduce_sum(tf.abs(snes.adam_m))) == 0.0
+    assert int(snes.adam_t.numpy()) == 0
+    assert snes.adam_v.shape == (snes.dim,)
+
+
 def test_optimizer_config_defaults():
     from TNEPconfig import TNEPconfig
     cfg = TNEPconfig()
@@ -83,6 +93,23 @@ def test_optimizer_config_defaults():
     assert cfg.adam_lr == 1e-3
     assert cfg.adam_reset_moments_on_entry is True
     assert cfg.hybrid_handoff_sigma is None
+
+
+def test_loss_grad_includes_regularisation(tiny_model):
+    model, train, _ = tiny_model
+    snes = model.optimizer
+    # fixture has toggle_regularization=False; flip it on with nonzero lambdas
+    import tensorflow as tf
+    snes.cfg.toggle_regularization = True
+    snes.lambda_1.assign(0.01); snes.lambda_2.assign(0.01)
+    loss_reg, grad_reg = snes._loss_and_grad(train)
+    snes.cfg.toggle_regularization = False
+    loss_noreg, grad_noreg = snes._loss_and_grad(train)
+    assert float(loss_reg) > float(loss_noreg)            # reg adds positive penalty
+    assert float(tf.norm(grad_reg - grad_noreg)) > 0.0     # reg changes the gradient
+    # restore fixture state for other tests (module-scoped fixture!)
+    snes.cfg.toggle_regularization = False
+    snes.lambda_1.assign(0.0); snes.lambda_2.assign(0.0)
 
 
 def test_hybrid_early_stop_guard():
