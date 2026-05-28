@@ -515,6 +515,38 @@ class TNEPconfig:
     # (or just continue if patience is None).
     max_sigma_resets: int | None = None
 
+    # --- hybrid Adam/SNES optimizer ------------------------------------
+    # Optimizer driver:
+    #   "snes"   : SNES only (default; bit-identical to legacy behaviour)
+    #   "adam"   : Adam only (gradient descent on self.mu; per-type
+    #              ranking inactive — minimises the plain global loss)
+    #   "hybrid" : alternate Adam and SNES on a plateau-triggered FSM.
+    # In hybrid mode Adam descends fast into a basin; when it plateaus
+    # (adam_plateau_patience val-ticks without improvement) control
+    # swaps to SNES, which explores/escapes until IT plateaus
+    # (snes_plateau_patience), then swaps back to Adam — repeating.
+    # Plateau is measured PHASE-LOCALLY (reset on each swap) so neither
+    # optimizer thrashes against a stale global best; the global best_mu
+    # is tracked separately for the returned model.
+    optimizer_mode: str = "snes"
+    hybrid_start: str = "adam"            # "adam" | "snes" — which phase first
+    adam_plateau_patience: int = 100      # Adam->SNES swap (val-ticks; * val_interval for gens)
+    snes_plateau_patience: int = 2000     # SNES->Adam swap (val-ticks)
+    hybrid_max_cycles: int | None = None  # cap alternations (None = until num_generations)
+    # Sigma to (re)initialise when entering an SNES phase. Too small ->
+    # SNES can't escape Adam's basin; too large -> discards Adam's work.
+    # None = use cfg.init_sigma.
+    hybrid_handoff_sigma: float | None = None
+    # Reset Adam moments (m, v, t) on each entry into an Adam phase.
+    # Stale moments from a different basin mislead the first steps.
+    adam_reset_moments_on_entry: bool = True
+    # Adam hyperparameters.
+    adam_lr: float = 1e-3
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-8
+    adam_clipnorm: float | None = None    # optional global-norm gradient clip
+
     # ═══════════════════════════════════════════════════════════════════
     # 6. MEMORY & I/O STAGING
     # ═══════════════════════════════════════════════════════════════════

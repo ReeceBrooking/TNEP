@@ -71,3 +71,38 @@ def test_loss_grad_matches_finite_difference(tiny_model):
         fd = (lp - lm) / (2 * eps)
         assert abs(fd - grad[i]) < 1e-2 * (abs(grad[i]) + 1.0), \
             f"param {i}: analytic {grad[i]:.4e} vs FD {fd:.4e}"
+
+
+def test_optimizer_config_defaults():
+    from TNEPconfig import TNEPconfig
+    cfg = TNEPconfig()
+    assert cfg.optimizer_mode == "snes"           # default unchanged
+    assert cfg.adam_plateau_patience == 100
+    assert cfg.snes_plateau_patience == 2000
+    assert cfg.hybrid_start == "adam"
+    assert cfg.adam_lr == 1e-3
+    assert cfg.adam_reset_moments_on_entry is True
+    assert cfg.hybrid_handoff_sigma is None
+
+
+def test_hybrid_early_stop_guard():
+    import pytest
+    from TNEPconfig import TNEPconfig
+    from data import collect, split, pad_and_stack
+    from DescriptorBuilderGPU import compute_dim_q
+    from TNEP import TNEP
+    cfg = TNEPconfig()
+    cfg.data_path = 'datasets/test.xyz'; cfg.test_data_path = None
+    cfg.allowed_species = [6, 1, 7, 8]; cfg.filter_mode = 'subset'
+    cfg.target_mode = 1; cfg.total_N = 16; cfg.test_ratio = 0.25
+    cfg.num_neurons = 8; cfg.descriptor_mode = 0; cfg.descriptor_mixing = False
+    cfg.pop_size = 8; cfg.population_chunk_size = None; cfg.batch_chunk_size = None
+    cfg.pin_data_to_cpu = True; cfg.cache_gradients_to_disk = False
+    cfg.chunk_prefetch = False; cfg.use_pinned_buffers = False; cfg.use_cufile = False
+    cfg.save_path = None; cfg.checkpoint_interval = None; cfg.seed = 0
+    cfg.optimizer_mode = "hybrid"
+    cfg.patience = 50            # < snes_plateau_patience (2000) -> must raise
+    cfg.snes_plateau_patience = 2000
+    dataset, ti = collect(cfg); cfg.randomise(dataset); cfg.dim_q = compute_dim_q(cfg)
+    with pytest.raises(ValueError):
+        TNEP(cfg)   # SNES.__init__ guard fires during model construction

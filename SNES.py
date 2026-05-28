@@ -291,6 +291,18 @@ class SNES:
         self.eta_sigma = self.cfg.eta_sigma if self.cfg.eta_sigma is not None else self.compute_eta_sigma()
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
+        # Hybrid mode: a too-tight early-stop patience would terminate the
+        # run before SNES ever plateaus and hands back to Adam, silently
+        # defeating the schedule. Fail loudly.
+        if (str(getattr(cfg, "optimizer_mode", "snes")).lower() == "hybrid"
+                and cfg.patience is not None
+                and int(cfg.patience) <= int(cfg.snes_plateau_patience)):
+            raise ValueError(
+                f"cfg.patience ({cfg.patience}) must exceed "
+                f"cfg.snes_plateau_patience ({cfg.snes_plateau_patience}) in "
+                f"hybrid mode, else early-stopping fires before SNES can hand "
+                f"back to Adam. Raise patience or lower snes_plateau_patience.")
+
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray
                                ) -> tuple[float, float, float]:
         """Compute L1, L2, and orthogonal regularisation penalties.
