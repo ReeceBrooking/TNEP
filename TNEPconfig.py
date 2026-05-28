@@ -137,7 +137,7 @@ class TNEPconfig:
 
     # --- geometric parameters ------------------------------------------
     l_max: int = 4
-    alpha_max: int = 6
+    alpha_max: int = 4
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5
     basis: str = "poly3"
