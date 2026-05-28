@@ -453,6 +453,32 @@ class TNEPconfig:
     # so 1e-6 is non-distorting.
     sigma_floor: float | None = 1e-6
 
+    # ES mean-update preconditioner:
+    #   "vanilla" : mu += sigma * grad_mu          (canonical SNES; default)
+    #   "adam"    : precondition the ES natural-gradient estimate grad_mu
+    #               with Adam (momentum + per-dim variance scaling) and
+    #               step mu += snes_mean_lr * m_hat/(sqrt(v_hat)+eps).
+    #               sigma then controls ONLY the sampling width, not the
+    #               mean step. Smooths the noisy ES gradient across
+    #               generations (complements within-gen mirrored sampling).
+    snes_mean_optimizer: str = "vanilla"
+    snes_mean_lr: float | None = None   # None -> 1e-2 (Adam normalises per-dim step; decoupled from init_sigma — tune per problem)
+    snes_mean_beta1: float = 0.9
+    snes_mean_beta2: float = 0.999
+    snes_mean_epsilon: float = 1e-8
+
+    # Step-size adaptation for sigma:
+    #   False : memoryless multiplicative update sigma *= exp(eta*grad_sigma) (default)
+    #   True  : per-coordinate cumulative step-size adaptation (separable CSA).
+    #           Maintains an evolution path p (EMA of the whitened mean
+    #           gradient) and adapts sigma_d from path_d^2 vs its neutral
+    #           expectation (1). Integrates the step-size signal over time
+    #           -> more stable on ill-conditioned landscapes than the
+    #           memoryless update. REPLACES the grad_sigma update when on.
+    snes_sigma_cumulation: bool = False
+    snes_cumulation_c: float | None = None   # path EMA constant; None -> (mu_eff+2)/(dim+mu_eff+5)
+    snes_cumulation_rate: float = 0.05       # damping on the per-dim log-sigma step
+
     # --- validation ----------------------------------------------------
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None

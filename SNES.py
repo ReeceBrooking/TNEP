@@ -291,6 +291,19 @@ class SNES:
         self.eta_sigma = self.cfg.eta_sigma if self.cfg.eta_sigma is not None else self.compute_eta_sigma()
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
+        # Effective selection mass: under neutral selection s_i ~ N(0,1),
+        # the zero-mean log-rank utilities give Var(grad_mu_d) = Σ u_i^2,
+        # so mu_eff = 1 / Σ u_i^2. Utilities are fixed -> compute once.
+        self._mu_eff = float(1.0 / np.sum(self.utilities.numpy() ** 2))
+
+        # ES-upgrade state (lazy — only allocated when the opt-in branches fire).
+        # Adam preconditioning of the ES mean gradient (Feature A):
+        self._es_m = None
+        self._es_v = None
+        self._es_t = None
+        # Per-coordinate evolution-path cumulation for sigma (Feature B):
+        self._sigma_path = None
+
         # Hybrid-optimizer state (lazy — Adam moments only materialised when used).
         self._opt_mode = str(getattr(cfg, "optimizer_mode", "snes")).lower()
         self.adam_m = None
@@ -928,6 +941,29 @@ class SNES:
         samples = self.mu + s * self.sigma
         return samples, s
 
+    def _ensure_es_mean_state(self) -> None:
+        """Lazily allocate Adam moment buffers for the ES mean gradient.
+
+        Distinct from the hybrid true-gradient Adam buffers (self.adam_*);
+        only materialised the first time snes_mean_optimizer == "adam" fires.
+        """
+        if self._es_m is None:
+            self._es_m = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
+                                     trainable=False, name="es_mean_m")
+            self._es_v = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
+                                     trainable=False, name="es_mean_v")
+            self._es_t = tf.Variable(0, dtype=tf.int64, trainable=False,
+                                     name="es_mean_t")
+
+    def _ensure_es_sigma_state(self) -> None:
+        """Lazily allocate the per-coordinate sigma evolution path.
+
+        Only materialised the first time snes_sigma_cumulation is on.
+        """
+        if self._sigma_path is None:
+            self._sigma_path = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
+                                           trainable=False, name="es_sigma_path")
+
     def update(self, utilities: tf.Tensor, s: tf.Tensor) -> None:
         """Update mu and sigma using fitness-ranked noise vectors.
 
@@ -944,11 +980,41 @@ class SNES:
         distribution can't silently kill exploration on long runs.
         """
         grad_mu = tf.einsum('p,pd->d', utilities, s)
-        grad_sigma = tf.einsum('p,pd->d', utilities, s ** 2 - 1.0)
 
-        self.mu.assign_add(self.sigma * grad_mu)
+        # --- mean update (Feature A: optional Adam preconditioning) ---
+        if str(getattr(self.cfg, "snes_mean_optimizer", "vanilla")).lower() == "adam":
+            self._ensure_es_mean_state()
+            b1 = float(self.cfg.snes_mean_beta1); b2 = float(self.cfg.snes_mean_beta2)
+            eps = float(self.cfg.snes_mean_epsilon)
+            lr = self.cfg.snes_mean_lr
+            # None -> 1e-2. Adam normalises the per-dim step magnitude, so the
+            # learning rate is decoupled from init_sigma (tying it to init_sigma
+            # overshoots ~100x in high dim). ~1e-2 matches the per-dim vanilla
+            # step scale empirically; tune per problem.
+            lr = float(lr) if lr is not None else 1e-2
+            self._es_t.assign_add(1)
+            t = tf.cast(self._es_t, tf.float32)
+            self._es_m.assign(b1 * self._es_m + (1.0 - b1) * grad_mu)
+            self._es_v.assign(b2 * self._es_v + (1.0 - b2) * tf.square(grad_mu))
+            m_hat = self._es_m / (1.0 - tf.pow(b1, t))
+            v_hat = self._es_v / (1.0 - tf.pow(b2, t))
+            self.mu.assign_add(lr * m_hat / (tf.sqrt(v_hat) + eps))
+        else:
+            self.mu.assign_add(self.sigma * grad_mu)   # canonical vanilla step
+
+        # --- sigma update (Feature B: optional separable CSA) ---
+        if bool(getattr(self.cfg, "snes_sigma_cumulation", False)):
+            self._ensure_es_sigma_state()
+            c = self.cfg.snes_cumulation_c
+            c = float(c) if c is not None else (self._mu_eff + 2.0) / (self.dim + self._mu_eff + 5.0)
+            rate = float(self.cfg.snes_cumulation_rate)
+            new_path = (1.0 - c) * self._sigma_path + tf.sqrt(c * (2.0 - c) * self._mu_eff) * grad_mu
+            self._sigma_path.assign(new_path)
+            new_sigma = self.sigma * tf.exp(rate * (tf.square(new_path) - 1.0))
+        else:
+            grad_sigma = tf.einsum('p,pd->d', utilities, s ** 2 - 1.0)
+            new_sigma = self.sigma * tf.exp(self.eta_sigma * grad_sigma)   # canonical vanilla
         floor = getattr(self.cfg, "sigma_floor", 1e-5)
-        new_sigma = self.sigma * tf.exp(self.eta_sigma * grad_sigma)
         if floor is not None and floor > 0.0:
             new_sigma = tf.maximum(new_sigma, float(floor))
         self.sigma.assign(new_sigma)
