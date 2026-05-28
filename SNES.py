@@ -1501,6 +1501,25 @@ class SNES:
 
         return loss, grad
 
+    def _adam_step(self, batch_data: dict) -> float:
+        """One Adam update on self.mu (in place). Returns the pre-step loss."""
+        self._ensure_adam_state()
+        loss, grad = self._loss_and_grad(batch_data)
+        clip = getattr(self.cfg, "adam_clipnorm", None)
+        if clip is not None:
+            grad, _ = tf.clip_by_global_norm([grad], float(clip))
+            grad = grad[0]
+        b1 = float(self.cfg.adam_beta1); b2 = float(self.cfg.adam_beta2)
+        eps = float(self.cfg.adam_epsilon); lr = float(self.cfg.adam_lr)
+        self.adam_t.assign_add(1)
+        t = tf.cast(self.adam_t, tf.float32)
+        self.adam_m.assign(b1 * self.adam_m + (1.0 - b1) * grad)
+        self.adam_v.assign(b2 * self.adam_v + (1.0 - b2) * tf.square(grad))
+        m_hat = self.adam_m / (1.0 - tf.pow(b1, t))
+        v_hat = self.adam_v / (1.0 - tf.pow(b2, t))
+        self.mu.assign_sub(lr * m_hat / (tf.sqrt(v_hat) + eps))
+        return float(loss)
+
     def validate(self, val_data: dict[str, tf.Tensor], mu_tf: tf.Tensor | None = None) -> float:
         """Compute mean RMSE on a subset of validation structures using batched predict.
 

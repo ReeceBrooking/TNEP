@@ -112,6 +112,27 @@ def test_loss_grad_includes_regularisation(tiny_model):
     snes.lambda_1.assign(0.0); snes.lambda_2.assign(0.0)
 
 
+def test_adam_steps_reduce_loss(tiny_model):
+    import numpy as np
+    model, train, _ = tiny_model
+    snes = model.optimizer
+    mu_save = snes.mu.numpy().copy()
+    try:
+        snes.cfg.adam_lr = 5e-3
+        snes._ensure_adam_state()
+        l0, _ = snes._loss_and_grad(train)
+        for _ in range(50):
+            snes._adam_step(train)
+        l1, _ = snes._loss_and_grad(train)
+        assert float(l1) < float(l0), f"Adam did not reduce loss: {float(l0)} -> {float(l1)}"
+    finally:
+        snes.mu.assign(mu_save)
+        # reset Adam moments so a later test starting fresh isn't polluted
+        snes.adam_m.assign(np.zeros(snes.dim, dtype=np.float32))
+        snes.adam_v.assign(np.zeros(snes.dim, dtype=np.float32))
+        snes.adam_t.assign(0)
+
+
 def test_hybrid_early_stop_guard():
     import pytest
     from TNEPconfig import TNEPconfig
