@@ -419,11 +419,14 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     # the same scaled+centered space the model was trained on. Without
     # this, downstream metrics that aren't shift-invariant (cos_sim,
     # total_rmse) silently report wrong values when centering is on.
+    _self_only = (cfg.target_mode == 1
+                  and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
     return pad_and_stack(
         data,
         num_types=cfg.num_types,
         q_scaler=getattr(cfg, "_q_scaler", None),
-        target_mean=getattr(cfg, "_target_mean", None))
+        target_mean=getattr(cfg, "_target_mean", None),
+        self_pairs_only=_self_only)
 
 
 def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> tuple[dict, dict, dict]:
@@ -619,12 +622,15 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
         test_descriptors, test_gradients, test_grad_index, cfg)
     if test_streamed is not None:
         test_data["_prebuilt_gv"] = test_streamed
+    _self_only = (cfg.target_mode == 1
+                  and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
     test_data = pad_and_stack(
         test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="test",
         q_scaler=getattr(cfg, "_q_scaler", None),
-        target_mean=getattr(cfg, "_target_mean", None))
+        target_mean=getattr(cfg, "_target_mean", None),
+        self_pairs_only=_self_only)
     # Pre-stage per-chunk pair indices to GPU. Test eval doesn't go
     # through `_evaluate_chunk` (TNEP.score uses model.predict_batch),
     # so XLA padding isn't needed for test data.
@@ -868,7 +874,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
                   cache_tag: str = "data",
                   prebuilt_gv: dict | None = None,
                   q_scaler: np.ndarray | None = None,
-                  target_mean: np.ndarray | None = None) -> dict[str, tf.Tensor]:
+                  target_mean: np.ndarray | None = None,
+                  self_pairs_only: bool = False) -> dict[str, tf.Tensor]:
     """Convert variable-length list-of-tensors data into COO + padded tensors.
 
     Gradient data is stored in COO (Coordinate) sparse format to avoid the
@@ -926,8 +933,31 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     # When prebuilt_gv is provided, the gradient COO is already on disk —
     # we still need pair_counts/struct_ptr to slice the on-disk file per
     # chunk, but we don't allocate grad_values_np in RAM.
+    if self_pairs_only and prebuilt_gv is not None:
+        raise NotImplementedError(
+            "self_pairs_only=True (dipole_rij_power=0) is not yet wired "
+            "for the prebuilt_gv / streamed-to-disk gradient path. "
+            "Either disable streaming (set cfg.cache_gradients_to_disk=False) "
+            "or extend the streaming descriptor builders to emit only "
+            "self pairs upstream.")
+
     if prebuilt_gv is not None:
         pair_counts = list(prebuilt_gv["pair_count_per_struct"])
+    elif self_pairs_only:
+        # Self-only: count how many centres have at least one row in
+        # data["grad_index"][s][i] equal to i (the centre's own index).
+        # Quippy/soap_turbo emits the zero-image self entry FIRST per
+        # centre. We keep ONLY that first row; periodic self-images
+        # (same atom index, nonzero displacement vector) are
+        # intentionally dropped — including them would double-count the
+        # self contribution under dipole_rij_power=0.
+        # Defensive: an atom with no neighbours and no self entry
+        # contributes zero pairs.
+        pair_counts = [
+            int(sum(1 for i in range(atom_counts[s])
+                    if bool(np.any(np.asarray(data["grad_index"][s][i]) == i))))
+            for s in range(S)
+        ]
     else:
         pair_counts = [
             sum(data["gradients"][s][i].shape[0] for i in range(atom_counts[s]))
@@ -1001,13 +1031,40 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             pair_offset = k_end
         else:
             for i in range(N_s):
-                n_nbrs = data["gradients"][s][i].shape[0]
-                k_end  = pair_offset + n_nbrs
-                grad_values_np[pair_offset:k_end] = data["gradients"][s][i].numpy()
-                pair_struct_np[pair_offset:k_end] = s
-                pair_atom_np[pair_offset:k_end]   = i
-                pair_gidx_np[pair_offset:k_end]   = data["grad_index"][s][i]
-                pair_offset += n_nbrs
+                gv_full = data["gradients"][s][i]
+                gidx_full = np.asarray(data["grad_index"][s][i])
+                if self_pairs_only:
+                    # Keep only the FIRST row where the neighbour index ==
+                    # centre index. soap_turbo/quippy emit the zero-image
+                    # self entry first per centre; any subsequent matches
+                    # are periodic IMAGES of atom i (same atom index,
+                    # nonzero displacement vector) and would double-count
+                    # the self contribution under dipole_rij_power=0, so
+                    # we intentionally drop them. Drops the neighbour
+                    # pairs entirely — grad_values_np shrinks from
+                    # O(N·M) per structure to O(N), and N=0 dipole
+                    # becomes a clean Σ_i de_dq[i] · grad_values[i, i].
+                    mask = (gidx_full == i)
+                    if not bool(np.any(mask)):
+                        continue
+                    k0 = int(np.argmax(mask))  # first True index
+                    gv_arr = (gv_full.numpy()
+                              if hasattr(gv_full, "numpy") else np.asarray(gv_full))
+                    grad_values_np[pair_offset] = gv_arr[k0]
+                    pair_struct_np[pair_offset] = s
+                    pair_atom_np[pair_offset]   = i
+                    pair_gidx_np[pair_offset]   = int(gidx_full[k0])
+                    pair_offset += 1
+                else:
+                    n_nbrs = gv_full.shape[0]
+                    k_end  = pair_offset + n_nbrs
+                    grad_values_np[pair_offset:k_end] = (
+                        gv_full.numpy() if hasattr(gv_full, "numpy")
+                        else np.asarray(gv_full))
+                    pair_struct_np[pair_offset:k_end] = s
+                    pair_atom_np[pair_offset:k_end]   = i
+                    pair_gidx_np[pair_offset:k_end]   = gidx_full
+                    pair_offset += n_nbrs
 
     # Apply per-channel descriptor scaling (cfg.descriptor_scaling="q_scaler").
     # Multiplying BOTH desc and grad_values by the same s[Q] is the

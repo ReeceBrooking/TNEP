@@ -45,7 +45,7 @@ class TNEPconfig:
     # None : uses entire dataset, int : defines maximum structures to use in training
     total_N: int | None = None
     # Seed for randomisation (dataset shuffle, SNES sampling, etc.)
-    seed: int | None = None
+    seed: int | None = 1284760333973115944
 
     # --- target type, units, conversions -------------------------------
     # 0 : PES (energy), 1 : Dipole, 2 : Polarizability
@@ -75,27 +75,40 @@ class TNEPconfig:
     lambda_shear: float = 1.0
 
     # Power of |r_ij| applied to per-pair forces in the dipole contraction
-    # (target_mode=1 only):
-    #   N = 0   →  μ = − Σ F_ij                (EXPERIMENTAL — no radial
-    #             weight; pure sum of partial forces. Drops the |r_ij|^N
-    #             scalar entirely. Useful as a diagnostic for whether the
-    #             radial weight is doing useful work, and as an ablation
-    #             baseline. A runtime warning is printed when this is used.)
-    #   N = 1   →  μ = − Σ |r_ij|   · F_ij     (first radial moment;
+    # (target_mode=1 only). Two algebraic branches:
+    #
+    #   N = 0   →  μ = − Σ_i de_dq[i] · grad_values[i, i]
+    #             (EXPERIMENTAL — sums ONLY the self-pair (i, i) contributions.
+    #             A naive μ = -Σ F_ij over all pairs would be identically
+    #             zero by translation invariance of q_i, since
+    #             Σ_{all j incl. self} ∂q_i/∂R_j = 0. Restricting the sum
+    #             to self pairs isolates the centre's own gradient, which
+    #             equals −Σ_{j≠i} ∂q_i/∂R_j and is non-zero. The result
+    #             is rotation-covariant and a valid dipole-like quantity,
+    #             but DIFFERENT in functional form from the N ≥ 1 branches —
+    #             not a "lower-power" version of the same formula.
+    #             A runtime warning is printed when this is used.)
+    #
+    #   N = 1   →  μ = − Σ_{pair} |r_ij|   · F_ij  (first radial moment;
     #             Schofield-style virial-like weight)
-    #   N = 2   →  μ = − Σ |r_ij|²  · F_ij     (Xu et al. JCTC 2024 / GPUMD
-    #             default — what the dipole pathway has used to date)
-    #   N ≥ 3  →   μ = − Σ |r_ij|^N · F_ij     (higher moments; mostly
-    #             diagnostic / sensitivity studies)
-    # All N ≥ 1 use the SAME algebraic shape: a scalar |r_ij|^N weight
-    # applied to the force vector F_ij. Each output component μ_α depends
-    # only on the matching component of F_α, with the positive-definite
-    # scalar weight ensuring no per-axis signed cancellation. N = 0 keeps
-    # the same shape with a unit scalar weight.
-    # Default 2 keeps existing-model behaviour bit-for-bit identical.
-    # Models saved with one N MUST be re-trained if N is changed — the
-    # contraction defines what the network's per-atom scalar is mapped to.
-    dipole_rij_power: int = 1
+    #   N = 2   →  μ = − Σ_{pair} |r_ij|²  · F_ij  (Xu et al. JCTC 2024 /
+    #             GPUMD default — what the dipole pathway has used to date)
+    #   N ≥ 3   →  μ = − Σ_{pair} |r_ij|^N · F_ij  (higher moments;
+    #             mostly diagnostic / sensitivity studies)
+    #
+    # For N ≥ 1, self pairs (i, i) are present in the COO list but
+    # contribute zero automatically because |r_ii|^N = 0 — no separate
+    # handling needed. The N = 0 branch uses the COO list's self entries
+    # exclusively and skips all neighbour pairs.
+    #
+    # Default 0 enables the EXPERIMENTAL self-pair-only formulation
+    # (a runtime warning prints on first model construction). For the
+    # standard Xu et al. JCTC 2024 / GPUMD-compatible formula, set
+    # `dipole_rij_power = 2`; for the GAP-style first radial moment,
+    # set it to 1. Models saved with one N MUST be re-trained if N is
+    # changed — the contraction defines what the network's per-atom
+    # scalar is mapped to.
+    dipole_rij_power: int = 0
 
     # Skip H atoms as DESCRIPTOR CENTERS:
     #   False (default) — every atom (including H) gets its own SOAP
@@ -124,7 +137,7 @@ class TNEPconfig:
 
     # --- geometric parameters ------------------------------------------
     l_max: int = 4
-    alpha_max: int = 4
+    alpha_max: int = 6
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5
     basis: str = "poly3"
@@ -367,8 +380,8 @@ class TNEPconfig:
     #           of the data RMSE. Starts from the auto value.
     #   float : fixed scalar
     toggle_regularization: bool = True
-    lambda_1: float | None = 0.001
-    lambda_2: float | None = 0.001
+    lambda_1: float | None = 0.03
+    lambda_2: float | None = 0.03
     # Dynamic-λ controls (only used when lambda_1 or lambda_2 == -1).
     # `target_ratio`: target ratio of reg-penalty to data RMSE. 0.05
     #   means "keep regularisation at ~5% of the data loss." GPUMD

@@ -408,11 +408,24 @@ def _train_model_inner(cfg: TNEPconfig,
     elif cfg.target_mode == 2:
         print_polarizability_statistics(dataset, target_key=_resolve_target_key(cfg))
 
+    # Resolve cfg.seed=None to a concrete, serialisable seed BEFORE any RNG
+    # is constructed (whether this is a fresh run or a resume from an old
+    # checkpoint that didn't persist its seed). Without this the actual
+    # entropy consumed by np.random.default_rng(None) / TF's
+    # non-deterministic generator is lost — and a resumed run from a
+    # pre-fix checkpoint would carry the unreproducibility forward.
+    if cfg.seed is None:
+        cfg.seed = int(
+            np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
+        print(f"  cfg.seed was None — generated and stored "
+              f"reproducible seed: {cfg.seed}")
+
     if resume_state is not None and isinstance(getattr(cfg, "indices", None), np.ndarray):
         # Indices already restored from checkpoint — would re-shuffle to
-        # the same values anyway (deterministic via cfg.seed), but
-        # skipping makes the resume self-explanatory and avoids any
-        # surprise if the dataset was extended between runs.
+        # the same values anyway (deterministic via cfg.seed for runs
+        # that persisted the resolved seed), but skipping makes the
+        # resume self-explanatory and avoids any surprise if the
+        # dataset was extended between runs.
         print(f"  resume: using checkpoint train/val split "
               f"({len(cfg.indices)} indices)")
     else:
@@ -498,18 +511,33 @@ def _train_model_inner(cfg: TNEPconfig,
     # Convert to padded dense tensors for GPU-batched evaluation. test_data
     # is intentionally NOT padded here; it gets padded by materialize_test_data
     # the first time it's actually consumed.
+    # When dipole_rij_power=0 (target_mode=1), only self-pair gradients
+    # contribute to the dipole sum — neighbour pairs would be multiplied
+    # by zero. Tell pad_and_stack to drop them at data-build time so
+    # grad_values shrinks from O(N·M) to O(N) per structure. Actual
+    # savings depend on the average neighbour count — the train_P /
+    # val_P counts logged below report the true post-filter pair count.
+    _self_only = (cfg.target_mode == 1
+                  and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
     train_data = pad_and_stack(
         train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="train",
         q_scaler=getattr(cfg, "_q_scaler", None),
-        target_mean=getattr(cfg, "_target_mean", None))
+        target_mean=getattr(cfg, "_target_mean", None),
+        self_pairs_only=_self_only)
     val_data   = pad_and_stack(
         val_data,   num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="val",
         q_scaler=getattr(cfg, "_q_scaler", None),
-        target_mean=getattr(cfg, "_target_mean", None))
+        target_mean=getattr(cfg, "_target_mean", None),
+        self_pairs_only=_self_only)
+    if _self_only:
+        n_train_pairs = int(train_data["grad_values"].shape[0])
+        n_val_pairs   = int(val_data["grad_values"].shape[0])
+        print(f"  dipole_rij_power=0: COO restricted to self-pairs only "
+              f"(train P={n_train_pairs}, val P={n_val_pairs})")
 
     _setup_grad_staging(cfg, train_data, val_data)
 

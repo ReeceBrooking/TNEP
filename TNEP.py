@@ -86,17 +86,19 @@ class TNEP(layers.Layer):
             if _N < 0:
                 raise ValueError(
                     f"cfg.dipole_rij_power must be an integer ≥ 0, got {_N}. "
-                    f"0 = ΣF only (experimental — no radial weight), "
+                    f"0 = self-pair only (μ = -Σ_i de_dq[i] · ∂q_i/∂R_i), "
                     f"1 = |r|·F (first radial moment), "
                     f"2 = |r|²·F (Xu et al. JCTC 2024 default), "
                     f"≥3 = higher radial moments."
                 )
             if _N == 0:
                 print(
-                    "[EXPERIMENTAL] cfg.dipole_rij_power=0: dipole computed as "
-                    "μ = -Σ F_ij (pure sum of partial forces, no |r_ij| weight). "
-                    "This is an ablation/diagnostic path — results not directly "
-                    "comparable to N≥1 models."
+                    "[EXPERIMENTAL] cfg.dipole_rij_power=0: dipole reduced to "
+                    "the per-atom self-pair sum, μ = -Σ_i de_dq[i] · grad_values[i,i]. "
+                    "Translation invariance forces the neighbour sum to cancel "
+                    "against the self entry, so isolating self gives a non-zero, "
+                    "rotation-covariant prediction. Not directly comparable to "
+                    "N ≥ 1 (different functional form, not just a different weight)."
                 )
 
         # Scalar ANN for polarizability mode (target_mode == 2)
@@ -508,15 +510,15 @@ class TNEP(layers.Layer):
 
         if self.cfg.target_mode == 1:
             # Dipole contraction. `cfg.dipole_rij_power` selects the
-            # radial-weight exponent N in:
-            #   μ = -Σ |r_ij|^N · F_ij   (scalar weight × force vector)
-            # All N ≥ 1 use the same algebraic shape — each output
-            # component μ_α uses the matching F_α with a positive
-            # scalar weight, so there is no signed-cancellation issue
-            # at any N.
+            # weighting:
+            #   N >= 1 : μ = -Σ_pair |r_ij|^N · F_ij
+            #   N == 0 : μ = -Σ_i de_dq[i] · grad_values[i, i]   (self-only)
+            # The dispatcher returns the appropriate per-pair scalar
+            # weight for the chosen branch.
             _, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)
-            rij_n = self._scalar_rij_pow(tf.square(rij)) * neighbor_mask  # [A, M]
+            rij_n = (self._dipole_pair_weight_padded(tf.square(rij), grad_index)
+                     * neighbor_mask)                                     # [A, M]
             dipole_contribs = rij_n[:, :, tf.newaxis] * forces            # [A, M, 3]
             dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])         # [3]
             if _do_uncenter:
@@ -1008,23 +1010,18 @@ class TNEP(layers.Layer):
         return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
 
     def _scalar_rij_pow(self, rij2: tf.Tensor) -> tf.Tensor:
-        """|r_ij|^N as a scalar per-pair weight (N ≥ 0).
+        """|r_ij|^N as a scalar per-pair weight (N ≥ 1 only).
 
         Derived from the rij² primitive without a fresh sqrt for even N:
-            N = 0      → ones (experimental — drops the radial weight,
-                         so dipole becomes pure -Σ F_ij)
             N = 1      → sqrt(rij²)
             N = 2      → rij² unchanged (zero ops; default path)
             N even ≥ 4 → tf.pow(rij², N/2)
             N odd  ≥ 3 → tf.pow(rij², (N-1)/2) · sqrt(rij²)
 
-        All N produce a scalar weight that broadcasts across the
-        Cartesian axis of the force vector — there is no per-axis
-        component variant.
+        N = 0 is handled by `_dipole_pair_weight_*` (different algebraic
+        branch — restricts the dipole sum to self pairs only), not here.
         """
         N = int(getattr(self.cfg, "dipole_rij_power", 2))
-        if N == 0:
-            return tf.ones_like(rij2)
         if N == 1:
             return tf.sqrt(rij2)
         if N == 2:
@@ -1033,6 +1030,54 @@ class TNEP(layers.Layer):
             return tf.pow(rij2, N // 2)
         # Odd N ≥ 3
         return tf.pow(rij2, (N - 1) // 2) * tf.sqrt(rij2)
+
+    def _dipole_pair_weight_coo(self, rij2: tf.Tensor,
+                                 pair_atom: tf.Tensor,
+                                 pair_gidx: tf.Tensor) -> tf.Tensor:
+        """Per-pair weight in the dipole sum, COO-pair interface.
+
+            N == 0 : 1 where pair_atom == pair_gidx AND rij² < 1e-20
+                     (true zero-image self pair), 0 elsewhere
+                     → dipole collapses to -Σ_i de_dq[i] · grad_values[i, i].
+                     The rij² guard rejects periodic IMAGES of atom i that
+                     appear as its own neighbour with the same atom index
+                     but a nonzero displacement vector — including those
+                     would double-count the self contribution.
+            N >= 1 : |r_ij|^N — self pairs naturally contribute 0 via
+                     |r_ii|^N = 0, and periodic-image self pairs are
+                     weighted correctly by their nonzero |r|^N.
+        """
+        N = int(getattr(self.cfg, "dipole_rij_power", 2))
+        if N == 0:
+            is_self = tf.logical_and(tf.equal(pair_atom, pair_gidx),
+                                     rij2 < 1e-20)
+            return tf.cast(is_self, rij2.dtype)
+        return self._scalar_rij_pow(rij2)
+
+    def _dipole_pair_weight_padded(self, rij2: tf.Tensor,
+                                    grad_index: tf.Tensor) -> tf.Tensor:
+        """Per-pair weight in the dipole sum, padded [A, M] interface.
+
+        Same dispatch as the COO variant. The "centre" for row i is just
+        i itself (the padded layout is [centre A, neighbour-slot M]), so
+        self pairs are wherever `grad_index[i, m] == i` AND rij² < 1e-20.
+        The rij² guard rejects periodic-image self entries (same atom
+        index, nonzero displacement) that would otherwise double-count.
+
+        Contract: the returned weight tensor is only valid AFTER the
+        caller multiplies by `neighbor_mask` to zero out padding rows
+        (padding rows can have grad_index == 0 == some real centre and
+        rij2 == 0, so they look like self pairs). The single-structure
+        predict() path applies this mask at ~line 521.
+        """
+        N = int(getattr(self.cfg, "dipole_rij_power", 2))
+        if N == 0:
+            A = tf.shape(grad_index)[0]
+            center = tf.range(A, dtype=grad_index.dtype)[:, tf.newaxis]
+            is_self = tf.logical_and(tf.equal(grad_index, center),
+                                     rij2 < 1e-20)
+            return tf.cast(is_self, rij2.dtype)
+        return self._scalar_rij_pow(rij2)
 
     def _calc_forces_coo(self, de_dq: tf.Tensor, grad_values: tf.Tensor,
                          pair_struct: tf.Tensor, pair_atom: tf.Tensor) -> tf.Tensor:
@@ -1105,13 +1150,14 @@ class TNEP(layers.Layer):
         box_inv = tf.linalg.inv(boxes)
         # Match the contraction used in `_dipole_coo` / single-frame
         # path so the XLA-fused trajectory shortcut stays bit-equivalent.
-        # All N ≥ 1: scalar |r|^N weight × full grad_values vector.
+        #   N >= 1 : per-pair |r|^N weight (self pairs contribute 0 via |r_ii|=0).
+        #   N == 0 : per-pair 1[i==j] mask — only self pairs survive.
         _, rij2 = self._neighbor_displacements_coo(
             positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
 
         P = tf.shape(grad_values)[0]
         Q = tf.shape(grad_values)[2]
-        weight = self._scalar_rij_pow(rij2)                   # [P]
+        weight = self._dipole_pair_weight_coo(rij2, pair_atom, pair_gidx)  # [P]
         W = weight[:, tf.newaxis, tf.newaxis] * grad_values   # [P, 3, Q]
         W_flat = tf.reshape(W, [P, 3 * Q])                  # [P, 3*Q]
         ba_linear = pair_struct * A + pair_atom              # [P] linear index into [B*A]
@@ -1170,11 +1216,12 @@ class TNEP(layers.Layer):
         Returns:
             dipole : [B, 3]
         """
-        # Dipole contraction. Uniform algebraic form for all N ≥ 1:
-        #   μ = -Σ |r_ij|^N · F_ij  (scalar weight × force vector)
+        # Dipole contraction.
+        #   N >= 1 : μ = -Σ_pair |r_ij|^N · F_ij  (scalar weight × force vector)
+        #   N == 0 : μ = -Σ_i F_ii (self-only — see _dipole_pair_weight_coo)
         _, rij2 = self._neighbor_displacements_coo(
             positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
-        weight = self._scalar_rij_pow(rij2)                              # [P]
+        weight = self._dipole_pair_weight_coo(rij2, pair_atom, pair_gidx)  # [P]
         dipole_contrib = weight[:, tf.newaxis] * forces_per_pair         # [P, 3]
         dipole = -tf.math.unsorted_segment_sum(
             dipole_contrib, pair_struct, num_segments=B)                  # [B, 3]
