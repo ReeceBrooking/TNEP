@@ -1351,6 +1351,64 @@ class SNES:
 
         return history, final_model, best_val_model
 
+    def _loss_and_grad(self, batch_data: dict) -> tuple[tf.Tensor, tf.Tensor]:
+        """Differentiable (loss, dloss/dmu) for the CURRENT self.mu on batch_data.
+
+        Mirrors validate()'s weight reconstruction + chunk forward, but on
+        training data and wrapped in a per-chunk GradientTape. Per-chunk
+        gradient accumulation bounds tape memory; summing the squared error
+        and the gradient then dividing both by the element count yields the
+        correct mean-loss gradient. grad_values is a constant, so this is a
+        single backprop (no nested tape). MSE only for now; loss_type and
+        regularisation are added in a later task.
+        """
+        from data import prefetched_chunks
+        S = batch_data["num_atoms"].shape[0]
+        struct_chunk = (self.cfg.batch_chunk_size
+                        if self.cfg.batch_chunk_size is not None else S)
+        ranges = [(s, min(s + struct_chunk, S)) for s in range(0, S, struct_chunk)]
+
+        grad_accum = tf.zeros_like(self.mu)
+        sq_sum = tf.constant(0.0, tf.float32)
+        cnt = tf.constant(0.0, tf.float32)
+
+        for _, _, chunk in prefetched_chunks(
+                batch_data, ranges, pin_to_cpu=self.cfg.pin_data_to_cpu,
+                enabled=False):
+            with tf.GradientTape() as tape:
+                tape.watch(self.mu)
+                params = self.reconstruct_params_tf(self.mu)
+                has_U = self.n_U_pair > 0
+                U_pair = params[-1] if has_U else None
+                head = params[:-1] if has_U else params
+                if self.cfg.target_mode == 2:
+                    W0, b0, W1, b1, W0p, b0p, W1p, b1p = head
+                else:
+                    W0, b0, W1, b1 = head
+                    W0p = b0p = W1p = b1p = None
+                if U_pair is not None:
+                    W0 = self.model._W0_eff(W0, U_pair)
+                    if W0p is not None:
+                        W0p = self.model._W0_eff(W0p, U_pair)
+                preds = self.model.predict_batch(
+                    chunk["descriptors"], chunk["grad_values"],
+                    chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
+                    chunk["positions"], chunk["Z_int"], chunk["boxes"],
+                    chunk["atom_mask"], W0, b0, W1, b1, W0p, b0p, W1p, b1p)
+                if self.cfg.scale_targets and self.cfg.target_mode == 1:
+                    na = tf.reduce_sum(chunk["atom_mask"], axis=1)
+                    preds = preds / tf.maximum(na, 1.0)[:, tf.newaxis]
+                diff = preds - chunk["targets"]
+                chunk_sq = tf.reduce_sum(tf.square(diff))
+            grad_accum += tape.gradient(chunk_sq, self.mu)
+            sq_sum += chunk_sq
+            cnt += tf.cast(tf.size(diff), tf.float32)
+            del chunk
+
+        loss = sq_sum / tf.maximum(cnt, 1.0)
+        grad = grad_accum / tf.maximum(cnt, 1.0)
+        return loss, grad
+
     def validate(self, val_data: dict[str, tf.Tensor], mu_tf: tf.Tensor | None = None) -> float:
         """Compute mean RMSE on a subset of validation structures using batched predict.
 
