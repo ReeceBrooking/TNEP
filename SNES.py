@@ -313,6 +313,12 @@ class SNES:
                 f"hybrid mode, else early-stopping fires before SNES can hand "
                 f"back to Adam. Raise patience or lower snes_plateau_patience.")
 
+        if (str(getattr(cfg, "optimizer_mode", "snes")).lower() == "hybrid"
+                and int(getattr(cfg, "hybrid_tail_polish_gens", 0)) >= int(cfg.num_generations)):
+            print(f"  [hybrid] hybrid_tail_polish_gens "
+                  f"({cfg.hybrid_tail_polish_gens}) >= num_generations "
+                  f"({cfg.num_generations}): entire run forced to SNES.")
+
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray
                                ) -> tuple[float, float, float]:
         """Compute L1, L2, and orthogonal regularisation penalties.
@@ -1091,8 +1097,16 @@ class SNES:
             # `phase` is forced to "snes" WITHOUT calling _advance_schedule,
             # so the SNES path below runs byte-identically. `phase_gwi` is
             # the phase-local plateau counter that drives the FSM swaps.
-            phase = (self._advance_schedule(phase_gwi)
-                     if self._opt_mode != "snes" else "snes")
+            if self._opt_mode == "snes":
+                phase = "snes"
+            else:
+                phase = self._advance_schedule(phase_gwi)
+                # SNES owns the tail: force the final window to SNES so the
+                # run never ends mid-Adam. (Override AFTER _advance_schedule
+                # so the FSM's internal phase bookkeeping still advances.)
+                tail = int(getattr(cfg, "hybrid_tail_polish_gens", 0))
+                if tail > 0 and gen >= cfg.num_generations - tail:
+                    phase = "snes"
 
             if phase == "adam":
                 adam_loss = self._adam_step(batch_data)

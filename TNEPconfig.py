@@ -546,6 +546,10 @@ class TNEPconfig:
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
     adam_clipnorm: float | None = None    # optional global-norm gradient clip
+    # Final generations forced to SNES regardless of the FSM, so a hybrid
+    # run never ends mid-Adam (SNES owns the tail — the returned model
+    # gets exploration, not just Adam's last basin floor). 0 disables.
+    hybrid_tail_polish_gens: int = 200
 
     # ═══════════════════════════════════════════════════════════════════
     # 6. MEMORY & I/O STAGING

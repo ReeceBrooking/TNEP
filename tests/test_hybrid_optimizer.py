@@ -213,6 +213,24 @@ def test_snes_mode_unchanged():
     assert snes.adam_m is None
 
 
+def test_hybrid_ends_on_snes(tiny_model):
+    model, train, val = tiny_model
+    snes = model.optimizer
+    snes.cfg.optimizer_mode = "hybrid"; snes._opt_mode = "hybrid"
+    snes.cfg.hybrid_start = "adam"; snes._opt_phase = "adam"
+    snes.cfg.adam_plateau_patience = 3
+    snes.cfg.snes_plateau_patience = 6
+    snes.cfg.num_generations = 30
+    snes.cfg.hybrid_tail_polish_gens = 5     # final 5 gens forced to SNES
+    snes.cfg.adam_lr = 5e-3
+    snes.cfg.patience = None
+    snes.fit(train, val)
+    assert snes._last_phase == "snes", \
+        f"hybrid run ended in phase {snes._last_phase!r}, expected 'snes'"
+    # restore fixture
+    snes.cfg.optimizer_mode = "snes"; snes._opt_mode = "snes"; snes._opt_phase = "adam"
+
+
 def test_hybrid_early_stop_guard():
     import pytest
     from TNEPconfig import TNEPconfig
