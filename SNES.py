@@ -917,35 +917,67 @@ class SNES:
             print("utilities = ", utilities)
         return utilities
 
-    def ask(self) -> tuple[tf.Tensor, tf.Tensor]:
-        """Sample pop_size candidate parameter vectors from N(mu, diag(sigma^2)).
+    def _mirrored_normal(self, shape: tuple[int, int]) -> tf.Tensor:
+        """Draw mirrored (antithetic) standard-normal noise.
 
-        Uses **mirrored (antithetic) sampling**: draws pop_size/2 independent
-        noise vectors ε_i and pairs each with its mirror −ε_i. The
-        first-order Taylor noise in the mean update Σ u_i s_i then
-        cancels per pair exactly when u_+ = −u_−, which is what
-        Hansen's zero-mean utility shaping produces by construction.
-        Net: same evaluation cost, ~1.5–2× lower mean-update variance
-        (Salimans et al. 2017; Brockhoff et al. 2010).
+        `shape = (P, width)`: draws P//2 independent rows ε_i, returns
+        them stacked with their mirrors −ε_i, plus one standalone i.i.d.
+        row when P is odd so the total leading-dim count is preserved.
 
-        When pop_size is odd we use floor(pop_size/2) pairs plus one
-        standalone i.i.d. sample so the total population count is preserved.
+        The per-pair antithesis is what cancels the first-order Taylor
+        noise in the natural-gradient mean step under Hansen's zero-mean
+        utility shaping (Salimans et al. 2017; Brockhoff et al. 2010).
+        """
+        P, width = int(shape[0]), int(shape[1])
+        half = P // 2
+        s_half = self.tf_rng.normal(shape=(half, width))
+        if P % 2 == 0:
+            return tf.concat([s_half, -s_half], axis=0)
+        s_extra = self.tf_rng.normal(shape=(1, width))
+        return tf.concat([s_half, -s_half, s_extra], axis=0)
 
-        All operations run on GPU via TensorFlow.
+    def ask(self) -> tuple[tf.Tensor, dict[str, tf.Tensor]]:
+        """Sample pop_size candidate parameter vectors from the search
+        distribution, optionally with guided (gradient-subspace) sampling.
+
+        Uses **mirrored (antithetic) sampling** for both the isotropic
+        noise and (when guided) the subspace noise — see
+        `_mirrored_normal`.
+
+        Sampling covariance:
+          - guided OFF (or `self._U is None`): isotropic
+                delta = sigma * s_iso          (samples = μ + delta)
+          - guided ON: isotropic + gradient-subspace component
+                delta = sigma * s_iso + gamma * (eps_k @ Uᵀ)
+            where U = self._U  [dim, k] (orthonormal cols), eps_k is
+            mirrored-normal [pop_size, k], and
+                gamma = sqrt(guided_es_alpha) * mean(sigma).
+            This inflates variance ALONG the recent surrogate-gradient
+            subspace so the population explores promising directions more.
+
+        The returned `delta` is the ACTUAL displacement (samples − μ).
+        The natural-gradient mean step Σ_p u_p · delta_p is correct for
+        ANY sampling covariance (it's the utility-weighted displacement
+        sum), so update() uses delta directly for the mean. The per-dim
+        sigma update, by contrast, must use ONLY the isotropic component
+        `s_iso` (else sigma absorbs the injected subspace variance and
+        drifts) — hence we return both.
 
         Returns:
-            samples : [pop_size, dim] float32 tensor — candidate parameter vectors
-            s       : [pop_size, dim] float32 tensor — standard normal noise used
+            samples : [pop_size, dim] float32 — candidate parameter vectors
+            aux     : dict with
+                "s_iso" : [pop_size, dim] standard-normal isotropic noise
+                "delta" : [pop_size, dim] actual displacement (samples − μ)
         """
-        half = self.pop_size // 2
-        s_half = self.tf_rng.normal(shape=(half, self.dim))
-        if self.pop_size % 2 == 0:
-            s = tf.concat([s_half, -s_half], axis=0)
-        else:
-            s_extra = self.tf_rng.normal(shape=(1, self.dim))
-            s = tf.concat([s_half, -s_half, s_extra], axis=0)
-        samples = self.mu + s * self.sigma
-        return samples, s
+        s_iso = self._mirrored_normal((self.pop_size, self.dim))
+        delta = s_iso * self.sigma
+        if bool(getattr(self.cfg, "guided_es_enabled", False)) and self._U is not None:
+            k = int(self._U.shape[1])
+            eps_k = self._mirrored_normal((self.pop_size, k))     # [P, k]
+            gamma = tf.sqrt(float(self.cfg.guided_es_alpha)) * tf.reduce_mean(self.sigma)
+            delta = delta + gamma * tf.matmul(eps_k, self._U, transpose_b=True)
+        samples = self.mu + delta
+        return samples, {"s_iso": s_iso, "delta": delta}
 
     def _ensure_es_mean_state(self) -> None:
         """Lazily allocate Adam moment buffers for the ES mean gradient.
@@ -970,22 +1002,39 @@ class SNES:
             self._grad_sigma_ema = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
                                                trainable=False, name="es_grad_sigma_ema")
 
-    def update(self, utilities: tf.Tensor, s: tf.Tensor) -> None:
-        """Update mu and sigma using fitness-ranked noise vectors.
+    def update(self, utilities: tf.Tensor, aux: dict[str, tf.Tensor]) -> None:
+        """Update mu and sigma using fitness-ranked samples.
 
         All operations run on GPU via TensorFlow.
 
         Args:
             utilities : [pop_size] float32 tensor — rank-based weights (best first)
-            s         : [pop_size, dim] float32 tensor — noise vectors sorted by fitness
-                        (s[0] = noise of best individual, s[-1] = worst)
+            aux       : dict from ask(), already sorted by fitness, with
+                "s_iso" : [pop_size, dim] isotropic standard-normal noise
+                          (s_iso[0] = best individual, s_iso[-1] = worst)
+                "delta" : [pop_size, dim] actual displacement (samples − μ),
+                          same fitness ordering as s_iso
+
+        Mean step is COVARIANCE-AGNOSTIC: it is the utility-weighted sum of
+        actual displacements `Σ_p u_p · delta_p`, which is the natural-
+        gradient mean step for any sampling covariance (isotropic OR
+        guided). When delta = sigma·s_iso (guided off) this is bit-
+        identical to the old `mu += sigma·Σ u_p s_iso`.
+
+        Sigma step uses ONLY the isotropic component s_iso (grad_sigma =
+        Σ u_p (s_iso² − 1)): if it used the guided displacement, sigma
+        would absorb the injected gradient-subspace variance and drift.
 
         Mutates self.mu and self.sigma tf.Variables in place. Sigma is
         clamped to a small floor (cfg.sigma_floor, default 1e-5) after
         the multiplicative update so a near-collapse of the search
         distribution can't silently kill exploration on long runs.
         """
-        grad_mu = tf.einsum('p,pd->d', utilities, s)
+        s_iso = aux["s_iso"]
+        delta = aux["delta"]
+        # Kept for the mean-Adam branch, which preconditions the ES mean
+        # gradient (the standard-normal natural gradient, not displacements).
+        grad_mu = tf.einsum('p,pd->d', utilities, s_iso)
 
         # --- mean update (Feature A: optional Adam preconditioning) ---
         if str(getattr(self.cfg, "snes_mean_optimizer", "vanilla")).lower() == "adam":
@@ -1006,7 +1055,11 @@ class SNES:
             v_hat = self._es_v / (1.0 - tf.pow(b2, t))
             self.mu.assign_add(lr * m_hat / (tf.sqrt(v_hat) + eps))
         else:
-            self.mu.assign_add(self.sigma * grad_mu)   # canonical vanilla step
+            # Covariance-agnostic vanilla step: utility-weighted sum of
+            # actual displacements. Equals the old sigma·Σ u_p s_iso when
+            # delta = sigma·s_iso (guided off), and is the correct natural-
+            # gradient mean step when guided sampling inflates delta.
+            self.mu.assign_add(tf.einsum('p,pd->d', utilities, delta))
 
         # --- sigma update (Feature B: optional cumulation) ---
         # grad_sigma = Σ u_i (s_i² − 1) is the NES natural gradient on log-sigma.
@@ -1022,7 +1075,7 @@ class SNES:
         # MEAN-gradient path grad_mu, which accumulates monotonically downhill
         # with NO negative feedback → sigma compounded to float overflow. Fixed
         # by switching the driving signal to grad_sigma and reusing eta.)
-        grad_sigma = tf.einsum('p,pd->d', utilities, s ** 2 - 1.0)
+        grad_sigma = tf.einsum('p,pd->d', utilities, s_iso ** 2 - 1.0)
         if bool(getattr(self.cfg, "snes_sigma_cumulation", False)):
             self._ensure_es_sigma_state()
             c = self.cfg.snes_cumulation_c
@@ -1229,7 +1282,7 @@ class SNES:
                 t2 = time.perf_counter()
             else:
                 # ===== existing SNES path EXACTLY AS-IS =====
-                samples, s = self.ask()
+                samples, aux = self.ask()
 
                 # Evaluate entire population on GPU
                 if self._per_type:
@@ -1299,12 +1352,22 @@ class SNES:
             # is no population (`samples`/`s`/`fitness` are undefined), and
             # the mu/sigma step was already taken inside _adam_step.
             if phase == "snes":
+                # Rank BOTH the isotropic noise and the actual displacement
+                # by the same per-candidate fitness ordering, then hand the
+                # sorted pair to update(). The mean step consumes `delta`
+                # (covariance-agnostic) and the sigma step consumes `s_iso`
+                # (isotropic component only) — see ask()/update() docs.
                 if self._per_type:
-                    s_sorted = self._build_per_type_gradients(s, fitness_per_type_rmse, samples)
+                    s_iso_sorted = self._build_per_type_gradients(
+                        aux["s_iso"], fitness_per_type_rmse, samples)
+                    delta_sorted = self._build_per_type_gradients(
+                        aux["delta"], fitness_per_type_rmse, samples)
                 else:
                     ranks = tf.argsort(fitness)
-                    s_sorted = tf.gather(s, ranks)
-                self.update(self.utilities, s_sorted)
+                    s_iso_sorted = tf.gather(aux["s_iso"], ranks)
+                    delta_sorted = tf.gather(aux["delta"], ranks)
+                self.update(self.utilities,
+                            {"s_iso": s_iso_sorted, "delta": delta_sorted})
 
             t3 = time.perf_counter()
 

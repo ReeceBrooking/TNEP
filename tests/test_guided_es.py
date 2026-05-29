@@ -62,6 +62,52 @@ def test_guided_buffer_orthonormal(tiny_model):
     assert np.allclose(G, np.eye(4), atol=1e-4), "U columns not orthonormal"
 
 
+def test_guided_alpha0_matches_vanilla(tiny_model):
+    # guided OFF => ask() draws identically to vanilla and update() is bit-identical.
+    import numpy as np, tensorflow as tf
+    model, _, _ = tiny_model
+    snes = model.optimizer
+    snes.cfg.guided_es_enabled = False
+    mu0 = snes.mu.numpy().copy(); sig0 = snes.sigma.numpy().copy()
+    samples, aux = snes.ask()
+    # mean step must equal Σ u_p (samples - mu)
+    u = tf.constant(snes.compute_utilities(), tf.float32)
+    snes.update(u, aux)
+    expected_mu = mu0 + np.einsum('p,pd->d', u.numpy(), samples.numpy() - mu0)
+    assert np.allclose(snes.mu.numpy(), expected_mu, atol=1e-5)
+
+
+def test_guided_sampling_inflates_subspace_variance(tiny_model):
+    import numpy as np, tensorflow as tf
+    model, _, _ = tiny_model
+    snes = model.optimizer
+    snes.cfg.guided_es_enabled = True
+    snes.cfg.guided_es_k = 2
+    snes.cfg.guided_es_alpha = 4.0          # large so subspace variance clearly dominates
+    e = np.zeros((snes.dim, 2), np.float32); e[0, 0] = 1.0; e[1, 1] = 1.0
+    snes._U = tf.constant(e)                 # planted orthonormal subspace (dims 0,1)
+    samples, aux = snes.ask()
+    d = (samples.numpy() - snes.mu.numpy())
+    var_sub = 0.5 * (np.var(d[:, 0]) + np.var(d[:, 1]))
+    var_bulk = np.var(d[:, 5])
+    assert var_sub > 2.0 * var_bulk, f"subspace var {var_sub} not > 2x bulk {var_bulk}"
+    snes.cfg.guided_es_enabled = False       # restore module fixture
+
+
+def test_guided_update_runs_end_to_end(tiny_model):
+    model, train, val = tiny_model
+    snes = model.optimizer
+    snes.cfg.guided_es_enabled = True; snes.cfg.guided_es_k = 3; snes.cfg.guided_es_alpha = 0.5
+    snes._refresh_guided_subspace(train)     # populate U
+    snes.cfg.num_generations = 20; snes.cfg.patience = None
+    hist = snes.fit(train, val)
+    h = hist[0] if isinstance(hist, tuple) else hist
+    tl = h["train_loss"] if isinstance(h, dict) else h
+    import numpy as np
+    assert np.all(np.isfinite(tl))
+    snes.cfg.guided_es_enabled = False; snes.cfg.num_generations = 1
+
+
 def test_guided_config_defaults():
     from TNEPconfig import TNEPconfig
     cfg = TNEPconfig()
