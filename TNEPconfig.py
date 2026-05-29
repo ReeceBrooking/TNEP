@@ -490,7 +490,7 @@ class TNEPconfig:
     # spanned by the last `guided_es_k` surrogate gradients (from
     # _loss_and_grad). Extra variance is added ALONG that subspace; the
     # per-dim σ and the rank-based update are unchanged. alpha=0 => vanilla.
-    guided_es_enabled: bool = True
+    guided_es_enabled: bool = False
     guided_es_k: int = 4                 # subspace rank (2-20)
     guided_es_alpha: float = 0.5         # subspace exploration scale (gamma = sqrt(alpha)*mean(sigma))
     guided_es_grad_interval: int = 20    # refresh U every N gens (surrogate cost control)
@@ -575,7 +575,7 @@ class TNEPconfig:
     optimizer_mode: str = "snes"
     hybrid_start: str = "adam"            # "adam" | "snes" — which phase first
     adam_plateau_patience: int = 100      # Adam->SNES swap (val-ticks; * val_interval for gens)
-    snes_plateau_patience: int = 2000     # SNES->Adam swap (val-ticks)
+    snes_plateau_patience: int = 3000     # SNES->Adam swap (val-ticks)
     hybrid_max_cycles: int | None = None  # cap alternations (None = until num_generations)
     # Sigma to (re)initialise when entering an SNES phase. Too small ->
     # SNES can't escape Adam's basin; too large -> discards Adam's work.
