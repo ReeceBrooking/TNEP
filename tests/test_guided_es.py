@@ -117,6 +117,40 @@ def test_guided_config_defaults():
     assert isinstance(cfg.guided_es_grad_interval, int) and cfg.guided_es_grad_interval >= 1
 
 
+def test_guided_autorefresh_in_fit(tiny_model):
+    # With guided enabled, fit() must refresh the subspace itself — _U should
+    # become populated during the run WITHOUT any manual _refresh call.
+    model, train, val = tiny_model
+    snes = model.optimizer
+    snes._U = None   # reset any state left by earlier tests in this module session
+    assert snes._U is None
+    snes.cfg.guided_es_enabled = True
+    snes.cfg.guided_es_k = 3
+    snes.cfg.guided_es_grad_interval = 5
+    snes.cfg.num_generations = 12
+    snes.cfg.patience = None
+    try:
+        snes.fit(train, val)
+        assert snes._U is not None, "fit() did not auto-refresh the guided subspace"
+        assert snes._U.shape[1] >= 1
+    finally:
+        snes.cfg.guided_es_enabled = False
+        snes.cfg.num_generations = 1
+        snes._U = None   # reset shared fixture state
+
+
+def test_guided_disabled_no_refresh(tiny_model):
+    # guided OFF: fit() must NEVER touch the subspace (stays None, zero cost).
+    model, train, val = tiny_model
+    snes = model.optimizer
+    snes._U = None
+    snes.cfg.guided_es_enabled = False
+    snes.cfg.num_generations = 5; snes.cfg.patience = None
+    snes.fit(train, val)
+    assert snes._U is None
+    snes.cfg.num_generations = 1
+
+
 def test_guided_with_per_type_ranking():
     # Coverage for the danger-zone: guided sampling + per-type ranking, where
     # _build_per_type_gradients must permute BOTH s_iso and delta by the same

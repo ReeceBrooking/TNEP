@@ -1287,6 +1287,12 @@ class SNES:
                 t2 = time.perf_counter()
             else:
                 # ===== existing SNES path EXACTLY AS-IS =====
+                # Periodic guided-subspace refresh (A3): runs only in the SNES
+                # branch so Adam-phase gens never incur the extra forward pass.
+                # batch_data and gen are in scope here; _U is populated lazily.
+                if (self.cfg.guided_es_enabled
+                        and (gen % max(1, int(self.cfg.guided_es_grad_interval)) == 0)):
+                    self._refresh_guided_subspace(batch_data)
                 samples, aux = self.ask()
 
                 # Evaluate entire population on GPU
