@@ -46,6 +46,14 @@ class TNEPconfig:
     total_N: int | None = None
     # Seed for randomisation (dataset shuffle, SNES sampling, etc.)
     seed: int | None = 1284760333973115944
+    # Bitwise-reproducible runs. cfg.seed alone makes runs reproducible on
+    # CPU, but GPU reductions (unsorted_segment_sum / atomic adds in the
+    # dipole kernel) are non-deterministic across runs even with a fixed
+    # seed. When True, MasterTNEP calls tf.config.experimental.
+    # enable_op_determinism() so same-seed runs are bitwise identical on GPU
+    # too. Cost: slower GPU ops, and a hard error if any op used has no
+    # deterministic GPU implementation. Leave False for normal runs.
+    deterministic: bool = False
 
     # --- target type, units, conversions -------------------------------
     # 0 : PES (energy), 1 : Dipole, 2 : Polarizability
@@ -482,7 +490,7 @@ class TNEPconfig:
     # spanned by the last `guided_es_k` surrogate gradients (from
     # _loss_and_grad). Extra variance is added ALONG that subspace; the
     # per-dim σ and the rank-based update are unchanged. alpha=0 => vanilla.
-    guided_es_enabled: bool = False
+    guided_es_enabled: bool = True
     guided_es_k: int = 4                 # subspace rank (2-20)
     guided_es_alpha: float = 0.5         # subspace exploration scale (gamma = sqrt(alpha)*mean(sigma))
     guided_es_grad_interval: int = 20    # refresh U every N gens (surrogate cost control)

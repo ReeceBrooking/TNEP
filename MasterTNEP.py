@@ -420,6 +420,19 @@ def _train_model_inner(cfg: TNEPconfig,
         print(f"  cfg.seed was None — generated and stored "
               f"reproducible seed: {cfg.seed}")
 
+    # Optional bitwise reproducibility: cfg.seed fixes every RNG stream, but
+    # GPU reductions are still non-deterministic across runs unless TF op
+    # determinism is enabled. Done here (before data/model/training ops are
+    # built) so the whole training computation runs deterministically.
+    if getattr(cfg, "deterministic", False):
+        try:
+            tf.config.experimental.enable_op_determinism()
+            print("  cfg.deterministic=True — TF op determinism enabled "
+                  "(same cfg.seed => bitwise-identical runs; GPU ops slower, "
+                  "and an op lacking a deterministic GPU kernel will raise).")
+        except Exception as e:                       # pragma: no cover
+            print(f"  WARNING: could not enable op determinism: {e}")
+
     if resume_state is not None and isinstance(getattr(cfg, "indices", None), np.ndarray):
         # Indices already restored from checkpoint — would re-shuffle to
         # the same values anyway (deterministic via cfg.seed for runs
