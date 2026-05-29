@@ -1054,12 +1054,17 @@ class SNES:
             m_hat = self._es_m / (1.0 - tf.pow(b1, t))
             v_hat = self._es_v / (1.0 - tf.pow(b2, t))
             self.mu.assign_add(lr * m_hat / (tf.sqrt(v_hat) + eps))
-        else:
-            # Covariance-agnostic vanilla step: utility-weighted sum of
-            # actual displacements. Equals the old sigma·Σ u_p s_iso when
-            # delta = sigma·s_iso (guided off), and is the correct natural-
-            # gradient mean step when guided sampling inflates delta.
+        elif self.cfg.guided_es_enabled and self._U is not None:
+            # Guided sampling inflated delta beyond sigma·s_iso, so the
+            # covariance-agnostic mean step (utility-weighted sum of actual
+            # displacements) is required for the correct natural gradient.
             self.mu.assign_add(tf.einsum('p,pd->d', utilities, delta))
+        else:
+            # Vanilla path: keep the exact original reduction order
+            # (sigma · Σ u_p s_iso) so behaviour is BIT-identical to
+            # pre-guided SNES, not just allclose. Algebraically equal to the
+            # displacement form above (delta == sigma·s_iso here).
+            self.mu.assign_add(self.sigma * grad_mu)
 
         # --- sigma update (Feature B: optional cumulation) ---
         # grad_sigma = Σ u_i (s_i² − 1) is the NES natural gradient on log-sigma.

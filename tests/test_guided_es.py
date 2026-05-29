@@ -115,3 +115,49 @@ def test_guided_config_defaults():
     assert isinstance(cfg.guided_es_k, int) and cfg.guided_es_k >= 1
     assert cfg.guided_es_alpha >= 0
     assert isinstance(cfg.guided_es_grad_interval, int) and cfg.guided_es_grad_interval >= 1
+
+
+def test_guided_with_per_type_ranking():
+    # Coverage for the danger-zone: guided sampling + per-type ranking, where
+    # _build_per_type_gradients must permute BOTH s_iso and delta by the same
+    # per-type rankings. A mismatched permutation would desync the mean/sigma
+    # steps and typically diverge or NaN. Builds its own model with per-type
+    # ON from construction (so _type_of_variable is properly initialised).
+    import numpy as np
+    from TNEPconfig import TNEPconfig
+    from data import collect, split, pad_and_stack
+    from DescriptorBuilderGPU import compute_dim_q
+    from TNEP import TNEP
+    cfg = TNEPconfig()
+    cfg.data_path = 'datasets/test.xyz'; cfg.test_data_path = None
+    cfg.allowed_species = [6, 1, 7, 8]; cfg.filter_mode = 'subset'
+    cfg.target_mode = 1; cfg.dipole_units = 'e*bohr'; cfg.scale_targets = True
+    cfg.convert_dipole_to_eangstrom = False
+    cfg.total_N = 16; cfg.test_ratio = 0.25; cfg.skip_h_centers = False
+    cfg.num_neurons = 8; cfg.descriptor_mode = 0; cfg.descriptor_mixing = False
+    cfg.pop_size = 12; cfg.population_chunk_size = None; cfg.batch_chunk_size = None
+    cfg.pin_data_to_cpu = True; cfg.cache_gradients_to_disk = False
+    cfg.chunk_prefetch = False; cfg.use_pinned_buffers = False; cfg.use_cufile = False
+    cfg.save_path = None; cfg.checkpoint_interval = None
+    cfg.lambda_1 = 0.001; cfg.lambda_2 = 0.001
+    cfg.seed = 0; cfg.eval_jit_compile = False; cfg.val_interval = 5; cfg.val_size = None
+    cfg.dipole_rij_power = 2; cfg.optimizer_mode = "snes"; cfg.patience = None
+    cfg.snes_mean_optimizer = "vanilla"; cfg.snes_sigma_cumulation = False
+    # per-type ranking ON (num_types=4 here so the per-type path is active)
+    cfg.per_type_regularization = True; cfg.toggle_regularization = True
+    # guided ON
+    cfg.guided_es_enabled = True; cfg.guided_es_k = 3
+    cfg.guided_es_alpha = 0.5; cfg.guided_es_grad_interval = 5
+    cfg.num_generations = 25
+    ds, ti = collect(cfg); cfg.randomise(ds); cfg.dim_q = compute_dim_q(cfg)
+    td, _, vd = split(ds, ti, cfg)
+    train = pad_and_stack(td, num_types=cfg.num_types, pin_to_cpu=True)
+    val = pad_and_stack(vd, num_types=cfg.num_types, pin_to_cpu=True)
+    snes = TNEP(cfg).optimizer
+    assert snes._per_type, "per-type ranking must be active for this test"
+    hist = snes.fit(train, val)
+    h = hist[0] if isinstance(hist, tuple) else hist
+    tl = h["train_loss"] if isinstance(h, dict) else h
+    assert np.all(np.isfinite(tl)), "per-type guided run went non-finite"
+    assert float(np.max(snes.sigma.numpy())) < 100.0 * float(cfg.init_sigma), \
+        "sigma exploded under per-type guided"
