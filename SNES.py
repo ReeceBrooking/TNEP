@@ -1104,6 +1104,7 @@ class SNES:
             history = {
                 "generation": [],
                 "train_loss": [],
+                "train_rmse": [],
                 "val_loss": [],
                 "L1": [],
                 "L2": [],
@@ -1137,6 +1138,13 @@ class SNES:
 
         gen_l1, gen_l2, gen_lorth = 0.0, 0.0, 0.0
         val_fitness = float('inf')
+        # True RMSE of the mean μ on train data — the SAME estimator as
+        # val_fitness (validate at μ), so train vs val is an apples-to-apples
+        # comparison for ANY loss_type. (The progress bar previously showed
+        # avg_fitness here, which is the mean population *fitness* — equal to
+        # RMSE only for loss_type="mse"; under huber/mae it is the loss value
+        # itself, on a wildly different scale, making "train RMSE" look tiny.)
+        train_rmse = float('inf')
         sigma_min = sigma_max = sigma_mean = sigma_median = float(cfg.init_sigma)
         # Last finite RRMSE values, carried into Adam gens (which don't compute
         # a population RRMSE) so the history series stays finite for plotting.
@@ -1298,6 +1306,11 @@ class SNES:
             _do_val = (gen % cfg.val_interval == 0) or (gen == cfg.num_generations - 1)
             if _do_val:
                 val_fitness = self.validate(val_data, self.mu)
+                # Train RMSE at μ, computed identically to val_fitness so the
+                # two are directly comparable regardless of loss_type. Costs
+                # one extra forward pass at μ (~1/pop_size of the population
+                # eval), only at val ticks.
+                train_rmse = self.validate(train_data, self.mu)
 
             t4 = time.perf_counter()
 
@@ -1317,7 +1330,8 @@ class SNES:
             # bar and the early-stopping counter.
             if _do_val:
                 history["generation"].append(gen)
-                history["train_loss"].append(avg_fitness)
+                history["train_loss"].append(avg_fitness)   # optimised objective (loss_type)
+                history.setdefault("train_rmse", []).append(train_rmse)  # at-μ RMSE, comparable to val
                 history["val_loss"].append(val_fitness)
                 history["L1"].append(gen_l1)
                 history["L2"].append(gen_l2)
@@ -1342,12 +1356,13 @@ class SNES:
             elapsed_str = _format_duration(elapsed)
             eta_str = _format_duration(eta)
             line = (f"\r{bar} {gen + 1}/{cfg.num_generations} "
-                    f"train RMSE: {avg_fitness:.6f}  "
+                    f"train RMSE: {train_rmse:.6f}  "
                     f"val RMSE: {val_fitness:.6f}  "
                     f"best val RMSE: {best_val_loss:.6f}  "
                     f"elapsed: {elapsed_str}  ETA: {eta_str}")
             if cfg.debug:
                 line += f"  L1: {gen_l1:.6f}  L2: {gen_l2:.6f}"
+                line += f"  train obj({cfg.loss_type}): {avg_fitness:.6f}"
                 line += f"  best_RMSE: {best_rmse:.6f}  best_RRMSE: {best_rrmse:.6f}"
                 if self._mix_reg_mode == "orthogonal":
                     line += f"  L_orth: {gen_lorth:.6f}"

@@ -460,3 +460,31 @@ def test_hybrid_early_stop_guard():
     dataset, ti = collect(cfg); cfg.randomise(dataset); cfg.dim_q = compute_dim_q(cfg)
     with pytest.raises(ValueError):
         TNEP(cfg)   # SNES.__init__ guard fires during model construction
+
+
+def test_huber_train_rmse_is_true_rmse(tiny_model):
+    # Regression: under Huber the reported/recorded train RMSE must be a true
+    # RMSE at μ (comparable to val RMSE), NOT the mean Huber objective — which
+    # is ~delta-scale and previously made "train RMSE" look spuriously tiny
+    # next to the at-μ val RMSE.
+    model, train, val = tiny_model
+    snes = model.optimizer
+    snes.cfg.loss_type = "huber"; snes.cfg.huber_delta = 1e-3
+    snes.cfg.optimizer_mode = "snes"; snes._opt_mode = "snes"
+    snes.cfg.num_generations = 30; snes.cfg.patience = None
+    snes.cfg.val_interval = 5
+    try:
+        hist = snes.fit(train, val)
+        h = hist[0] if isinstance(hist, tuple) else hist
+        train_rmse = h["train_rmse"][-1]      # at-μ RMSE (the comparable metric)
+        train_obj = h["train_loss"][-1]        # mean Huber objective (~delta scale)
+        assert np.isfinite(train_rmse) and train_rmse > 0
+        # it is a genuine RMSE, orders larger than the tiny Huber loss value
+        assert train_rmse > 5.0 * train_obj, \
+            f"train RMSE ({train_rmse:.3e}) ~ Huber objective ({train_obj:.3e}) — mislabeled?"
+        # and on the same scale as the val RMSE (within a sane factor), not 100x off
+        val_rmse = h["val_loss"][-1]
+        assert 0.02 < train_rmse / val_rmse < 50.0, \
+            f"train RMSE {train_rmse:.3e} not on the same scale as val RMSE {val_rmse:.3e}"
+    finally:
+        snes.cfg.loss_type = "mse"; snes.cfg.num_generations = 1; snes.cfg.val_interval = 1
