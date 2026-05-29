@@ -31,6 +31,12 @@ def tiny_model():
     cfg.val_interval = 1; cfg.val_size = None
     cfg.toggle_regularization = False; cfg.per_type_regularization = False
     cfg.dipole_rij_power = 2
+    # Pin the optimizer baseline so tests are hermetic regardless of the
+    # class-level defaults a user may flip for experiments (mean-Adam /
+    # cumulation / hybrid). Individual tests opt into a feature explicitly.
+    cfg.optimizer_mode = "snes"
+    cfg.snes_mean_optimizer = "vanilla"
+    cfg.snes_sigma_cumulation = False
     dataset, ti = collect(cfg)
     cfg.randomise(dataset); cfg.dim_q = compute_dim_q(cfg)
     td, _, vd = split(dataset, ti, cfg)
@@ -322,6 +328,10 @@ def test_defaults_leave_es_state_unallocated():
     cfg.toggle_regularization = False; cfg.per_type_regularization = False
     cfg.dipole_rij_power = 2
     cfg.optimizer_mode = "snes"            # pure SNES loop
+    # Explicitly OFF — this test asserts the lazy ES state is never touched
+    # when both features are disabled (don't inherit a user's class default).
+    cfg.snes_mean_optimizer = "vanilla"
+    cfg.snes_sigma_cumulation = False
     cfg.patience = None
     dataset, ti = collect(cfg)
     cfg.randomise(dataset); cfg.dim_q = compute_dim_q(cfg)
@@ -334,7 +344,7 @@ def test_defaults_leave_es_state_unallocated():
     # Defaults (vanilla mean step, memoryless sigma) must never touch the
     # new branches, so their lazy state stays unallocated.
     assert snes._es_m is None
-    assert snes._sigma_path is None
+    assert snes._grad_sigma_ema is None
 
 
 def test_mean_adam_reduces_loss(tiny_model):
@@ -382,6 +392,51 @@ def test_mu_eff_positive(tiny_model):
     snes = model.optimizer
     print(f"[mu_eff] = {snes._mu_eff}")
     assert snes._mu_eff > 1.0
+
+
+def test_sigma_cumulation_bounded_long_run():
+    # Regression for the cumulation sigma-explosion: over many generations of
+    # sustained selection the old per-coordinate exp(rate*(p^2-1)) law drove
+    # sigma off the mean-gradient path (no negative feedback) and compounded
+    # to ~1e38 -> NaN. Must use pop_size=100 (the user's setting) — the bug is
+    # population-dependent and does NOT trigger at the fixture's pop_size=8.
+    # The corrected EMA-of-grad_sigma law keeps sigma bounded + loss finite.
+    from TNEPconfig import TNEPconfig
+    from data import collect, split, pad_and_stack
+    from DescriptorBuilderGPU import compute_dim_q
+    from TNEP import TNEP
+    cfg = TNEPconfig()
+    cfg.data_path = 'datasets/test.xyz'; cfg.test_data_path = None
+    cfg.allowed_species = [6, 1, 7, 8]; cfg.filter_mode = 'subset'
+    cfg.target_mode = 1; cfg.dipole_units = 'e*bohr'; cfg.scale_targets = True
+    cfg.convert_dipole_to_eangstrom = False
+    cfg.total_N = 16; cfg.test_ratio = 0.25; cfg.skip_h_centers = False
+    cfg.num_neurons = 8; cfg.descriptor_mode = 0; cfg.descriptor_mixing = False
+    cfg.pop_size = 100; cfg.population_chunk_size = None; cfg.batch_chunk_size = None
+    cfg.pin_data_to_cpu = True; cfg.cache_gradients_to_disk = False
+    cfg.chunk_prefetch = False; cfg.use_pinned_buffers = False; cfg.use_cufile = False
+    cfg.save_path = None; cfg.checkpoint_interval = None
+    cfg.lambda_1 = 0.0; cfg.lambda_2 = 0.0
+    cfg.toggle_regularization = False; cfg.per_type_regularization = False
+    cfg.seed = 0; cfg.eval_jit_compile = False; cfg.val_interval = 10; cfg.val_size = None
+    cfg.dipole_rij_power = 0; cfg.optimizer_mode = "snes"; cfg.patience = None
+    cfg.num_generations = 300
+    cfg.snes_sigma_cumulation = True
+    ds, ti = collect(cfg); cfg.randomise(ds); cfg.dim_q = compute_dim_q(cfg)
+    td, _, vd = split(ds, ti, cfg)
+    train = pad_and_stack(td, num_types=cfg.num_types, pin_to_cpu=True)
+    val = pad_and_stack(vd, num_types=cfg.num_types, pin_to_cpu=True)
+    snes = TNEP(cfg).optimizer
+    hist = snes.fit(train, val)
+    h = hist[0] if isinstance(hist, tuple) else hist
+    tl = h["train_loss"] if isinstance(h, dict) else h
+    sig_max = float(tf.reduce_max(snes.sigma))
+    print(f"[cumulation pop100 300gen] loss {tl[0]:.3e}->{tl[-1]:.3e} "
+          f"max {max(tl):.3e} | sigma_max {sig_max:.3e}")
+    assert np.all(np.isfinite(tl)), "train_loss went non-finite (divergence)"
+    assert sig_max < 100.0 * float(cfg.init_sigma), \
+        f"sigma exploded: max={sig_max:.3e} (init_sigma={cfg.init_sigma})"
+    assert min(tl) <= tl[0], "cumulation made no progress"
 
 
 def test_hybrid_early_stop_guard():

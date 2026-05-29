@@ -302,7 +302,7 @@ class SNES:
         self._es_v = None
         self._es_t = None
         # Per-coordinate evolution-path cumulation for sigma (Feature B):
-        self._sigma_path = None
+        self._grad_sigma_ema = None
 
         # Hybrid-optimizer state (lazy — Adam moments only materialised when used).
         self._opt_mode = str(getattr(cfg, "optimizer_mode", "snes")).lower()
@@ -956,13 +956,13 @@ class SNES:
                                      name="es_mean_t")
 
     def _ensure_es_sigma_state(self) -> None:
-        """Lazily allocate the per-coordinate sigma evolution path.
+        """Lazily allocate the EMA buffer for the step-size gradient.
 
         Only materialised the first time snes_sigma_cumulation is on.
         """
-        if self._sigma_path is None:
-            self._sigma_path = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
-                                           trainable=False, name="es_sigma_path")
+        if self._grad_sigma_ema is None:
+            self._grad_sigma_ema = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
+                                               trainable=False, name="es_grad_sigma_ema")
 
     def update(self, utilities: tf.Tensor, s: tf.Tensor) -> None:
         """Update mu and sigma using fitness-ranked noise vectors.
@@ -1002,17 +1002,32 @@ class SNES:
         else:
             self.mu.assign_add(self.sigma * grad_mu)   # canonical vanilla step
 
-        # --- sigma update (Feature B: optional separable CSA) ---
+        # --- sigma update (Feature B: optional cumulation) ---
+        # grad_sigma = Σ u_i (s_i² − 1) is the NES natural gradient on log-sigma.
+        # It is self-equilibrating (too-small sigma → best samples are the
+        # larger-step ones → grad_sigma>0 → grow; too-large → shrink), which is
+        # exactly why the vanilla `sigma *= exp(eta·grad_sigma)` update is
+        # stable. Cumulation low-pass-filters THIS signal (an EMA) and feeds it
+        # through the SAME exp(eta·.) update, so it inherits vanilla's
+        # equilibrium and bounded per-gen growth — it adds temporal smoothing
+        # without a runaway.
+        #
+        # (The original separable-CSA law exp(rate·(p²−1)) drove sigma off the
+        # MEAN-gradient path grad_mu, which accumulates monotonically downhill
+        # with NO negative feedback → sigma compounded to float overflow. Fixed
+        # by switching the driving signal to grad_sigma and reusing eta.)
+        grad_sigma = tf.einsum('p,pd->d', utilities, s ** 2 - 1.0)
         if bool(getattr(self.cfg, "snes_sigma_cumulation", False)):
             self._ensure_es_sigma_state()
             c = self.cfg.snes_cumulation_c
-            c = float(c) if c is not None else (self._mu_eff + 2.0) / (self.dim + self._mu_eff + 5.0)
-            rate = float(self.cfg.snes_cumulation_rate)
-            new_path = (1.0 - c) * self._sigma_path + tf.sqrt(c * (2.0 - c) * self._mu_eff) * grad_mu
-            self._sigma_path.assign(new_path)
-            new_sigma = self.sigma * tf.exp(rate * (tf.square(new_path) - 1.0))
+            c = float(c) if c is not None else 0.2   # EMA decay (smooth ~1/c gens)
+            g_ema = (1.0 - c) * self._grad_sigma_ema + c * grad_sigma
+            self._grad_sigma_ema.assign(g_ema)
+            # Defense-in-depth: clamp the per-gen log-sigma step so no step-size
+            # law can blow sigma up in a single generation (≤ e¹ ≈ 2.7× / gen).
+            log_step = tf.clip_by_value(self.eta_sigma * g_ema, -1.0, 1.0)
+            new_sigma = self.sigma * tf.exp(log_step)
         else:
-            grad_sigma = tf.einsum('p,pd->d', utilities, s ** 2 - 1.0)
             new_sigma = self.sigma * tf.exp(self.eta_sigma * grad_sigma)   # canonical vanilla
         floor = getattr(self.cfg, "sigma_floor", 1e-5)
         if floor is not None and floor > 0.0:
