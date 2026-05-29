@@ -974,7 +974,9 @@ class SNES:
         if bool(getattr(self.cfg, "guided_es_enabled", False)) and self._U is not None:
             k = int(self._U.shape[1])
             eps_k = self._mirrored_normal((self.pop_size, k))     # [P, k]
-            gamma = tf.sqrt(float(self.cfg.guided_es_alpha)) * tf.reduce_mean(self.sigma)
+            # max(0, alpha) guards against a negative alpha producing NaN via
+            # sqrt — that would silently poison every sample's displacement.
+            gamma = tf.sqrt(max(0.0, float(self.cfg.guided_es_alpha))) * tf.reduce_mean(self.sigma)
             delta = delta + gamma * tf.matmul(eps_k, self._U, transpose_b=True)
         samples = self.mu + delta
         return samples, {"s_iso": s_iso, "delta": delta}
