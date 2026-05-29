@@ -46,6 +46,14 @@ class TNEPconfig:
     total_N: int | None = None
     # Seed for randomisation (dataset shuffle, SNES sampling, etc.)
     seed: int | None = 1284760333973115944
+    # Bitwise-reproducible runs. cfg.seed alone makes runs reproducible on
+    # CPU, but GPU reductions (unsorted_segment_sum / atomic adds in the
+    # dipole kernel) are non-deterministic across runs even with a fixed
+    # seed. When True, MasterTNEP calls tf.config.experimental.
+    # enable_op_determinism() so same-seed runs are bitwise identical on GPU
+    # too. Cost: slower GPU ops, and a hard error if any op used has no
+    # deterministic GPU implementation. Leave False for normal runs.
+    deterministic: bool = False
 
     # --- target type, units, conversions -------------------------------
     # 0 : PES (energy), 1 : Dipole, 2 : Polarizability
