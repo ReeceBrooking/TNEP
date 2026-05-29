@@ -367,7 +367,7 @@ class TNEPconfig:
     #                         — separate weight per (structure, component).
     #                         Useful when individual axes of vector
     #                         targets have systematically small magnitudes.
-    inverse_weight_mode: str = "none"
+    inverse_weight_mode: str = "vector_magnitude"
     # Epsilon floor for the inverse-weight denominator. Smaller eps
     # → stronger small-target emphasis but more numerical instability.
     # Only used when inverse_weight_mode != "none".
@@ -476,6 +476,16 @@ class TNEPconfig:
     #           -> more stable on ill-conditioned landscapes than the
     #           memoryless update. REPLACES the grad_sigma update when on.
     snes_sigma_cumulation: bool = False
+
+    # --- Guided Evolutionary Strategies (gradient-biased sampling) -----
+    # When enabled, bias the SNES sampling covariance toward the subspace
+    # spanned by the last `guided_es_k` surrogate gradients (from
+    # _loss_and_grad). Extra variance is added ALONG that subspace; the
+    # per-dim σ and the rank-based update are unchanged. alpha=0 => vanilla.
+    guided_es_enabled: bool = False
+    guided_es_k: int = 4                 # subspace rank (2-20)
+    guided_es_alpha: float = 0.5         # subspace exploration scale (gamma = sqrt(alpha)*mean(sigma))
+    guided_es_grad_interval: int = 20    # refresh U every N gens (surrogate cost control)
     snes_cumulation_c: float | None = None   # path EMA constant; None -> (mu_eff+2)/(dim+mu_eff+5)
     snes_cumulation_rate: float = 0.05       # damping on the per-dim log-sigma step
 

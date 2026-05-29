@@ -314,6 +314,12 @@ class SNES:
         self._phase_best = float("inf")
         self._hybrid_cycles = 0
 
+        # Guided-ES state (lazy — only materialised when guided_es_enabled).
+        self._grad_buffer = None     # tf.Variable [k, dim] ring of recent surrogate grads
+        self._grad_buf_pos = 0
+        self._grad_buf_count = 0
+        self._U = None               # tf.Tensor [dim, m] orthonormal gradient subspace
+
         # Hybrid mode: a too-tight early-stop patience would terminate the
         # run before SNES ever plateaus and hands back to Adam, silently
         # defeating the schedule. Fail loudly.
@@ -1731,6 +1737,32 @@ class SNES:
             loss = loss + reg
 
         return loss, grad
+
+    def _refresh_guided_subspace(self, batch_data: dict) -> None:
+        """Push a fresh surrogate gradient into the ring buffer and refresh
+        the orthonormal gradient subspace U (d×m, m = min(filled, k)).
+        Cost: one _loss_and_grad (a forward pass at μ) + a QR (O(d·m²))."""
+        k = int(self.cfg.guided_es_k)
+        if self._grad_buffer is None:
+            self._grad_buffer = tf.Variable(
+                tf.zeros([k, self.dim], dtype=tf.float32), trainable=False,
+                name="guided_grad_buffer")
+            self._grad_buf_pos = 0
+            self._grad_buf_count = 0
+        _, g = self._loss_and_grad(batch_data)
+        n = tf.norm(g)
+        g = tf.cond(n > 1e-12, lambda: g / n, lambda: g)   # normalise (skip-safe if ~0)
+        self._grad_buffer.scatter_nd_update([[self._grad_buf_pos]], [g])
+        self._grad_buf_pos = (self._grad_buf_pos + 1) % k
+        self._grad_buf_count = min(self._grad_buf_count + 1, k)
+        m = self._grad_buf_count
+        # Cast to float64 before QR so that the orthonormality error in
+        # Q^T Q stays well below 1e-4 even at dim~10k (fp32 accumulates
+        # ~dim × eps_fp32 ≈ 1e-3 rounding in the Gram matrix at typical
+        # parameter-vector sizes). Cast back to float32 for storage.
+        buf_f64 = tf.cast(tf.transpose(self._grad_buffer[:m]), tf.float64)
+        q64, _ = tf.linalg.qr(buf_f64)                              # [dim, m] orthonormal cols
+        self._U = tf.cast(q64, tf.float32)
 
     def _advance_schedule(self, gwi: int) -> str:
         """Hybrid FSM. `gwi` = PHASE-LOCAL generations-without-improvement.
