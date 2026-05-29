@@ -10,6 +10,17 @@ Output: a comparison table showing, for each optimizer mode:
 
 ``gens_to_target`` is the first generation index at which the validation RMSE
 fell to or below ``target_rmse``, or "—" if the target was never reached.
+
+Guided-ES rows (``run_guided=True``) use vanilla SNES as the base
+(``optimizer_mode="snes"``, ``snes_sigma_cumulation=False``) with
+``guided_es_enabled=True`` so the comparison isolates the effect of
+gradient-subspace sampling.  One row is emitted per alpha in
+``guided_alphas``.
+
+NOTE: The guided subspace state (``_U``, gradient accumulation buffer) is NOT
+checkpointed.  After a resume it is rebuilt from the first
+``guided_es_grad_interval`` post-resume refresh — harmless, since it only
+steers sampling direction.
 """
 from __future__ import annotations
 
@@ -68,6 +79,14 @@ class Config:
 
     # If True, also benchmark pure Adam mode (in addition to snes + hybrid).
     run_adam_only: bool = False
+
+    # Guided-ES sweep — one benchmark row per alpha value.
+    # Uses vanilla SNES base + guided gradient-subspace sampling so the
+    # comparison isolates the guided effect (mean-Adam and cumulation are OFF).
+    run_guided: bool = True
+    guided_alphas: tuple = (0.25, 0.5, 0.75)
+    guided_es_k: int = 4
+    guided_es_grad_interval: int = 20
 
     # Random seed — controls dataset split + SNES initialisation.
     seed: int = 0
@@ -223,9 +242,72 @@ def _run_mode(bench_cfg: Config, mode: str) -> dict:
     }
 
 
+def _run_guided_mode(bench_cfg: Config, alpha: float) -> dict:
+    """Run one guided-ES configuration and return a result dict with stats.
+
+    The base optimizer is vanilla SNES (``optimizer_mode="snes"``,
+    ``snes_sigma_cumulation=False``); only ``guided_es_enabled`` and
+    ``guided_es_alpha`` differ so the comparison isolates the guided effect.
+    """
+    from TNEP import TNEP
+
+    label = f"guided a={alpha:.2f}"
+
+    print(f"\n{'='*60}")
+    print(f"Running mode: {label!r}")
+    print(f"{'='*60}")
+
+    cfg, train, val = _build_cfg_for_mode(bench_cfg, "snes")
+
+    # Enable guided-ES on top of vanilla SNES.
+    cfg.guided_es_enabled = True
+    cfg.guided_es_alpha = float(alpha)
+    cfg.guided_es_k = bench_cfg.guided_es_k
+    cfg.guided_es_grad_interval = bench_cfg.guided_es_grad_interval
+    # Keep mean-Adam and cumulation OFF so the result is purely SNES + guided.
+    cfg.snes_sigma_cumulation = False
+
+    model = TNEP(cfg)
+
+    t_start = time.perf_counter()
+    result = model.optimizer.fit(train, val)
+    wall_time = time.perf_counter() - t_start
+
+    if isinstance(result, tuple):
+        history = result[0]
+    else:
+        history = result
+
+    val_series = np.array(history["val_loss"], dtype=np.float64)
+    gen_series = np.array(history["generation"], dtype=np.int64)
+
+    if len(val_series) == 0:
+        return {
+            "mode": label,
+            "final_val": float("nan"),
+            "best_val": float("nan"),
+            "gens_to_target": None,
+            "wall_time": wall_time,
+        }
+
+    final_val = float(val_series[-1])
+    best_val = float(np.min(val_series))
+
+    hits = np.where(val_series <= bench_cfg.target_rmse)[0]
+    gens_to_target = int(gen_series[hits[0]]) if len(hits) > 0 else None
+
+    return {
+        "mode": label,
+        "final_val": final_val,
+        "best_val": best_val,
+        "gens_to_target": gens_to_target,
+        "wall_time": wall_time,
+    }
+
+
 def _print_table(results: list[dict], target_rmse: float) -> None:
     """Print a formatted comparison table to stdout."""
-    col_w = {"mode": 8, "final_val": 14, "best_val": 13, "gens_to_target": 16, "wall_time": 13}
+    col_w = {"mode": 14, "final_val": 14, "best_val": 13, "gens_to_target": 16, "wall_time": 13}
     header = (
         f"{'mode':<{col_w['mode']}} "
         f"{'final_val_rmse':>{col_w['final_val']}} "
@@ -237,7 +319,7 @@ def _print_table(results: list[dict], target_rmse: float) -> None:
 
     print()
     print("=" * len(header))
-    print(f"HYBRID vs SNES OPTIMIZER BENCHMARK  (target_rmse={target_rmse})")
+    print(f"OPTIMIZER BENCHMARK  (target_rmse={target_rmse})")
     print("=" * len(header))
     print(header)
     print(sep)
@@ -265,15 +347,21 @@ def main() -> int:
     if bench_cfg.run_adam_only:
         modes.append("adam")
 
+    guided_alphas = list(bench_cfg.guided_alphas) if bench_cfg.run_guided else []
+
     print(f"Benchmark settings:")
-    print(f"  data_path       = {bench_cfg.data_path}")
-    print(f"  total_N         = {bench_cfg.total_N}")
-    print(f"  num_generations = {bench_cfg.num_generations}")
-    print(f"  num_neurons     = {bench_cfg.num_neurons}")
-    print(f"  pop_size        = {bench_cfg.pop_size}")
-    print(f"  target_rmse     = {bench_cfg.target_rmse}")
-    print(f"  seed            = {bench_cfg.seed}")
-    print(f"  modes           = {modes}")
+    print(f"  data_path            = {bench_cfg.data_path}")
+    print(f"  total_N              = {bench_cfg.total_N}")
+    print(f"  num_generations      = {bench_cfg.num_generations}")
+    print(f"  num_neurons          = {bench_cfg.num_neurons}")
+    print(f"  pop_size             = {bench_cfg.pop_size}")
+    print(f"  target_rmse          = {bench_cfg.target_rmse}")
+    print(f"  seed                 = {bench_cfg.seed}")
+    print(f"  modes                = {modes}")
+    if guided_alphas:
+        print(f"  guided_alphas        = {guided_alphas}")
+        print(f"  guided_es_k          = {bench_cfg.guided_es_k}")
+        print(f"  guided_es_grad_interval = {bench_cfg.guided_es_grad_interval}")
 
     results = []
     for mode in modes:
@@ -284,6 +372,21 @@ def main() -> int:
             print(f"\n[ERROR] mode={mode!r} raised: {exc!r}")
             results.append({
                 "mode": mode,
+                "final_val": float("nan"),
+                "best_val": float("nan"),
+                "gens_to_target": None,
+                "wall_time": 0.0,
+            })
+
+    for alpha in guided_alphas:
+        label = f"guided a={alpha:.2f}"
+        try:
+            r = _run_guided_mode(bench_cfg, alpha)
+            results.append(r)
+        except Exception as exc:
+            print(f"\n[ERROR] mode={label!r} raised: {exc!r}")
+            results.append({
+                "mode": label,
                 "final_val": float("nan"),
                 "best_val": float("nan"),
                 "gens_to_target": None,
