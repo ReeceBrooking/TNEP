@@ -497,6 +497,17 @@ class TNEPconfig:
     snes_cumulation_c: float | None = None   # path EMA constant; None -> (mu_eff+2)/(dim+mu_eff+5)
     snes_cumulation_rate: float = 0.05       # damping on the per-dim log-sigma step
 
+    # --- Low-rank covariance (CMA-style learned correction) ------------
+    #   "none"   : vanilla per-dim diagonal SNES (bit-identical).
+    #   "rank1"  : add a single learned evolution-path direction p_c to the
+    #              sampling covariance (CMA-ES rank-1 update; O(d)).
+    #   "lowrank": LM-CMA rank-k (future; treated as "rank1" until implemented).
+    #   The sigma (diagonal) update is UNCHANGED — the rank correction is added
+    #   to the displacement delta, not s_iso, so the diagonal can't absorb the
+    #   injected directional variance (same isolation guided-ES uses). Default "none".
+    snes_cov_mode: str = "none"
+    snes_cma_c1_scale: float = 1.0   # multiplies the ported rank-1 rate c_1
+
     # --- validation ----------------------------------------------------
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None

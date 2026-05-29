@@ -320,6 +320,12 @@ class SNES:
         self._grad_buf_count = 0
         self._U = None               # tf.Tensor [dim, m] orthonormal gradient subspace
 
+        # Low-rank CMA state (lazy — only materialised when snes_cov_mode != "none").
+        self._cma_pc = None          # tf.Variable [dim] rank-1 evolution path (normalized units)
+        self._cma_a1 = None          # tf.Variable scalar — rank-1 sampling amplitude sqrt(c1)
+        # NB: self._recomb_w (CMA recombination weights, sum 1) is populated by
+        # compute_utilities() above — do NOT reset it here or the cache is lost.
+
         # Hybrid mode: a too-tight early-stop patience would terminate the
         # run before SNES ever plateaus and hands back to Adam, silently
         # defeating the schedule. Fail loudly.
@@ -912,10 +918,26 @@ class SNES:
         else:
             if self.cfg.debug:
                 print("Utility calc failed due to negative total")
+        # Cache the pre-shift, sum-1 recombination weights for CMA rank-1
+        # (mu_eff = 1/sum(w^2)); read directly rather than inverting the shift.
+        self._recomb_w = tf.constant(raw.astype(np.float32))
         utilities = raw - 1.0 / lam
         if self.cfg.debug:
             print("utilities = ", utilities)
         return utilities
+
+    def _cma_constants(self) -> tuple[float, float, float]:
+        """Ported CMA-ES rank-1 constants (Hansen 2016, arXiv:1604.00772,
+        Eq. 24 + 57). mu_eff = 1/sum(w_i^2) over the recombination weights
+        self._recomb_w (the pre-shift positive log-rank weights, sum 1)."""
+        if self._recomb_w is None:
+            self.compute_utilities()
+        n = float(self.dim)
+        w = self._recomb_w.numpy()
+        mu_eff = float(1.0 / np.sum(w ** 2))
+        c_c = (4.0 + mu_eff / n) / (n + 4.0 + 2.0 * mu_eff / n)
+        c_1 = 2.0 / ((n + 1.3) ** 2 + mu_eff)
+        return float(c_c), float(c_1), mu_eff
 
     def _mirrored_normal(self, shape: tuple[int, int]) -> tf.Tensor:
         """Draw mirrored (antithetic) standard-normal noise.
@@ -955,6 +977,21 @@ class SNES:
             This inflates variance ALONG the recent surrogate-gradient
             subspace so the population explores promising directions more.
 
+        Low-rank CMA covariance (`snes_cov_mode != "none"`):
+            A learned rank-1 evolution-path direction `p_c` is added to the
+            sampling covariance via the DISPLACEMENT only:
+                delta = sigma * s_iso + a1 * xi * (sigma ⊙ p_c)
+            where xi is a mirrored scalar normal [P,1]. The realized
+            normalized step is therefore `delta/sigma = s_iso + a1*xi*p_c`,
+            giving `Σ = diag(sigma²)·(I + a1²·p_c p_cᵀ)`. The correction
+            lands in `delta` and NOT in `s_iso`, so the mean step
+            (Σ_p u_p δ_p) stays the exact covariance-agnostic natural
+            gradient while the sigma step (which reads `s_iso` only) is
+            PROVABLY unaffected — the same isolation discipline guided-ES
+            uses (a per-coordinate sigma cannot cancel rank-1 directional
+            variance, so coupling it would bias sigma upward along p_c).
+            NOTE: combining rank-1 with guided-ES is UNTESTED (fit() warns).
+
         The returned `delta` is the ACTUAL displacement (samples − μ).
         The natural-gradient mean step Σ_p u_p · delta_p is correct for
         ANY sampling covariance (it's the utility-weighted displacement
@@ -978,6 +1015,15 @@ class SNES:
             # sqrt — that would silently poison every sample's displacement.
             gamma = tf.sqrt(max(0.0, float(self.cfg.guided_es_alpha))) * tf.reduce_mean(self.sigma)
             delta = delta + gamma * tf.matmul(eps_k, self._U, transpose_b=True)
+        # Rank-1 CMA correction lives in `delta` (sigma-isolated). The extra
+        # _mirrored_normal draw is INSIDE this guard so that when
+        # snes_cov_mode == "none" the RNG stream is byte-for-byte unchanged
+        # and vanilla SNES stays bit-identical.
+        if str(getattr(self.cfg, "snes_cov_mode", "none")).lower() != "none" \
+                and self._cma_pc is not None:
+            xi = self._mirrored_normal((self.pop_size, 1))        # [P,1] mirrored scalar
+            # delta += a1·xi·(sigma⊙p_c)  =>  realized normalized step delta/sigma = s_iso + a1·xi·p_c
+            delta = delta + self._cma_a1 * xi * (self.sigma * self._cma_pc)[None, :]
         samples = self.mu + delta
         return samples, {"s_iso": s_iso, "delta": delta}
 
@@ -1003,6 +1049,18 @@ class SNES:
         if self._grad_sigma_ema is None:
             self._grad_sigma_ema = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
                                                trainable=False, name="es_grad_sigma_ema")
+
+    def _ensure_cma_state(self) -> None:
+        """Lazily allocate the rank-1 CMA evolution path + amplitude.
+
+        Only materialised when snes_cov_mode != "none"; pure-SNES leaves
+        these None so the search state stays byte-identical.
+        """
+        if self._cma_pc is None:
+            self._cma_pc = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
+                                       trainable=False, name="cma_pc")
+            self._cma_a1 = tf.Variable(0.0, dtype=tf.float32, trainable=False,
+                                       name="cma_a1")
 
     def update(self, utilities: tf.Tensor, aux: dict[str, tf.Tensor]) -> None:
         """Update mu and sigma using fitness-ranked samples.
@@ -1056,10 +1114,13 @@ class SNES:
             m_hat = self._es_m / (1.0 - tf.pow(b1, t))
             v_hat = self._es_v / (1.0 - tf.pow(b2, t))
             self.mu.assign_add(lr * m_hat / (tf.sqrt(v_hat) + eps))
-        elif self.cfg.guided_es_enabled and self._U is not None:
-            # Guided sampling inflated delta beyond sigma·s_iso, so the
-            # covariance-agnostic mean step (utility-weighted sum of actual
-            # displacements) is required for the correct natural gradient.
+        elif (self.cfg.guided_es_enabled and self._U is not None) \
+                or str(getattr(self.cfg, "snes_cov_mode", "none")).lower() != "none":
+            # Guided sampling OR rank-1 CMA inflated delta beyond sigma·s_iso,
+            # so the covariance-agnostic mean step (utility-weighted sum of
+            # actual displacements) is required for the correct natural
+            # gradient. (With the rank-1 correction delta != sigma·s_iso, so
+            # the vanilla sigma·grad_mu form would be wrong.)
             self.mu.assign_add(tf.einsum('p,pd->d', utilities, delta))
         else:
             # Vanilla path: keep the exact original reduction order
@@ -1067,6 +1128,30 @@ class SNES:
             # pre-guided SNES, not just allclose. Algebraically equal to the
             # displacement form above (delta == sigma·s_iso here).
             self.mu.assign_add(self.sigma * grad_mu)
+
+        # --- rank-1 CMA covariance (evolution path + amplitude) ---
+        # Cross-coordinate p_c cumulation. Runs AFTER the mean step (which
+        # consumed delta) and BEFORE the sigma step (which reads s_iso only,
+        # so the rank correction never leaks into the diagonal).
+        if str(getattr(self.cfg, "snes_cov_mode", "none")).lower() != "none":
+            self._ensure_cma_state()
+            cc, c1, mu_eff = self._cma_constants()
+            c1 = c1 * float(getattr(self.cfg, "snes_cma_c1_scale", 1.0))
+            # Realized normalized step, GLOBALLY ranked (cross-coordinate p_c
+            # must NOT use per-type column shuffles). fit() supplies
+            # s_eff_global; unit tests fall back to the raw-order displacement.
+            s_eff = aux.get("s_eff_global")
+            if s_eff is None:
+                s_eff = delta / self.sigma
+            mean_step = tf.einsum('p,pd->d', self._recomb_w, s_eff)   # CMA Eq.24
+            new_pc = (1.0 - cc) * self._cma_pc \
+                + tf.sqrt(cc * (2.0 - cc) * mu_eff) * mean_step
+            self._cma_pc.assign(new_pc)
+            # C <- (1-c1)C + c1 p_c p_c^T realised on the sampling side as
+            # added variance c1 along p_c: amplitude a1 = sqrt(c1). (The
+            # (1-c1) shrink of the diagonal base is omitted — negligible at
+            # canonical c1.)
+            self._cma_a1.assign(tf.sqrt(tf.maximum(c1, 0.0)))
 
         # --- sigma update (Feature B: optional cumulation) ---
         # grad_sigma = Σ u_i (s_i² − 1) is the NES natural gradient on log-sigma.
@@ -1155,6 +1240,20 @@ class SNES:
                 self._opt_phase = str(resume_state["opt_phase"])
                 self._phase_best = float(resume_state["phase_best"])
                 self._hybrid_cycles = int(resume_state["hybrid_cycles"])
+            # Restore rank-1 CMA evolution path when present. Guarded so
+            # pure-SNES checkpoints (no cma_pc) resume exactly as before.
+            if resume_state.get("cma_pc") is not None:
+                cma_pc = np.asarray(resume_state["cma_pc"], dtype=np.float32)
+                if cma_pc.shape[0] == self.dim:
+                    self._ensure_cma_state()
+                    self._cma_pc.assign(cma_pc)
+                    self._cma_a1.assign(float(resume_state["cma_a1"]))
+                else:
+                    # dim changed (arch differs) — drop the path with a warning
+                    # rather than crash; it rebuilds from zero on first update().
+                    print(f"  WARNING: checkpoint cma_pc dim "
+                          f"{cma_pc.shape[0]} != model dim {self.dim}; "
+                          f"dropping rank-1 evolution path on resume.")
             start_gen = int(resume_state["last_gen"]) + 1
             # Offset train_start so the displayed elapsed continues from
             # the checkpointed wall-time rather than restarting at zero.
@@ -1201,6 +1300,14 @@ class SNES:
         # restored from checkpoint — a fresh attempt to escape any
         # plateau seen so far is fine on resume).
         n_sigma_resets = 0
+
+        # One-time warning: rank-1 CMA + guided-ES is an untested combination
+        # (both inject correlated variance into `delta`). Printed once, before
+        # the generation loop — not per-gen.
+        if bool(getattr(cfg, "guided_es_enabled", False)) and \
+                str(getattr(cfg, "snes_cov_mode", "none")).lower() != "none":
+            print("  WARNING: guided-ES + snes_cov_mode!='none' is an UNTESTED "
+                  "combination (rank-1 CMA and guided-ES both add to delta).")
 
         gen_l1, gen_l2, gen_lorth = 0.0, 0.0, 0.0
         val_fitness = float('inf')
@@ -1379,8 +1486,17 @@ class SNES:
                     ranks = tf.argsort(fitness)
                     s_iso_sorted = tf.gather(aux["s_iso"], ranks)
                     delta_sorted = tf.gather(aux["delta"], ranks)
+                # The CMA evolution path is a CROSS-COORDINATE object, so it
+                # must be built from a single GLOBAL fitness ranking of the
+                # realized normalized step — never the per-type column
+                # permutation (whose columns carry different orderings, which
+                # would corrupt p_c's direction). Supplied for both branches;
+                # update() reads it only when snes_cov_mode != "none".
+                global_ranks = tf.argsort(fitness)
+                s_eff_global = tf.gather(aux["delta"], global_ranks) / self.sigma
                 self.update(self.utilities,
-                            {"s_iso": s_iso_sorted, "delta": delta_sorted})
+                            {"s_iso": s_iso_sorted, "delta": delta_sorted,
+                             "s_eff_global": s_eff_global})
 
             t3 = time.perf_counter()
 
@@ -1604,6 +1720,11 @@ class SNES:
                     ckpt_state["opt_phase"] = self._opt_phase
                     ckpt_state["phase_best"] = self._phase_best
                     ckpt_state["hybrid_cycles"] = self._hybrid_cycles
+                # Rank-1 CMA learned state (guarded — absent for pure-SNES /
+                # cov_mode="none" runs, so those checkpoints stay byte-identical).
+                if self._cma_pc is not None:
+                    ckpt_state["cma_pc"] = self._cma_pc
+                    ckpt_state["cma_a1"] = float(self._cma_a1.numpy())
                 save_checkpoint(ckpt_path, cfg, ckpt_state, history, gen)
                 # Print a one-line note above the in-place progress bar.
                 sys.stdout.write(

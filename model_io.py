@@ -344,6 +344,10 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
             sg.attrs["opt_phase"] = str(state["opt_phase"])
             sg.attrs["phase_best"] = float(state["phase_best"])
             sg.attrs["hybrid_cycles"] = int(state["hybrid_cycles"])
+        # Rank-1 CMA learned state (guarded — absent for pure-SNES checkpoints).
+        if state.get("cma_pc") is not None:
+            sg.create_dataset("cma_pc", data=_np(state["cma_pc"]))
+            sg.attrs["cma_a1"] = float(state["cma_a1"])
         # Per-channel descriptor scaler (frozen at training-set creation
         # time). Persist into the SNES group so load_checkpoint can
         # restore it BEFORE pad_and_stack runs again — preventing a
@@ -422,6 +426,9 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
             resume_state["opt_phase"] = str(sg.attrs["opt_phase"])
             resume_state["phase_best"] = float(sg.attrs["phase_best"])
             resume_state["hybrid_cycles"] = int(sg.attrs["hybrid_cycles"])
+        if "cma_pc" in sg:
+            resume_state["cma_pc"] = sg["cma_pc"][:]
+            resume_state["cma_a1"] = float(sg.attrs["cma_a1"])
         # Restore the per-channel descriptor scaler if the checkpoint
         # carries one — sets cfg._q_scaler BEFORE pad_and_stack runs
         # on resume, ensuring the scaler is reused (not recomputed)
