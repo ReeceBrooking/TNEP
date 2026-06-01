@@ -485,6 +485,24 @@ class TNEPconfig:
     #           memoryless update. REPLACES the grad_sigma update when on.
     snes_sigma_cumulation: bool = False
 
+    # --- Median Success Rule (MSR) global σ controller -----------------
+    # Ait ElHara, Auger, Hansen, GECCO 2013. Conservative rank-aggregated
+    # σ multiplier applied AFTER the existing per-coord σ update. Compares
+    # the current generation's fitness distribution against the previous
+    # generation's median; expands σ if more than `snes_msr_z_target` of
+    # the new population beats that reference, contracts otherwise.
+    #
+    # SILENTLY DISABLED under: cov_mode="crfmnes" (CR-FM-NES owns σ);
+    # Adam phases of hybrid mode (no SNES update fires that gen).
+    #
+    # The log-step is clipped to ±snes_msr_clip per gen as a defence-in-
+    # depth measure matching snes_sigma_cumulation's clip pattern. Default
+    # damping `c_σ = 0.3` is conservative; the paper suggests up to 1.0.
+    snes_msr_enabled: bool = False
+    snes_msr_z_target: float = 0.5         # target success rate (0.5 = median)
+    snes_msr_c_sigma: float = 0.3          # damping on the log-σ step
+    snes_msr_clip: float = 0.3             # max |log-step| per generation
+
     # --- Guided Evolutionary Strategies (gradient-biased sampling) -----
     # When enabled, bias the SNES sampling covariance toward the subspace
     # spanned by the last `guided_es_k` surrogate gradients (from
