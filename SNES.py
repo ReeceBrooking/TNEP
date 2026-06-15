@@ -427,8 +427,50 @@ class SNES:
             self._mix_per_type = False
             self._mix_arch = "linear"
             self._mix_cayley = False
-            self._mix_orth_map = None
+            # Output-side R layer + cross-channel layer reuse
+            # `_cayley_blocks_batched`, which dispatches on
+            # `_mix_orth_map`. When per-pair mixing is OFF but EITHER of
+            # those layers is on, honour cfg.descriptor_mixing_regularizer
+            # rather than defaulting to Cayley (the historical default in
+            # _cayley_blocks_batched). Otherwise enabling
+            # descriptor_mixing_output_layer with cfg's "expm" default
+            # would silently fall back to Cayley.
+            _r_or_cross = (bool(getattr(self.cfg, "descriptor_mixing_output_layer", False))
+                           or bool(getattr(self.cfg, "descriptor_mixing_cross_layer", False)))
+            if _r_or_cross:
+                _orth_map_cfg = str(getattr(
+                    self.cfg, "descriptor_mixing_regularizer", "off")).lower()
+                self._mix_orth_map = (_orth_map_cfg
+                                       if _orth_map_cfg in ("cayley", "expm")
+                                       else "cayley")
+            else:
+                self._mix_orth_map = None
+            # When per-pair mixing is OFF but the output-R or cross-layer
+            # is ON, `_cayley_blocks_batched` is still called with the
+            # corresponding block size (H_ for output R, Q-derived for
+            # cross). The mixing-side population path above doesn't run,
+            # so populate the cache with the block sizes those layers
+            # need — otherwise the first reconstruct hits a KeyError on
+            # `self._cayley_scatter_cache[bs]`.
             self._cayley_scatter_cache = {}
+            if _r_or_cross:
+                _extra_bs = set()
+                if bool(getattr(self.cfg, "descriptor_mixing_output_layer", False)):
+                    _h_out = int(getattr(self.cfg, "num_neurons", 0))
+                    _h2 = getattr(self.cfg, "num_neurons_layer_2", None)
+                    _h_eff = int(_h2) if _h2 is not None else _h_out
+                    if _h_eff > 1:
+                        _extra_bs.add(_h_eff)
+                for _bs in _extra_bs:
+                    _num_upper = _bs * (_bs - 1) // 2
+                    _scat = np.zeros((_bs, _bs, _num_upper), dtype=np.float32)
+                    _k = 0
+                    for _i in range(_bs):
+                        for _j in range(_i + 1, _bs):
+                            _scat[_i, _j, _k] = 1.0
+                            _scat[_j, _i, _k] = -1.0
+                            _k += 1
+                    self._cayley_scatter_cache[_bs] = tf.constant(_scat)
             self.n_U_pair = 0
             self.n_U_pair_per_layer = 0
             self._mix_n_layers = 1
@@ -775,38 +817,17 @@ class SNES:
         self.lambda_2 = tf.Variable(init_lambda_2, dtype=tf.float32,
                                     trainable=False, name="lambda_2")
 
-        # V_pair regulariser mode: "off" | "shrinkage" | "orthogonal".
-        # Orthogonal penalty has its own lambda (defaults to the same
-        # auto formula scaled by n_U_pair only, since the orth penalty
-        # is naturally per-mixing-entry and shouldn't inherit the ANN's
-        # dimensionality scaling). -1 sentinel enables dynamic adapt.
+        # V_pair regulariser mode: "off" | "cayley" | "expm". Both
+        # non-off modes are STRUCTURAL parameterisations (U is
+        # reconstructed from a skew-symmetric A; orthogonality is
+        # guaranteed regardless of any λ), so the L1/L2 path is silent
+        # on V_pair when either is active.
         self._mix_reg_mode = str(getattr(
             self.cfg, "descriptor_mixing_regularizer", "off")).lower()
-        if self._mix_reg_mode not in (
-                "off", "shrinkage", "orthogonal", "cayley", "expm"):
+        if self._mix_reg_mode not in ("off", "cayley", "expm"):
             raise ValueError(
                 f"descriptor_mixing_regularizer={self._mix_reg_mode!r} not "
-                "recognised (expected 'off', 'shrinkage', 'orthogonal', "
-                "'cayley', or 'expm')")
-        # The "cayley" and "expm" modes are *parameterisations*, not soft
-        # penalties: U is reconstructed structurally from a skew-symmetric A
-        # (via either the Cayley rational chord or the matrix exponential),
-        # so it's exactly orthogonal regardless of any λ. The
-        # shrinkage / orthogonal soft-penalty paths must remain
-        # silent under cayley — the existing dispatches `reg_Vpair` /
-        # `reg_Vorth` already gate on the exact strings "shrinkage" /
-        # "orthogonal", so this just works.
-        if self.n_U_pair > 0:
-            auto_lambda_orth = float(np.sqrt(
-                self.n_U_pair * 1e-6 / max(self.cfg.num_types, 1)))
-        else:
-            auto_lambda_orth = 0.0
-        cfg_lo = getattr(self.cfg, "lambda_orth", None)
-        self._dyn_lambda_orth = (cfg_lo == -1)
-        init_lambda_orth = (auto_lambda_orth if (cfg_lo is None or self._dyn_lambda_orth)
-                            else float(cfg_lo))
-        self._lambda_orth = tf.Variable(init_lambda_orth, dtype=tf.float32,
-                                        trainable=False, name="lambda_orth")
+                "recognised (expected 'off', 'cayley', or 'expm')")
 
         # Gating regularisation strengths. Penalty form per type t:
         #   L1_g[t] = λ_g1 · ‖g[t, :] − g_init‖_1 / n_gates_per_type
@@ -914,38 +935,28 @@ class SNES:
 
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray
                                ) -> tuple[float, float, float]:
-        """Compute L1, L2, and orthogonal regularisation penalties.
+        """Compute L1 and L2 regularisation penalties.
 
-        For multi-element systems, computes per-type regularization
+        For multi-element systems, computes per-type regularisation
         (GPUMD NEP4): each atom type's parameters are penalised
         separately using num_vars/num_types as the denominator, then
         averaged across types and added to a global regularisation
         term over all parameters.
 
-        The orthogonal penalty (when mode == "orthogonal") is reported
-        separately from L2 so it can drive an independent dynamic-λ
-        schedule — otherwise lambda_2 would chase a signal it doesn't
-        control.
-
         Args:
             param_vector : [dim] tensor or ndarray — flat parameter vector
 
         Returns:
-            l1     : float — L1 penalty (ANN + shrinkage V_pair when on)
-            l2     : float — L2 penalty (ANN + shrinkage V_pair when on)
-            l_orth : float — orthogonal penalty on V_pair (0 unless mode=="orthogonal")
+            l1     : float — L1 penalty on the ANN block
+            l2     : float — L2 penalty on the ANN block
+            l_orth : float — 0.0 (retained for API compatibility; no
+                     orthogonal soft-penalty path remains since the
+                     mixing regulariser is now structural cayley/expm
+                     or off).
         """
         pv = tf.cast(param_vector, tf.float32)
         T = self.cfg.num_types
-        Q = self.dim_q
-        H = self.cfg.num_neurons
         n_per_type = self._n_per_type  # W0_t + b0_t (+ W0_2_t + b0_2_t) + W1_t
-
-        # V_pair regularisation mode (set in __init__ from cfg). The
-        # shrinkage path uses lambda_1/2 on the residual tail; the
-        # orthogonal path uses lambda_orth on ‖UᵀU - I‖².
-        reg_Vpair = (self.n_U_pair > 0 and self._mix_reg_mode == "shrinkage")
-        reg_Vorth = (self.n_U_pair > 0 and self._mix_reg_mode == "orthogonal")
 
         if T > 1:
             # Per-type regularization: average L1/L2 across types + global term
@@ -967,70 +978,16 @@ class SNES:
             l1 = total_l1 / T + self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / n_typed_total
             l2 = total_l2 / T + self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed)) / n_typed_total)
         else:
-            # Single-type path: when V_pair is handled separately (by
-            # shrinkage, orthogonal, OR Cayley parameterisation), keep
-            # it out of the main L1/L2 sum. Cayley is a structural
-            # constraint, not a soft penalty — its A entries are NOT
-            # to be regularised, since shrinking A toward 0 collapses
-            # U toward I and defeats the Cayley map's purpose.
-            v_handled = reg_Vpair or reg_Vorth or self._mix_cayley
-            ann = pv[:self.n_anns_total] if v_handled else pv
-            ann_n = self.n_anns_total if v_handled else self.dim
+            # Single-type path: when V_pair lives behind a cayley / expm
+            # parameterisation, keep its A entries out of the main L1/L2
+            # sum — shrinking A toward 0 collapses U toward I and defeats
+            # the structural map's purpose.
+            ann = pv[:self.n_anns_total] if self._mix_cayley else pv
+            ann_n = self.n_anns_total if self._mix_cayley else self.dim
             l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann)) / ann_n
             l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(ann)) / ann_n)
 
-        # Optional V_pair tail regularisation (residual mixing layer).
-        # Per-type slabs averaged across T (matching the ANN per-type
-        # convention); shared V is added as a single global term.
-        if reg_Vpair:
-            # Bound the slice to the V_pair region only; the nonlinear bias
-            # tail (n_U_bias_total > 0 when descriptor_mixing_nonlinear=True)
-            # lives in residual form and is excluded from this shrinkage.
-            tail = pv[self.n_anns_total : self.n_anns_total + self.n_U_pair]
-            if self._mix_per_type and T > 1:
-                # reconstruct_params_tf produces layers-major, types-inner:
-                #   [L0_t0 | L0_t1 | ... | L0_tT-1 | L1_t0 | ... | LN-1_tT-1]
-                # So per-type slab for type t is the union of (L_k, t)
-                # sub-blocks across all N layers.
-                per_layer = self.n_U_pair_per_layer
-                per_T_block = per_layer // T
-                vp_l1 = tf.constant(0.0)
-                vp_l2 = tf.constant(0.0)
-                for t in range(T):
-                    if self._mix_n_layers == 1:
-                        slab = tail[t * per_T_block:(t + 1) * per_T_block]
-                    else:
-                        slab = tf.concat(
-                            [tail[k * per_layer + t * per_T_block
-                                  : k * per_layer + (t + 1) * per_T_block]
-                             for k in range(self._mix_n_layers)], axis=0)
-                    n_per_t = per_T_block * self._mix_n_layers
-                    vp_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(slab)) / n_per_t
-                    vp_l2 += self.lambda_2 * tf.sqrt(
-                        tf.reduce_sum(tf.square(slab)) / n_per_t)
-                l1 = l1 + vp_l1 / T
-                l2 = l2 + vp_l2 / T
-            else:
-                l1 = l1 + self.lambda_1 * tf.reduce_sum(tf.abs(tail)) / self.n_U_pair
-                l2 = l2 + self.lambda_2 * tf.sqrt(
-                    tf.reduce_sum(tf.square(tail)) / self.n_U_pair)
-
-        # Orthogonal V_pair regularisation (replaces shrinkage when
-        # mode == "orthogonal"). The penalty enforces UᵀU = I per
-        # block, so U is constrained to the orthogonal group (a pure
-        # rotation/reflection of the descriptor basis, no scaling) —
-        # which lets the data fit pick whichever rotation works,
-        # without anchoring at identity. Reported as a separate
-        # signal so its lambda can adapt independently.
-        if reg_Vorth:
-            # See reg_Vpair branch: bound the slice to the V_pair region.
-            tail = pv[self.n_anns_total : self.n_anns_total + self.n_U_pair]
-            l_orth = float(self._lambda_orth.numpy()) * float(
-                self._orth_penalty_total(tail))
-        else:
-            l_orth = 0.0
-
-        return float(l1), float(l2), float(l_orth)
+        return float(l1), float(l2), 0.0
 
     def _build_mu_init(self, rng: np.random.Generator) -> np.ndarray:
         """Initialise the μ vector according to cfg.mu_init_scheme.
@@ -1049,10 +1006,10 @@ class SNES:
             mu = rng.uniform(-1.0, 1.0, size=self.dim).astype(np.float32)
         elif scheme == "glorot":
             mu = np.zeros(self.dim, dtype=np.float32)
-            # Activation-dependent Glorot gain (see _ACTIVATION_REGISTRY in
-            # TNEP.py). gain=1 reproduces the legacy tanh init exactly; other
-            # activations push more variance through, so this scales the
-            # uniform bound to match the activation's slope near origin.
+            # Activation-dependent Glorot gain. gain=1 reproduces the
+            # legacy tanh init exactly; other activations may want a
+            # different scale, but SNES corrects through σ adaptation
+            # so the practical impact is small.
             gain = float(getattr(self.model, "_glorot_gain", 1.0))
             c_W0 = gain * float(np.sqrt(6.0 / (Q + H)))
             c_W1 = gain * float(np.sqrt(6.0 / (H_final + 1)))
@@ -1171,8 +1128,7 @@ class SNES:
 
     def _maybe_adapt_lambda(self, gen: int, data_loss: float,
                             l1: float, l2: float, l_orth: float = 0.0) -> None:
-        """Rescale lambda_1 / lambda_2 / lambda_orth toward
-        `target_ratio · data_loss`.
+        """Rescale lambda_1 / lambda_2 toward `target_ratio · data_loss`.
 
         Activated only for lambdas that were set to -1 in cfg. Runs at
         the same cadence as `compute_regularization` is sampled (every
@@ -1192,9 +1148,9 @@ class SNES:
             data_loss : reference signal (best train RMSE this gen).
             l1, l2    : current L1 / L2 penalties (from
                         compute_regularization at this gen).
-            l_orth    : current orthogonal penalty (mode=="orthogonal").
+            l_orth    : retained for API compatibility; ignored.
         """
-        if not (self._dyn_lambda_1 or self._dyn_lambda_2 or self._dyn_lambda_orth):
+        if not (self._dyn_lambda_1 or self._dyn_lambda_2):
             return
         interval = max(1, int(getattr(self.cfg, "lambda_adapt_interval", 100)))
         if gen % interval != 0:
@@ -1215,87 +1171,6 @@ class SNES:
             ratio = (target * ref) / float(l2)
             new = float(self.lambda_2.numpy()) * (ratio ** damping)
             self.lambda_2.assign(float(np.clip(new, lmin, lmax)))
-        if self._dyn_lambda_orth and l_orth > 1e-12:
-            ratio = (target * ref) / float(l_orth)
-            new = float(self._lambda_orth.numpy()) * (ratio ** damping)
-            self._lambda_orth.assign(float(np.clip(new, lmin, lmax)))
-
-    def _orth_penalty_slab(self, V_tail: tf.Tensor,
-                           slab_idx: int = 0) -> tf.Tensor:
-        """Compute Σ_p ‖U_pᵀ U_p − I‖²_F for the pair blocks in one
-        type-slab of V_tail. In residual form `U = I + V`:
-
-            UᵀU − I = V + Vᵀ + VᵀV
-
-        so the penalty is `‖V + Vᵀ + VᵀV‖²_F` per pair block, summed.
-        Block sizes vary (trivial compression), so we loop over pairs
-        and pick out each block's `bs²` entries from the flat tail.
-
-        Args:
-            V_tail   : [..., n_U_pair] flat residual tail (last axis
-                       carries the param entries; any leading axes are
-                       broadcast — supports scalar `[n_U_pair]`,
-                       population `[P, n_U_pair]`, etc.)
-            slab_idx : which T-slab to read (0 for shared U_pair).
-
-        Returns:
-            penalty  : `[...]` (leading axes preserved). Normalised by
-                       the number of entries in this slab so the value
-                       scales like an averaged squared-residual.
-        """
-        # Cayley parameterisation owns the orthogonality constraint
-        # structurally — the V_tail under Cayley contains upper-
-        # triangle entries of A (skew-symmetric), NOT the dense V
-        # blocks this penalty assumes. Indexing it as bs² per block
-        # would silently mis-slice. Hard-fail to catch any future
-        # code path that calls into this helper while cayley is on.
-        if self._mix_cayley:
-            raise RuntimeError(
-                "_orth_penalty_slab is not valid under "
-                "descriptor_mixing_regularizer='cayley': the V_tail "
-                "encodes the upper-triangle of skew-symmetric A, not "
-                "dense V blocks. Cayley provides orthogonality as a "
-                "structural constraint, so no soft penalty is needed.")
-        # V_tail layout (from reconstruct_params_tf) is layers-major,
-        # types-inner per layer. Sum across all N layers so stacked mixing
-        # doesn't silently leave layers 1..N-1 unconstrained.
-        per_layer = self.n_U_pair_per_layer
-        per_T_block = (per_layer // self.cfg.num_types
-                       if self._mix_per_type else per_layer)
-        if self._mix_arch == "linear":
-            iterator = [(bs,) for bs in self._mix_block_sizes]
-        elif self._mix_arch == "l_aware":
-            iterator = [(alpha,) for alpha in self._mix_alpha_per_pair
-                        for _ in range(self._mix_L)]
-        else:  # cross_pair_l: one [N_l × N_l] sub-block per angular momentum
-            iterator = [(self._mix_N_per_l,) for _ in range(self._mix_L)]
-        pen = tf.zeros(tf.shape(V_tail)[:-1])
-        for k in range(self._mix_n_layers):
-            start = k * per_layer + slab_idx * per_T_block
-            offset = 0
-            for (dim,) in iterator:
-                n = dim * dim
-                block_flat = V_tail[..., start + offset:start + offset + n]
-                new_shape = tf.concat(
-                    [tf.shape(block_flat)[:-1], [dim, dim]], axis=0)
-                V = tf.reshape(block_flat, new_shape)
-                VtV = tf.matmul(V, V, transpose_a=True)
-                M = V + tf.linalg.matrix_transpose(V) + VtV
-                pen = pen + tf.reduce_sum(tf.square(M), axis=[-2, -1])
-                offset += n
-        return pen / float(per_T_block * self._mix_n_layers)
-
-    def _orth_penalty_total(self, V_tail: tf.Tensor) -> tf.Tensor:
-        """Sum the orthogonal penalty across all T slabs (per-type)
-        or compute it once (shared). Output preserves leading dims of
-        V_tail. Average across T (per-type) matches the ANN per-type
-        convention used by the L1/L2 path.
-        """
-        T = self.cfg.num_types
-        if self._mix_per_type:
-            slabs = [self._orth_penalty_slab(V_tail, t) for t in range(T)]
-            return tf.add_n(slabs) / float(T)
-        return self._orth_penalty_slab(V_tail, 0)
 
     def _cayley_blocks_batched(self, A_upper_stacked: tf.Tensor,
                                 bs: int) -> tf.Tensor:
@@ -1596,11 +1471,8 @@ class SNES:
         # Optional V_pair tail routing. With per-type V_pair, slab t
         # is owned by label t (per-type ranking); with shared V_pair,
         # the whole tail is owned by the global label T. Dispatched on
-        # cfg.descriptor_mixing_regularizer: "off" leaves V_pair alone,
-        # "shrinkage" adds L1+L2 of the slab, "orthogonal" adds
-        # λ_orth · ‖UᵀU - I‖² per block.
-        reg_Vpair = (self.n_U_pair > 0 and self._mix_reg_mode == "shrinkage")
-        reg_Vorth = (self.n_U_pair > 0 and self._mix_reg_mode == "orthogonal")
+        # V_pair has no soft regulariser now — cayley/expm own the
+        # constraint structurally, off leaves V_pair unconstrained.
         # Per-type gating regulariser (L1 / L2 on g − g_init, plus a one-
         # sided anti-sparsity hinge on max(0, floor − |g|)²).
         lg1 = float(self._lambda_gate_1.numpy())
@@ -1621,19 +1493,6 @@ class SNES:
                 self._gating_floor - tf.abs(g_tail))                 # [P, T·PL]
             g_floor_sq = tf.square(g_floor_slack)
             n_per_t = PL
-        if reg_Vpair or reg_Vorth:
-            # Bound the slice to the V_pair region (excludes nonlinear bias tail).
-            V_tail = samples[:, self.n_anns_total
-                             : self.n_anns_total + self.n_U_pair]
-            if self._mix_per_type:
-                # Layers-major, types-inner per layer.
-                _vp_per_layer = self.n_U_pair_per_layer
-                _vp_per_T_block = _vp_per_layer // T
-                _vp_n_per_t = _vp_per_T_block * self._mix_n_layers
-            else:
-                _vp_per_layer = None
-                _vp_per_T_block = None
-                _vp_n_per_t = None
 
         # Add per-type regularization to per-type RMSE → [T+1] fitness values
         fitness_per_type = []
@@ -1642,25 +1501,6 @@ class SNES:
             l1 = self.lambda_1 * tf.reduce_sum(tf.abs(type_params), axis=1) / n_per_type
             l2 = self.lambda_2 * tf.sqrt(
                 tf.reduce_sum(tf.square(type_params), axis=1) / n_per_type)
-            if reg_Vpair and self._mix_per_type:
-                # Slab t routes to label t. With stacked layers, type-t's
-                # slab is the union of (L_k, t) sub-blocks across all N
-                # layers — see compute_regularization() for the layout.
-                if self._mix_n_layers == 1:
-                    slab = V_tail[:, t * _vp_per_T_block
-                                    :(t + 1) * _vp_per_T_block]
-                else:
-                    slab = tf.concat(
-                        [V_tail[:, k * _vp_per_layer + t * _vp_per_T_block
-                                  : k * _vp_per_layer + (t + 1) * _vp_per_T_block]
-                         for k in range(self._mix_n_layers)], axis=1)
-                l1 = l1 + self.lambda_1 * tf.reduce_sum(tf.abs(slab), axis=1) / _vp_n_per_t
-                l2 = l2 + self.lambda_2 * tf.sqrt(
-                    tf.reduce_sum(tf.square(slab), axis=1) / _vp_n_per_t)
-            if reg_Vorth and self._mix_per_type:
-                # Slab t orth penalty routes to label t.
-                orth_t = self._orth_penalty_slab(V_tail, slab_idx=t)
-                l2 = l2 + self._lambda_orth * orth_t
             if reg_gate:
                 # Per-type gating slab: gates[t, :] lives at
                 #   g_tail[:, t·PL : (t+1)·PL]
@@ -1686,14 +1526,6 @@ class SNES:
         global_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed), axis=1) / n_typed_total
         global_l2 = self.lambda_2 * tf.sqrt(
             tf.reduce_sum(tf.square(typed), axis=1) / n_typed_total)
-        if reg_Vpair and not self._mix_per_type:
-            # Shared V_pair routes to the global label (shrinkage).
-            global_l1 = global_l1 + self.lambda_1 * tf.reduce_sum(
-                tf.abs(V_tail), axis=1) / self.n_U_pair
-            global_l2 = global_l2 + self.lambda_2 * tf.sqrt(
-                tf.reduce_sum(tf.square(V_tail), axis=1) / self.n_U_pair)
-        if reg_Vorth and not self._mix_per_type:
-            global_l2 = global_l2 + self._lambda_orth * self._orth_penalty_total(V_tail)
         if reg_gate:
             # Global gating reg: aggregate (g − g_init) penalty across all
             # types/blocks. Normalised by total entries n_gates to match
@@ -2738,8 +2570,7 @@ class SNES:
             # `lambda_adapt_interval` cadence when any λ is in dynamic mode.
             # Between samples the values carry over (history at val gens
             # reads the most recent 100-gen sample).
-            need_adapt = (self._dyn_lambda_1 or self._dyn_lambda_2
-                          or self._dyn_lambda_orth)
+            need_adapt = (self._dyn_lambda_1 or self._dyn_lambda_2)
             adapt_cadence = max(
                 1, int(getattr(cfg, "lambda_adapt_interval", 100)))
             do_adapt_now = need_adapt and (gen % adapt_cadence == 0)
@@ -2865,8 +2696,6 @@ class SNES:
                 line += f"  L1: {gen_l1:.6f}  L2: {gen_l2:.6f}"
                 line += f"  train obj(mse): {avg_fitness:.6f}"
                 line += f"  best_RMSE: {best_rmse:.6f}  best_RRMSE: {best_rrmse:.6f}"
-                if self._mix_reg_mode == "orthogonal":
-                    line += f"  L_orth: {gen_lorth:.6f}"
             sys.stdout.write(line)
             sys.stdout.flush()
 
@@ -3095,17 +2924,14 @@ class SNES:
                       + (Σ_t λ2·sqrt(Σ type_params_t²/n_per_type))/T       (per-type L2)
                       + λ2·sqrt(Σ typed²/n_typed_total)                    (global  L2)
           T == 1: reg = λ1·Σ|ann|/ann_n + λ2·sqrt(Σ ann²/ann_n)
-          (+ V_pair shrinkage tail when reg_Vpair, mirroring compute_regularization)
 
         ``typed`` excludes b1; for target_mode==2 it includes both ANNs' typed
         params (n_typed doubled), exactly as compute_regularization does.
 
-        DELIBERATELY OMITTED: the orthogonal-mixing penalty (l_orth, the third
-        element of compute_regularization's return). It is reported/optimised by
-        SNES as a SEPARATE signal driving an independent dynamic-λ schedule, and
-        replicating ‖UᵀU - I‖² differentiably for Adam here is out of scope. The
-        TNEP CHO dipole fixture has descriptor_mixing=False, so n_U_pair == 0 and
-        l_orth == 0 anyway (and both V_pair paths below are inert).
+        V_pair has no soft-penalty path: cayley / expm own orthogonality
+        structurally, and "off" leaves V_pair to SNES sigma. The third
+        element of compute_regularization's return (l_orth) is always
+        zero in this build, so it's not mirrored here.
 
         Stays fully differentiable w.r.t. mu (pure TF ops, no .numpy(), no
         python branching on tensor values).
@@ -3114,12 +2940,7 @@ class SNES:
             reg : scalar tf.Tensor — L1 + L2 regularisation penalty.
         """
         T = self.cfg.num_types
-        Q = self.dim_q
-        H = self.cfg.num_neurons
         n_per_type = self._n_per_type  # W0_t + b0_t (+ W0_2_t + b0_2_t) + W1_t
-
-        reg_Vpair = (self.n_U_pair > 0 and self._mix_reg_mode == "shrinkage")
-        reg_Vorth = (self.n_U_pair > 0 and self._mix_reg_mode == "orthogonal")
 
         if T > 1:
             # Per-type term: λ1/2 over each type's params, averaged across T.
@@ -3142,33 +2963,12 @@ class SNES:
             l2 = total_l2 / T + self.lambda_2 * tf.sqrt(
                 tf.reduce_sum(tf.square(typed)) / n_typed_total)
         else:
-            # Single-type: reg over ANN params only when V_pair is handled
-            # separately (shrinkage / orthogonal / Cayley), else all of mu.
-            v_handled = reg_Vpair or reg_Vorth or self._mix_cayley
-            ann = mu[:self.n_anns_total] if v_handled else mu
-            ann_n = float(self.n_anns_total if v_handled else self.dim)
+            # Single-type: reg over ANN params only when V_pair is held
+            # by the cayley / expm parameterisation, else all of mu.
+            ann = mu[:self.n_anns_total] if self._mix_cayley else mu
+            ann_n = float(self.n_anns_total if self._mix_cayley else self.dim)
             l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann)) / ann_n
             l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(ann)) / ann_n)
-
-        # V_pair shrinkage tail (mode == "shrinkage"), mirroring
-        # compute_regularization. Differentiable. Inert when n_U_pair == 0.
-        if reg_Vpair:
-            tail = mu[self.n_anns_total:]
-            if self._mix_per_type and T > 1:
-                per_T = self.n_U_pair // T
-                vp_l1 = tf.constant(0.0, tf.float32)
-                vp_l2 = tf.constant(0.0, tf.float32)
-                for t in range(T):
-                    slab = tail[t * per_T:(t + 1) * per_T]
-                    vp_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(slab)) / per_T
-                    vp_l2 += self.lambda_2 * tf.sqrt(
-                        tf.reduce_sum(tf.square(slab)) / per_T)
-                l1 = l1 + vp_l1 / T
-                l2 = l2 + vp_l2 / T
-            else:
-                l1 = l1 + self.lambda_1 * tf.reduce_sum(tf.abs(tail)) / self.n_U_pair
-                l2 = l2 + self.lambda_2 * tf.sqrt(
-                    tf.reduce_sum(tf.square(tail)) / self.n_U_pair)
 
         return l1 + l2
 
@@ -4015,7 +3815,7 @@ class SNES:
                      [n_pairs, L, max_alpha, max_alpha]], axis=0)
                 return tf.reshape(V, out_shape)
 
-            # Non-Cayley (orthogonal regularizer) non-uniform fallback:
+            # Non-cayley/expm ("off" regulariser) non-uniform fallback:
             # no solve/expm to batch, so the Python loop is just reshapes
             # + pads — bounded launch overhead.
             pair_blocks: list = []
@@ -4096,10 +3896,10 @@ class SNES:
                     [leading,
                      [T, n_pairs, L, max_alpha, max_alpha]], axis=0)
                 return tf.reshape(V, final_shape)
-            # Fall back to the per-T list-comp ONLY for the non-Cayley
-            # orthogonal regularizer (no expm to batch). Cayley/expm
-            # paths (uniform-α and non-uniform-α) are handled above with
-            # a single batched expm call across T.
+            # Fall back to the per-T list-comp ONLY for the "off"
+            # regulariser (no solve/expm to batch). Cayley/expm paths
+            # (uniform-α and non-uniform-α) are handled above with a
+            # single batched expm call across T.
             per_t = [_extract_t_block_l_aware(t) for t in range(T)]
             stack_axis = 1 if is_batched else 0
             return tf.stack(per_t, axis=stack_axis)
@@ -4122,9 +3922,6 @@ class SNES:
         T = self.cfg.num_types
         Q = self.dim_q
         H = self.cfg.num_neurons
-
-        reg_Vpair = (self.n_U_pair > 0 and self._mix_reg_mode == "shrinkage")
-        reg_Vorth = (self.n_U_pair > 0 and self._mix_reg_mode == "orthogonal")
 
         if T > 1:
             n_per_type = self._n_per_type  # W0_t + b0_t (+ W0_2_t + b0_2_t) + W1_t
@@ -4149,12 +3946,11 @@ class SNES:
 
             reg = total_l1 / T + global_l1 + total_l2 / T + global_l2
         else:
-            # Single-type path: keep V_pair out of the main sum whenever
-            # it's handled separately (shrinkage, orth, OR Cayley).
-            # Cayley's A entries must NEVER be L1/L2-regularised — that
-            # would pull A → 0 → U → I and collapse the rotation.
-            v_handled = reg_Vpair or reg_Vorth or self._mix_cayley
-            if v_handled:
+            # Single-type path: keep V_pair out of the main sum when
+            # it's held by the cayley / expm parameterisation — those
+            # A entries must NEVER be L1/L2-regularised, since pulling
+            # A → 0 collapses U → I and defeats the rotation map.
+            if self._mix_cayley:
                 ann = param_vectors[:, :self.n_anns_total]
                 ann_n = self.n_anns_total
             else:
@@ -4165,44 +3961,44 @@ class SNES:
                 tf.reduce_sum(tf.square(ann), axis=1) / ann_n)
             reg = l1 + l2
 
-        # V_pair shrinkage path (mode=="shrinkage"). See
-        # compute_regularization() for the rationale.
-        if reg_Vpair:
-            # See compute_regularization() for the layout rationale; same
-            # bounded slice and same layers-major / types-inner unpacking.
-            tail = param_vectors[:, self.n_anns_total
-                                 : self.n_anns_total + self.n_U_pair]
-            if self._mix_per_type and T > 1:
-                per_layer = self.n_U_pair_per_layer
-                per_T_block = per_layer // T
-                vp_l1 = tf.zeros([tf.shape(param_vectors)[0]])
-                vp_l2 = tf.zeros([tf.shape(param_vectors)[0]])
-                for t in range(T):
-                    if self._mix_n_layers == 1:
-                        slab = tail[:, t * per_T_block:(t + 1) * per_T_block]
-                    else:
-                        slab = tf.concat(
-                            [tail[:, k * per_layer + t * per_T_block
-                                   : k * per_layer + (t + 1) * per_T_block]
-                             for k in range(self._mix_n_layers)], axis=1)
-                    n_per_t = per_T_block * self._mix_n_layers
-                    vp_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(slab), axis=1) / n_per_t
-                    vp_l2 += self.lambda_2 * tf.sqrt(
-                        tf.reduce_sum(tf.square(slab), axis=1) / n_per_t)
-                reg = reg + vp_l1 / T + vp_l2 / T
-            else:
-                vp_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(tail), axis=1) / self.n_U_pair
-                vp_l2 = self.lambda_2 * tf.sqrt(
-                    tf.reduce_sum(tf.square(tail), axis=1) / self.n_U_pair)
-                reg = reg + vp_l1 + vp_l2
-
-        # V_pair orthogonal path (mode=="orthogonal"). One scalar
-        # penalty per candidate, summed/averaged over slabs. Uses its
-        # own lambda so it can be dialled independently.
-        if reg_Vorth:
-            tail = param_vectors[:, self.n_anns_total
-                                 : self.n_anns_total + self.n_U_pair]  # [P, n_U_pair]
-            reg = reg + self._lambda_orth * self._orth_penalty_total(tail)
+        # Gating regularisation. Mirrors the per-type gating path in
+        # `_build_per_type_gradients` (the per-type slab block and the
+        # global slab block — search for `g_dev` / `g_floor_sq`) so the
+        # main-fitness reg used at evolution time (this function is
+        # called from `evaluate_population`, see `reg = self.compute_
+        # regularization_tf(samples_tf)`) includes the same penalty as
+        # the per-type-ranking gradient. Without this, enabling
+        # `descriptor_gating_enabled=True` with non-zero gating lambdas
+        # silently leaves the gates unregularised in the canonical
+        # (non per-type-ranking) SNES path.
+        if self.n_gates > 0:
+            lg1 = float(self._lambda_gate_1.numpy())
+            lg2 = float(self._lambda_gate_2.numpy())
+            lgf = float(self._lambda_gate_floor.numpy())
+            if lg1 > 0.0 or lg2 > 0.0 or lgf > 0.0:
+                PL = self._gating_num_pairs * self._gating_L
+                g_start = (self.n_anns_total + self.n_U_pair
+                           + self.n_U_bias_total + self.n_U_cross)
+                g_tail = param_vectors[:, g_start:g_start + self.n_gates]    # [P, T·PL]
+                g_init = float(self._gating_init_value)
+                g_dev = g_tail - g_init                                       # [P, T·PL]
+                # Symmetric in sign — see _build_per_type_gradients for the
+                # rationale on the squared hinge over (floor − |g|).
+                g_floor_slack = tf.nn.relu(
+                    self._gating_floor - tf.abs(g_tail))                      # [P, T·PL]
+                g_floor_sq = tf.square(g_floor_slack)
+                # Per-type slab routes — match _build_per_type_gradients's
+                # `n_per_t = PL` and average over T to match its per-type
+                # accumulation pattern.
+                if lg1 > 0.0:
+                    reg = reg + self._lambda_gate_1 * tf.reduce_sum(
+                        tf.abs(g_dev), axis=1) / (self.n_gates)
+                if lg2 > 0.0:
+                    reg = reg + self._lambda_gate_2 * tf.sqrt(
+                        tf.reduce_sum(tf.square(g_dev), axis=1) / self.n_gates)
+                if lgf > 0.0:
+                    reg = reg + self._lambda_gate_floor * tf.reduce_sum(
+                        g_floor_sq, axis=1) / self.n_gates
 
         return reg
 

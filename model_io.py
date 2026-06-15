@@ -9,13 +9,12 @@ from TNEP import TNEP
 
 
 # Backward-compat: when a saved model predates a config field, the live
-# TNEPconfig class default may be an EXPERIMENTAL value (set for current
-# work) that does not match what the field implicitly was when the model
-# was trained. Loading would then silently change the model's behaviour
-# — e.g. dipole_rij_power's class default is 0 (self-pair-only ablation)
-# but every pre-2026-05-28 model was trained with the |r|^2·F (N=2)
-# construction, so loading one with the class default would evaluate it
-# with the wrong dipole formula.
+# TNEPconfig class default may have been changed since that model was
+# trained. Loading would then silently change the model's behaviour —
+# e.g. dipole_rij_power's class default is 0 (self-pair-only) but every
+# pre-2026-05-28 model was trained with the |r|^2·F (N=2) construction,
+# so loading one with the class default would evaluate it with the
+# wrong dipole formula.
 #
 # Policy: for every field listed here, if the saved config dict has no
 # value for it, override the class default with the value it implicitly

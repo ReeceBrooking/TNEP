@@ -10,60 +10,6 @@ from SNES import SNES
 from TNEPconfig import TNEPconfig
 
 
-# ---------------------------------------------------------------------------
-# Activation registry: name → (canonical key, Glorot gain).
-#
-# Only activations whose backward derivative is plumbed through the dipole /
-# polarisability chain rule below appear here. Adding a new activation
-# requires (a) a Keras-recognised forward, (b) a closed-form derivative
-# branch in `_activation_grad`, and (c) a gain value. Until that's done,
-# unsupported activations fail fast at TNEP construction rather than
-# silently breaking the dipole backward.
-#
-# Glorot gain convention: c_W0 = gain · sqrt(6 / (Q + H)) for uniform init.
-# tanh: gain=1 (current default, established in TNEP). swish/silu: gain=1
-# (similar slope near origin; PyTorch's Xavier doesn't define silu so we
-# pick a conservative value — SNES corrects through σ adaptation anyway).
-_ACTIVATION_REGISTRY: dict[str, tuple[str, float]] = {
-    "tanh":  ("tanh",  1.0),
-    "swish": ("swish", 1.0),
-    "silu":  ("swish", 1.0),     # silu is swish, just different name
-}
-
-
-def _normalize_activation_name(name: str) -> str:
-    """Map a cfg.activation string to the canonical key used by _activation_grad.
-
-    Raises ValueError when the activation is not in the supported registry —
-    not 'unsupported by TF' (most Keras activations work for the forward),
-    but specifically 'backward derivative not plumbed here'. Catches the
-    silent-incorrect-dipole failure mode where someone sets `cfg.activation
-    = 'gelu'` and gets a forward that works but a backward computed as if
-    it were tanh.
-    """
-    key = str(name).lower().strip()
-    if key not in _ACTIVATION_REGISTRY:
-        supported = sorted(set(v[0] for v in _ACTIVATION_REGISTRY.values()))
-        raise ValueError(
-            f"cfg.activation={name!r} not supported in this build. "
-            f"The dipole / polarisability backward uses a hand-coded "
-            f"derivative chain (see TNEP._activation_grad); only activations "
-            f"with an entry in _ACTIVATION_REGISTRY are correct end-to-end. "
-            f"Supported: {supported}.")
-    return _ACTIVATION_REGISTRY[key][0]
-
-
-def _glorot_gain_for(canonical_name: str) -> float:
-    """Per-activation multiplier on the standard sqrt(6/(Q+H)) Glorot bound.
-
-    Applied to c_W0 and c_W1 in SNES._build_mu_init.
-    """
-    for entry in _ACTIVATION_REGISTRY.values():
-        if entry[0] == canonical_name:
-            return float(entry[1])
-    raise ValueError(f"no Glorot gain for {canonical_name!r}")
-
-
 class TNEP(layers.Layer):
     """Per-type single-hidden-layer ANN for predicting energy, dipole, or polarizability.
 
@@ -100,8 +46,7 @@ class TNEP(layers.Layer):
         # mutual-exclusion guards then override cfg.dim_q to the
         # contracted output dim BEFORE allocating W0 and downstream
         # Variables that key off cfg.dim_q. Phase 2 below allocates the
-        # per-type coefficient Variable W_pre_*. See plan doc at
-        # docs/superpowers/plans/2026-06-02-descriptor-preprocess-contraction.md.
+        # per-type coefficient Variable W_pre_*.
         self.descriptor_preprocess_contract = str(getattr(
             cfg, "descriptor_preprocess_contract", "off"))
         if self.descriptor_preprocess_contract not in (
@@ -198,12 +143,14 @@ class TNEP(layers.Layer):
                     if self.num_neurons_layer_2 is not None else None)
         # H_final is the actual input dim of W1.
         self._H_final = self._H2 if self._H2 is not None else cfg.num_neurons
-        # Validate / normalise activation BEFORE resolving the Keras callable.
-        # Unsupported activations fail here (cleaner than a silent
-        # wrong-backward bug at first dipole prediction).
-        self._activation_name = _normalize_activation_name(cfg.activation)
-        self._glorot_gain = _glorot_gain_for(self._activation_name)
-        self.activation = tf.keras.activations.get(self._activation_name)
+        # Resolve the Keras activation callable. Any name supported by
+        # `tf.keras.activations.get` is accepted at construction; the
+        # backward derivative path (`_activation_grad`) will raise
+        # NotImplementedError at first dipole / pol prediction if the
+        # chosen activation isn't plumbed there.
+        self._activation_name = str(cfg.activation).lower().strip()
+        self._glorot_gain = 1.0
+        self.activation = tf.keras.activations.get(cfg.activation)
         self.builder = make_descriptor_builder(cfg)
 
         # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type
@@ -263,9 +210,26 @@ class TNEP(layers.Layer):
 
         # Per-(t, l) ANN heads (only allocated when descriptor_per_l_ann_heads).
         # Each head has its own W0_l[T, Q_l, H], b0_l[T, H], W1_l[T, H], b1_l[1].
-        # Forward output is the sum over heads. See the plan at
-        # docs/superpowers/plans/2026-06-02-per-l-ann-heads.md for rationale.
+        # Forward output is the sum over heads.
         self.per_l_heads = bool(getattr(cfg, "descriptor_per_l_ann_heads", False))
+        if self.per_l_heads and bool(getattr(cfg, "descriptor_mixing", False)):
+            # Mirrors the guard in SNES.__init__ — fail at model construction
+            # instead of later inside the optimiser, so the error fires at
+            # the same place every cfg conflict is reported.
+            raise NotImplementedError(
+                "descriptor_per_l_ann_heads + descriptor_mixing is not "
+                "yet supported. Disable one or the other.")
+        if self.per_l_heads and bool(getattr(
+                cfg, "descriptor_mixing_output_layer", False)):
+            # predict_per_l_batch_candidates does not implement the R-fold
+            # that predict_batch_candidates does for output-side mixing.
+            # Enabling both flags would silently train against an
+            # un-rotated h1, producing incorrect predictions. Until the
+            # R-fold is plumbed through the per-l path, forbid the combo.
+            raise NotImplementedError(
+                "descriptor_per_l_ann_heads + descriptor_mixing_output_layer "
+                "is not yet supported. The per-l prediction path does not "
+                "apply the output-side R rotation. Disable one or the other.")
         if self.per_l_heads:
             from DescriptorBuilderGPU import descriptor_block_layout
             _layout = descriptor_block_layout(cfg)
@@ -348,15 +312,6 @@ class TNEP(layers.Layer):
                     f"1 = |r|·F (first radial moment), "
                     f"2 = |r|²·F (Xu et al. JCTC 2024 default), "
                     f"≥3 = higher radial moments."
-                )
-            if _N == 0:
-                print(
-                    "[EXPERIMENTAL] cfg.dipole_rij_power=0: dipole reduced to "
-                    "the per-atom self-pair sum, μ = -Σ_i de_dq[i] · grad_values[i,i]. "
-                    "Translation invariance forces the neighbour sum to cancel "
-                    "against the self entry, so isolating self gives a non-zero, "
-                    "rotation-covariant prediction. Not directly comparable to "
-                    "N ≥ 1 (different functional form, not just a different weight)."
                 )
 
         # Scalar ANN for polarizability mode (target_mode == 2)
@@ -670,8 +625,17 @@ class TNEP(layers.Layer):
             self.V_cross = tf.Variable(
                 tf.zeros([Q, Q], dtype=tf.float32),
                 trainable=False, name="V_cross")
+            # Precompute the [Q, Q] identity once. `_W0_eff` builds
+            # `U_cross = I + V_cross` on every forward pass and was
+            # calling `tf.eye(cfg.dim_q)` inside the @tf.function-traced
+            # `predict_batch_candidates` hot path each gen; with the
+            # identity static, the matmul `U_full = U_cross · U_full`
+            # avoids one allocation per call.
+            self._eye_Q = tf.constant(
+                np.eye(Q, dtype=np.float32), name="eye_Q")
         else:
             self.V_cross = None
+            self._eye_Q = None
 
         # Optional output-side (hidden-layer) orthogonal mixing R per type.
         # Stored as residual V_R = R − I; SNES populates this each
@@ -801,6 +765,13 @@ class TNEP(layers.Layer):
                 self._nep4_n_max_out = n_max_out
                 self._nep4_alpha_max = alpha_max
                 self._nep4_L = int(_lay["L"])
+                # Precompute the [n_max_out, L] mid-shape constant used
+                # in `_W0_preprocess_eff_nep4` to reshape W0 from
+                # [..., T, n_max_out·L, H] → [..., T, n_max_out, L, H].
+                # Without this the fold creates a fresh tf.constant per
+                # call inside the @tf.function-traced predict_batch path.
+                self._nep4_mid_shape = tf.constant(
+                    [self._nep4_n_max_out, self._nep4_L], dtype=tf.int32)
                 self._nep4_l_of_q = tf.constant(
                     _lay["nep4_l_of_q"], dtype=tf.int32)
                 self._nep4_n_global = tf.constant(
@@ -1195,14 +1166,19 @@ class TNEP(layers.Layer):
         if (self.descriptor_mixing_cross_layer
                 and self.V_cross is not None
                 and V_cross_override is None):
-            U_cross = tf.eye(self.cfg.dim_q, dtype=U_full.dtype) + self.V_cross
+            U_cross = self._eye_Q + self.V_cross
             if U_full.shape.rank == 3 and self.descriptor_mixing_per_type:
                 # Per-type: U_full has shape [..., T, Q, Q]; broadcast cross.
                 U_full = tf.einsum("qp,...tpr->...tqr", U_cross, U_full)
             else:
                 U_full = tf.matmul(U_cross, U_full)
         elif V_cross_override is not None:
-            U_cross = tf.eye(self.cfg.dim_q, dtype=U_full.dtype) + V_cross_override
+            # Override path (candidate eval): _eye_Q may be None if
+            # cross_layer is configured off — fall back to tf.eye on
+            # demand (cold path, rarely taken).
+            _eye = (self._eye_Q if self._eye_Q is not None
+                    else tf.eye(self.cfg.dim_q, dtype=V_cross_override.dtype))
+            U_cross = _eye + V_cross_override
             U_full = tf.matmul(U_cross, U_full)
         if self.descriptor_mixing_per_type:
             W0_eff = tf.einsum('...tqp,...tqh->...tph', U_full, W0)
@@ -1329,10 +1305,12 @@ class TNEP(layers.Layer):
         W0_shape = tf.shape(W0)
         H_ = W0_shape[-1]
         # Build new shape preserving any leading batch (e.g. candidate) axes.
+        # The [n_max_out, L] middle slice is precomputed at __init__ as
+        # `self._nep4_mid_shape` so this concat doesn't allocate a fresh
+        # tf.constant per call in the @tf.function-traced path.
         leading = W0_shape[:-2]
         new_shape = tf.concat(
-            [leading, tf.constant([n_max_out, L_], dtype=W0_shape.dtype),
-             tf.reshape(H_, [1])], axis=0)
+            [leading, self._nep4_mid_shape, tf.reshape(H_, [1])], axis=0)
         W0_NLH = tf.reshape(W0, new_shape)   # [..., T, n_max_out, L, H]
         # Gather along the l axis using l_of_q:
         # W0_at_q[..., t, n'', q, h] = W0_NLH[..., t, n'', l_of_q(q), h]
@@ -1538,8 +1516,8 @@ class TNEP(layers.Layer):
             return sig * (1.0 + z * (1.0 - sig))
         raise NotImplementedError(
             f"_activation_grad: backward not implemented for activation "
-            f"{self._activation_name!r}. Extend _ACTIVATION_REGISTRY and add a "
-            f"branch here.")
+            f"{self._activation_name!r}. Add a branch here, or use 'tanh' "
+            f"or 'swish' / 'silu'.")
 
     def calc_forces(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
                     W0_t: tf.Tensor, neighbor_mask: tf.Tensor,

@@ -86,7 +86,7 @@ class TNEPconfig:
     # (target_mode=1 only). Two algebraic branches:
     #
     #   N = 0   →  μ = − Σ_i de_dq[i] · grad_values[i, i]
-    #             (EXPERIMENTAL — sums ONLY the self-pair (i, i) contributions.
+    #             (Sums ONLY the self-pair (i, i) contributions.
     #             A naive μ = -Σ F_ij over all pairs would be identically
     #             zero by translation invariance of q_i, since
     #             Σ_{all j incl. self} ∂q_i/∂R_j = 0. Restricting the sum
@@ -94,8 +94,7 @@ class TNEPconfig:
     #             equals −Σ_{j≠i} ∂q_i/∂R_j and is non-zero. The result
     #             is rotation-covariant and a valid dipole-like quantity,
     #             but DIFFERENT in functional form from the N ≥ 1 branches —
-    #             not a "lower-power" version of the same formula.
-    #             A runtime warning is printed when this is used.)
+    #             not a "lower-power" version of the same formula.)
     #
     #   N = 1   →  μ = − Σ_{pair} |r_ij|   · F_ij  (first radial moment;
     #             Schofield-style virial-like weight)
@@ -109,8 +108,7 @@ class TNEPconfig:
     # handling needed. The N = 0 branch uses the COO list's self entries
     # exclusively and skips all neighbour pairs.
     #
-    # Default 0 enables the EXPERIMENTAL self-pair-only formulation
-    # (a runtime warning prints on first model construction). For the
+    # Default 0 enables the self-pair-only formulation. For the
     # standard Xu et al. JCTC 2024 / GPUMD-compatible formula, set
     # `dipole_rij_power = 2`; for the GAP-style first radial moment,
     # set it to 1. Models saved with one N MUST be re-trained if N is
@@ -265,6 +263,14 @@ class TNEPconfig:
 
     # Hidden-layer width of the per-type ANN.
     num_neurons: int = 30
+    # Activation function for the hidden layer. Any name accepted by
+    # `tf.keras.activations.get` works for the forward pass. For
+    # dipole / polarisability training (target_mode = 1 or 2), the
+    # backward derivative is hand-coded — only `tanh` and `swish`
+    # (alias `silu`) are fully plumbed. Other activations will raise
+    # NotImplementedError at the first force / dipole prediction.
+    # Energy training (target_mode = 0) doesn't use the hand-coded
+    # backward and works with any Keras activation.
     activation: str = 'tanh'
 
     # When True, insert a learnable per-species-pair linear mixing
@@ -285,15 +291,12 @@ class TNEPconfig:
     # per-central-atom-type: shape [T, num_pairs, max_bs, max_bs]
     # instead of [num_pairs, max_bs, max_bs]. Each central type t
     # gets its own learned set of pair-mixing matrices, applied to
-    # atoms of that type. Captures central-type-specific feature
-    # selection on top of the pair-block decomposition — strictly
-    # more expressive than the shared variant (which is the T=1
-    # case of this). Cost: T× the U_pair param count
-    # (for your typical T=3, that's ~15k extra params on top of
-    # the shared 4.9k — bringing the descriptor-mixing layer to
-    # roughly 2× the size of the per-type ANN). Identity-init per
-    # (t, p) so the model still starts bit-identical to the
-    # mixing-disabled baseline.
+    # atoms of that type. Strictly more expressive than the shared
+    # variant (which is the T=1 case of this) — captures central-
+    # type-specific feature selection on top of the pair-block
+    # decomposition. Cost: T× the U_pair param count. Identity-init
+    # per (t, p) so the model starts bit-identical to the mixing-
+    # disabled baseline regardless of T.
     descriptor_mixing_per_type: bool = False
     # Linear-mixing architecture variant.
     #   "linear"       : one [bs_p × bs_p] matrix per pair. Mixes all
@@ -318,83 +321,63 @@ class TNEPconfig:
     # All three use the same `_W0_eff = (I + V_full)ᵀ · W0` absorption.
     # Only consulted when descriptor_mixing=True.
     descriptor_mixing_arch: str = "l_aware"
-    # Regulariser / parameterisation applied to the V_pair descriptor-
-    # mixing layer.
-    #   "off"        : V_pair is unregularised (default; relies on SNES
-    #                  sigma to bound exploration). Each block has bs²
-    #                  trainable parameters.
-    #   "shrinkage"  : L1+L2 on V_pair using cfg.lambda_1 / lambda_2.
-    #                  Pulls V → 0 ⇔ U → I — strong "no mixing" prior
-    #                  that empirically collapses any learned mixing
-    #                  back to the baseline. Useful for ablations only.
-    #   "orthogonal" : Frobenius penalty ‖UᵀU − I‖²_F per pair block
-    #                  (computed in residual form as ‖V + Vᵀ + VᵀV‖²).
-    #                  Minimum is the *orthogonal group*, not identity —
-    #                  every rotation/reflection of the descriptor basis
-    #                  is at zero penalty. Soft constraint, λ-tuned.
-    #                  Uses cfg.lambda_orth.
-    #   "cayley"     : STRUCTURAL constraint, not a soft penalty. Each
-    #                  block U_p is parameterised as
-    #                      U_p = (I + A_p) (I − A_p)⁻¹
-    #                  with A_p skew-symmetric. U is GUARANTEED to be a
-    #                  rotation (det = +1, all singular values = 1)
-    #                  regardless of A_p. SNES sees only the upper
-    #                  triangle of A_p — bs·(bs−1)/2 free params per
-    #                  block, roughly half the count of the soft
-    #                  variants. Zero λ to tune; the "regularisation"
-    #                  is via the bijection between A's space and the
-    #                  rotation group. Reflections (det = −1) excluded.
+    # Parameterisation applied to each V_pair descriptor-mixing block.
+    # Both non-off modes are STRUCTURAL constraints (not soft penalties):
+    # SNES walks the upper-triangle of a skew-symmetric A and U is
+    # reconstructed from A by a closed-form map. U is exactly orthogonal
+    # regardless of any λ.
+    #   "off"    : V_pair is unregularised. Each block has bs² trainable
+    #              parameters; SNES sigma bounds exploration.
+    #   "cayley" : U = (I − A)(I + A)⁻¹  — rational chord. Cannot
+    #              represent rotations with a −1 eigenvalue except in
+    #              the limit |A| → ∞. bs·(bs−1)/2 free params per block.
+    #   "expm"   : U = exp(A)              — exponential geodesic.
+    #              Surjective onto SO(n); no Jacobian singularity.
+    #              bs·(bs−1)/2 free params per block. RECOMMENDED.
+    # Only consulted when descriptor_mixing=True.
     descriptor_mixing_regularizer: str = "expm"
 
-    # Descriptor preprocessing contraction layer. Sits BEFORE the W0 layer
-    # of the per-type ANN; output becomes the new descriptor input. A
-    # learned per-(centre type, raw channel) scalar coefficient table
-    # contracts the chosen axis of the raw SOAP descriptor down to a
-    # smaller feature vector. NEP-inspired but applied AFTER the SOAP
-    # power-spectrum squaring (vs NEP's pre-squaring projection on the
-    # density coefficients) — strictly less expressive than NEP's c-table
-    # but the same parameter-pattern (per-type, per-pair).
+    # Descriptor preprocessing contraction layer. Sits BEFORE the W0
+    # layer of the per-type ANN; output becomes the new descriptor
+    # input. A learned per-(centre type, raw channel) coefficient
+    # table contracts the chosen axis of the raw SOAP descriptor
+    # down to a smaller feature vector. NEP-inspired but applied
+    # AFTER the SOAP power-spectrum squaring (vs NEP's pre-squaring
+    # projection on the density coefficients).
     #
-    # Modes:
-    #   "off"          : (default) no preprocessing; W0 sees raw Q.
-    #   "angular"      : per-(pair, n_pair), produce TWO output channels —
-    #                    one for l=0 alone (single contributor) and one
-    #                    for l=1..l_max summed. Output dim
-    #                    Q_new = 2 · Σ_pair α_eff_per_pair. Coefficients
-    #                    shape [T, Q_raw] (one scalar per (centre type,
-    #                    raw q); init "mean" → 1.0 for l=0 entries,
-    #                    1/(L-1) for l>0).
-    #   "species_pair" : per-central-type contraction into TWO blocks:
-    #                    SELF (the (t,t) pair) and OTHER (all (t, j ≠ t)
-    #                    pairs summed). Output dim Q_new = 2 · max_α · L.
-    #                    Coefficients shape [T, Q_raw] (per (centre type,
-    #                    raw q); entries whose pair doesn't involve t are
-    #                    silently masked at the fold step).
-    #   "both"         : collapses BOTH axes. Output indexed by (block ∈
-    #                    {self, other}, l_group ∈ {l=0, l>0}, n_pair) for
-    #                    Q_new = 4 · max_α. Smallest Q_new of the four
-    #                    modes; biggest information loss if per-block
-    #                    contraction is too aggressive. "mean" init is
-    #                    per-(t, q_raw) — each of the four (block,
-    #                    l_group) slot types gets its own init magnitude
-    #                    (1.0 for self+l=0, 1/(L-1) for self+l>0,
-    #                    1/(T-1) for other+l=0, 1/((T-1)(L-1)) for
-    #                    other+l>0).
-    #   "nep4_radial"  : NEP4-faithful learned-basis fold. Applies the
-    #                    rank-1 outer-product weighting
-    #                      g[t, n'', l] = Σ_{n,n'} c[t, s(n), n'', k(n)]
-    #                                            · c[t, s(n'), n'', k(n')]
-    #                                            · p[n, n', l]
-    #                    to the SOAP power spectrum, mathematically
-    #                    equivalent to a NEP4 descriptor with the SOAP-
-    #                    turbo radial basis as primitives. Output dim
-    #                    Q_new = n_max_out · L; n_max_out defaults to
-    #                    Q_raw / L so the descriptor dim is PRESERVED
-    #                    (pure non-linear transformation). Coefficients
-    #                    shape [T_centre, T_neighbour, n_max_out, α] —
-    #                    rank-4 tensor; same indexing as NEP4's
+    # Modes (Q_raw = raw SOAP dim, L = l_max+1):
+    #   "off"          : (default) no preprocessing; W0 sees raw Q_raw.
+    #   "angular"      : Contract over l per (pair, n_pair). l < l_keep
+    #                    are kept as passthrough channels; l ≥ l_keep
+    #                    summed into one output channel. Output dim
+    #                    Q_new = (l_keep + 1 if l_keep < L else 0) ·
+    #                    Σ_pair α_eff_per_pair. Coefficients [T, Q_raw].
+    #   "species_pair" : Per-central-type contraction into SELF (the
+    #                    (t,t) pair) vs OTHER (all (t, j ≠ t) pairs
+    #                    summed). Output dim Q_new = 2 · max_α · L.
+    #                    Coefficients [T, Q_raw], pair-masked.
+    #   "both"         : Collapse BOTH axes — combines "angular" and
+    #                    "species_pair". Smallest Q_new; biggest info
+    #                    loss; per-(block, l_group) per-type init.
+    #   "nep4_radial"  : NEP4-faithful learned-basis fold (rank-1
+    #                    outer-product weighting on (n, n')):
+    #                      g[t, n'', l] = Σ_{n,n'} c[t,s(n),n'',k(n)]
+    #                                          · c[t,s(n'),n'',k(n')]
+    #                                          · p[n, n', l]
+    #                    Mathematically equivalent to a NEP4 descriptor
+    #                    with SOAP-turbo's radial basis as primitives.
+    #                    Output dim Q_new = n_max_out · L; n_max_out
+    #                    defaults to Q_raw/L so the descriptor dim is
+    #                    PRESERVED (pure non-linear transformation).
+    #                    Coefficients shape [T_centre, T_neighbour,
+    #                    n_max_out, α] — same indexing as NEP4's
     #                    c^{Z_i,Z_j}_{n'',k}. Requires
     #                    compress_mode='trivial'.
+    #
+    # Mutually exclusive with descriptor_gating_enabled and (for
+    # angular / both modes) descriptor_per_l_ann_heads. l_aware
+    # mixing composes with all preprocess modes; other mixing archs
+    # raise NotImplementedError when preprocess is on.
     descriptor_preprocess_contract: str = "off"
     # NEP4 learned-basis fold output radial-channel count. Only consulted
     # when descriptor_preprocess_contract == "nep4_radial". When None
@@ -470,13 +453,20 @@ class TNEPconfig:
     # Only used when inverse_weight_mode != "none".
     inverse_weight_eps: float = 1e-4
 
+    # Master switch for the L1/L2 regularisation block. When False:
+    # both the per-type fitness path and the main fitness add 0
+    # regularisation regardless of lambda_1 / lambda_2 / per-type
+    # settings. lambda values are still maintained (and reported in
+    # history) so flipping back to True mid-run resumes seamlessly.
+    # Useful for ablation studies and for early "warm-up" generations
+    # where the data fit dominates.
+    toggle_regularization: bool = True
     # L1/L2 regularization strengths.
     #   None  : auto = sqrt(dim * 1e-6 / num_types)
     #   -1.0  : dynamic — adapt every `lambda_adapt_interval` gens so
     #           the L1 (or L2) penalty stays at `lambda_target_ratio`
     #           of the data RMSE. Starts from the auto value.
     #   float : fixed scalar
-    toggle_regularization: bool = True
     lambda_1: float | None = 0.03
     lambda_2: float | None = 0.03
     # Dynamic-λ controls (only used when lambda_1 or lambda_2 == -1).
@@ -499,13 +489,6 @@ class TNEPconfig:
     # Only effective for multi-element systems (auto-disabled for single-element).
     per_type_regularization: bool = True
 
-    # Strength of the orthogonal-mixing regulariser (used when
-    # descriptor_mixing_regularizer == "orthogonal").
-    #   None : auto = sqrt(n_U_pair * 1e-6 / num_types)
-    #   -1   : dynamic adaptation (see SNES._maybe_adapt_lambda)
-    #   float: fixed scalar
-    lambda_orth: float | None = -1
-
     # ═══════════════════════════════════════════════════════════════════
     # 5. SNES OPTIMISER
     # ═══════════════════════════════════════════════════════════════════
@@ -520,25 +503,25 @@ class TNEPconfig:
     # Learning rate for sigma (None = auto from canonical SNES heuristic)
     eta_sigma: float | None = None
     # SNES μ vector initialisation scheme.
-    #   "uniform" : each ANN entry drawn uniform[-1, 1] (GPUMD default;
-    #               see snes.cu line 6709). The biases come in at the
-    #               same scale as the weights, so b0 typically dominates
-    #               the pre-activation in the first generation — this
-    #               relies on SNES exploration to find a sensible
-    #               magnitude over the first ~100 gens.
+    #   "uniform" : each ANN entry drawn uniform[-1, 1] (GPUMD default).
+    #               The biases come in at the same scale as the weights,
+    #               so b0 typically dominates the pre-activation in the
+    #               first generation — this relies on SNES exploration
+    #               to find a sensible magnitude over the first ~100 gens.
     #   "glorot"  : Glorot/Xavier uniform per weight group:
     #                 W0   ~ U(-c_W0, c_W0),  c_W0 = √(6 / (Q + H))
     #                 W1   ~ U(-c_W1, c_W1),  c_W1 = √(6 / (H + 1))
     #                 b0   = 0
     #                 b1   = 0
-    #               Preserves activation variance through tanh; the
-    #               initial forward pass produces well-scaled pre-
-    #               activations regardless of Q / H, so SNES doesn't
-    #               waste generations climbing out of a saturated-tanh
-    #               regime. Identical scheme applied to the
-    #               polarisability ANN's W0_pol / W1_pol when
-    #               target_mode == 2. The V_pair tail (residual mixing
-    #               layer) stays at zero in both schemes.
+    #               Keeps initial pre-activations well-scaled regardless
+    #               of Q / H, so SNES doesn't waste generations climbing
+    #               out of a saturated-activation regime. The same
+    #               scheme is applied to the polarisability ANN's
+    #               W0_pol / W1_pol when target_mode == 2. The V_pair
+    #               tail (residual mixing layer) stays at zero in both
+    #               schemes, so the model is bit-identical to the
+    #               mixing-disabled baseline at gen 0 regardless of the
+    #               chosen scheme.
     mu_init_scheme: str = "glorot"
     # Initial distribution standard deviation
     init_sigma: float = 0.1
