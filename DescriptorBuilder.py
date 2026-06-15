@@ -195,6 +195,70 @@ def _describe_structure_worker_flat(
     return descriptors, grad_values, pair_atom, pair_gidx
 
 
+def _filter_to_self_pairs(
+    descriptors_per_struct: list,
+    gradients_per_struct: list,
+    grad_index_per_struct: list,
+) -> tuple[list, list, list]:
+    """Reduce a full neighbour-gradient bundle to the self-pair entry per atom.
+
+    Used by `DescriptorBuilder.build_descriptors_self_only` (and any caller
+    that wants only ∂q_i/∂r_i, e.g. `dipole_rij_power = 0`). Each per-atom
+    gradient list is searched for the entry whose neighbour index equals
+    the atom's own index; the matched row is kept as a [1, 3, dim_q]
+    tensor, everything else is discarded. Atoms with no self entry
+    (should not happen — every centre lists itself as a neighbour) are
+    filled with a [1, 3, dim_q] zero tensor.
+
+    Args:
+        descriptors_per_struct: list of [N_i, dim_q] tensors (passed
+            through unmodified — descriptors don't depend on the
+            self/neighbour split).
+        gradients_per_struct: list of (list of [M_ij, 3, dim_q] tensors).
+        grad_index_per_struct: list of (list of [M_ij] neighbour indices).
+
+    Returns:
+        Same three-tuple structure but with each per-atom gradient
+        reduced to [1, 3, dim_q] and each grad_index list reduced to
+        a single-element [centre_idx] list.
+    """
+    new_grads = []
+    new_gidx  = []
+    for s, (grads, gidx) in enumerate(
+            zip(gradients_per_struct, grad_index_per_struct)):
+        atom_grads_kept: list = []
+        atom_gidx_kept:  list = []
+        for i, (g_i, idx_i) in enumerate(zip(grads, gidx)):
+            # `idx_i` is a list of neighbour indices for centre atom i.
+            # `g_i` is the matching [len(idx_i), 3, dim_q] tensor.
+            # We want the row where idx_i[k] == i.
+            try:
+                k_self = idx_i.index(i) if isinstance(idx_i, list) \
+                    else int(np.where(np.asarray(idx_i) == i)[0][0])
+            except (ValueError, IndexError):
+                # No explicit self entry — fall back to a zero row so
+                # downstream pad_and_stack / dipole contraction keep
+                # consistent COO shape. (Should be unreachable.)
+                dim_q = (g_i.shape[-1] if hasattr(g_i, "shape")
+                         else descriptors_per_struct[s].shape[-1])
+                atom_grads_kept.append(tf.zeros((1, 3, dim_q),
+                                                 dtype=tf.float32))
+                atom_gidx_kept.append([i])
+                continue
+            # Extract the single self row, materialise as [1, 3, dim_q].
+            if hasattr(g_i, "shape") and len(g_i.shape) == 3:
+                row = g_i[k_self:k_self + 1]
+            else:
+                # Numpy fallback (some worker paths return arrays).
+                row = tf.convert_to_tensor(
+                    np.asarray(g_i)[k_self:k_self + 1], dtype=tf.float32)
+            atom_grads_kept.append(row)
+            atom_gidx_kept.append([i])
+        new_grads.append(atom_grads_kept)
+        new_gidx.append(atom_gidx_kept)
+    return descriptors_per_struct, new_grads, new_gidx
+
+
 class DescriptorBuilder(layers.Layer):
     """Builds SOAP-turbo descriptors and their gradients using quippy.
 
@@ -421,6 +485,72 @@ class DescriptorBuilder(layers.Layer):
                 dataset_grad_index.append(grad_indexes)
 
         return dataset_descriptors, dataset_gradients, dataset_grad_index
+
+    def build_descriptors_self_only(
+        self,
+        dataset: list[Atoms],
+        batch_size: int | None = 100,
+        **build_kwargs,
+    ) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
+        """Batched descriptor build that retains only the self-pair
+        gradient (∂q_i/∂r_i) for each atom — used by the
+        `dipole_rij_power = 0` dipole contraction.
+
+        For each chunk of `batch_size` structures:
+          1. Call the standard `build_descriptors` on the chunk.
+          2. For every atom, filter the per-atom gradient list down to
+             the single entry whose neighbour index equals the centre's
+             own atom index (i.e. j == i).
+          3. Discard the chunk's full neighbour-gradient tensors so the
+             ~90% of the COO footprint that the N=0 forward never reads
+             never has to live in memory beyond one chunk.
+          4. Append the filtered per-structure data to the running result.
+
+        The output shape matches `build_descriptors`: each per-atom
+        gradient is a `[1, 3, dim_q]` tensor (the self-pair row only),
+        and `grad_index[i] == [i]`. Downstream `assemble_data_dict` /
+        `pad_and_stack` flatten this into a COO with `P = N_atoms_total`
+        rows (one self-pair per real atom) instead of `~15·N_atoms`.
+
+        Args:
+            dataset: list of ase.Atoms to process.
+            batch_size: structures per build chunk. `None` falls back to
+                the unbatched build (peak memory unchanged from
+                `build_descriptors`; only the self-pair filter applies).
+            **build_kwargs: forwarded verbatim to `build_descriptors`
+                (e.g. `progress_desc`).
+
+        Returns:
+            Same triple as `build_descriptors` — but every gradient list
+            has exactly one self-pair entry per atom.
+        """
+        if batch_size is None or batch_size >= len(dataset):
+            # Single-shot path — still filters, just doesn't chunk.
+            descs, grads, gidx = self.build_descriptors(dataset, **build_kwargs)
+            return _filter_to_self_pairs(descs, grads, gidx)
+
+        out_descs: list = []
+        out_grads: list = []
+        out_gidx:  list = []
+        n = len(dataset)
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            chunk = dataset[start:end]
+            # Build the full chunk (descriptors + ALL neighbour gradients).
+            chunk_descs, chunk_grads, chunk_gidx = self.build_descriptors(
+                chunk, **build_kwargs)
+            # Filter immediately to self-pair only.
+            filtered_descs, filtered_grads, filtered_gidx = _filter_to_self_pairs(
+                chunk_descs, chunk_grads, chunk_gidx)
+            out_descs.extend(filtered_descs)
+            out_grads.extend(filtered_grads)
+            out_gidx.extend(filtered_gidx)
+            # Explicitly drop chunk references so the neighbour-gradient
+            # tensors (which dominate the chunk's footprint) are eligible
+            # for GC before the next chunk's build allocates fresh memory.
+            del chunk_descs, chunk_grads, chunk_gidx
+            del filtered_descs, filtered_grads, filtered_gidx
+        return out_descs, out_grads, out_gidx
 
     def build_descriptors_flat(
         self,
