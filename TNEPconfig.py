@@ -346,6 +346,95 @@ class TNEPconfig:
     #                  rotation group. Reflections (det = −1) excluded.
     descriptor_mixing_regularizer: str = "expm"
 
+    # Descriptor preprocessing contraction layer. Sits BEFORE the W0 layer
+    # of the per-type ANN; output becomes the new descriptor input. A
+    # learned per-(centre type, raw channel) scalar coefficient table
+    # contracts the chosen axis of the raw SOAP descriptor down to a
+    # smaller feature vector. NEP-inspired but applied AFTER the SOAP
+    # power-spectrum squaring (vs NEP's pre-squaring projection on the
+    # density coefficients) — strictly less expressive than NEP's c-table
+    # but the same parameter-pattern (per-type, per-pair).
+    #
+    # Modes:
+    #   "off"          : (default) no preprocessing; W0 sees raw Q.
+    #   "angular"      : per-(pair, n_pair), produce TWO output channels —
+    #                    one for l=0 alone (single contributor) and one
+    #                    for l=1..l_max summed. Output dim
+    #                    Q_new = 2 · Σ_pair α_eff_per_pair. Coefficients
+    #                    shape [T, Q_raw] (one scalar per (centre type,
+    #                    raw q); init "mean" → 1.0 for l=0 entries,
+    #                    1/(L-1) for l>0).
+    #   "species_pair" : per-central-type contraction into TWO blocks:
+    #                    SELF (the (t,t) pair) and OTHER (all (t, j ≠ t)
+    #                    pairs summed). Output dim Q_new = 2 · max_α · L.
+    #                    Coefficients shape [T, Q_raw] (per (centre type,
+    #                    raw q); entries whose pair doesn't involve t are
+    #                    silently masked at the fold step).
+    #   "both"         : collapses BOTH axes. Output indexed by (block ∈
+    #                    {self, other}, l_group ∈ {l=0, l>0}, n_pair) for
+    #                    Q_new = 4 · max_α. Smallest Q_new of the four
+    #                    modes; biggest information loss if per-block
+    #                    contraction is too aggressive. "mean" init is
+    #                    per-(t, q_raw) — each of the four (block,
+    #                    l_group) slot types gets its own init magnitude
+    #                    (1.0 for self+l=0, 1/(L-1) for self+l>0,
+    #                    1/(T-1) for other+l=0, 1/((T-1)(L-1)) for
+    #                    other+l>0).
+    #   "nep4_radial"  : NEP4-faithful learned-basis fold. Applies the
+    #                    rank-1 outer-product weighting
+    #                      g[t, n'', l] = Σ_{n,n'} c[t, s(n), n'', k(n)]
+    #                                            · c[t, s(n'), n'', k(n')]
+    #                                            · p[n, n', l]
+    #                    to the SOAP power spectrum, mathematically
+    #                    equivalent to a NEP4 descriptor with the SOAP-
+    #                    turbo radial basis as primitives. Output dim
+    #                    Q_new = n_max_out · L; n_max_out defaults to
+    #                    Q_raw / L so the descriptor dim is PRESERVED
+    #                    (pure non-linear transformation). Coefficients
+    #                    shape [T_centre, T_neighbour, n_max_out, α] —
+    #                    rank-4 tensor; same indexing as NEP4's
+    #                    c^{Z_i,Z_j}_{n'',k}. Requires
+    #                    compress_mode='trivial'.
+    descriptor_preprocess_contract: str = "off"
+    # NEP4 learned-basis fold output radial-channel count. Only consulted
+    # when descriptor_preprocess_contract == "nep4_radial". When None
+    # (default), the layout auto-picks n_max_out = Q_raw / L so that
+    # Q_new = Q_raw (descriptor dim is preserved — pure non-linear
+    # transformation). Set explicitly to reduce / expand the descriptor
+    # — small values (≈ α or 2α) match NEP4's typical "compact learned
+    # basis" setting and give the strongest inductive bias.
+    descriptor_nep4_n_max_out: int | None = None
+    # Initialisation for preprocess coefficients:
+    #   "mean"   : (default) 1/N where N is the contracted-axis size.
+    #              For angular mode N = l_max+1, so each coefficient is
+    #              1/(l_max+1); gen-0 output ≈ mean across l per channel.
+    #              Output magnitude similar to inputs — well conditioned.
+    #   "sum"    : 1.0. Gen-0 output = sum across the contracted axis.
+    #              Output magnitude grows with N; W0 has to re-scale.
+    #   "glorot" : Glorot-uniform: U(-√(6/(fan_in+fan_out)), +√(...)).
+    descriptor_preprocess_init: str = "mean"
+    # Per-tail σ scaling for preprocess coefficients (analogous to
+    # mixing_sigma_scale). Default 1.0 = same as the ANN. Reduce
+    # (e.g. 0.1) if SNES sampling noise on preprocess coefficients
+    # overwhelms the optimisation signal.
+    preprocess_sigma_scale: float = 1.0
+    # Angular contraction threshold: l < angular_l_keep are kept as
+    # passthrough output channels (no learnable coefficient — the
+    # descriptor channel goes straight to its own W0 row). l ≥
+    # angular_l_keep are summed into ONE output channel per
+    # (pair, n_pair) with L − angular_l_keep learnable coefficients.
+    # Default 1 reproduces the original behaviour (l=0 kept, l>0 summed).
+    # Only consulted in modes that collapse the l axis ("angular", "both").
+    descriptor_preprocess_angular_l_keep: int = 1
+    # When True (default), W_pre coefficients are per central-atom type
+    # (shape [T, n_summed_q_raw, N]). When False, coefficients are
+    # GLOBAL across centre types — symmetric coupling, smallest param count.
+    descriptor_preprocess_per_type: bool = True
+    # L1/L2 regularisation strengths on (coefficient − init). Penalises
+    # deviation from the mean/sum/glorot init. Both default 0.0 (no penalty).
+    descriptor_preprocess_lambda_1: float = 0.0
+    descriptor_preprocess_lambda_2: float = 0.0
+
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION
     # ═══════════════════════════════════════════════════════════════════

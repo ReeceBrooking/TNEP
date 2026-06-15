@@ -206,6 +206,364 @@ def train_model(cfg: TNEPconfig | None = None,
             cfg._gradient_cache_path = None
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# A/B testing pipeline
+# ═══════════════════════════════════════════════════════════════════════
+
+# Config fields the A/B variant FORBIDS in per-arm overrides. These determine
+# the shared data/descriptor/architecture pipeline that runs once for both
+# arms; changing any of them between arms would invalidate the shared
+# descriptors/grad_values or change the model shape, so they MUST be set
+# identically in the base cfg.
+_AB_SHARED_FIELDS: frozenset[str] = frozenset({
+    # Dataset / split / seed
+    "data_path", "test_data_path", "allowed_species", "filter_mode",
+    "filter_bad_data", "test_ratio", "total_N", "seed",
+    # Targets / units (affect descriptor build and pad_and_stack)
+    "target_mode", "target_key", "scale_targets", "dipole_units",
+    "convert_dipole_to_eangstrom", "dipole_rij_power", "skip_h_centers",
+    # SOAP descriptor geometry
+    "l_max", "alpha_max", "rcut_hard", "rcut_soft", "basis",
+    "compress_mode", "atom_sigma_r", "atom_sigma_t",
+    "atom_sigma_r_scaling", "atom_sigma_t_scaling", "central_weight",
+    "amplitude_scaling", "scaling_mode", "radial_enhancement",
+    "descriptor_mode", "descriptor_precision",
+    # Descriptor preprocessing
+    "descriptor_scaling", "q_scaler_granularity", "target_centering",
+    # Model architecture (shapes the parameter vector)
+    "num_neurons", "activation", "descriptor_mixing",
+    "descriptor_mixing_arch", "descriptor_mixing_per_type",
+    # Loop budget and validation cadence (must be lockstep)
+    "num_generations", "val_interval", "val_size",
+    # Population sampling (same μ-step structure → shared mirrored noise scheme)
+    "pop_size", "init_sigma",
+})
+
+
+def train_model_ab(
+    base_cfg: TNEPconfig,
+    overrides_a: dict,
+    overrides_b: dict,
+    *,
+    label_a: str = "A",
+    label_b: str = "B",
+) -> tuple[TNEP, TNEP]:
+    """Run two optimizer configurations in lockstep on the SAME dataset.
+
+    Shared (taken from `base_cfg`, fixed across both arms):
+      - Data / split / seed
+      - SOAP descriptor geometry + preprocessing
+      - Target units / construction
+      - Model architecture (so μ is the same shape; sampling RNG matches)
+      - num_generations / val_interval / val_size / pop_size / init_sigma
+
+    Variable (specified independently in `overrides_a` and `overrides_b`):
+      - Anything NOT in `_AB_SHARED_FIELDS` — most commonly the optimiser
+        flags: `snes_active_utilities`, `snes_cov_mode`, `snes_mean_optimizer`,
+        `snes_sigma_cumulation`, etc.
+
+    Each arm gets the SAME train/val/test descriptors and grad_values
+    (built ONCE), the SAME seed (so RNG draws are identical for the
+    sampling-pre-rank phase), and the SAME validation set. They differ
+    only in the per-arm optimiser-side cfg. Progress bar shows both
+    arms' train/val RMSE per val tick plus the per-arm σ stats plus a
+    Δ column (B − A).
+
+    Args:
+        base_cfg     : TNEPconfig — fields in `_AB_SHARED_FIELDS` are
+                       used as-is. All other fields are overwritten by
+                       per-arm overrides; if absent from BOTH overrides
+                       the base value applies to both.
+        overrides_a  : dict — per-arm cfg overrides for arm A. Must NOT
+                       touch any field in `_AB_SHARED_FIELDS`.
+        overrides_b  : dict — same for arm B.
+        label_a, _b  : short tags shown on the progress bar / save dirs.
+
+    Returns:
+        (best_val_model_a, best_val_model_b)
+    """
+    # --- Validate overrides ---
+    valid_keys = set(getattr(TNEPconfig, "__annotations__", {}).keys())
+    for arm_name, ovr in (("overrides_a", overrides_a), ("overrides_b", overrides_b)):
+        unknown = set(ovr) - valid_keys
+        if unknown:
+            raise ValueError(f"{arm_name} has unknown TNEPconfig field(s): "
+                             f"{sorted(unknown)}")
+        forbidden = set(ovr) & _AB_SHARED_FIELDS
+        if forbidden:
+            raise ValueError(
+                f"{arm_name} overrides shared field(s) that determine the "
+                f"data/architecture pipeline: {sorted(forbidden)}. "
+                f"Set these on `base_cfg` instead — they must match between arms.")
+
+    # --- Build cfgs for each arm (start from base, apply overrides) ---
+    import copy as _copy
+    cfg_a = _copy.deepcopy(base_cfg)
+    cfg_b = _copy.deepcopy(base_cfg)
+    for k, v in overrides_a.items():
+        setattr(cfg_a, k, v)
+    for k, v in overrides_b.items():
+        setattr(cfg_b, k, v)
+    # Drop disk caches in BOTH arms — they'd race for the same scratch dir.
+    cfg_a.cache_gradients_to_disk = False
+    cfg_b.cache_gradients_to_disk = False
+    cfg_a._gradient_cache_path = None
+    cfg_b._gradient_cache_path = None
+
+    # --- Shared data prep: build descriptors + grad_values ONCE ---
+    # We do it on cfg_a (data + descriptor fields are identical across the
+    # two cfgs by construction — see _AB_SHARED_FIELDS).
+    print(f"\n=== A/B run: {label_a} vs {label_b} ===")
+    print(f"  shared base cfg → building data + descriptors once")
+    dataset, dataset_types_int = collect(cfg_a)
+    cfg_a.type_map = {z: idx for idx, z in enumerate(cfg_a.types)}
+    cfg_b.type_map = dict(cfg_a.type_map)
+    cfg_b.types = list(cfg_a.types)
+    cfg_b.num_types = cfg_a.num_types
+    if cfg_a.target_mode == 1:
+        print_dipole_statistics(dataset, cfg_a, target_key=_resolve_target_key(cfg_a))
+
+    # Resolve shared seed (both arms use the same value)
+    if cfg_a.seed is None:
+        cfg_a.seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
+        print(f"  cfg.seed was None — generated shared seed: {cfg_a.seed}")
+    cfg_b.seed = cfg_a.seed
+
+    cfg_a.randomise(dataset)
+    cfg_b.indices = cfg_a.indices   # share train/val split exactly
+    train_data, test_pending, val_data = split(dataset, dataset_types_int, cfg_a)
+
+    from DescriptorBuilderGPU import compute_dim_q
+    cfg_a.dim_q = compute_dim_q(cfg_a)
+    cfg_b.dim_q = cfg_a.dim_q
+
+    _self_only = (cfg_a.target_mode == 1
+                  and int(getattr(cfg_a, "dipole_rij_power", 2)) == 0)
+    train_data = pad_and_stack(
+        train_data, num_types=cfg_a.num_types,
+        pin_to_cpu=cfg_a.pin_data_to_cpu,
+        q_scaler=getattr(cfg_a, "_q_scaler", None),
+        q_zca_mean=getattr(cfg_a, "_q_zca_mean", None),
+        target_mean=getattr(cfg_a, "_target_mean", None),
+        self_pairs_only=_self_only)
+    val_data = pad_and_stack(
+        val_data, num_types=cfg_a.num_types,
+        pin_to_cpu=cfg_a.pin_data_to_cpu,
+        q_scaler=getattr(cfg_a, "_q_scaler", None),
+        q_zca_mean=getattr(cfg_a, "_q_zca_mean", None),
+        target_mean=getattr(cfg_a, "_target_mean", None),
+        self_pairs_only=_self_only)
+
+    # --- Build two models — separate run directories ---
+    if cfg_a.save_path is not None:
+        # Use a parent ab/ directory with per-arm sub-directories.
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        parent = os.path.join("models", f"ab_{label_a}_vs_{label_b}_{timestamp}")
+        os.makedirs(parent, exist_ok=True)
+        for cfg_arm, lab in ((cfg_a, label_a), (cfg_b, label_b)):
+            arm_dir = os.path.join(parent, lab)
+            os.makedirs(os.path.join(arm_dir, "plots"), exist_ok=True)
+            cfg_arm.save_path = os.path.join(arm_dir, "auto")
+            cfg_arm.save_plots = os.path.join(arm_dir, "plots")
+        print(f"  output → {parent}/{{{label_a},{label_b}}}/")
+
+    model_a = TNEP(cfg_a)
+    model_b = TNEP(cfg_b)
+    print(f"  {label_a}: dim={model_a.optimizer.dim} "
+          f"pop={model_a.optimizer.pop_size}")
+    print(f"  {label_b}: dim={model_b.optimizer.dim} "
+          f"pop={model_b.optimizer.pop_size}")
+    if model_a.optimizer.dim != model_b.optimizer.dim:
+        raise RuntimeError(
+            f"Architecture mismatch: {label_a} dim={model_a.optimizer.dim} "
+            f"vs {label_b} dim={model_b.optimizer.dim}. Make sure overrides "
+            f"don't touch architecture fields (see _AB_SHARED_FIELDS).")
+
+    # --- Custom interleaved training loop ---
+    history_a, history_b, final_a, final_b, best_a, best_b = _run_ab_fit(
+        model_a, model_b, train_data, val_data, label_a, label_b)
+
+    # --- Score + save both arms ---
+    test_data = materialize_test_data(test_pending, cfg_a,
+                                       num_types=cfg_a.num_types,
+                                       pin_to_cpu=cfg_a.pin_data_to_cpu)
+    for arm_label, arm_model, arm_history in (
+            (label_a, best_a, history_a), (label_b, best_b, history_b)):
+        m, _ = arm_model.score(test_data)
+        print_score_summary(m, arm_model.cfg, prefix=f"[{arm_label}] best-val test set")
+        if arm_model.cfg.save_path is not None:
+            save_model(arm_model, arm_model.cfg, arm_model.cfg.save_path, label="best_val")
+            save_history(arm_history, arm_model.cfg)
+            plot_snes_history(arm_history, arm_model.cfg, arm_model.cfg.save_plots, arm_model.cfg.show_plots)
+            plot_log_val_fitness(arm_history, arm_model.cfg, arm_model.cfg.save_plots, arm_model.cfg.show_plots)
+            plot_sigma_history(arm_history, arm_model.cfg, arm_model.cfg.save_plots, arm_model.cfg.show_plots)
+
+    # --- A/B summary ---
+    final_best_a = float(np.min(history_a["val_loss"])) if history_a["val_loss"] else float("nan")
+    final_best_b = float(np.min(history_b["val_loss"])) if history_b["val_loss"] else float("nan")
+    print(f"\n=== A/B summary ===")
+    print(f"  {label_a}: best val_RMSE = {final_best_a:.6e}")
+    print(f"  {label_b}: best val_RMSE = {final_best_b:.6e}")
+    delta = final_best_b - final_best_a
+    pct = (delta / final_best_a * 100.0) if final_best_a > 0 else 0.0
+    print(f"  Δ (B − A) = {delta:+.6e}  ({pct:+.2f}%)")
+    if abs(pct) < 0.5:
+        print(f"  → arms statistically indistinguishable at this granularity")
+    elif delta < 0:
+        print(f"  → {label_b} wins by {-pct:.2f}%")
+    else:
+        print(f"  → {label_a} wins by {pct:.2f}%")
+    return best_a, best_b
+
+
+def _run_ab_fit(
+    model_a: TNEP, model_b: TNEP,
+    train_data: dict, val_data: dict,
+    label_a: str, label_b: str,
+):
+    """Interleaved per-generation training of two TNEPs sharing the same data.
+
+    Mirrors the core mechanics of SNES.fit() — ask, evaluate (per-type or
+    global), rank, update, validate — but runs both optimisers in lockstep
+    inside one Python loop so we can:
+      1. share the training/val tensors (built once, by the caller);
+      2. print a single combined progress bar with both arms' stats + Δ;
+      3. keep their RNG streams independent (each has its own tf_rng
+         generator seeded from cfg.seed).
+
+    Intentionally simplified vs SNES.fit():
+      - No plateau-driven σ reset.
+      - No checkpointing — A/B is a comparison utility, not a long-running
+        production run. Use train_model() for production resumability.
+    """
+    import time, sys
+    cfg_a = model_a.cfg
+    cfg_b = model_b.cfg
+    snes_a = model_a.optimizer
+    snes_b = model_b.optimizer
+
+    def _init_history():
+        return {
+            "generation": [], "train_loss": [], "train_rmse": [], "val_loss": [],
+            "best_rmse": [], "worst_rmse": [],
+            "sigma_min": [], "sigma_max": [], "sigma_mean": [], "sigma_median": [],
+            "L1": [], "L2": [], "best_rrmse": [], "avg_rrmse": [],
+            "timing": {"sample_batch": [], "evaluate": [], "rank_update": [],
+                       "validate": [], "overhead": []},
+        }
+    history_a = _init_history()
+    history_b = _init_history()
+
+    num_gen = int(cfg_a.num_generations)
+    val_interval = int(cfg_a.val_interval)
+    best_val_a, best_val_b = float("inf"), float("inf")
+    best_mu_a = tf.identity(snes_a.mu)
+    best_mu_b = tf.identity(snes_b.mu)
+
+    train_start = time.perf_counter()
+    print(f"\n  ── A/B training: {num_gen} gens, val every {val_interval} ──")
+
+    def _one_gen(snes, batch_data) -> tuple[float, float, np.ndarray]:
+        """One SNES generation for a single arm. Returns (avg_fitness,
+        best_rmse, fitness_per_cand). Mirrors SNES.fit's SNES branch."""
+        samples, aux = snes.ask()
+        if snes._per_type:
+            fitness_per_type_rmse = snes.evaluate_population(
+                samples, batch_data, return_per_type=True)
+            fitness = fitness_per_type_rmse[:, -1]
+        else:
+            fitness = snes.evaluate_population(samples, batch_data)
+            fitness_per_type_rmse = None
+        rmse_pc = snes._last_rmse_per_cand
+        avg_f = float(tf.reduce_mean(fitness).numpy())
+        best_f = float(tf.reduce_min(rmse_pc).numpy())
+        if snes._per_type:
+            s_iso_sorted = snes._build_per_type_gradients(
+                aux["s_iso"], fitness_per_type_rmse, samples)
+            delta_sorted = snes._build_per_type_gradients(
+                aux["delta"], fitness_per_type_rmse, samples)
+        else:
+            ranks = tf.argsort(fitness)
+            s_iso_sorted = tf.gather(aux["s_iso"], ranks)
+            delta_sorted = tf.gather(aux["delta"], ranks)
+        global_ranks = tf.argsort(fitness)
+        s_eff_global = tf.gather(aux["delta"], global_ranks) / snes.sigma
+        update_aux = {"s_iso": s_iso_sorted, "delta": delta_sorted,
+                      "s_eff_global": s_eff_global}
+        if "y" in aux:
+            update_aux["y_global"] = tf.gather(aux["y"], global_ranks)
+            update_aux["s_iso_global"] = tf.gather(aux["s_iso"], global_ranks)
+        snes.update(snes.utilities, update_aux)
+        return avg_f, best_f, fitness.numpy()
+
+    for gen in range(num_gen):
+        avg_a, best_rmse_a, _ = _one_gen(snes_a, train_data)
+        avg_b, best_rmse_b, _ = _one_gen(snes_b, train_data)
+
+        do_val = (gen % val_interval == 0) or (gen == num_gen - 1)
+        if do_val:
+            val_a = float(snes_a.validate(val_data, snes_a.mu))
+            val_b = float(snes_b.validate(val_data, snes_b.mu))
+            train_a = float(snes_a.validate(train_data, snes_a.mu))
+            train_b = float(snes_b.validate(train_data, snes_b.mu))
+            if val_a < best_val_a:
+                best_val_a = val_a
+                best_mu_a = tf.identity(snes_a.mu)
+            if val_b < best_val_b:
+                best_val_b = val_b
+                best_mu_b = tf.identity(snes_b.mu)
+            for hist, lab, train_l, val_l, best_v, snes in (
+                    (history_a, label_a, train_a, val_a, best_val_a, snes_a),
+                    (history_b, label_b, train_b, val_b, best_val_b, snes_b)):
+                sig = snes.sigma.numpy()
+                hist["generation"].append(gen)
+                hist["train_loss"].append(train_l)
+                hist["train_rmse"].append(train_l)
+                hist["val_loss"].append(val_l)
+                hist["best_rmse"].append(best_rmse_a if lab == label_a else best_rmse_b)
+                hist["worst_rmse"].append(0.0)
+                hist["sigma_min"].append(float(sig.min()))
+                hist["sigma_max"].append(float(sig.max()))
+                hist["sigma_mean"].append(float(sig.mean()))
+                hist["sigma_median"].append(float(np.median(sig)))
+                hist["L1"].append(0.0); hist["L2"].append(0.0)
+                hist["best_rrmse"].append(0.0); hist["avg_rrmse"].append(0.0)
+                for k in hist["timing"]:
+                    hist["timing"][k].append(0.0)
+
+            elapsed = time.perf_counter() - train_start
+            eta_s = (elapsed / max(gen + 1, 1)) * (num_gen - gen - 1)
+            d_train = train_b - train_a
+            d_val = val_b - val_a
+            d_best = best_val_b - best_val_a
+            sigma_a_max = float(snes_a.sigma.numpy().max())
+            sigma_b_max = float(snes_b.sigma.numpy().max())
+            # Single compact line; \r-rewriting style like SNES.fit
+            line = (
+                f"\r{gen+1:>6}/{num_gen}  "
+                f"[{label_a}] tr={train_a:.4e} v={val_a:.4e} bv={best_val_a:.4e} σmax={sigma_a_max:.2e}  "
+                f"[{label_b}] tr={train_b:.4e} v={val_b:.4e} bv={best_val_b:.4e} σmax={sigma_b_max:.2e}  "
+                f"Δv={d_val:+.3e} Δbv={d_best:+.3e}  "
+                f"⏱ {int(elapsed//60):02d}:{int(elapsed%60):02d} "
+                f"ETA {int(eta_s//60):02d}:{int(eta_s%60):02d}"
+            )
+            sys.stdout.write(line[:240])   # truncate if narrower terminal
+            sys.stdout.flush()
+            if (gen + 1) % (val_interval * 100) == 0:
+                sys.stdout.write("\n")   # periodic line-flush so log files stay readable
+
+    sys.stdout.write("\n")
+
+    # Build final and best-val models for each arm
+    from SNES import _set_model_params
+    final_a = TNEP(cfg_a); _set_model_params(final_a, *snes_a.reconstruct_params_tf(snes_a.mu))
+    best_a  = TNEP(cfg_a); _set_model_params(best_a,  *snes_a.reconstruct_params_tf(best_mu_a))
+    final_b = TNEP(cfg_b); _set_model_params(final_b, *snes_b.reconstruct_params_tf(snes_b.mu))
+    best_b  = TNEP(cfg_b); _set_model_params(best_b,  *snes_b.reconstruct_params_tf(best_mu_b))
+    return history_a, history_b, final_a, final_b, best_a, best_b
+
+
 def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
                    suffix_per_atom: str, suffix_total: str,
                    save_dir: str | None = None,
@@ -380,6 +738,67 @@ def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> No
                   f"{pool.nbytes/1e6:.0f} MB) attached to {tag}_data")
 
 
+def _print_param_breakdown(model) -> None:
+    """Print a per-layer breakdown of the SNES parameter budget.
+
+    Pulls the cached per-component counts from `model.optimizer` and
+    prints a table of (component → count → % of total). Polarisability
+    mirrors the primary ANN when target_mode == 2 (n_anns_total =
+    2 · n_primary).
+    """
+    opt = model.optimizer
+    cfg = model.cfg
+    total = int(opt.dim)
+    if total <= 0:
+        return
+
+    rows: list[tuple[str, int]] = []
+
+    # Primary ANN — per-layer breakdown.
+    rows.append(("ANN  W0  [T·Q·H]",        int(opt._n_W0)))
+    rows.append(("ANN  b0  [T·H]",          int(opt._n_b0)))
+    if int(opt._n_W0_2) > 0:
+        rows.append(("ANN  W0_2 [T·H·H2]",  int(opt._n_W0_2)))
+        rows.append(("ANN  b0_2 [T·H2]",    int(opt._n_b0_2)))
+    rows.append(("ANN  W1  [T·H_final]",    int(opt._n_W1)))
+    rows.append(("ANN  b1",                 int(opt._n_b1)))
+
+    # Polarisability ANN — same per-layer shape, mirrored doubling.
+    if cfg.target_mode == 2:
+        rows.append(("ANN_pol  W0  [T·Q·H]",     int(opt._n_W0)))
+        rows.append(("ANN_pol  b0  [T·H]",       int(opt._n_b0)))
+        if int(opt._n_W0_2) > 0:
+            rows.append(("ANN_pol  W0_2 [T·H·H2]", int(opt._n_W0_2)))
+            rows.append(("ANN_pol  b0_2 [T·H2]",   int(opt._n_b0_2)))
+        rows.append(("ANN_pol  W1  [T·H_final]",  int(opt._n_W1)))
+        rows.append(("ANN_pol  b1",               int(opt._n_b1)))
+
+    # Optional add-ons.
+    if int(opt.n_U_pair) > 0:
+        rows.append(("input-side mixing  U_pair", int(opt.n_U_pair)))
+    if int(opt.n_U_bias_total) > 0:
+        rows.append(("mixing biases  b_mix",     int(opt.n_U_bias_total)))
+    if int(opt.n_U_cross) > 0:
+        rows.append(("cross-channel mixing  V_cross", int(opt.n_U_cross)))
+    if int(opt.n_gates) > 0:
+        rows.append(("gating  g[T·P·L]",         int(opt.n_gates)))
+    if int(opt.n_preprocess) > 0:
+        rows.append(("preprocess  W_pre (summed only)", int(opt.n_preprocess)))
+    if int(opt.n_R_pair) > 0:
+        rows.append(("output-side mixing  R_pair", int(opt.n_R_pair)))
+
+    accounted = sum(n for _, n in rows)
+    if accounted != total:
+        rows.append(("other / overhead", total - accounted))
+
+    label_w = max(len(lbl) for lbl, _ in rows)
+    print("Parameter breakdown:")
+    for label, n in rows:
+        pct = 100.0 * n / total
+        print(f"  {label.ljust(label_w)}  {n:>8d}  ({pct:5.1f}%)")
+    print(f"  {'TOTAL'.ljust(label_w)}  {total:>8d}")
+
+
 def _train_model_inner(cfg: TNEPconfig,
                         resume_state: dict | None = None,
                         extract_model: bool = False) -> TNEP:
@@ -477,21 +896,58 @@ def _train_model_inner(cfg: TNEPconfig,
                 layout = descriptor_block_layout(cfg)
                 cfg._q_scaler = _compute_q_scaler_l_block(
                     train_data["descriptors"], layout)
+            elif granularity == "l_block_zca":
+                # ZCA whitening per (pair, l) block. Produces a [Q, Q]
+                # block-diagonal matrix instead of a [Q] vector; the
+                # _apply_q_scaler_np path dispatches on ndim and applies
+                # q' = W · (q − μ_q), with the per-block mean μ_q stored
+                # in cfg._q_zca_mean and threaded through pad_and_stack.
+                # The mean subtraction at apply time is REQUIRED for the
+                # whitened input to have the zero-mean unit-cov property
+                # the network is trained against; omitting it would
+                # inject a constant bias W·μ that saturates the first
+                # tanh layer from gen 0.
+                # Channels stay in their original frame (decorrelated +
+                # variance-equalised) — see Huang 2019/2021 for the
+                # "ZCA before learnable transform" pattern that motivates
+                # this option.
+                from data import _compute_q_zca_l_block
+                from DescriptorBuilderGPU import descriptor_block_layout
+                layout = descriptor_block_layout(cfg)
+                cfg._q_scaler, cfg._q_zca_mean = _compute_q_zca_l_block(
+                    train_data["descriptors"], layout)
             else:
                 raise ValueError(
                     f"cfg.q_scaler_granularity={granularity!r} not "
-                    "recognised (expected 'per_component' or 'l_block').")
+                    "recognised (expected 'per_component', 'l_block', "
+                    "or 'l_block_zca').")
             qs = cfg._q_scaler
-            n_unique = int(np.unique(qs).size)
-            print(f"  Computed q_scaler ({granularity}) over "
-                  f"{n_atoms_total} training atoms: {qs.size} q-channels, "
-                  f"{n_unique} unique multipliers:")
-            print(f"    multiplier distribution: "
-                  f"min={qs.min():.4f}  max={qs.max():.4f}  "
-                  f"mean={qs.mean():.4f}  std={qs.std():.4f}")
-            mid = qs.size // 2
-            print(f"    sample channels: s[0]={qs[0]:.4f}  "
-                  f"s[{mid}]={qs[mid]:.4f}  s[{qs.size - 1}]={qs[-1]:.4f}")
+            if qs.ndim == 1:
+                n_unique = int(np.unique(qs).size)
+                print(f"  Computed q_scaler ({granularity}) over "
+                      f"{n_atoms_total} training atoms: {qs.size} q-channels, "
+                      f"{n_unique} unique multipliers:")
+                print(f"    multiplier distribution: "
+                      f"min={qs.min():.4f}  max={qs.max():.4f}  "
+                      f"mean={qs.mean():.4f}  std={qs.std():.4f}")
+                mid = qs.size // 2
+                print(f"    sample channels: s[0]={qs[0]:.4f}  "
+                      f"s[{mid}]={qs[mid]:.4f}  s[{qs.size - 1}]={qs[-1]:.4f}")
+            else:
+                # 2D ZCA whitening matrix.
+                nnz = int((np.abs(qs) > 1e-8).sum())
+                offdiag = qs - np.diag(np.diag(qs))
+                print(f"  Computed q_scaler ({granularity}) over "
+                      f"{n_atoms_total} training atoms: {qs.shape[0]}×"
+                      f"{qs.shape[1]} block-diagonal matrix, {nnz} nonzero "
+                      f"entries ({100*nnz/qs.size:.1f}% density)")
+                print(f"    diagonal: min={np.diag(qs).min():.4f}  "
+                      f"max={np.diag(qs).max():.4f}  "
+                      f"mean={np.diag(qs).mean():.4f}")
+                print(f"    off-diagonal ||F: {np.linalg.norm(offdiag):.4f}")
+                mean_norm = float(np.linalg.norm(cfg._q_zca_mean))
+                print(f"    q_zca_mean ‖μ‖₂ = {mean_norm:.4f} "
+                      f"(subtracted at apply time)")
         else:
             print(f"  Reusing q_scaler from checkpoint (shape="
                   f"{cfg._q_scaler.shape}, no recompute on resume).")
@@ -537,6 +993,7 @@ def _train_model_inner(cfg: TNEPconfig,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="train",
         q_scaler=getattr(cfg, "_q_scaler", None),
+        q_zca_mean=getattr(cfg, "_q_zca_mean", None),
         target_mean=getattr(cfg, "_target_mean", None),
         self_pairs_only=_self_only)
     val_data   = pad_and_stack(
@@ -544,6 +1001,7 @@ def _train_model_inner(cfg: TNEPconfig,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="val",
         q_scaler=getattr(cfg, "_q_scaler", None),
+        q_zca_mean=getattr(cfg, "_q_zca_mean", None),
         target_mean=getattr(cfg, "_target_mean", None),
         self_pairs_only=_self_only)
     if _self_only:
@@ -583,9 +1041,21 @@ def _train_model_inner(cfg: TNEPconfig,
         print(f"  resume: writing outputs to existing run dir {run_dir}")
 
     model = TNEP(cfg)
+    # When preprocess contraction is on, cfg.dim_q has been overridden to
+    # the contracted Q_new (raw dim lives at cfg.dim_q_raw). Report the
+    # compression ratio so the effect of mode / l_keep / per_type is visible.
+    if getattr(cfg, "descriptor_preprocess_contract", "off") != "off":
+        q_raw  = int(getattr(cfg, "dim_q_raw", cfg.dim_q))
+        q_new  = int(cfg.dim_q)
+        ratio  = q_raw / q_new if q_new else float("inf")
+        reduce = (1.0 - q_new / q_raw) * 100.0 if q_raw else 0.0
+        print(f"Preprocess contraction ({cfg.descriptor_preprocess_contract}): "
+              f"Q_raw={q_raw} → Q_new={q_new}  "
+              f"(×{ratio:.2f} compression, {reduce:.1f}% reduction)")
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
     print("Parameter Root: " + str(np.sqrt(model.optimizer.dim)))
+    _print_param_breakdown(model)
 
     def periodic_plot_callback(history, gen):
         """Called during training at plot_interval to show progress."""
@@ -665,8 +1135,14 @@ def _train_model_inner(cfg: TNEPconfig,
         # so any downstream caller that re-uses `model` directly sees
         # the best run-end configuration, matching post-fit behaviour.
         snes.mu.assign(best_mu)
-        snes.sigma.assign(tf.constant(
-            resume_state["best_sigma"], dtype=tf.float32))
+        # best_sigma is None under cov_mode="crfmnes" (snapshot skipped on
+        # save; the active scale lives in _cr_sig). Same lifecycle pattern
+        # as SNES.fit's end-of-run restore at SNES.py:2248 — skip the assign
+        # rather than KeyError'ing on None.
+        if (str(getattr(cfg, "snes_cov_mode", "none")).lower() != "crfmnes"
+                and resume_state.get("best_sigma") is not None):
+            snes.sigma.assign(tf.constant(
+                resume_state["best_sigma"], dtype=tf.float32))
         _set_model_params(model, *best_val_params)
 
         history = resume_state["history"]
@@ -1148,8 +1624,29 @@ def dump_dipole_predictions(model_path: str,
 
 if __name__ == '__main__':
     model = train_model()
-    #model = load_model("models/n50_q165_pop100_20260513_161930_CHO_best_r2/train_C_O_H_dipole_best_val.h5")
-    #dipoles = process_trajectory(model, "plots/Ethanol/Ethanol_mace/10_MOL/nve.traj", dt_fs = 1.0, batch_size=50, descriptor_mode=1, descriptor_batch_frames=20, pin_to_cpu=False, descriptor_precision="float32", descriptor_pair_tile_size=8000)
+    #model = load_model("models/n30_q75_pop100_20260530_181726_water_bulk_dipole_NEW/train_waterbulk_O_H_dipole_best_val.h5")
+    #dipoles = process_trajectory(model, "plots/BulkWater/GPUMD traj/water_bulk_traj.xyz", dt_fs = 1.0, batch_size=40, descriptor_mode=1, descriptor_batch_frames=40, pin_to_cpu=False, descriptor_precision="float32", descriptor_pair_tile_size=2000)
     #dump_dipole_predictions(model_path="models/n50_q165_pop100_20260513_161930_CHO_best_r2/train_C_O_H_dipole_best_val.h5", test_xyz="datasets/test.xyz", out_path="datasets/dipole_test_tnep.out")
     #filter_dataset_by_species(input_xyz="datasets/test.xyz", output_xyz="datasets/cho_filter_test.xyz", allowed_species=[6, 1, 8])
-    #ir_spectrum_from_file(dipole_path="plots/Ethanol/Ethanol_mace/nve_dipoles.txt", dt_fs = 1, save_dir=None, acf_ratio=0.1, smooth_k=20, quantum_correction="harmonic")
+    #ir_spectrum_from_file(dipole_path="plots/nve_dipoles.txt", dt_fs = 1, save_dir=None, acf_ratio=0.1, smooth_k=10, quantum_correction="quadratic")
+    #model.cfg.plot_units = "e*angstrom"
+    #model.score_from_file("datasets/test_waterbulk.xyz", plot=True, presentation=True, shared_axis_scale=True)
+    """
+    from spectroscopy import plot_ir_overlay
+
+    plot_ir_overlay(dipoles={
+        "Adapted TNEP": ["plots/BulkWater/GPUMD traj/water_bulk_traj_dipoles.txt",
+                                1.0],
+        "TNEP (Xu et al)": ["plots/BulkWater/GPUMD traj/dipole_gpumd_out.out",
+                            1.0]
+    },
+    spectra= {
+        "Experimental (Max et al)": ["max_water_ir.csv", "wavenumber_cm1", "k_H2O"]
+    },
+    temperature=298.15,
+    quantum_correction="harmonic",
+    window_cm=(100, 4000),
+    smooth_k=20,
+    presentation=True
+    )
+    """
