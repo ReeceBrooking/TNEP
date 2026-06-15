@@ -343,14 +343,12 @@ def train_model_ab(
         train_data, num_types=cfg_a.num_types,
         pin_to_cpu=cfg_a.pin_data_to_cpu,
         q_scaler=getattr(cfg_a, "_q_scaler", None),
-        q_zca_mean=getattr(cfg_a, "_q_zca_mean", None),
         target_mean=getattr(cfg_a, "_target_mean", None),
         self_pairs_only=_self_only)
     val_data = pad_and_stack(
         val_data, num_types=cfg_a.num_types,
         pin_to_cpu=cfg_a.pin_data_to_cpu,
         q_scaler=getattr(cfg_a, "_q_scaler", None),
-        q_zca_mean=getattr(cfg_a, "_q_zca_mean", None),
         target_mean=getattr(cfg_a, "_target_mean", None),
         self_pairs_only=_self_only)
 
@@ -896,58 +894,21 @@ def _train_model_inner(cfg: TNEPconfig,
                 layout = descriptor_block_layout(cfg)
                 cfg._q_scaler = _compute_q_scaler_l_block(
                     train_data["descriptors"], layout)
-            elif granularity == "l_block_zca":
-                # ZCA whitening per (pair, l) block. Produces a [Q, Q]
-                # block-diagonal matrix instead of a [Q] vector; the
-                # _apply_q_scaler_np path dispatches on ndim and applies
-                # q' = W · (q − μ_q), with the per-block mean μ_q stored
-                # in cfg._q_zca_mean and threaded through pad_and_stack.
-                # The mean subtraction at apply time is REQUIRED for the
-                # whitened input to have the zero-mean unit-cov property
-                # the network is trained against; omitting it would
-                # inject a constant bias W·μ that saturates the first
-                # tanh layer from gen 0.
-                # Channels stay in their original frame (decorrelated +
-                # variance-equalised) — see Huang 2019/2021 for the
-                # "ZCA before learnable transform" pattern that motivates
-                # this option.
-                from data import _compute_q_zca_l_block
-                from DescriptorBuilderGPU import descriptor_block_layout
-                layout = descriptor_block_layout(cfg)
-                cfg._q_scaler, cfg._q_zca_mean = _compute_q_zca_l_block(
-                    train_data["descriptors"], layout)
             else:
                 raise ValueError(
                     f"cfg.q_scaler_granularity={granularity!r} not "
-                    "recognised (expected 'per_component', 'l_block', "
-                    "or 'l_block_zca').")
+                    "recognised (expected 'per_component' or 'l_block').")
             qs = cfg._q_scaler
-            if qs.ndim == 1:
-                n_unique = int(np.unique(qs).size)
-                print(f"  Computed q_scaler ({granularity}) over "
-                      f"{n_atoms_total} training atoms: {qs.size} q-channels, "
-                      f"{n_unique} unique multipliers:")
-                print(f"    multiplier distribution: "
-                      f"min={qs.min():.4f}  max={qs.max():.4f}  "
-                      f"mean={qs.mean():.4f}  std={qs.std():.4f}")
-                mid = qs.size // 2
-                print(f"    sample channels: s[0]={qs[0]:.4f}  "
-                      f"s[{mid}]={qs[mid]:.4f}  s[{qs.size - 1}]={qs[-1]:.4f}")
-            else:
-                # 2D ZCA whitening matrix.
-                nnz = int((np.abs(qs) > 1e-8).sum())
-                offdiag = qs - np.diag(np.diag(qs))
-                print(f"  Computed q_scaler ({granularity}) over "
-                      f"{n_atoms_total} training atoms: {qs.shape[0]}×"
-                      f"{qs.shape[1]} block-diagonal matrix, {nnz} nonzero "
-                      f"entries ({100*nnz/qs.size:.1f}% density)")
-                print(f"    diagonal: min={np.diag(qs).min():.4f}  "
-                      f"max={np.diag(qs).max():.4f}  "
-                      f"mean={np.diag(qs).mean():.4f}")
-                print(f"    off-diagonal ||F: {np.linalg.norm(offdiag):.4f}")
-                mean_norm = float(np.linalg.norm(cfg._q_zca_mean))
-                print(f"    q_zca_mean ‖μ‖₂ = {mean_norm:.4f} "
-                      f"(subtracted at apply time)")
+            n_unique = int(np.unique(qs).size)
+            print(f"  Computed q_scaler ({granularity}) over "
+                  f"{n_atoms_total} training atoms: {qs.size} q-channels, "
+                  f"{n_unique} unique multipliers:")
+            print(f"    multiplier distribution: "
+                  f"min={qs.min():.4f}  max={qs.max():.4f}  "
+                  f"mean={qs.mean():.4f}  std={qs.std():.4f}")
+            mid = qs.size // 2
+            print(f"    sample channels: s[0]={qs[0]:.4f}  "
+                  f"s[{mid}]={qs[mid]:.4f}  s[{qs.size - 1}]={qs[-1]:.4f}")
         else:
             print(f"  Reusing q_scaler from checkpoint (shape="
                   f"{cfg._q_scaler.shape}, no recompute on resume).")
@@ -993,7 +954,6 @@ def _train_model_inner(cfg: TNEPconfig,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="train",
         q_scaler=getattr(cfg, "_q_scaler", None),
-        q_zca_mean=getattr(cfg, "_q_zca_mean", None),
         target_mean=getattr(cfg, "_target_mean", None),
         self_pairs_only=_self_only)
     val_data   = pad_and_stack(
@@ -1001,7 +961,6 @@ def _train_model_inner(cfg: TNEPconfig,
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="val",
         q_scaler=getattr(cfg, "_q_scaler", None),
-        q_zca_mean=getattr(cfg, "_q_zca_mean", None),
         target_mean=getattr(cfg, "_target_mean", None),
         self_pairs_only=_self_only)
     if _self_only:

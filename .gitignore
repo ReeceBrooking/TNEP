@@ -1183,3 +1183,6 @@ plots/Ethanol/Ethanol_tgap/ethanol_traj_dipoles.txt
 plots/Ethanol/Ethanol_tgap/ir_spectrum_dipole_pop100_n50_l4_ethanol.png
 plots/Ethanol/Ethanol_tgap/ir_spectrum_dipole_pop100_n50_l4.png
 plots/Ethanol/Ethanol_tgap/thermoplot.png
+models/n30_q165_pop100_20260615_212615/config.txt
+models/n30_q165_pop100_20260615_214157/checkpoint.h5
+models/n30_q165_pop100_20260615_214157/config.txt

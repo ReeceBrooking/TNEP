@@ -1586,7 +1586,7 @@ class SNES:
         round-trip that used to be repeated ~14× per generation across
         `ask()` / `update()` / `fit()`.
         """
-        return str(self.cfg.snes_cov_mode).lower()
+        return str(getattr(self.cfg, "snes_cov_mode", "none")).lower()
 
     def compute_utilities(self) -> np.ndarray:
         """Precompute rank-based utility weights for the population.
