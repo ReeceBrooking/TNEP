@@ -529,10 +529,33 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         train_grad_index = [[] for _ in range(len(train_dataset))]
         val_grad_index   = [[] for _ in range(len(val_dataset))]
     else:
-        _kw = {"progress_desc": "Building train descriptors"} if cfg.descriptor_mode == 1 else {}
-        train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset, **_kw)
-        _kw = {"progress_desc": "Building val descriptors"} if cfg.descriptor_mode == 1 else {}
-        val_descriptors,   val_gradients,   val_grad_index   = builder.build_descriptors(val_dataset, **_kw)
+        # When `dipole_rij_power == 0` the dipole forward consumes only
+        # self-pair gradients ∂q_i/∂r_i. Build in batches and immediately
+        # drop the neighbour-gradient rows that the forward will never
+        # read — bounds peak memory to one batch's worth of the
+        # ~90%-of-COO neighbour-gradient tensor (see
+        # `descriptor_self_batch_size` doc).
+        _self_only_batch = (int(cfg.descriptor_self_batch_size)
+                            if getattr(cfg, "descriptor_self_batch_size", None)
+                            is not None else None)
+        _self_only = (int(getattr(cfg, "dipole_rij_power", 0)) == 0
+                      and cfg.target_mode == 1)
+        if _self_only:
+            _kw = {"progress_desc": "Building train descriptors (self-only, batched)"} \
+                if cfg.descriptor_mode == 1 else {}
+            train_descriptors, train_gradients, train_grad_index = \
+                builder.build_descriptors_self_only(
+                    train_dataset, batch_size=_self_only_batch, **_kw)
+            _kw = {"progress_desc": "Building val descriptors (self-only, batched)"} \
+                if cfg.descriptor_mode == 1 else {}
+            val_descriptors, val_gradients, val_grad_index = \
+                builder.build_descriptors_self_only(
+                    val_dataset, batch_size=_self_only_batch, **_kw)
+        else:
+            _kw = {"progress_desc": "Building train descriptors"} if cfg.descriptor_mode == 1 else {}
+            train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset, **_kw)
+            _kw = {"progress_desc": "Building val descriptors"} if cfg.descriptor_mode == 1 else {}
+            val_descriptors,   val_gradients,   val_grad_index   = builder.build_descriptors(val_dataset, **_kw)
 
     train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
     val_data   = assemble_data_dict(val_dataset,   val_types_int,   val_descriptors,   val_gradients,   val_grad_index,   cfg)
