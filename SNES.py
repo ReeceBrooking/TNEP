@@ -121,9 +121,21 @@ class SNES:
             # storage. Halves (roughly) the search-space dimensionality
             # and guarantees U lies on the rotation group regardless of
             # any λ — see plan and TNEPconfig docs.
-            self._mix_cayley = (
-                str(getattr(self.cfg, "descriptor_mixing_regularizer",
-                            "off")).lower() == "cayley")
+            # Two STRUCTURAL orthogonal parameterisations share the same
+            # skew upper-triangle layout (bs(bs-1)/2 entries per block) —
+            # they differ only in the map A → U:
+            #   "cayley"  : U = (I − A)(I + A)^{−1}  — rational chord; cannot
+            #               represent rotations with −1 eigenvalues except
+            #               in the limit |A| → ∞
+            #   "expm"    : U = exp(A)                — exponential geodesic;
+            #               surjective onto SO(n), no Jacobian singularity
+            # `_mix_cayley` stays True for either (it gates the skew layout
+            # everywhere downstream); `_mix_orth_map` selects the backend.
+            _reg_mode = str(getattr(self.cfg,
+                                    "descriptor_mixing_regularizer",
+                                    "off")).lower()
+            self._mix_cayley = _reg_mode in ("cayley", "expm")
+            self._mix_orth_map = _reg_mode if self._mix_cayley else None
             # `block_count(bs)` returns the per-block SNES dim for the
             # current arch+regulariser combination.
             def _block_count(bs: int) -> int:
@@ -193,6 +205,7 @@ class SNES:
             self._mix_per_type = False
             self._mix_arch = "linear"
             self._mix_cayley = False
+            self._mix_orth_map = None
             self._cayley_scatter_cache = {}
             self.n_U_pair = 0
         self.dim = self.n_anns_total + self.n_U_pair
@@ -240,17 +253,19 @@ class SNES:
         # dimensionality scaling). -1 sentinel enables dynamic adapt.
         self._mix_reg_mode = str(getattr(
             self.cfg, "descriptor_mixing_regularizer", "off")).lower()
-        if self._mix_reg_mode not in ("off", "shrinkage", "orthogonal", "cayley"):
+        if self._mix_reg_mode not in (
+                "off", "shrinkage", "orthogonal", "cayley", "expm"):
             raise ValueError(
                 f"descriptor_mixing_regularizer={self._mix_reg_mode!r} not "
                 "recognised (expected 'off', 'shrinkage', 'orthogonal', "
-                "or 'cayley')")
-        # The "cayley" mode is a *parameterisation*, not a soft penalty:
-        # U is reconstructed via the Cayley map from a skew-symmetric A,
-        # so it's structurally orthogonal regardless of any λ. The
+                "'cayley', or 'expm')")
+        # The "cayley" and "expm" modes are *parameterisations*, not soft
+        # penalties: U is reconstructed structurally from a skew-symmetric A
+        # (via either the Cayley rational chord or the matrix exponential),
+        # so it's exactly orthogonal regardless of any λ. The
         # shrinkage / orthogonal soft-penalty paths must remain
-        # silent under cayley — the existing dispatches `reg_Vpair` /
-        # `reg_Vorth` already gate on the exact strings "shrinkage" /
+        # silent under cayley / expm — the existing dispatches `reg_Vpair`
+        # / `reg_Vorth` already gate on the exact strings "shrinkage" /
         # "orthogonal", so this just works.
         if self.n_U_pair > 0:
             auto_lambda_orth = float(np.sqrt(
@@ -607,7 +622,15 @@ class SNES:
         # A[..., n, i, j] = Σ_k scatter[i, j, k] · A_upper[..., n, k]
         A = tf.einsum('ijk,...nk->...nij', scatter, A_upper_stacked)
         I = tf.eye(bs, dtype=A.dtype)
-        U = tf.linalg.solve(I - A, I + A)
+        if self._mix_orth_map == "expm":
+            # U = exp(A): geodesic on SO(n). tf.linalg.expm handles batched
+            # leading dims natively (Padé approx + squaring/scaling). For
+            # the bs ≤ 8 blocks SNES uses, cost is a few small matmuls per
+            # block — comparable to the Cayley solve but with no singular
+            # Jacobian and full SO(n) coverage (Cayley misses −1 eigvals).
+            U = tf.linalg.expm(A)
+        else:                                        # "cayley"
+            U = tf.linalg.solve(I - A, I + A)
         return U - I
 
     def _cayley_block(self, A_upper_flat: tf.Tensor, bs: int) -> tf.Tensor:

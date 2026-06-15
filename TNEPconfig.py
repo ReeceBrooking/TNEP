@@ -344,7 +344,7 @@ class TNEPconfig:
     #                  variants. Zero λ to tune; the "regularisation"
     #                  is via the bijection between A's space and the
     #                  rotation group. Reflections (det = −1) excluded.
-    descriptor_mixing_regularizer: str = "cayley"
+    descriptor_mixing_regularizer: str = "expm"
 
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION
