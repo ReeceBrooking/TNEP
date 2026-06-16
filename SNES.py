@@ -30,90 +30,42 @@ def _format_duration(seconds: float) -> str:
 
 
 def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
-    """Assign weight arrays directly into the TNEP model's tf.Variables.
+    """Assign weight tensors produced by SNES.reconstruct_params_tf into
+    the TNEP model's Variables.
 
-    Tail conventions produced by SNES.reconstruct_params_tf (legacy /
-    extended) — the order of fields per ANN is:
-        single hidden : W0, b0, W1, b1
-        two hidden    : W0, b0, W0_2, b0_2, W1, b1
-    Followed (when mixing enabled) by:
-        N==1 layer    : a single U_pair tensor
-        N>1 layers    : a list of N U_pair tensors (descriptor_mixing_n_layers)
-    And finally (when nonlinear mixing on):
-        b_mix_list    : a list of N bias tensors
-    Parses each section in order so all four feature combinations work.
+    Tail order:
+        ANN                            : W0, b0, W1, b1
+        + optional pol ANN (mode 2)    : W0_pol, b0_pol, W1_pol, b1_pol
+        + optional U_pair (mixing)     : single tensor — the per-pair
+                                         skew/residual mixing layer
+        + optional W_pre_angular (preprocess_contract != "off")
     """
-    has_h2 = getattr(model, "W0_2", None) is not None
-    per_l = getattr(model, "per_l_heads", False)
     params = list(params)
     idx = 0
-    if per_l:
-        # Per-l head ANN: each ANN supplies 4 list-of-L entries.
-        for var_list in (model.W0_per_l, model.b0_per_l,
-                          model.W1_per_l, model.b1_per_l):
-            entry = params[idx]; idx += 1
-            for l, t in enumerate(entry):
-                var_list[l].assign(t)
-        if model.cfg.target_mode == 2:
-            for var_list in (model.W0_pol_per_l, model.b0_pol_per_l,
-                              model.W1_pol_per_l, model.b1_pol_per_l):
-                entry = params[idx]; idx += 1
-                for l, t in enumerate(entry):
-                    var_list[l].assign(t)
-    else:
-        # Primary ANN
-        model.W0.assign(params[idx]); idx += 1
-        model.b0.assign(params[idx]); idx += 1
-        if has_h2:
-            model.W0_2.assign(params[idx]); idx += 1
-            model.b0_2.assign(params[idx]); idx += 1
-        model.W1.assign(params[idx]); idx += 1
-        model.b1.assign(params[idx]); idx += 1
-        # Polarizability ANN
-        if model.cfg.target_mode == 2:
-            model.W0_pol.assign(params[idx]); idx += 1
-            model.b0_pol.assign(params[idx]); idx += 1
-            if has_h2:
-                model.W0_2_pol.assign(params[idx]); idx += 1
-                model.b0_2_pol.assign(params[idx]); idx += 1
-            model.W1_pol.assign(params[idx]); idx += 1
-            model.b1_pol.assign(params[idx]); idx += 1
-    # Mixing tail (per-layer U_pair + optional b_mix lists)
+    model.W0.assign(params[idx]); idx += 1
+    model.b0.assign(params[idx]); idx += 1
+    model.W1.assign(params[idx]); idx += 1
+    model.b1.assign(params[idx]); idx += 1
+    if model.cfg.target_mode == 2:
+        model.W0_pol.assign(params[idx]); idx += 1
+        model.b0_pol.assign(params[idx]); idx += 1
+        model.W1_pol.assign(params[idx]); idx += 1
+        model.b1_pol.assign(params[idx]); idx += 1
     if getattr(model, "descriptor_mixing", False) and idx < len(params):
         U_pair_entry = params[idx]; idx += 1
+        # Pre-Stage-6 the TNEP model still stores U_pair as the head of
+        # a 1-element list (U_pair_list); accept either shape here.
         if isinstance(U_pair_entry, list):
-            for k, U_k in enumerate(U_pair_entry):
-                model.U_pair_list[k].assign(U_k)
-        else:
-            model.U_pair_list[0].assign(U_pair_entry)
-        # Optional bias list (only present when nonlinear mixing is on).
-        if idx < len(params) and getattr(model, "descriptor_mixing_nonlinear", False):
-            b_mix_entry = params[idx]; idx += 1
-            for k, b_k in enumerate(b_mix_entry):
-                model.b_mix_list[k].assign(b_k)
-        # Optional cross-channel mixing layer (single [Q, Q] V_cross).
-        if (idx < len(params)
-                and getattr(model, "descriptor_mixing_cross_layer", False)
-                and getattr(model, "V_cross", None) is not None):
-            model.V_cross.assign(params[idx]); idx += 1
-    # Optional per-(pair, l, type) gating tail. Lives OUTSIDE the mixing
-    # block: gating is allowed independent of descriptor_mixing.
-    if (idx < len(params)
-            and getattr(model, "descriptor_gating_enabled", False)
-            and getattr(model, "gates_pair_l", None) is not None):
-        model.gates_pair_l.assign(params[idx]); idx += 1
-    # Optional preprocess tail (descriptor_preprocess_contract). Per-type
-    # coefficients [T, Q_raw] feed _W0_preprocess_eff. Mutually exclusive
-    # with mixing/gating but routed at the same set-model-params layer.
+            U_pair_entry = U_pair_entry[0]
+        U_target = getattr(model, "U_pair", None)
+        if U_target is None and getattr(model, "U_pair_list", None) is not None:
+            U_target = model.U_pair_list[0]
+        if U_target is not None:
+            U_target.assign(U_pair_entry)
     if (idx < len(params)
             and getattr(model, "descriptor_preprocess_contract", "off") != "off"
             and getattr(model, "W_pre_angular", None) is not None):
         model.W_pre_angular.assign(params[idx]); idx += 1
-    # Output-side mixing R tail: V_R = R − I of shape [T, H, H].
-    if (idx < len(params)
-            and getattr(model, "descriptor_mixing_output_layer", False)
-            and getattr(model, "R_pair", None) is not None):
-        model.R_pair.assign(params[idx]); idx += 1
 
 class SNES:
     """Separable Natural Evolution Strategy optimizer for TNEP.
@@ -149,79 +101,28 @@ class SNES:
             self.tf_rng = tf.random.Generator.from_non_deterministic_state()
 
         # Total number of trainable parameters
-        # Cache widths for new optional second hidden layer.
         self.H = int(self.cfg.num_neurons)
-        H2_cfg = getattr(self.cfg, "num_neurons_layer_2", None)
-        self.H2 = int(H2_cfg) if H2_cfg is not None else None
-        self.H_final = self.H2 if self.H2 is not None else self.H
-
-        # Per-(type, l) ANN heads mode. Replaces the single-ANN-per-type
-        # layout with per-l heads, each seeing only Q_l channels.
-        self._per_l_heads = bool(getattr(
-            self.cfg, "descriptor_per_l_ann_heads", False))
-        if self._per_l_heads:
-            # Cross-feature guards (restrictions for the first impl).
-            if bool(getattr(self.cfg, "descriptor_mixing", False)):
-                raise NotImplementedError(
-                    "descriptor_per_l_ann_heads + descriptor_mixing is not "
-                    "yet supported. Disable one or the other.")
-            if self.H2 is not None:
-                raise NotImplementedError(
-                    "descriptor_per_l_ann_heads + num_neurons_layer_2 is "
-                    "not yet supported. Set num_neurons_layer_2=None.")
-            from DescriptorBuilderGPU import descriptor_block_layout
-            _layout = descriptor_block_layout(self.cfg)
-            L = int(self.cfg.l_max) + 1
-            self._per_l_L = L
-            # Q_l = number of descriptor channels at that l (sum across pairs).
-            self._per_l_Q_l = []
-            for l in range(L):
-                Q_l = sum(
-                    len(_layout["pair_ln_index"][p][l])
-                    for p in _layout["pair_keys"]
-                    if l in _layout["pair_ln_index"][p])
-                self._per_l_Q_l.append(int(Q_l))
-            # Per-l per-ANN params: W0_l (T·Q_l·H) + b0_l (T·H) + W1_l (T·H) + b1_l (1)
-            T_ = int(self.cfg.num_types)
-            n_W0 = sum(T_ * Q_l * self.H for Q_l in self._per_l_Q_l)
-            n_b0 = T_ * self.H * L
-            n_W1 = T_ * self.H * L
-            n_b1 = L                                              # one b1 per l
-            n_W0_2 = 0; n_b0_2 = 0
-            self.n_typed = n_W0 + n_b0 + n_W1                     # excludes b1
-            # Per-type param count (per type t, summed over l):
-            #   sum_l (Q_l · H + H + H) = Q·H + 2·L·H
-            self._n_per_type = (self.cfg.dim_q * self.H
-                                + 2 * L * self.H)
-            self.n_primary = self.n_typed + n_b1
-            self._n_W0 = n_W0
-            self._n_b0 = n_b0
-            self._n_W0_2 = n_W0_2
-            self._n_b0_2 = n_b0_2
-            self._n_W1 = n_W1
-            self._n_b1 = n_b1
-        else:
-            n_W0 = self.cfg.num_types * self.cfg.dim_q * self.H
-            n_b0 = self.cfg.num_types * self.H
-            if self.H2 is not None:
-                n_W0_2 = self.cfg.num_types * self.H * self.H2
-                n_b0_2 = self.cfg.num_types * self.H2
-            else:
-                n_W0_2 = 0
-                n_b0_2 = 0
-            n_W1 = self.cfg.num_types * self.H_final
-            n_b1 = 1
-            self.n_typed = n_W0 + n_b0 + n_W0_2 + n_b0_2 + n_W1
-            self._n_per_type = (self.cfg.dim_q * self.H + self.H
-                                + (self.H * self.H2 + self.H2 if self.H2 is not None else 0)
-                                + self.H_final)
-            self.n_primary = self.n_typed + n_b1
-            self._n_W0 = n_W0
-            self._n_b0 = n_b0
-            self._n_W0_2 = n_W0_2
-            self._n_b0_2 = n_b0_2
-            self._n_W1 = n_W1
-            self._n_b1 = n_b1
+        # Stage-5 / Stage-1 legacy stubs — kept for downstream methods
+        # whose consumer-side cleanup is staged separately.
+        self.H2 = None
+        self.H_final = self.H
+        self._n_W0_2 = 0
+        self._n_b0_2 = 0
+        self._per_l_heads = False
+        self._per_l_L = 0
+        self._per_l_Q_l = []
+        n_W0 = self.cfg.num_types * self.cfg.dim_q * self.H
+        n_b0 = self.cfg.num_types * self.H
+        n_W1 = self.cfg.num_types * self.H
+        n_b1 = 1
+        self.n_typed = n_W0 + n_b0 + n_W1
+        # Per-type param count (per type t): W0 Q·H + b0 H + W1 H.
+        self._n_per_type = self.cfg.dim_q * self.H + 2 * self.H
+        self.n_primary = self.n_typed + n_b1
+        self._n_W0 = n_W0
+        self._n_b0 = n_b0
+        self._n_W1 = n_W1
+        self._n_b1 = n_b1
         # Mode 2 (polarizability) adds a second ANN with identical shape
         if self.cfg.target_mode == 2:
             self.n_anns_total = 2 * self.n_primary
@@ -953,8 +854,6 @@ class SNES:
         T = self.cfg.num_types
         Q = self.dim_q
         H = self.H
-        H2 = self.H2
-        H_final = self.H_final
         if scheme == "uniform":
             mu = rng.uniform(-1.0, 1.0, size=self.dim).astype(np.float32)
         elif scheme == "glorot":
@@ -965,14 +864,11 @@ class SNES:
             # so the practical impact is small.
             gain = float(getattr(self.model, "_glorot_gain", 1.0))
             c_W0 = gain * float(np.sqrt(6.0 / (Q + H)))
-            c_W1 = gain * float(np.sqrt(6.0 / (H_final + 1)))
-            c_W0_2 = (gain * float(np.sqrt(6.0 / (H + (H2 or H))))
-                      if H2 is not None else 0.0)
+            c_W1 = gain * float(np.sqrt(6.0 / (H + 1)))
 
             def _fill_ann(off: int) -> int:
-                """Fill one ANN's worth of weights starting at `off`.
-                Layout: [W0(T,Q,H) | b0(T,H) | (W0_2(T,H,H2) | b0_2(T,H2))?
-                          | W1(T,H_final) | b1(1)].
+                """Fill one ANN's worth of weights starting at ``off``.
+                Layout: [W0(T,Q,H) | b0(T,H) | W1(T,H) | b1(1)].
                 """
                 n_W0 = T * Q * H
                 mu[off:off + n_W0] = rng.uniform(
@@ -980,14 +876,7 @@ class SNES:
                 off += n_W0
                 # b0 zero
                 off += T * H
-                if H2 is not None:
-                    n_W0_2 = T * H * H2
-                    mu[off:off + n_W0_2] = rng.uniform(
-                        -c_W0_2, c_W0_2, size=n_W0_2).astype(np.float32)
-                    off += n_W0_2
-                    # b0_2 zero
-                    off += T * H2
-                n_W1 = T * H_final
+                n_W1 = T * H
                 mu[off:off + n_W1] = rng.uniform(
                     -c_W1, c_W1, size=n_W1).astype(np.float32)
                 off += n_W1
@@ -995,42 +884,9 @@ class SNES:
                 off += 1
                 return off
 
-            def _fill_ann_per_l(off: int) -> int:
-                """Fill one ANN's worth of per-l-head weights.
-                Layout per ANN (per l in 0..L-1):
-                    W0_l(T, Q_l, H) | b0_l(T, H) | W1_l(T, H) | b1_l(1)
-                """
-                L = self._per_l_L
-                for l in range(L):
-                    Q_l = self._per_l_Q_l[l]
-                    # Per-head Glorot bound (scaled by the activation gain
-                    # to match the outer-ANN init convention).
-                    c_W0_l = (gain * float(np.sqrt(6.0 / (Q_l + H)))
-                              if Q_l > 0 else 0.0)
-                    n_W0_l = T * Q_l * H
-                    if n_W0_l > 0:
-                        mu[off:off + n_W0_l] = rng.uniform(
-                            -c_W0_l, c_W0_l, size=n_W0_l).astype(np.float32)
-                    off += n_W0_l
-                    # b0_l zero
-                    off += T * H
-                    # W1_l ~ U(-c_W1, c_W1) with c_W1 = sqrt(6/(H+1))
-                    n_W1_l = T * H
-                    mu[off:off + n_W1_l] = rng.uniform(
-                        -c_W1, c_W1, size=n_W1_l).astype(np.float32)
-                    off += n_W1_l
-                    # b1_l zero
-                    off += 1
-                return off
-
-            if self._per_l_heads:
-                off = _fill_ann_per_l(0)
-                if self.cfg.target_mode == 2:
-                    off = _fill_ann_per_l(off)
-            else:
-                off = _fill_ann(0)
-                if self.cfg.target_mode == 2:
-                    off = _fill_ann(off)
+            off = _fill_ann(0)
+            if self.cfg.target_mode == 2:
+                off = _fill_ann(off)
         else:
             raise ValueError(
                 f"mu_init_scheme={scheme!r} not in ('uniform', 'glorot')")
@@ -1263,29 +1119,6 @@ class SNES:
         H_final = self.H_final
 
         def _ann_types() -> np.ndarray:
-            if getattr(self, "_per_l_heads", False):
-                # Per-l-head layout per ANN (per l):
-                #   W0_l[T, Q_l, H] | b0_l[T, H] | W1_l[T, H] | b1_l[1]
-                tov = np.empty(self.n_primary, dtype=np.int32)
-                offset = 0
-                for l in range(self._per_l_L):
-                    Q_l = self._per_l_Q_l[l]
-                    # W0_l: per-type
-                    for t in range(T):
-                        tov[offset:offset + Q_l * H] = t
-                        offset += Q_l * H
-                    # b0_l: per-type
-                    for t in range(T):
-                        tov[offset:offset + H] = t
-                        offset += H
-                    # W1_l: per-type
-                    for t in range(T):
-                        tov[offset:offset + H] = t
-                        offset += H
-                    # b1_l: global label per head
-                    tov[offset] = T
-                    offset += 1
-                return tov
             tov = np.empty(self.n_primary, dtype=np.int32)
             offset = 0
             # W0: [T, Q, H] — type t owns contiguous block of Q*H
@@ -1296,15 +1129,6 @@ class SNES:
             for t in range(T):
                 tov[offset:offset + H] = t
                 offset += H
-            if H2 is not None:
-                # W0_2: [T, H, H2]
-                for t in range(T):
-                    tov[offset:offset + H * H2] = t
-                    offset += H * H2
-                # b0_2: [T, H2]
-                for t in range(T):
-                    tov[offset:offset + H2] = t
-                    offset += H2
             # W1: [T, H_final]
             for t in range(T):
                 tov[offset:offset + H_final] = t
@@ -2422,75 +2246,45 @@ class SNES:
 
         def _consume(chunk, chunk_idx=0):
             nonlocal diff_sq_sum, diff_count
-            if self._per_l_heads:
-                # Build singleton-candidate per-l tensors and use
-                # predict_per_l_batch_candidates with C=1.
-                if mu_tf is not None:
-                    W0_per_l_v = [t[tf.newaxis] for t in named["W0_per_l"]]
-                    b0_per_l_v = [t[tf.newaxis] for t in named["b0_per_l"]]
-                    W1_per_l_v = [t[tf.newaxis] for t in named["W1_per_l"]]
-                    b1_per_l_v = [t[tf.newaxis] for t in named["b1_per_l"]]
-                else:
-                    W0_per_l_v = [v[tf.newaxis] for v in self.model.W0_per_l]
-                    b0_per_l_v = [v[tf.newaxis] for v in self.model.b0_per_l]
-                    W1_per_l_v = [v[tf.newaxis] for v in self.model.W1_per_l]
-                    b1_per_l_v = [v[tf.newaxis] for v in self.model.b1_per_l]
-                # Precompute W_atom for dipole, same as predict_batch does.
-                if self.cfg.target_mode == 1:
+            # Pre-compute W_atom once per (val_data, chunk_idx) and
+            # reuse across generations when val_size is None (full
+            # set, static chunks). When val_size is set, chunks are
+            # random subsets per gen — bypass the cache. Two-level
+            # dict: outer keyed by `id(val_data)`, inner by chunk_idx.
+            # This lets val_data and train_data each hold their own
+            # per-chunk W_atom across gens.
+            W_atom_v = None
+            if self.cfg.target_mode == 1:
+                _can_cache = (self.cfg.val_size is None)
+                if _can_cache:
+                    _vd_id = id(val_data)
+                    _cache_top = getattr(
+                        self, "_W_atom_validate_cache", None)
+                    if _cache_top is None:
+                        self._W_atom_validate_cache = {}
+                        _cache_top = self._W_atom_validate_cache
+                    _sub = _cache_top.setdefault(_vd_id, {})
+                    W_atom_v = _sub.get(chunk_idx)
+                if W_atom_v is None:
                     B_arg = chunk["descriptors"].shape[0]
                     A_arg = chunk["descriptors"].shape[1]
                     W_atom_v = self.model._precompute_dipole_kernel(
                         chunk["grad_values"], chunk["pair_struct"],
                         chunk["pair_atom"], chunk["pair_gidx"],
-                        chunk["positions"], chunk["boxes"], B_arg, A_arg)
-                else:
-                    W_atom_v = None
-                preds = self.model.predict_per_l_batch_candidates(
-                    chunk["descriptors"], W_atom_v,
-                    chunk["Z_int"], chunk["atom_mask"],
-                    W0_per_l_v, b0_per_l_v, W1_per_l_v, b1_per_l_v,
-                    gates=None)
-                preds = tf.squeeze(preds, axis=0)
-            else:
-                # Pre-compute W_atom once per (val_data, chunk_idx) and
-                # reuse across generations when val_size is None (full
-                # set, static chunks). When val_size is set, chunks are
-                # random subsets per gen — bypass the cache. Two-level
-                # dict: outer keyed by `id(val_data)`, inner by chunk_idx.
-                # This lets val_data and train_data each hold their own
-                # per-chunk W_atom across gens.
-                W_atom_v = None
-                if self.cfg.target_mode == 1:
-                    _can_cache = (self.cfg.val_size is None)
+                        chunk["positions"], chunk["boxes"],
+                        B_arg, A_arg)
                     if _can_cache:
-                        _vd_id = id(val_data)
-                        _cache_top = getattr(
-                            self, "_W_atom_validate_cache", None)
-                        if _cache_top is None:
-                            self._W_atom_validate_cache = {}
-                            _cache_top = self._W_atom_validate_cache
-                        _sub = _cache_top.setdefault(_vd_id, {})
-                        W_atom_v = _sub.get(chunk_idx)
-                    if W_atom_v is None:
-                        B_arg = chunk["descriptors"].shape[0]
-                        A_arg = chunk["descriptors"].shape[1]
-                        W_atom_v = self.model._precompute_dipole_kernel(
-                            chunk["grad_values"], chunk["pair_struct"],
-                            chunk["pair_atom"], chunk["pair_gidx"],
-                            chunk["positions"], chunk["boxes"],
-                            B_arg, A_arg)
-                        if _can_cache:
-                            _sub[chunk_idx] = W_atom_v
-                preds = self.model.predict_batch(
-                    chunk["descriptors"], chunk["grad_values"],
-                    chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
-                    chunk["positions"], chunk["Z_int"], chunk["boxes"],
-                    chunk["atom_mask"],
-                    W0, b0, W1, b1, W0p, b0p, W1p, b1p,
-                    W_atom=W_atom_v,
-                    W0_2=W0_2, b0_2=b0_2,
-                    W0_2_pol=W0_2_pol, b0_2_pol=b0_2_pol,
-                )
+                        _sub[chunk_idx] = W_atom_v
+            preds = self.model.predict_batch(
+                chunk["descriptors"], chunk["grad_values"],
+                chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
+                chunk["positions"], chunk["Z_int"], chunk["boxes"],
+                chunk["atom_mask"],
+                W0, b0, W1, b1, W0p, b0p, W1p, b1p,
+                W_atom=W_atom_v,
+                W0_2=W0_2, b0_2=b0_2,
+                W0_2_pol=W0_2_pol, b0_2_pol=b0_2_pol,
+            )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
                 num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
                 preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]
@@ -2540,65 +2334,36 @@ class SNES:
             W0_pol, b0_pol, W0_2_pol, b0_2_pol, W1_pol, b1_pol (mode==2)
             U_pair, U_pair_list, b_mix_list                  (when mixing)
         """
-        has_h2 = self.H2 is not None
-        out: dict = {"W0_2": None, "b0_2": None,
-                     "W0_2_pol": None, "b0_2_pol": None,
-                     "U_pair": None, "U_pair_list": None,
-                     "b_mix_list": None,
-                     "W0_per_l": None, "b0_per_l": None,
-                     "W1_per_l": None, "b1_per_l": None,
-                     "W0_pol_per_l": None, "b0_pol_per_l": None,
-                     "W1_pol_per_l": None, "b1_pol_per_l": None}
+        out: dict = {
+            "W0_2": None, "b0_2": None,
+            "W0_2_pol": None, "b0_2_pol": None,
+            "U_pair": None, "U_pair_list": None,
+            "b_mix_list": None,
+            "V_cross": None, "gates": None, "R_pair": None,
+            "W_pre_angular": None,
+        }
         idx = 0
-        if self._per_l_heads:
-            # Each ANN contributes 4 list-of-L tensors (W0, b0, W1, b1).
-            out["W0_per_l"] = params[idx]; idx += 1
-            out["b0_per_l"] = params[idx]; idx += 1
-            out["W1_per_l"] = params[idx]; idx += 1
-            out["b1_per_l"] = params[idx]; idx += 1
-            if self.cfg.target_mode == 2:
-                out["W0_pol_per_l"] = params[idx]; idx += 1
-                out["b0_pol_per_l"] = params[idx]; idx += 1
-                out["W1_pol_per_l"] = params[idx]; idx += 1
-                out["b1_pol_per_l"] = params[idx]; idx += 1
-        else:
-            out["W0"] = params[idx]; idx += 1
-            out["b0"] = params[idx]; idx += 1
-            if has_h2:
-                out["W0_2"] = params[idx]; idx += 1
-                out["b0_2"] = params[idx]; idx += 1
-            out["W1"] = params[idx]; idx += 1
-            out["b1"] = params[idx]; idx += 1
-            if self.cfg.target_mode == 2:
-                out["W0_pol"] = params[idx]; idx += 1
-                out["b0_pol"] = params[idx]; idx += 1
-                if has_h2:
-                    out["W0_2_pol"] = params[idx]; idx += 1
-                    out["b0_2_pol"] = params[idx]; idx += 1
-                out["W1_pol"] = params[idx]; idx += 1
-                out["b1_pol"] = params[idx]; idx += 1
+        out["W0"] = params[idx]; idx += 1
+        out["b0"] = params[idx]; idx += 1
+        out["W1"] = params[idx]; idx += 1
+        out["b1"] = params[idx]; idx += 1
+        if self.cfg.target_mode == 2:
+            out["W0_pol"] = params[idx]; idx += 1
+            out["b0_pol"] = params[idx]; idx += 1
+            out["W1_pol"] = params[idx]; idx += 1
+            out["b1_pol"] = params[idx]; idx += 1
         if self.n_U_pair > 0 and idx < len(params):
             entry = params[idx]; idx += 1
+            # Either a single tensor (canonical) or a 1-element list
+            # (pre-Stage-6 multi-layer fallthrough).
             if isinstance(entry, list):
                 out["U_pair_list"] = entry
-                out["U_pair"] = entry[0]  # backward-compat alias
+                out["U_pair"] = entry[0]
             else:
                 out["U_pair"] = entry
                 out["U_pair_list"] = [entry]
-            if self.n_U_bias_total > 0 and idx < len(params):
-                out["b_mix_list"] = params[idx]; idx += 1
-        out["V_cross"] = None
-        if self.n_U_cross > 0 and idx < len(params):
-            out["V_cross"] = params[idx]; idx += 1
-        out["gates"] = None
-        if self.n_gates > 0 and idx < len(params):
-            out["gates"] = params[idx]; idx += 1
-        out["W_pre_angular"] = None
         if self.n_preprocess > 0 and idx < len(params):
             out["W_pre_angular"] = params[idx]; idx += 1
-        out["R_pair"] = None
-        if self.n_R_pair > 0 and idx < len(params):
-            out["R_pair"] = params[idx]; idx += 1
         return out
 
     def reconstruct_params_tf(self, param_vectors: tf.Tensor) -> tuple:
@@ -2616,56 +2381,19 @@ class SNES:
         T = self.cfg.num_types
         Q = self.dim_q
         H = self.H
-        H2 = self.H2
         H_final = self.H_final
 
         n_W0 = T * Q * H
         n_b0 = T * H
-        n_W0_2 = T * H * H2 if H2 is not None else 0
-        n_b0_2 = T * H2 if H2 is not None else 0
         n_W1 = T * H_final
         n_b1 = 1
 
         is_batched = len(param_vectors.shape) == 2
 
-        def _extract_per_l(pv, offset):
-            """Extract one ANN's worth of per-l-head tensors.
-            Returns (W0_list, b0_list, W1_list, b1_list, offset)
-            where each *_list is a Python list of L tensors.
-            """
-            L = self._per_l_L
-            W0_list, b0_list, W1_list, b1_list = [], [], [], []
-            for l in range(L):
-                Q_l = self._per_l_Q_l[l]
-                n_W0_l = T * Q_l * H
-                W0_l = tf.reshape(
-                    pv[..., offset:offset + n_W0_l],
-                    [-1, T, Q_l, H] if is_batched else [T, Q_l, H])
-                offset += n_W0_l
-                n_b0_l = T * H
-                b0_l = tf.reshape(
-                    pv[..., offset:offset + n_b0_l],
-                    [-1, T, H] if is_batched else [T, H])
-                offset += n_b0_l
-                n_W1_l = T * H
-                W1_l = tf.reshape(
-                    pv[..., offset:offset + n_W1_l],
-                    [-1, T, H] if is_batched else [T, H])
-                offset += n_W1_l
-                b1_l = pv[..., offset]
-                offset += 1
-                W0_list.append(W0_l)
-                b0_list.append(b0_l)
-                W1_list.append(W1_l)
-                b1_list.append(b1_l)
-            return W0_list, b0_list, W1_list, b1_list, offset
-
         def _extract(pv, offset):
-            """Extract one ANN's weights.
+            """Extract one ANN's worth of weights from the flat slab.
 
-            Returns one of:
-              (W0, b0, W1, b1, offset)               — single hidden (legacy)
-              (W0, b0, W0_2, b0_2, W1, b1, offset)  — two hidden layers
+            Returns (W0, b0, W1, b1, offset).
             """
             W0 = tf.reshape(pv[..., offset:offset + n_W0],
                             [-1, T, Q, H] if is_batched else [T, Q, H])
@@ -2673,34 +2401,19 @@ class SNES:
             b0 = tf.reshape(pv[..., offset:offset + n_b0],
                             [-1, T, H] if is_batched else [T, H])
             offset += n_b0
-            if H2 is not None:
-                W0_2 = tf.reshape(pv[..., offset:offset + n_W0_2],
-                                  [-1, T, H, H2] if is_batched else [T, H, H2])
-                offset += n_W0_2
-                b0_2 = tf.reshape(pv[..., offset:offset + n_b0_2],
-                                  [-1, T, H2] if is_batched else [T, H2])
-                offset += n_b0_2
             W1 = tf.reshape(pv[..., offset:offset + n_W1],
                             [-1, T, H_final] if is_batched else [T, H_final])
             offset += n_W1
-            b1 = pv[..., offset]  # [P] or scalar
+            b1 = pv[..., offset]
             offset += n_b1
-            if H2 is not None:
-                return W0, b0, W0_2, b0_2, W1, b1, offset
             return W0, b0, W1, b1, offset
 
-        if self._per_l_heads:
-            first = _extract_per_l(param_vectors, 0)
-        else:
-            first = _extract(param_vectors, 0)
+        first = _extract(param_vectors, 0)
         offset = first[-1]
         primary = first[:-1]
 
         if self.cfg.target_mode == 2:
-            if self._per_l_heads:
-                second = _extract_per_l(param_vectors, offset)
-            else:
-                second = _extract(param_vectors, offset)
+            second = _extract(param_vectors, offset)
             offset = second[-1]
             tail = primary + second[:-1]
         else:
@@ -3604,12 +3317,6 @@ class SNES:
         # W_pre_angular_cand: per-(candidate, type, q_raw) preprocess
         # coefficients (or None when descriptor_preprocess_contract='off').
         W_pre_angular_cand = named.get("W_pre_angular")
-        # Per-l ANN heads — when enabled, predict_per_l_batch_candidates
-        # replaces predict_batch_candidates entirely.
-        W0_per_l_cand = named.get("W0_per_l")
-        b0_per_l_cand = named.get("b0_per_l")
-        W1_per_l_cand = named.get("W1_per_l")
-        b1_per_l_cand = named.get("b1_per_l")
 
         # Loss / weighting hyperparameters from cfg + batch context. Reading
         # these dynamically (instead of hardcoding mse) restores parity with
@@ -3709,26 +3416,17 @@ class SNES:
                         pos, boxes,
                         B_arg, A_arg)
 
-            if self._per_l_heads:
-                # Per-l ANN heads path: separate forward pass that loops
-                # over l and sums per-l dipole/PES contributions.
-                preds = self.model.predict_per_l_batch_candidates(
-                    desc, W_atom, Z, amask,
-                    W0_per_l_cand, b0_per_l_cand,
-                    W1_per_l_cand, b1_per_l_cand,
-                    gates=gates_cand)
-            else:
-                # Evaluate all C candidates simultaneously using explicit batched GEMMs.
-                # predict_batch_candidates executes one GEMM per type in each direction
-                # rather than C separate matmuls inside vectorized_map.
-                preds = self.model.predict_batch_candidates(
-                    desc, W_atom, Z, amask, W0, b0, W1, b1,
-                    U_pair=U_pair_cand,
-                    W0_2=W0_2_cand, b0_2=b0_2_cand,
-                    V_cross=V_cross_cand,
-                    gates=gates_cand,
-                    W_pre_angular=W_pre_angular_cand,
-                    R_pair=named.get("R_pair"))  # [C, B, T_dim]
+            # Evaluate all C candidates simultaneously using explicit batched GEMMs.
+            # predict_batch_candidates executes one GEMM per type in each direction
+            # rather than C separate matmuls inside vectorized_map.
+            preds = self.model.predict_batch_candidates(
+                desc, W_atom, Z, amask, W0, b0, W1, b1,
+                U_pair=U_pair_cand,
+                W0_2=W0_2_cand, b0_2=b0_2_cand,
+                V_cross=V_cross_cand,
+                gates=gates_cand,
+                W_pre_angular=W_pre_angular_cand,
+                R_pair=named.get("R_pair"))  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]

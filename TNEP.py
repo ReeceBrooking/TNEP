@@ -64,31 +64,13 @@ class TNEP(layers.Layer):
                     f"fold needs the (n, n', l) decomposition that only "
                     f"trivial compression preserves.")
             # nep4_radial collapses the (n, n', species_pair) structure
-            # into a flat (n'', l) axis, so the post-contraction layout
-            # used by descriptor_mixing / descriptor_mixing_output_layer
-            # / cross_layer / per_l_ann_heads is undefined. Disallow
-            # composition in this first pass — set the offending flag(s)
-            # to off, or run nep4_radial standalone.
-            _conflicts = []
+            # into a flat (n'', l) axis, so the post-contraction block
+            # layout that descriptor_mixing assumes is undefined.
             if bool(getattr(cfg, "descriptor_mixing", False)):
-                _conflicts.append("descriptor_mixing")
-            if bool(getattr(cfg, "descriptor_mixing_output_layer", False)):
-                _conflicts.append("descriptor_mixing_output_layer")
-            if bool(getattr(cfg, "descriptor_mixing_cross_layer", False)):
-                _conflicts.append("descriptor_mixing_cross_layer")
-            if bool(getattr(cfg, "descriptor_per_l_ann_heads", False)):
-                _conflicts.append("descriptor_per_l_ann_heads")
-            if bool(getattr(cfg, "descriptor_gating_enabled", False)):
-                _conflicts.append("descriptor_gating_enabled")
-            if _conflicts:
                 raise NotImplementedError(
-                    f"descriptor_preprocess_contract='nep4_radial' is "
-                    f"mutually exclusive in this build with: "
-                    f"{', '.join(_conflicts)}. The bilinear fold collapses "
-                    f"the (n, n', species_pair) descriptor structure into "
-                    f"a flat (n'', l) axis, so the post-contraction layout "
-                    f"those flags assume is undefined. Disable the conflicting "
-                    f"flag(s) or run nep4_radial standalone.")
+                    "descriptor_preprocess_contract='nep4_radial' is "
+                    "mutually exclusive with descriptor_mixing in this "
+                    "build. Disable mixing or run nep4_radial standalone.")
         if self.descriptor_preprocess_contract != "off":
             # Mixing composes with preprocess only in the l_aware
             # architecture (where blocks are per (post-pair, l_post) and
@@ -101,16 +83,6 @@ class TNEP(layers.Layer):
                         f"descriptor_mixing_arch={_arch!r} does not compose "
                         f"with descriptor_preprocess_contract in this build. "
                         f"Set arch to 'l_aware' or disable preprocess.")
-            if bool(getattr(cfg, "descriptor_gating_enabled", False)):
-                raise NotImplementedError(
-                    "descriptor_preprocess_contract is mutually exclusive "
-                    "with descriptor_gating_enabled in this build. Set one to off.")
-            if bool(getattr(cfg, "descriptor_per_l_ann_heads", False)) \
-                    and self.descriptor_preprocess_contract in ("angular", "both"):
-                raise NotImplementedError(
-                    f"descriptor_preprocess_contract={self.descriptor_preprocess_contract!r} "
-                    f"collapses the l axis and is incompatible with "
-                    f"descriptor_per_l_ann_heads. Set one to off.")
             from DescriptorBuilderGPU import (
                 descriptor_block_layout, descriptor_preprocess_layout)
             _layout_pre = descriptor_block_layout(cfg)
@@ -135,14 +107,10 @@ class TNEP(layers.Layer):
             self.dim_q_forward = int(cfg.dim_q)
         self.num_types = cfg.num_types
         self.num_neurons = cfg.num_neurons
-        # Optional second hidden layer width. When None (legacy default), the
-        # ANN is single-hidden. When set, an extra [num_neurons, H2] layer is
-        # inserted before W1 (whose first-axis size becomes H2 instead of H).
-        self.num_neurons_layer_2 = getattr(cfg, "num_neurons_layer_2", None)
-        self._H2 = (int(self.num_neurons_layer_2)
-                    if self.num_neurons_layer_2 is not None else None)
-        # H_final is the actual input dim of W1.
-        self._H_final = self._H2 if self._H2 is not None else cfg.num_neurons
+        # Single-hidden-layer ANN. _H_final is the input dim of W1.
+        self.num_neurons_layer_2 = None
+        self._H2 = None
+        self._H_final = cfg.num_neurons
         # Resolve the Keras activation callable. Any name supported by
         # `tf.keras.activations.get` is accepted at construction; the
         # backward derivative path (`_activation_grad`) will raise
@@ -169,26 +137,8 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        # Optional second hidden layer (per-type). Only created when
-        # cfg.num_neurons_layer_2 is set. Identity init is not required —
-        # the model only needs to be a valid neural net at gen 0; SNES does
-        # the actual exploration. Glorot keeps initial activations balanced.
-        if self._H2 is not None:
-            self.W0_2 = self.add_weight(
-                name="W0_2",
-                shape=(cfg.num_types, cfg.num_neurons, self._H2),
-                initializer="glorot_uniform",
-                trainable=True,
-            )
-            self.b0_2 = self.add_weight(
-                name="b0_2",
-                shape=(cfg.num_types, self._H2),
-                initializer="zeros",
-                trainable=True,
-            )
-        else:
-            self.W0_2 = None
-            self.b0_2 = None
+        self.W0_2 = None
+        self.b0_2 = None
 
         # W1 : [num_types, H_final] — hidden-to-scalar weights per type
         # H_final == num_neurons in the legacy single-hidden case; H2 when
@@ -207,98 +157,6 @@ class TNEP(layers.Layer):
             initializer="zeros",
             trainable=True,
         )
-
-        # Per-(t, l) ANN heads (only allocated when descriptor_per_l_ann_heads).
-        # Each head has its own W0_l[T, Q_l, H], b0_l[T, H], W1_l[T, H], b1_l[1].
-        # Forward output is the sum over heads.
-        self.per_l_heads = bool(getattr(cfg, "descriptor_per_l_ann_heads", False))
-        if self.per_l_heads and bool(getattr(cfg, "descriptor_mixing", False)):
-            # Mirrors the guard in SNES.__init__ — fail at model construction
-            # instead of later inside the optimiser, so the error fires at
-            # the same place every cfg conflict is reported.
-            raise NotImplementedError(
-                "descriptor_per_l_ann_heads + descriptor_mixing is not "
-                "yet supported. Disable one or the other.")
-        if self.per_l_heads and bool(getattr(
-                cfg, "descriptor_mixing_output_layer", False)):
-            # predict_per_l_batch_candidates does not implement the R-fold
-            # that predict_batch_candidates does for output-side mixing.
-            # Enabling both flags would silently train against an
-            # un-rotated h1, producing incorrect predictions. Until the
-            # R-fold is plumbed through the per-l path, forbid the combo.
-            raise NotImplementedError(
-                "descriptor_per_l_ann_heads + descriptor_mixing_output_layer "
-                "is not yet supported. The per-l prediction path does not "
-                "apply the output-side R rotation. Disable one or the other.")
-        if self.per_l_heads:
-            from DescriptorBuilderGPU import descriptor_block_layout
-            _layout = descriptor_block_layout(cfg)
-            L = int(cfg.l_max) + 1
-            self._per_l_L = L
-            # Per-l q-index lookup tensors (used by the forward path).
-            self._per_l_q_indices = []
-            self._per_l_Q_l = []
-            for l in range(L):
-                qs = []
-                for p in _layout["pair_keys"]:
-                    if l in _layout["pair_ln_index"][p]:
-                        qs.extend(_layout["pair_ln_index"][p][l])
-                qs_sorted = sorted(qs)
-                self._per_l_q_indices.append(
-                    tf.constant(qs_sorted, dtype=tf.int32))
-                self._per_l_Q_l.append(len(qs_sorted))
-            # Allocate per-l Variables for the primary ANN.
-            T_ = int(cfg.num_types)
-            H_ = int(cfg.num_neurons)
-            self.W0_per_l = [
-                self.add_weight(name=f"W0_l{l}",
-                                shape=(T_, self._per_l_Q_l[l], H_),
-                                initializer="zeros", trainable=False)
-                for l in range(L)]
-            self.b0_per_l = [
-                self.add_weight(name=f"b0_l{l}", shape=(T_, H_),
-                                initializer="zeros", trainable=False)
-                for l in range(L)]
-            self.W1_per_l = [
-                self.add_weight(name=f"W1_l{l}", shape=(T_, H_),
-                                initializer="zeros", trainable=False)
-                for l in range(L)]
-            self.b1_per_l = [
-                self.add_weight(name=f"b1_l{l}", shape=(),
-                                initializer="zeros", trainable=False)
-                for l in range(L)]
-            if int(cfg.target_mode) == 2:
-                self.W0_pol_per_l = [
-                    self.add_weight(name=f"W0_pol_l{l}",
-                                    shape=(T_, self._per_l_Q_l[l], H_),
-                                    initializer="zeros", trainable=False)
-                    for l in range(L)]
-                self.b0_pol_per_l = [
-                    self.add_weight(name=f"b0_pol_l{l}", shape=(T_, H_),
-                                    initializer="zeros", trainable=False)
-                    for l in range(L)]
-                self.W1_pol_per_l = [
-                    self.add_weight(name=f"W1_pol_l{l}", shape=(T_, H_),
-                                    initializer="zeros", trainable=False)
-                    for l in range(L)]
-                self.b1_pol_per_l = [
-                    self.add_weight(name=f"b1_pol_l{l}", shape=(),
-                                    initializer="zeros", trainable=False)
-                    for l in range(L)]
-            else:
-                self.W0_pol_per_l = None
-                self.b0_pol_per_l = None
-                self.W1_pol_per_l = None
-                self.b1_pol_per_l = None
-        else:
-            self.W0_per_l = None
-            self.b0_per_l = None
-            self.W1_per_l = None
-            self.b1_per_l = None
-            self.W0_pol_per_l = None
-            self.b0_pol_per_l = None
-            self.W1_pol_per_l = None
-            self.b1_pol_per_l = None
 
         # Validate dipole contraction power (mode 1 only). Caught here
         # so configuration errors surface at model construction rather
@@ -328,23 +186,8 @@ class TNEP(layers.Layer):
                 initializer="zeros",
                 trainable=True,
             )
-            # Optional second hidden layer mirror for pol ANN.
-            if self._H2 is not None:
-                self.W0_2_pol = self.add_weight(
-                    name="W0_2_pol",
-                    shape=(cfg.num_types, cfg.num_neurons, self._H2),
-                    initializer="glorot_uniform",
-                    trainable=True,
-                )
-                self.b0_2_pol = self.add_weight(
-                    name="b0_2_pol",
-                    shape=(cfg.num_types, self._H2),
-                    initializer="zeros",
-                    trainable=True,
-                )
-            else:
-                self.W0_2_pol = None
-                self.b0_2_pol = None
+            self.W0_2_pol = None
+            self.b0_2_pol = None
             self.W1_pol = self.add_weight(
                 name="W1_pol",
                 shape=(cfg.num_types, self._H_final),
@@ -384,14 +227,8 @@ class TNEP(layers.Layer):
         # N=1 + linear (the legacy defaults) is bit-identical to the original
         # single-shared-V_pair path; in particular self.U_pair remains a single
         # tf.Variable referenced by save/load and by _U_full.
-        self.descriptor_mixing_n_layers = int(getattr(
-            cfg, "descriptor_mixing_n_layers", 1))
-        if self.descriptor_mixing_n_layers < 1:
-            raise ValueError(
-                f"descriptor_mixing_n_layers must be >= 1, got "
-                f"{self.descriptor_mixing_n_layers}")
-        self.descriptor_mixing_nonlinear = bool(getattr(
-            cfg, "descriptor_mixing_nonlinear", False))
+        self.descriptor_mixing_n_layers = 1
+        self.descriptor_mixing_nonlinear = False
         if self.descriptor_mixing_arch not in ("linear", "l_aware", "cross_pair_l"):
             raise ValueError(
                 f"descriptor_mixing_arch={self.descriptor_mixing_arch!r} not in "
@@ -462,17 +299,13 @@ class TNEP(layers.Layer):
                              self._mix_max_block_size, self._mix_max_block_size)
                 # Build N stacked mixing layers. Layer 0 keeps the legacy
                 # name "U_pair" so save/load round-trips for N=1.
-                self.U_pair_list = []
-                for k in range(self.descriptor_mixing_n_layers):
-                    name = "U_pair" if k == 0 else f"U_pair_{k}"
-                    var = self.add_weight(
-                        name=name,
-                        shape=shape,
-                        initializer="zeros",
-                        trainable=True,
-                    )
-                    self.U_pair_list.append(var)
-                self.U_pair = self.U_pair_list[0]
+                self.U_pair = self.add_weight(
+                    name="U_pair",
+                    shape=shape,
+                    initializer="zeros",
+                    trainable=True,
+                )
+                self.U_pair_list = [self.U_pair]
             elif self.descriptor_mixing_arch == "l_aware":
                 # Per-(pair, l) residual blocks. Within a pair, only
                 # radial channels at the same l mix; cross-l mixing is
@@ -532,17 +365,13 @@ class TNEP(layers.Layer):
                 else:
                     shape = (self._mix_num_pairs, self._mix_L,
                              self._mix_max_alpha, self._mix_max_alpha)
-                self.U_pair_list = []
-                for k in range(self.descriptor_mixing_n_layers):
-                    name = "U_pair" if k == 0 else f"U_pair_{k}"
-                    var = self.add_weight(
-                        name=name,
-                        shape=shape,
-                        initializer="zeros",
-                        trainable=True,
-                    )
-                    self.U_pair_list.append(var)
-                self.U_pair = self.U_pair_list[0]
+                self.U_pair = self.add_weight(
+                    name="U_pair",
+                    shape=shape,
+                    initializer="zeros",
+                    trainable=True,
+                )
+                self.U_pair_list = [self.U_pair]
             else:  # cross_pair_l
                 # One [N_l × N_l] residual matrix per angular momentum,
                 # where N_l = Σ_p α_eff_p. Mixes radial channels at the
@@ -576,37 +405,15 @@ class TNEP(layers.Layer):
                 else:
                     shape = (self._mix_L,
                              self._mix_N_per_l, self._mix_N_per_l)
-                self.U_pair_list = []
-                for k in range(self.descriptor_mixing_n_layers):
-                    name = "U_pair" if k == 0 else f"U_pair_{k}"
-                    var = self.add_weight(
-                        name=name,
-                        shape=shape,
-                        initializer="zeros",
-                        trainable=True,
-                    )
-                    self.U_pair_list.append(var)
-                self.U_pair = self.U_pair_list[0]
+                self.U_pair = self.add_weight(
+                    name="U_pair",
+                    shape=shape,
+                    initializer="zeros",
+                    trainable=True,
+                )
+                self.U_pair_list = [self.U_pair]
 
-            # Optional per-layer bias for nonlinear mixing.
-            # b_mix_k shape: [num_types, dim_q] if per_type else [dim_q].
-            # Zero-init so model starts close to the linear-mixing case.
-            if self.descriptor_mixing_nonlinear:
-                if self.descriptor_mixing_per_type:
-                    b_mix_shape = (cfg.num_types, self._mix_Q)
-                else:
-                    b_mix_shape = (self._mix_Q,)
-                self.b_mix_list = [
-                    self.add_weight(
-                        name=f"b_mix_{k}",
-                        shape=b_mix_shape,
-                        initializer="zeros",
-                        trainable=True,
-                    )
-                    for k in range(self.descriptor_mixing_n_layers)
-                ]
-            else:
-                self.b_mix_list = []
+            self.b_mix_list = []
         else:
             self.U_pair = None
             self.U_pair_list = []
@@ -618,78 +425,20 @@ class TNEP(layers.Layer):
         # stored as the residual V_cross = U_cross − I. SNES populates this
         # each candidate via _set_model_params. Zero-initialised so
         # U_cross = I at gen 0 (off-path bit-equivalence).
-        self.descriptor_mixing_cross_layer = bool(getattr(
-            cfg, "descriptor_mixing_cross_layer", False))
-        if self.descriptor_mixing and self.descriptor_mixing_cross_layer:
-            Q = int(cfg.dim_q)
-            self.V_cross = tf.Variable(
-                tf.zeros([Q, Q], dtype=tf.float32),
-                trainable=False, name="V_cross")
-            # Precompute the [Q, Q] identity once. `_W0_eff` builds
-            # `U_cross = I + V_cross` on every forward pass and was
-            # calling `tf.eye(cfg.dim_q)` inside the @tf.function-traced
-            # `predict_batch_candidates` hot path each gen; with the
-            # identity static, the matmul `U_full = U_cross · U_full`
-            # avoids one allocation per call.
-            self._eye_Q = tf.constant(
-                np.eye(Q, dtype=np.float32), name="eye_Q")
-        else:
-            self.V_cross = None
-            self._eye_Q = None
+        self.descriptor_mixing_cross_layer = False
+        self.V_cross = None
+        self._eye_Q = None
 
-        # Optional output-side (hidden-layer) orthogonal mixing R per type.
-        # Stored as residual V_R = R − I; SNES populates this each
-        # candidate. Init at zero → R = I at gen 0 (off-path bit-identity).
-        # Reconstructed to an orthogonal R via the same Cayley/expm path as
-        # U_pair (see self._R_full). Shape: [T, H, H].
-        self.descriptor_mixing_output_layer = bool(getattr(
-            cfg, "descriptor_mixing_output_layer", False))
-        if self.descriptor_mixing_output_layer:
-            H_out = int(self.num_neurons)
-            T_ = int(self.num_types)
-            self.R_pair = tf.Variable(
-                tf.zeros([T_, H_out, H_out], dtype=tf.float32),
-                trainable=False, name="R_pair")
-            self._R_H = H_out
-            # Precompute the H_out × H_out identity once. `_R_full` was
-            # allocating a fresh `tf.eye(self._R_H)` on every forward
-            # call inside predict_batch_candidates' @tf.function trace —
-            # a per-candidate eager allocation that adds up at λ=100.
-            self._eye_H = tf.constant(
-                np.eye(H_out, dtype=np.float32), name="eye_H")
-        else:
-            self.R_pair = None
-            self._R_H = 0
-            self._eye_H = None
+        # Output-side mixing R was removed; stubs kept so downstream
+        # consumer branches still resolve False at runtime.
+        self.descriptor_mixing_output_layer = False
+        self.R_pair = None
+        self._R_H = 0
+        self._eye_H = None
 
-        # Optional per-(species-pair, l, central-type) gating: g[t, p·L+l]
-        # is folded into W0 as a per-channel multiplier (channel attention).
-        # Allocated as [T, num_pairs·L] flat for fast tf.gather along the
-        # (pair, l) axis. Init = cfg.descriptor_gating_init (default 1.0).
-        self.descriptor_gating_enabled = bool(getattr(
-            cfg, "descriptor_gating_enabled", False))
-        if self.descriptor_gating_enabled:
-            from DescriptorBuilderGPU import descriptor_block_layout
-            _layout = descriptor_block_layout(cfg)
-            T_ = int(cfg.num_types)
-            num_pairs = len(_layout["pair_keys"])
-            L = int(cfg.l_max) + 1
-            init = float(getattr(cfg, "descriptor_gating_init", 1.0))
-            self.gates_pair_l = tf.Variable(
-                tf.fill([T_, num_pairs * L], init),
-                trainable=False, name="gates_pair_l")
-            # q→(pair·L+l) flat index for fast gather in the forward path.
-            pair_idx_of = {p: i for i, p in enumerate(_layout["pair_keys"])}
-            q_to_pl = np.full(int(cfg.dim_q), -1, dtype=np.int64)
-            for p in _layout["pair_keys"]:
-                pi = pair_idx_of[p]
-                for l, q_idx_list in _layout["pair_ln_index"][p].items():
-                    for q in q_idx_list:
-                        q_to_pl[int(q)] = pi * L + int(l)
-            self._gating_q_to_pl = tf.constant(q_to_pl)
-        else:
-            self.gates_pair_l = None
-            self._gating_q_to_pl = None
+        self.descriptor_gating_enabled = False
+        self.gates_pair_l = None
+        self._gating_q_to_pl = None
 
         # Preprocessing contraction (phase 2 of 2): Variable allocation
         # and mutual-exclusion guards. cfg.dim_q has already been
@@ -701,16 +450,6 @@ class TNEP(layers.Layer):
                     f"descriptor_mixing_arch={self.descriptor_mixing_arch!r} "
                     f"does not compose with descriptor_preprocess_contract in "
                     f"this build. Set arch to 'l_aware' or disable preprocess.")
-            if self.descriptor_gating_enabled:
-                raise NotImplementedError(
-                    "descriptor_preprocess_contract is mutually exclusive "
-                    "with descriptor_gating_enabled in this build. Set one to off.")
-            if bool(getattr(cfg, "descriptor_per_l_ann_heads", False)) \
-                    and self.descriptor_preprocess_contract in ("angular", "both"):
-                raise NotImplementedError(
-                    f"descriptor_preprocess_contract={self.descriptor_preprocess_contract!r} "
-                    f"collapses the l axis and is incompatible with "
-                    f"descriptor_per_l_ann_heads. Set one to off.")
             init_scheme = str(getattr(cfg, "descriptor_preprocess_init", "mean"))
             T_pre = int(cfg.num_types)
             self.preprocess_per_type = bool(getattr(
@@ -2392,144 +2131,6 @@ class TNEP(layers.Layer):
 
         # W_atom [B, A, 3, Q]: dipole[c,b,s] = -Σ_{a,q} de_dq[c,b,a,q]*W_atom[b,a,s,q]
         return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
-
-    def predict_per_l_batch_candidates(self,
-                                        descriptors: tf.Tensor,
-                                        W_atom: tf.Tensor | None,
-                                        Z: tf.Tensor,
-                                        atom_mask: tf.Tensor,
-                                        W0_per_l: list,
-                                        b0_per_l: list,
-                                        W1_per_l: list,
-                                        b1_per_l: list,
-                                        gates: tf.Tensor | None = None) -> tf.Tensor:
-        """Per-l-head version of predict_batch_candidates.
-
-        Computes U_i = Σ_l ANN_{Z[i], l}(q_i restricted to l) per atom,
-        then runs the standard dipole / PES contraction per-l and sums.
-
-        Inputs are lists of length L (one per angular momentum), each
-        carrying the per-candidate tensors:
-            W0_per_l[l] : [C, T, Q_l, H]
-            b0_per_l[l] : [C, T, H]
-            W1_per_l[l] : [C, T, H]
-            b1_per_l[l] : [C]
-
-        Returns:
-            target_mode 0 (PES)    : [C, B, 1]  (sum over atoms)
-            target_mode 1 (dipole) : [C, B, 3]
-        Target mode 2 (polarisability) is NOT supported in this first impl.
-        """
-        if self.cfg.target_mode == 2:
-            raise NotImplementedError(
-                "predict_per_l_batch_candidates does not yet support "
-                "target_mode=2 (polarisability).")
-        H = self.num_neurons
-        T = self.num_types
-        L = self._per_l_L
-        Q = self.dim_q
-        B = tf.shape(descriptors)[0]
-        A = tf.shape(descriptors)[1]
-        C = tf.shape(W0_per_l[0])[0]
-        Z_flat = tf.reshape(Z, [B * A])
-
-        type_masks = [
-            tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
-            for t in range(T)]
-
-        # Apply gating to the descriptor (gates flow to channels before
-        # per-l partitioning, so just multiply into descriptors here).
-        if self.descriptor_gating_enabled and gates is not None:
-            gates_q = tf.gather(gates, self._gating_q_to_pl, axis=-1)  # [C,T,Q]
-            # gates_q has [C, T, Q]; descriptors [B, A, Q]; to apply
-            # type-dependent gates per atom: for each candidate c we need
-            # gates_q[c, Z[i], :] for atom i. Build a gated descriptor as:
-            #   desc_gated[c, b, a, q] = descriptors[b, a, q] * gates_q[c, Z[b,a], q]
-            gates_per_atom = tf.gather(gates_q, Z, axis=1)            # [C, B, A, Q]
-            descriptors_for_l = descriptors[tf.newaxis, ...] * gates_per_atom
-        else:
-            descriptors_for_l = None  # use per-l gather of bare descriptors
-
-        accumulated_target = None   # PES energy or dipole, summed over l
-        for l in range(L):
-            Q_l = self._per_l_Q_l[l]
-            if Q_l == 0:
-                continue
-            q_indices_l = self._per_l_q_indices[l]
-            if descriptors_for_l is not None:
-                q_l = tf.gather(descriptors_for_l, q_indices_l, axis=-1)  # [C,B,A,Q_l]
-                # q_l_flat for the matmul: need per-candidate batched matmul.
-                # Path: per-type GEMMs on [C, B*A, Q_l].
-                q_l_flat = tf.reshape(q_l, [C, B * A, Q_l])
-                pre_h_l_terms = []
-                for t in range(T):
-                    W0_l_t = W0_per_l[l][:, t, :, :]                     # [C, Q_l, H]
-                    ph = tf.matmul(q_l_flat, W0_l_t)                     # [C, B*A, H]
-                    ph = tf.reshape(ph, [C, B, A, H])
-                    pre_h_l_terms.append(ph * type_masks[t][tf.newaxis])
-                pre_h_l = tf.add_n(pre_h_l_terms)                         # [C, B, A, H]
-            else:
-                # Bare descriptors (no gating). Slim path: gather q-slice
-                # once into [B, A, Q_l], then per-type [B*A, Q_l] @
-                # [Q_l, C*H] GEMM (mirrors the predict_batch_candidates
-                # trick when gating is off).
-                q_l = tf.gather(descriptors, q_indices_l, axis=-1)        # [B, A, Q_l]
-                desc_flat = tf.reshape(q_l, [B * A, Q_l])
-                pre_h_l_terms = []
-                for t in range(T):
-                    W0_l_t = W0_per_l[l][:, t, :, :]                     # [C, Q_l, H]
-                    W0_l_t_mat = tf.reshape(
-                        tf.transpose(W0_l_t, [1, 0, 2]),
-                        [Q_l, C * H])                                    # [Q_l, C*H]
-                    ph_flat = tf.matmul(desc_flat, W0_l_t_mat)           # [B*A, C*H]
-                    ph = tf.transpose(
-                        tf.reshape(ph_flat, [B, A, C, H]),
-                        [2, 0, 1, 3])                                    # [C,B,A,H]
-                    pre_h_l_terms.append(ph * type_masks[t][tf.newaxis])
-                pre_h_l = tf.add_n(pre_h_l_terms)
-
-            # Add per-atom bias b0_l[c, Z[a], :].
-            b0_l_t_all = tf.reshape(
-                tf.gather(b0_per_l[l], Z_flat, axis=1),
-                [C, B, A, H])
-            W1_l_t_all = tf.reshape(
-                tf.gather(W1_per_l[l], Z_flat, axis=1),
-                [C, B, A, H])
-            # Pre-activation z_l preserved for the swish-side backward chain.
-            z_l = pre_h_l + b0_l_t_all
-            h_l = self.activation(z_l)
-            h_l = h_l * atom_mask[tf.newaxis, :, :, tf.newaxis]
-
-            if self.cfg.target_mode == 0:
-                # PES per-l contribution.
-                U_per_atom_l = (tf.reduce_sum(h_l * W1_l_t_all, axis=3)
-                                + b1_per_l[l][:, tf.newaxis, tf.newaxis])
-                U_per_atom_l = U_per_atom_l * atom_mask[tf.newaxis]
-                E_l = -tf.reduce_sum(U_per_atom_l, axis=2, keepdims=True)
-                accumulated_target = E_l if accumulated_target is None \
-                    else accumulated_target + E_l
-                continue
-
-            # Dipole branch.
-            de_da_l = self._activation_grad(h_l, z_l) * W1_l_t_all        # [C,B,A,H]
-            de_da_l_flat = tf.reshape(de_da_l, [C, B * A, H])             # [C,B*A,H]
-            de_dq_l_terms = []
-            for t in range(T):
-                W0_l_t_T = tf.transpose(
-                    W0_per_l[l][:, t, :, :], [0, 2, 1])                  # [C, H, Q_l]
-                dq_flat = tf.matmul(de_da_l_flat, W0_l_t_T)              # [C,B*A,Q_l]
-                dq = tf.reshape(dq_flat, [C, B, A, Q_l])
-                de_dq_l_terms.append(dq * type_masks[t][tf.newaxis])
-            de_dq_l = tf.add_n(de_dq_l_terms)                             # [C,B,A,Q_l]
-
-            # Restrict W_atom to this l's q-indices and contract.
-            W_atom_l = tf.gather(W_atom, q_indices_l, axis=-1)            # [B,A,3,Q_l]
-            dipole_l = -tf.einsum(
-                'cbaq,basq->cbs', de_dq_l, W_atom_l)                      # [C,B,3]
-            accumulated_target = dipole_l if accumulated_target is None \
-                else accumulated_target + dipole_l
-
-        return accumulated_target
 
     def _scalar_rij_pow(self, rij2: tf.Tensor) -> tf.Tensor:
         """|r_ij|^N as a scalar per-pair weight (N ≥ 1 only).
