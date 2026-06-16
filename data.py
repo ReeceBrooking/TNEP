@@ -425,6 +425,7 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
         data,
         num_types=cfg.num_types,
         q_scaler=getattr(cfg, "_q_scaler", None),
+        q_zca_mean=getattr(cfg, "_q_zca_mean", None),
         target_mean=getattr(cfg, "_target_mean", None),
         self_pairs_only=_self_only)
 
@@ -652,6 +653,7 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
         gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
         cache_tag="test",
         q_scaler=getattr(cfg, "_q_scaler", None),
+        q_zca_mean=getattr(cfg, "_q_zca_mean", None),
         target_mean=getattr(cfg, "_target_mean", None),
         self_pairs_only=_self_only)
     # Pre-stage per-chunk pair indices to GPU. Test eval doesn't go
@@ -820,27 +822,131 @@ def _compute_q_scaler_l_block(descriptors_list, layout: dict,
     return scaler
 
 
+def _compute_q_zca_l_block(descriptors_list, layout: dict,
+                           eps: float = 1e-4) -> tuple[np.ndarray, np.ndarray]:
+    """Compute a per-(species-pair, l)-block ZCA whitening matrix.
+
+    For each (pair, l) sub-block B with column indices `idx ⊂ [0, Q)`:
+        C_B  = (1/N) · X_Bᵀ X_B           where X_B = train atoms × B
+        W_B  = (C_B + ε I)⁻¹⁄²            via eigendecomposition
+    The output is a single `[Q, Q]` block-diagonal matrix `W` where
+    `W[idx_B, idx_B] = W_B` for each block and 0 off-block. Applied via
+    `q' = W q`, this yields `Cov(q') = I` per block AND keeps the
+    original channel meanings (ZCA is the unique whitening with
+    minimum ‖W − I‖_F).
+
+    Each block is computed independently and centred on its own mean
+    before the covariance — descriptors are NOT centred globally
+    because the per-block centring is what makes the block-diagonal
+    structure exact.
+
+    ε regularises near-singular blocks (rare but possible when a
+    channel is nearly degenerate across the training set).
+
+    Args:
+        descriptors_list : list of [N_i, Q] arrays / tensors (one per
+                           training structure, pre-padding).
+        layout           : dict from `descriptor_block_layout(cfg)` —
+                           supplies "pair_keys", "pair_ln_index", "dim_q".
+        eps              : diagonal regulariser on C_B before inversion.
+
+    Returns:
+        W : [Q, Q] float32 block-diagonal whitening matrix.
+    """
+    dim_q = int(layout["dim_q"])
+    # Stream the data: build per-block covariance accumulators
+    # incrementally to avoid concatenating all train atoms into RAM.
+    pair_keys = layout["pair_keys"]
+    pair_ln_index = layout["pair_ln_index"]
+    blocks = []
+    for pair in pair_keys:
+        for l, idx in pair_ln_index[pair].items():
+            blocks.append(np.asarray(idx, dtype=np.int64))
+    # Two-pass: pass 1 = per-block mean; pass 2 = per-block covariance.
+    N_total = 0
+    block_sum = [np.zeros(b.size, dtype=np.float64) for b in blocks]
+    for d in descriptors_list:
+        arr = (d.numpy() if hasattr(d, "numpy") else np.asarray(d))
+        arr = arr.reshape(-1, dim_q)
+        N_total += arr.shape[0]
+        for i, b in enumerate(blocks):
+            block_sum[i] += arr[:, b].sum(axis=0)
+    if N_total < 2:
+        raise RuntimeError(
+            f"_compute_q_zca_l_block: too few atoms ({N_total}) to "
+            "estimate covariance.")
+    block_mean = [s / N_total for s in block_sum]
+    block_cov = [np.zeros((b.size, b.size), dtype=np.float64) for b in blocks]
+    for d in descriptors_list:
+        arr = (d.numpy() if hasattr(d, "numpy") else np.asarray(d))
+        arr = arr.reshape(-1, dim_q).astype(np.float64)
+        for i, b in enumerate(blocks):
+            x = arr[:, b] - block_mean[i][None, :]
+            block_cov[i] += x.T @ x
+    W = np.zeros((dim_q, dim_q), dtype=np.float32)
+    mean_full = np.zeros(dim_q, dtype=np.float32)
+    for i, b in enumerate(blocks):
+        C = block_cov[i] / max(1, N_total - 1)
+        # Symmetrise (numerical hygiene) then eigendecompose.
+        C = 0.5 * (C + C.T) + eps * np.eye(C.shape[0])
+        w_eig, V = np.linalg.eigh(C)
+        # All eigvals should be > 0 after ε regularisation; guard anyway.
+        w_eig = np.maximum(w_eig, eps)
+        W_block = (V * (1.0 / np.sqrt(w_eig))[None, :]) @ V.T  # V Λ⁻¹⁄² Vᵀ
+        W[np.ix_(b, b)] = W_block.astype(np.float32)
+        mean_full[b] = block_mean[i].astype(np.float32)
+    return W, mean_full
+
+
 def _apply_q_scaler_np(desc_np: np.ndarray,
                        grad_values_np: np.ndarray | None,
-                       scaler: np.ndarray) -> None:
-    """In-place per-channel scaling of `desc_np` and `grad_values_np`.
+                       scaler: np.ndarray,
+                       mean: np.ndarray | None = None) -> None:
+    """In-place scaling of `desc_np` and `grad_values_np`.
 
-    Both tensors are multiplied by the same `[Q]`-shape scaler along
-    their last axis. The dipole chain rule (∂U/∂r = ∂U/∂q' · diag(s)
-    · ∂q/∂r) is satisfied when BOTH descriptor and grad are scaled at
-    the data pipeline — see plan §"Why option (A)".
+    Dispatches on `scaler.ndim`:
+      * 1D `[Q]` (default): per-channel multiplication along the last
+        axis. Used by `per_component` and `l_block` granularities.
+      * 2D `[Q, Q]` (block-diagonal whitening): matrix multiply along
+        the last axis — `q' = W·q`, equivalent to `q' = q @ Wᵀ`.
+        Used by `l_block_zca` granularity. The chain rule for the
+        dipole gradient gives `∂q'/∂r = W·∂q/∂r`, so grad_values
+        receive the same `@ Wᵀ` along their last axis.
 
     Args:
         desc_np        : [S, A, Q] float32 padded descriptors.
         grad_values_np : [P, 3, Q] float32 COO gradient values, or
-                         None (e.g. streaming path where grad is
-                         already on disk).
-        scaler         : [Q] float32 per-channel multiplier.
+                         None (streaming path).
+        scaler         : [Q] vector OR [Q, Q] block-diagonal matrix.
     """
     s = scaler.astype(np.float32)
-    desc_np *= s[None, None, :]
-    if grad_values_np is not None:
-        grad_values_np *= s[None, None, :]
+    if s.ndim == 1:
+        desc_np *= s[None, None, :]
+        if grad_values_np is not None:
+            grad_values_np *= s[None, None, :]
+    elif s.ndim == 2:
+        # Matrix-multiply along the last axis. For ZCA, the descriptor
+        # transformation is q' = W · (q − μ) — mean subtraction at apply
+        # time is REQUIRED for the trained model to see the same input
+        # distribution that the W matrix was derived from. Without it the
+        # network sees a constant bias W·μ that saturates first-layer
+        # activations from gen 0. (See _compute_q_zca_l_block.)
+        # The chain rule for grad_values is unaffected by the mean (∂μ/∂r = 0):
+        # ∂q'/∂r = W · ∂q/∂r, so grad_values just get the matrix multiply.
+        S = desc_np.shape[:-1]
+        desc_flat = desc_np.reshape(-1, desc_np.shape[-1])
+        if mean is not None:
+            m = mean.astype(np.float32).reshape(-1)
+            desc_flat[:] = (desc_flat - m[None, :]) @ s.T
+        else:
+            desc_flat[:] = desc_flat @ s.T
+        if grad_values_np is not None:
+            G = grad_values_np.shape[:-1]
+            g_flat = grad_values_np.reshape(-1, grad_values_np.shape[-1])
+            g_flat[:] = g_flat @ s.T
+    else:
+        raise ValueError(
+            f"_apply_q_scaler_np: scaler must be 1D or 2D, got ndim={s.ndim}")
 
 
 def _compute_target_mean(targets_list, target_dim: int) -> np.ndarray:
@@ -897,6 +1003,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
                   cache_tag: str = "data",
                   prebuilt_gv: dict | None = None,
                   q_scaler: np.ndarray | None = None,
+                  q_zca_mean: np.ndarray | None = None,
                   target_mean: np.ndarray | None = None,
                   self_pairs_only: bool = False) -> dict[str, tf.Tensor]:
     """Convert variable-length list-of-tensors data into COO + padded tensors.
@@ -1103,7 +1210,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
                 "(prebuilt_gv) path because grad_values is already on "
                 "disk and cannot be modified in-place. Rebuild without "
                 "streaming, or pre-scale the .bin file offline.")
-        _apply_q_scaler_np(desc_np, grad_values_np, q_scaler)
+        _apply_q_scaler_np(desc_np, grad_values_np, q_scaler,
+                           mean=q_zca_mean)
 
     # Per-component target centering (cfg.target_centering=True). One
     # broadcast subtraction along the T_dim axis. Same mean is used for

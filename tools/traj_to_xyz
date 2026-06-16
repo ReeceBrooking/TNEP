@@ -1,0 +1,15 @@
+# tools/traj_to_xyz.py
+"""Convert ASE .traj → .xyz (or .extxyz). Preserves info dict, cell, pbc.
+
+    python tools/traj_to_xyz.py input.traj [output.xyz]
+"""
+import os, sys
+from ase.io import read, write
+
+def traj_to_xyz(traj : str, save_path : str = "datasets/new_dataset.xyz"):
+    frames = read(traj, index=":")
+    write(save_path, frames)
+    print(f"Wrote {len(frames)} frames to " + save_path)
+
+if __name__ == '__main__':
+    traj_to_xyz(traj = "datasets/ethanol_nve.traj", save_path = "datasets/ethanol_mace_traj.xyz")

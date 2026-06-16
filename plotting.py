@@ -51,6 +51,86 @@ def unit_label(cfg: TNEPconfig) -> str:
     return ""
 
 
+# Dipole-unit conversion table: factor to multiply by to convert
+# 1 unit_X into Debye. Used to derive any pairwise conversion via
+# `factor_X_to_Y = TO_DEBYE[X] / TO_DEBYE[Y]`. Values:
+#   1 e\u00b7\u00c5  = 4.80320 Debye
+#   1 e\u00b7a\u2080 = 2.54175 Debye   (since 1 a\u2080 = 0.52917721 \u00c5)
+#   1 Debye = 1 Debye
+_DIPOLE_TO_DEBYE: dict[str, float] = {
+    "e*angstrom": 4.80320,
+    "e*bohr":     2.54175,
+    "debye":      1.0,
+}
+
+# Display label for each canonical unit key.
+_DIPOLE_LABEL: dict[str, str] = {
+    "e*angstrom": "e\u00b7\u00c5",
+    "e*bohr":     "e\u00b7a\u2080",
+    "debye":      "Debye",
+}
+
+
+def _training_space_dipole_key(cfg: TNEPconfig) -> str:
+    """Return the canonical key for the unit the model TRAINS in.
+
+    When `cfg.convert_dipole_to_eangstrom=True`, training space is e\u00b7\u00c5
+    regardless of `cfg.dipole_units`. Otherwise it's the dataset's native
+    unit (cfg.dipole_units).
+    """
+    if getattr(cfg, "convert_dipole_to_eangstrom", True):
+        return "e*angstrom"
+    return getattr(cfg, "dipole_units", "e*angstrom")
+
+
+def _plot_dipole_conversion_factor(cfg: TNEPconfig) -> float:
+    """Return the scalar to multiply per-atom or molecular dipole arrays
+    (and absolute-error metrics like RMSE) by, to convert FROM training
+    space TO `cfg.plot_units`. Returns 1.0 (no-op) when:
+      - target_mode != 1 (dipole),
+      - cfg.plot_units is None, or
+      - plot unit equals training-space unit.
+    """
+    if cfg.target_mode != 1:
+        return 1.0
+    plot_unit = getattr(cfg, "plot_units", None)
+    if plot_unit is None:
+        return 1.0
+    if plot_unit not in _DIPOLE_TO_DEBYE:
+        raise ValueError(
+            f"cfg.plot_units={plot_unit!r} not recognised; expected one of "
+            f"{sorted(_DIPOLE_TO_DEBYE.keys())} or None.")
+    training_unit = _training_space_dipole_key(cfg)
+    if training_unit == plot_unit:
+        return 1.0
+    return _DIPOLE_TO_DEBYE[training_unit] / _DIPOLE_TO_DEBYE[plot_unit]
+
+
+def _plot_unit_label(cfg: TNEPconfig) -> str:
+    """Like `unit_label` but routes through `cfg.plot_units` if set.
+
+    For target_mode=1 with `cfg.plot_units` set, returns the plot-space
+    label. For all other modes \u2014 and for None / unrecognised plot_units \u2014
+    falls back to `unit_label(cfg)` (training-space label).
+    """
+    if cfg.target_mode != 1:
+        return unit_label(cfg)
+    plot_unit = getattr(cfg, "plot_units", None)
+    if plot_unit is None:
+        return unit_label(cfg)
+    return _DIPOLE_LABEL.get(plot_unit, unit_label(cfg))
+
+
+def _to_plot_units(arr: np.ndarray, cfg: TNEPconfig) -> np.ndarray:
+    """Rescale `arr` from training space into `cfg.plot_units`. No-op
+    when no conversion is configured (returns `arr` unchanged, NOT a copy).
+    """
+    factor = _plot_dipole_conversion_factor(cfg)
+    if factor == 1.0:
+        return arr
+    return arr * factor
+
+
 def _make_plot_filename(cfg: TNEPconfig, plot_name: str) -> str:
     """Generate an automatic filename for a plot based on config and plot name.
 
@@ -253,6 +333,15 @@ def plot_timing(history: dict, cfg: TNEPconfig,
 def _build_suptitle(cfg: TNEPconfig, suffix: str | None,
                     rmse: float, rrmse: float, r2: float) -> str:
     """Build a suptitle string with mode, suffix label, and metrics."""
+    presentation = bool(getattr(cfg, "_presentation_mode", False))
+    if presentation and cfg.target_mode == 1:
+        # Presentation override: poster-friendly title "Per-atom Dipole",
+        # higher-precision RMSE, total RRMSE kept (per-panel RRMSE is
+        # dropped separately inside plot_correlation).
+        units = _plot_unit_label(cfg)
+        return (f"Per-atom Dipole \u2014 RMSE: {rmse:.5f} {units}, "
+                f"RRMSE: {rrmse:.4f}, R\u00b2: {r2:.4f}")
+
     mode_names = {0: "PES", 1: "Dipole", 2: "Polarizability"}
     mode = mode_names.get(cfg.target_mode, f"Mode {cfg.target_mode}")
     if suffix:
@@ -277,13 +366,17 @@ def _build_suptitle(cfg: TNEPconfig, suffix: str | None,
         label = f" ({' '.join(label_parts)})" if label_parts else f" ({suffix})"
     else:
         label = ""
-    units = unit_label(cfg)
+    # Route via _plot_unit_label so cfg.plot_units overrides the suptitle
+    # unit when set. Callers that pass `rmse` are expected to have already
+    # rescaled it; this only relabels.
+    units = _plot_unit_label(cfg)
     return f"{mode}{label} \u2014 RMSE: {rmse:.4f} {units}, RRMSE: {rrmse:.4f}, R\u00b2: {r2:.4f}"
 
 
 def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict,
                      cfg: TNEPconfig, save_plots: str | None = None,
-                     show_plots: bool = True, suffix: str | None = None) -> None:
+                     show_plots: bool = True, suffix: str | None = None,
+                     shared_axis_scale: bool = False) -> None:
     """Plot target vs prediction correlation with per-component R².
 
     For scalar targets (PES), plots a single correlation panel.
@@ -297,6 +390,16 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
         cfg         : TNEPconfig — used to determine target mode and labels
         save_plots  : str or None — directory to save into
         show_plots  : bool — True to display interactively
+        shared_axis_scale : when True, every per-component panel is drawn
+                            with the SAME x/y limits — computed from the
+                            joint min/max of (targets, predictions) over
+                            all components together. Makes per-component
+                            magnitudes visually comparable (e.g. for
+                            anisotropic dipole/polarisability data where
+                            one component dominates and rescaling each
+                            panel individually hides the asymmetry). When
+                            False (default), each panel autoscales to its
+                            own component's range.
     """
     T = targets.shape[1]
     rmse = float(metrics["rmse"])
@@ -309,13 +412,36 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
     rrmse = float(metrics["rrmse"])
     rrmse_comp = np.asarray(metrics["rrmse_components"])
 
+    # Optional unit conversion for plotting only (cfg.plot_units). Rescales
+    # arrays and absolute-error metrics; R²/RRMSE/cosine are scale-invariant
+    # so untouched. No-op when cfg.plot_units is None (default).
+    conv = _plot_dipole_conversion_factor(cfg)
+    if conv != 1.0:
+        targets = targets * conv
+        predictions = predictions * conv
+        rmse = rmse * conv
+
     labels = component_labels(cfg.target_mode, T)
-    units = unit_label(cfg)
+    units = _plot_unit_label(cfg)
+    presentation = bool(getattr(cfg, "_presentation_mode", False))
 
     ncols = min(T, 3)
     nrows = (T + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), squeeze=False)
+
+    # Pre-compute shared (lo, hi) over ALL components when requested so
+    # every per-panel x/y limit is identical and per-component magnitudes
+    # are directly comparable. Same `margin` rule as the per-panel path so
+    # the x=y line still extends past the data on each side.
+    if shared_axis_scale:
+        _g_lo = float(min(targets.min(), predictions.min()))
+        _g_hi = float(max(targets.max(), predictions.max()))
+        _g_margin = 0.05 * (_g_hi - _g_lo) if _g_hi > _g_lo else 0.5
+        shared_lo = _g_lo - _g_margin
+        shared_hi = _g_hi + _g_margin
+    else:
+        shared_lo = shared_hi = None
 
     for i in range(T):
         ax = axes[i // ncols, i % ncols]
@@ -324,17 +450,32 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
 
         ax.scatter(t, p, s=10, alpha=0.6)
 
-        # x = y reference line
-        lo = min(t.min(), p.min())
-        hi = max(t.max(), p.max())
-        margin = 0.05 * (hi - lo) if hi > lo else 0.5
-        ax.plot([lo - margin, hi + margin], [lo - margin, hi + margin],
+        # x = y reference line — span the SHARED range when shared_axis_scale
+        # is set so the line is identical across every panel, otherwise span
+        # this component's own (lo, hi) plus a 5 % margin.
+        if shared_axis_scale:
+            line_lo, line_hi = shared_lo, shared_hi
+        else:
+            lo = min(t.min(), p.min())
+            hi = max(t.max(), p.max())
+            margin = 0.05 * (hi - lo) if hi > lo else 0.5
+            line_lo, line_hi = lo - margin, hi + margin
+        ax.plot([line_lo, line_hi], [line_lo, line_hi],
                 'k--', linewidth=1, label="x = y")
 
         ax.set_xlabel(f"Target {labels[i]} ({units})")
         ax.set_ylabel(f"Prediction {labels[i]} ({units})")
-        ax.set_title(f"{labels[i]}  R²={r2_comp[i]:.4f}  RRMSE={rrmse_comp[i]:.4f}")
+        # Presentation mode drops the per-panel RRMSE — the suptitle
+        # carries the overall RMSE / R², and the per-panel RRMSE is just
+        # noise at distance.
+        if presentation:
+            ax.set_title(f"{labels[i]}  R²={r2_comp[i]:.4f}")
+        else:
+            ax.set_title(f"{labels[i]}  R²={r2_comp[i]:.4f}  RRMSE={rrmse_comp[i]:.4f}")
         ax.set_aspect('equal', adjustable='box')
+        if shared_axis_scale:
+            ax.set_xlim(shared_lo, shared_hi)
+            ax.set_ylim(shared_lo, shared_hi)
         ax.legend(loc='upper left')
 
     # Hide unused subplots
@@ -401,6 +542,15 @@ def plot_error_vs_magnitude(targets: np.ndarray, predictions: np.ndarray,
     """
     T = targets.shape[1]
 
+    # Optional unit conversion for plotting only (cfg.plot_units). Slope of
+    # the absolute-error vs. target-magnitude fit is dimensionless and so
+    # invariant under uniform rescaling; the intercept inherits the unit
+    # and so rescales with the arrays. No-op when cfg.plot_units is None.
+    conv = _plot_dipole_conversion_factor(cfg)
+    if conv != 1.0:
+        targets = targets * conv
+        predictions = predictions * conv
+
     if T == 1:
         tgt_mag = np.abs(targets[:, 0])
         abs_err = np.abs(targets[:, 0] - predictions[:, 0])
@@ -418,7 +568,7 @@ def plot_error_vs_magnitude(targets: np.ndarray, predictions: np.ndarray,
         ax.plot(x_fit, slope * x_fit + intercept, 'r--', linewidth=1.5,
                 label=f"fit: {slope:.4f}x + {intercept:.4f}")
 
-    units = unit_label(cfg)
+    units = _plot_unit_label(cfg)
     ax.set_xlabel(f"Target magnitude ({units})")
     ax.set_ylabel(f"Absolute error ({units})")
     ax.set_xlim(left=0)

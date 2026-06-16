@@ -1183,3 +1183,56 @@ plots/Ethanol/Ethanol_tgap/ethanol_traj_dipoles.txt
 plots/Ethanol/Ethanol_tgap/ir_spectrum_dipole_pop100_n50_l4_ethanol.png
 plots/Ethanol/Ethanol_tgap/ir_spectrum_dipole_pop100_n50_l4.png
 plots/Ethanol/Ethanol_tgap/thermoplot.png
+docs/benchmarks/2026-05-31-crfmnes-vs-snes-sanity-raw.json
+docs/benchmarks/2026-05-31-crfmnes-vs-snes-sanity.md
+docs/benchmarks/2026-05-31-crfmnes-vs-snes-sanity.png
+docs/superpowers/plans/2026-05-28-hybrid-adam-snes-optimizer.md
+docs/superpowers/plans/2026-05-29-guided-es-lowrank-covariance.md
+docs/superpowers/plans/2026-05-31-crfmnes-snes.md
+docs/superpowers/plans/2026-06-01-msr-and-hessian-spectrum.md
+docs/superpowers/plans/2026-06-02-descriptor-preprocess-contraction.md
+docs/superpowers/plans/2026-06-02-output-side-mixing.md
+docs/superpowers/plans/2026-06-02-per-l-ann-heads.md
+datasets/cho_dipole_gpumd.out
+datasets/cho_filter_test.xyz
+datasets/dipole_test_tnep.out
+datasets/dipole_test.out
+datasets/ethanol_thermo_log.log
+datasets/test_CHO.xyz
+datasets/ethanol mlatom set/ethanol_traj_mlatom.xyz
+plots/BulkWater/GPUMD traj/dipole_error.png
+plots/BulkWater/GPUMD traj/dipole_gpumd_out.out
+plots/BulkWater/GPUMD traj/ir_spectrum_dipole_pop80_n30_l4_bulk_water.png
+plots/BulkWater/GPUMD traj/water_bulk_gpumd_spectra.png
+plots/BulkWater/GPUMD traj/water_bulk_traj_dipoles.txt
+plots/BulkWater/GPUMD traj/water_bulk_traj.xyz
+plots/BulkWater/MACE traj/nve_auto_absorbance_dipole_pop100_n30_l4.png
+plots/BulkWater/MACE traj/nve_auto_power_dipole_pop100_n30_l4.png
+plots/BulkWater/MACE traj/nve_auto_transmittance_dipole_pop100_n30_l4.png
+plots/BulkWater/MACE traj/nve_dipoles.txt
+.gitignore
+tests/__init__.py
+tests/test_activation_backward.py
+tests/test_crfmnes.py
+tests/test_cross_channel_mixing.py
+tests/test_descriptor_preprocess.py
+tests/test_descriptor_scaling.py
+tests/test_descriptor_worker.py
+tests/test_gating.py
+tests/test_guided_es.py
+tests/test_hybrid_optimizer.py
+tests/test_lowrank_cma.py
+tests/test_mixing_init.py
+tests/test_msr.py
+tests/test_per_l_heads.py
+tests/test_q_zca_whitening.py
+tests/test_startup_config.py
+tests/fixtures/crfmnes_step_reference.npz
+tests/fixtures/generate_crfmnes_reference.py
+tests/fixtures/h2_close.npz
+tests/fixtures/h2_far.npz
+tests/fixtures/si_bulk.npz
+tests/fixtures/si_dimer.npz
+tests/fixtures/single_h.npz
+tests/fixtures/water_dimer.npz
+tests/fixtures/water_monomer.npz

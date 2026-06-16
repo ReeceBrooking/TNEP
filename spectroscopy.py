@@ -546,6 +546,526 @@ def plot_ir_spectrum(freq_cm: np.ndarray, intensity: np.ndarray, cfg: TNEPconfig
     )
 
 
+def _load_dipole_source(source, *,
+                         usecols: tuple[int, ...] | None = None,
+                         skiprows: int = 0) -> np.ndarray:
+    """Resolve a dipole input into an ``[T, 3]`` ndarray.
+
+    Accepts:
+      - ``np.ndarray``: used as-is if shape ``[T, 3]``; if ``[T, K]`` with
+        ``K > 3``, the last 3 columns are taken (drops a leading time /
+        step index column — the GPUMD ``dipole.out`` convention).
+      - ``str`` / ``pathlib.Path`` ending in ``.npy``: loaded with
+        ``np.load`` then the same column rules apply.
+      - any other ``str`` / ``Path``: loaded with ``np.loadtxt`` then
+        the same column rules apply.
+
+    Args:
+        source: array, or path to a ``.npy`` / text file.
+        usecols: explicit column selection passed to the underlying
+            loader. Overrides the "last 3 columns" auto-detection.
+        skiprows: header rows to skip when loading a text file.
+
+    Returns:
+        ``[T, 3]`` float ndarray.
+    """
+    import os
+    from pathlib import Path
+
+    if isinstance(source, np.ndarray):
+        arr = source
+    elif isinstance(source, (str, Path)):
+        path = str(source)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"plot_ir_overlay: dipole source file does not exist: {path}")
+        if path.lower().endswith(".npy"):
+            arr = np.load(path)
+            if usecols is not None:
+                arr = arr[:, list(usecols)]
+        else:
+            arr = np.loadtxt(path, skiprows=skiprows,
+                             usecols=usecols if usecols is not None else None)
+    else:
+        raise TypeError(
+            f"plot_ir_overlay: dipole source must be ndarray, str, or Path; "
+            f"got {type(source).__name__} ({source!r})")
+
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError(
+            f"plot_ir_overlay: dipole source resolved to shape {arr.shape}; "
+            f"expected 2-D [T, K] with K >= 3.")
+    if arr.shape[1] == 3:
+        return arr
+    if arr.shape[1] > 3:
+        # Auto-strip the leading non-dipole columns (GPUMD `dipole.out`
+        # convention: first column is the time-step index).
+        return arr[:, -3:]
+    raise ValueError(
+        f"plot_ir_overlay: dipole source resolved to shape {arr.shape}; "
+        f"need at least 3 columns. Pass usecols=(...) to override.")
+
+
+def _load_spectrum_csv(path, x_col: str, y_col: str) -> tuple[np.ndarray, np.ndarray]:
+    """Read a header-bearing CSV / TSV / whitespace text file and pull out
+    two named columns as (x, y) ndarrays.
+
+    Args:
+        path: filesystem path to the file.
+        x_col: column name for the frequency / wavenumber axis. The first
+            line of the file is treated as the header row; whichever
+            column matches this name is returned as `x`.
+        y_col: column name for the intensity axis.
+
+    Returns:
+        (x, y): two 1-D float ndarrays of equal length.
+
+    Raises:
+        FileNotFoundError: if the file is missing.
+        ValueError: if either column name is not present in the header.
+    """
+    import os
+    from pathlib import Path
+
+    path = str(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"plot_ir_overlay: spectrum CSV does not exist: {path}")
+
+    # Sniff a delimiter from the first data-ish line. csv has plenty of
+    # built-in machinery for this; numpy.genfromtxt usually copes with
+    # whitespace fallback automatically when delimiter=None.
+    with open(path, "r", encoding="utf-8") as f:
+        first_line = f.readline().rstrip("\r\n")
+    if "," in first_line:
+        delimiter = ","
+    elif "\t" in first_line:
+        delimiter = "\t"
+    else:
+        delimiter = None   # whitespace
+
+    headers = ([h.strip() for h in first_line.split(delimiter)]
+               if delimiter is not None
+               else first_line.split())
+    if x_col not in headers:
+        raise ValueError(
+            f"plot_ir_overlay: x-axis column {x_col!r} not in {path} "
+            f"header. Available columns: {headers}")
+    if y_col not in headers:
+        raise ValueError(
+            f"plot_ir_overlay: y-axis column {y_col!r} not in {path} "
+            f"header. Available columns: {headers}")
+    x_idx = headers.index(x_col)
+    y_idx = headers.index(y_col)
+    arr = np.loadtxt(path, delimiter=delimiter, skiprows=1,
+                      usecols=(x_idx, y_idx))
+    if arr.ndim == 1:
+        # Single-row file collapses; reshape so the caller gets [N>=1, 2].
+        arr = arr[np.newaxis, :]
+    return arr[:, 0].astype(np.float64), arr[:, 1].astype(np.float64)
+
+
+def _unpack_spectrum_entry(label: str, entry) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve a spectra-dict value into (freq, intensity) arrays.
+
+    Two accepted shapes:
+      - ``(freq_array, intensity_array)``: arrays passed directly.
+      - ``(csv_path, x_col_name, y_col_name)``: load from disk, naming
+        the two columns to extract.
+
+    Raises ValueError with the label baked into the message on failure.
+    """
+    if isinstance(entry, (tuple, list)) and len(entry) == 2:
+        freq, intensity = entry
+        return np.asarray(freq), np.asarray(intensity)
+    if isinstance(entry, (tuple, list)) and len(entry) == 3:
+        path, x_col, y_col = entry
+        try:
+            return _load_spectrum_csv(path, x_col, y_col)
+        except (FileNotFoundError, ValueError) as exc:
+            raise type(exc)(
+                f"plot_ir_overlay: spectra[{label!r}]: {exc}") from exc
+    raise ValueError(
+        f"plot_ir_overlay: spectra[{label!r}] must be either "
+        f"(freq_array, intensity_array) or "
+        f"(csv_path, x_col_name, y_col_name); got {entry!r}.")
+
+
+def plot_ir_overlay(
+    dipoles: dict[str, tuple] | None = None,
+    spectra: dict[str, tuple] | None = None,
+    *,
+    quantum_correction: str = "harmonic",
+    temperature: float = 300.0,
+    window_cm: tuple[float, float] = (400.0, 4000.0),
+    acf_ratio: float = 0.1,
+    smooth_k: int = 10,
+    smooth_kind: str = "gaussian",
+    window: str | None = "hann",
+    usecols: tuple[int, ...] | None = None,
+    skiprows: int = 0,
+    styles: dict[str, dict] | None = None,
+    band_annotations: list[tuple[float, str]] | None = None,
+    title: str | None = None,
+    xlabel: str = "Wavenumber (cm⁻¹)",
+    ylabel: str = "IR Intensity (arb. units)",
+    figsize: tuple[float, float] | None = None,
+    presentation: bool = False,
+    cfg: "TNEPconfig | None" = None,
+    save_plots: str | None = None,
+    show_plots: bool = True,
+    ax: "plt.Axes | None" = None,
+) -> "plt.Axes":
+    """Overlay an arbitrary number of IR spectra on one axis.
+
+    Two input channels — both optional, mix freely:
+
+      - ``dipoles``: dict ``{label: (source, dt_fs)}`` where ``source``
+        is either an ``[T, 3]`` (or ``[T, K>3]``) ndarray, OR a string /
+        ``Path`` to a ``.npy`` or text file containing the dipole
+        time-series. Text files are loaded via ``np.loadtxt``; ``.npy``
+        via ``np.load``. If the loaded array has more than 3 columns the
+        last 3 are taken (drops a leading time-step index — GPUMD
+        ``dipole.out`` convention). Use ``usecols=(...)`` / ``skiprows=``
+        to override the loader heuristic.
+
+        Each entry is converted to an IR absorption spectrum by
+        ``compute_ir_spectrum`` using the SHARED ``quantum_correction``
+        and ``temperature`` so all MD-derived traces sit on the same
+        prefactor convention.
+
+      - ``spectra``: dict whose values can take either form:
+            ``(freq_cm, intensity)``               — two arrays passed directly
+            ``(csv_path, x_col_name, y_col_name)`` — load named columns from
+                                                     a CSV / TSV / whitespace
+                                                     text file with a header row
+        Use this for experimental references (Max & Chapados, Bertie &
+        Lan, Hale & Querry) or any spectrum already in ``α(ω)`` / ``k(ν̃)``
+        form. NO quantum correction is applied to these — they're
+        treated as ground-truth observables. Example loading the
+        already-extracted Max & Chapados CSV:
+            ``spectra={"Max et al": ("max_water_ir.csv",
+                                     "wavenumber_cm1", "k_H2O")}``
+
+    Every trace is peak-normalised within ``window_cm`` so absolute
+    intensity differences (which depend on units that aren't comparable
+    across MD vs experiment) are removed. Band positions, widths, and
+    relative heights of features INSIDE the window remain meaningful.
+
+    Args:
+        dipoles: dipole time-series, see channel description above.
+        spectra: pre-computed spectra, see channel description above.
+        quantum_correction: forwarded to ``compute_ir_spectrum``; same
+            value applied to every entry in ``dipoles``. Options:
+            ``"harmonic"`` (default; GPUMD / Xu et al. convention),
+            ``"classical"`` (ω²·M(ω); the GPUMD stock script's choice),
+            ``"linear"``, ``"none"``.
+        temperature: forwarded to ``compute_ir_spectrum`` for the
+            harmonic correction. Ignored for ``"classical"``.
+        window_cm: (low, high) wavenumber range used for BOTH the
+            x-axis and the peak-normalisation. Default 400–4000 cm⁻¹
+            covers librations through O–H stretch for water.
+        acf_ratio, smooth_k, smooth_kind, window: forwarded to
+            ``compute_ir_spectrum`` for every dipole entry. Match the
+            settings used for the GPUMD reference if you computed it
+            externally.
+        usecols: explicit column selection passed to the dipole loader
+            when a file path is supplied. ``None`` (default) means use
+            the "last 3 columns" auto-detection. Apply globally to all
+            ``dipoles`` entries.
+        skiprows: header rows to skip when a text file is supplied.
+        styles: optional per-label matplotlib kwargs, e.g.
+            ``{"this work": dict(color="#1f77b4", linewidth=2)}``.
+            Anything not specified falls back to the default palette.
+        band_annotations: list of ``(wavenumber_cm, label)`` tuples to
+            draw as vertical guide lines with band names. Default is
+            the liquid-water canonical set (libration 660, bend 1645,
+            O–H stretch 3410). Pass ``[]`` to disable; pass a custom
+            list to override.
+        title, xlabel, ylabel: standard matplotlib labels.
+        figsize: figure size when a new axis is created. ``None`` →
+            (8, 4.5) for paper / screen, (12.5, 6.5) for ``presentation=True``.
+        presentation: when ``True``, switch to a thick-line, large-font
+            preset designed to be readable from across a room (posters,
+            conference talks, projector slides). Line widths are ~2.5×,
+            font sizes are ~1.7×, the figure defaults to 12.5 × 6.5
+            inches, axis spines are thickened, and band-annotation
+            labels are enlarged. User-supplied ``styles`` entries are
+            still honoured but their line widths are scaled to match.
+        cfg: optional TNEPconfig; when provided, integrates with
+            ``_finish_fig`` for automatic save / show handling so the
+            output filename matches the project's naming convention.
+        save_plots: directory to save into. ``None`` skips saving.
+        show_plots: ``True`` to show interactively.
+        ax: existing axis to draw into. ``None`` creates a new figure.
+
+    Returns:
+        The matplotlib axis the overlay was drawn on.
+
+    Example:
+        >>> import numpy as np
+        >>> # MD-derived dipoles + Max & Chapados 2009 experimental k(ν̃)
+        >>> max_data = np.loadtxt("max_water_ir.csv", delimiter=",", skiprows=1)
+        >>> nu, k_h2o = max_data[:, 0], max_data[:, 2]
+        >>> plot_ir_overlay(
+        ...     dipoles={
+        ...         "this work":  (my_dipoles_t3,    dt_fs=1.0),
+        ...         "GPUMD ref":  (gpumd_dipoles_t3, dt_fs=1.0),
+        ...     },
+        ...     spectra={"Max & Chapados 2009": (nu, k_h2o)},
+        ...     quantum_correction="harmonic",
+        ...     temperature=300.0,
+        ... )
+    """
+    dipoles = dipoles or {}
+    spectra = spectra or {}
+    if not dipoles and not spectra:
+        raise ValueError(
+            "plot_ir_overlay: no traces to plot. Provide at least one entry "
+            "in `dipoles` or `spectra`.")
+
+    # ── Presentation-mode preset ────────────────────────────────────────────
+    # When `presentation=True`, the whole figure switches to a poster /
+    # projector-friendly preset:
+    #   - linewidths multiplied by `lw_scale` (≈ 2.5×)
+    #   - default figsize bumped to 12.5 × 6.5
+    #   - axis labels / ticks / legend / band-annotation fonts enlarged
+    #   - spine and tick widths thickened
+    # User-supplied styles are still honoured but any explicit ``linewidth``
+    # they set is also multiplied by `lw_scale` so a contributor's "make
+    # this trace extra thick" intent is preserved relative to other lines.
+    if presentation:
+        lw_scale = 2.5
+        if figsize is None:
+            figsize = (12.5, 7.5)
+        font_axes_label = 18
+        font_title = 20
+        font_tick = 14
+        font_legend = 14
+        font_band_anno = 12
+        spine_lw = 2.0
+        tick_major_w = 2.0
+        band_anno_alpha = 0.55
+        band_anno_lw = 1.4
+        # Small constant offset per trace — just enough so peaks don't
+        # land on top of each other but the overall y-extent stays close
+        # to the non-presentation graph. Traces will overlap below their
+        # peaks but the peaks themselves separate cleanly.
+        stack_offset = 0.4
+    else:
+        lw_scale = 1.0
+        if figsize is None:
+            figsize = (8.0, 4.5)
+        font_axes_label = 11
+        font_title = 12
+        font_tick = 10
+        font_legend = 9
+        font_band_anno = 8
+        spine_lw = 1.0
+        tick_major_w = 1.0
+        band_anno_alpha = 0.4
+        band_anno_lw = 0.8
+        stack_offset = 0.0
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    # Default styles — cycle through the matplotlib tab10 palette except for
+    # one reserved entry (black, dotted) commonly used for experimental refs.
+    # The base linewidths are then multiplied by `lw_scale` (presentation).
+    _DEFAULT_PALETTE = [
+        dict(color="#1f77b4", linestyle="-",  linewidth=1.6 * lw_scale),  # blue
+        dict(color="#d62728", linestyle="--", linewidth=1.3 * lw_scale),  # red
+        dict(color="#2ca02c", linestyle="-",  linewidth=1.3 * lw_scale),  # green
+        dict(color="#9467bd", linestyle="-.", linewidth=1.3 * lw_scale),  # purple
+        dict(color="#ff7f0e", linestyle="-",  linewidth=1.3 * lw_scale),  # orange
+        dict(color="#8c564b", linestyle="-",  linewidth=1.3 * lw_scale),  # brown
+    ]
+    # Experimental traces use a dotted-black style in both modes. In
+    # presentation mode the linewidth is bumped (via lw_scale) so the
+    # dotted segments remain readable on a projector.
+    if presentation:
+        _EXPERIMENT_STYLE = dict(color="#1e1e1e", linestyle=":",
+                                  linewidth=1.6 * lw_scale, alpha=0.95)
+    else:
+        _EXPERIMENT_STYLE = dict(color="black", linestyle=":",
+                                  linewidth=1.6, alpha=0.8)
+    styles = styles or {}
+
+    lo, hi = float(window_cm[0]), float(window_cm[1])
+    if hi <= lo:
+        raise ValueError(
+            f"window_cm must be (low, high) with high > low; got {window_cm}")
+
+    # --- compute spectra from dipole inputs --------------------------------
+    computed: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for label, entry in dipoles.items():
+        try:
+            source, dt_fs = entry
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"plot_ir_overlay: dipoles[{label!r}] must be "
+                f"(source, dt_fs) where source is an ndarray or file path; "
+                f"got {entry!r}") from exc
+        try:
+            data = _load_dipole_source(
+                source, usecols=usecols, skiprows=skiprows)
+        except (FileNotFoundError, ValueError, TypeError) as exc:
+            raise type(exc)(
+                f"plot_ir_overlay: dipoles[{label!r}]: {exc}") from exc
+        freq_cm, intensity, _power, _acf = compute_ir_spectrum(
+            data, dt_fs=float(dt_fs),
+            window=window, max_freq_cm=max(hi * 1.1, 4000.0),
+            acf_ratio=acf_ratio, smooth_k=smooth_k,
+            smooth_kind=smooth_kind,
+            temperature=temperature,
+            quantum_correction=quantum_correction)
+        computed[label] = (freq_cm, intensity)
+
+    # --- plot all traces ---------------------------------------------------
+    # Order: dipoles first (so the model trace is visually primary), then
+    # experimental / pre-computed spectra (often want them as a dotted
+    # reference layered on top).
+    all_traces: list[tuple[str, np.ndarray, np.ndarray, bool]] = []
+    for k, (f, i) in computed.items():
+        all_traces.append((k, np.asarray(f), np.asarray(i), False))
+    for k, entry in spectra.items():
+        f, i = _unpack_spectrum_entry(k, entry)
+        all_traces.append((k, f, i, True))
+
+    palette_idx = 0
+    trace_idx = 0      # counter of successfully-plotted traces (drives the
+                        # vertical stack offset in presentation mode)
+    for label, freq, intensity, is_external in all_traces:
+        if freq.shape != intensity.shape:
+            raise ValueError(
+                f"plot_ir_overlay: {label!r} has freq.shape={freq.shape} "
+                f"vs intensity.shape={intensity.shape}; must match.")
+        mask = (freq >= lo) & (freq <= hi)
+        if not mask.any():
+            print(f"  [plot_ir_overlay] WARNING: {label!r} has no data in "
+                  f"window [{lo}, {hi}] cm⁻¹; skipping.")
+            continue
+        f_w = freq[mask]
+        # Sort ascending in case the source array was descending
+        # (e.g. wavelength→wavenumber conversions invert order).
+        order = np.argsort(f_w)
+        f_w = f_w[order]
+        y_w = intensity[mask][order]
+        peak = float(np.max(y_w))
+        if peak <= 0.0:
+            print(f"  [plot_ir_overlay] WARNING: {label!r} peak ≤ 0 in "
+                  f"window; cannot normalise. Skipping.")
+            continue
+        y_w = y_w / peak
+        # Vertical stack: each trace is shifted up by `trace_idx * stack_offset`
+        # so they don't visually overlap (presentation mode). Default mode
+        # uses stack_offset=0 and behaviour is unchanged.
+        y_w = y_w + trace_idx * stack_offset
+        # Resolve style: user override > preset (experimental traces get
+        # the reserved dotted-black style) > rotating palette.
+        if label in styles:
+            kw = dict(styles[label])
+            # Scale user-supplied linewidth in presentation mode so their
+            # "make this trace thicker than others" intent is preserved
+            # relative to the auto-scaled palette/experiment widths.
+            if presentation and "linewidth" in kw:
+                kw["linewidth"] = kw["linewidth"] * lw_scale
+        elif is_external:
+            kw = dict(_EXPERIMENT_STYLE)
+        else:
+            kw = dict(_DEFAULT_PALETTE[palette_idx % len(_DEFAULT_PALETTE)])
+            palette_idx += 1
+        ax.plot(f_w, y_w, label=label, **kw)
+        trace_idx += 1
+
+    # Number of traces actually drawn — drives ylim and y-tick handling.
+    n_traces = trace_idx
+
+    # --- IR convention: high wavenumber on the LEFT ------------------------
+    ax.set_xlim(hi, lo)
+    # Y-axis extent depends on whether traces are stacked. With stack_offset
+    # = 1.3 and n_traces = 3, the topmost trace's peak sits at
+    # 2 · 1.3 + 1.0 = 3.6; add a small headroom for the band labels.
+    if stack_offset > 0 and n_traces > 0:
+        # Topmost trace's peak sits at (n_traces − 1)·stack_offset + 1.0.
+        # +0.05 for the trace top, +0.10 headroom for the band labels
+        # (libration / bend / O–H stretch) that sit just above the peak.
+        y_top = (n_traces - 1) * stack_offset + 1.05
+        ax.set_ylim(-0.05, y_top + 0.10)
+        # The numeric y-tick values are not meaningful after arbitrary
+        # offsetting (each trace has its own implicit "zero"), so remove
+        # them in presentation/stacked mode. Spine and frame stay.
+        ax.set_yticks([])
+    else:
+        ax.set_ylim(0.0, 1.05)
+    ax.set_xlabel(xlabel, fontsize=font_axes_label)
+    ax.set_ylabel(ylabel, fontsize=font_axes_label)
+    # Default: no title in presentation mode; a generic "IR spectrum"
+    # in regular mode. Pass title="..." explicitly to override either.
+    if title is None:
+        title = "" if presentation else "IR spectrum"
+    if title:
+        ax.set_title(title, fontsize=font_title)
+    ax.legend(loc="best", frameon=False, fontsize=font_legend)
+    if stack_offset == 0:
+        ax.grid(alpha=0.3, linewidth=spine_lw * 0.5)
+    else:
+        # Vertical-only grid; horizontal grid would intersect the offset
+        # traces at meaningless levels.
+        ax.grid(axis="x", alpha=0.3, linewidth=spine_lw * 0.5)
+    ax.tick_params(axis="both", labelsize=font_tick,
+                   width=tick_major_w, length=tick_major_w * 4)
+    for spine in ax.spines.values():
+        spine.set_linewidth(spine_lw)
+
+    # --- optional band annotations -----------------------------------------
+    if band_annotations is None:
+        # Liquid-water canonical band centres (Max & Chapados 2009).
+        band_annotations = [
+            (660,  "libration"),
+            (1645, "bend"),
+            (3410, "O–H stretch"),
+        ]
+    # Position band-name text just above the topmost trace's peak (which
+    # depends on whether traces are stacked).
+    if stack_offset > 0 and n_traces > 0:
+        band_text_y = (n_traces - 1) * stack_offset + 1.07
+    else:
+        band_text_y = 1.02
+    # Presentation mode keeps the vertical band guide-lines but drops the
+    # band-name text — the labels read as visual clutter on a projector
+    # whereas the lines still help the reader sight-track each band across
+    # the stacked traces.
+    show_band_text = not presentation
+    for nu_cm, name in band_annotations:
+        if lo <= nu_cm <= hi:
+            ax.axvline(nu_cm, color="grey", linestyle=":",
+                       alpha=band_anno_alpha, linewidth=band_anno_lw)
+            if show_band_text:
+                ax.text(nu_cm, band_text_y, name, ha="center", va="bottom",
+                        fontsize=font_band_anno, color="grey")
+
+    fig.tight_layout()
+
+    # Project-integrated save/show path; standalone path otherwise.
+    if cfg is not None:
+        _finish_fig(fig, cfg, "ir_overlay", save_plots, show_plots)
+    else:
+        if save_plots is not None:
+            import os
+            os.makedirs(save_plots, exist_ok=True)
+            path = os.path.join(save_plots, "ir_overlay.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight")
+            print(f"  Plot saved: {path}")
+        if show_plots:
+            plt.show()
+    return ax
+
+
 def ir_spectrum_from_file(
     dipole_path: str,
     dt_fs: float = 1.0,

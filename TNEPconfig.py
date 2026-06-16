@@ -45,7 +45,7 @@ class TNEPconfig:
     # None : uses entire dataset, int : defines maximum structures to use in training
     total_N: int | None = None
     # Seed for randomisation (dataset shuffle, SNES sampling, etc.)
-    seed: int | None = 1284760333973115944
+    seed: int | None = 928375439201
     # Bitwise-reproducible runs. cfg.seed alone makes runs reproducible on
     # CPU, but GPU reductions (unsorted_segment_sum / atomic adds in the
     # dipole kernel) are non-deterministic across runs even with a fixed
@@ -77,6 +77,19 @@ class TNEPconfig:
     # native units. Useful when you want loss / RMSE / RRMSE numbers
     # directly comparable with reference values quoted in e·a₀ or Debye.
     convert_dipole_to_eangstrom: bool = False
+    # Post-scoring unit override for plotting only. Does NOT change the
+    # training space or any stored arrays — applied as a uniform rescale
+    # of `predictions`, `targets`, and absolute-error metrics (RMSE, MAE)
+    # inside the plotting functions, with the axis labels updated to match.
+    # Scale-invariant metrics (R², RRMSE, cosine similarity) are unaffected
+    # by construction. Useful when the model is trained in one unit (e.g.
+    # e·Å) but the figure needs another (e.g. Debye for a poster). Only
+    # consulted for target_mode=1 (dipole); ignored for PES / polarisability.
+    #   None        : (default) use the training-space label, no rescale.
+    #   "e*angstrom": rescale + relabel as e·Å
+    #   "e*bohr"    : rescale + relabel as e·a₀
+    #   "debye"     : rescale + relabel as Debye
+    plot_units: str | None = None
     # Polarizability off-diagonal weight (target_mode=2 only): loss for
     # components [xy, yz, zx] scaled by lambda_shear^2. GPUMD default 1.0
     # — equal weighting; <1.0 downweights off-diagonal.
@@ -118,6 +131,20 @@ class TNEPconfig:
     # scalar is mapped to.
     dipole_rij_power: int = 0
 
+    # Batch size for the self-only descriptor build path that fires when
+    # `dipole_rij_power == 0`. The dipole contraction at N=0 reads only
+    # the self-pair gradient ∂q_i/∂r_i, so the per-batch neighbour
+    # gradients (~90% of the COO footprint per analysis) can be dropped
+    # immediately after each batch is built and before the next batch
+    # starts. This is purely a peak-memory control:
+    #   smaller batch    → lower peak memory, more Python loop overhead
+    #   larger batch     → higher peak memory, faster build wall time
+    # Default 100 keeps peak memory bounded to ~50 MB of neighbour
+    # gradients per batch even at large dim_q. Set to None to disable
+    # batching (single-shot build, same memory profile as N≥1).
+    # Ignored when dipole_rij_power != 0.
+    descriptor_self_batch_size: int | None = 100
+
     # Skip H atoms as DESCRIPTOR CENTERS:
     #   False (default) — every atom (including H) gets its own SOAP
     #     descriptor and contributes to the predicted total via U_i.
@@ -145,7 +172,7 @@ class TNEPconfig:
 
     # --- geometric parameters ------------------------------------------
     l_max: int = 4
-    alpha_max: int = 4
+    alpha_max: int = 7
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5
     basis: str = "poly3"
@@ -226,7 +253,19 @@ class TNEPconfig:
     #                     dominant inter-l magnitude gap (l=0 ~O(1) vs l=l_max
     #                     ~O(0.01)) while preserving intra-block axes. Use this
     #                     when running descriptor_mixing with l_aware/cross_pair_l.
-    q_scaler_granularity: str = "l_block"
+    #   "l_block_zca"   : ZCA whitening per (species-pair, l) block. Computes a
+    #                     full [Q, Q] block-diagonal matrix W = (C + εI)⁻¹⁄² where
+    #                     C is the per-block sample covariance, applied to both
+    #                     descriptors and grad_values via q' = W·q. Result has
+    #                     identity per-block covariance (decorrelated + variance-
+    #                     equalised) while keeping original channel meanings
+    #                     (ZCA is the minimum-departure-from-identity whitening).
+    #                     Stronger preprocessing than "l_block"; downstream
+    #                     mixing layer can focus on task-driven rotation rather
+    #                     than fighting input covariance. Cost: tiny — O(bs³)
+    #                     per block at training start, in-line matrix multiply at
+    #                     pad_and_stack. Persisted in /weights/q_scaler as 2D.
+    q_scaler_granularity: str = "l_block_zca"
 
     # Per-component target centering. When True, the per-component mean
     # of the training targets is computed once, subtracted from every
@@ -265,7 +304,52 @@ class TNEPconfig:
 
     # Hidden-layer width of the per-type ANN.
     num_neurons: int = 30
-    activation: str = 'tanh'
+    # Optional SECOND hidden layer width. When set (not None), the per-type
+    # ANN becomes 2-hidden-layer:
+    #     a1 = q ⋅ W0 + b0        [num_neurons]
+    #     h1 = tanh(a1)
+    #     a2 = h1 ⋅ W0_2 + b0_2   [num_neurons_layer_2]
+    #     h2 = tanh(a2)
+    #     U_i = h2 ⋅ W1 + b1      (W1 shape [num_neurons_layer_2] then)
+    # None preserves the legacy single-hidden-layer architecture exactly.
+    # Adds T*(num_neurons*num_neurons_layer_2 + num_neurons_layer_2) params.
+    num_neurons_layer_2: int | None = None
+    # Hidden-layer activation. Backward path is implemented for:
+    #   "tanh"  : (default) bounded [-1, 1], saturates symmetrically.
+    #             Derivative 1 - tanh²(z); Glorot gain = 1.0.
+    #   "swish" / "silu" : x·σ(x). Unbounded above, soft negative tail.
+    #             Derivative σ(z)·(1 + z·(1 - σ(z))). Solves the
+    #             positive-side saturation of tanh — `pre_h` of magnitude 3+
+    #             stays in the linear regime instead of dead-gradient.
+    #             Glorot gain ≈ 1.0 (similar slope to tanh near origin);
+    #             SNES will compensate either way over the first ~1k gens.
+    # Other Keras-recognised names (gelu, elu, softplus, …) fail-fast at
+    # construction since their backward derivative isn't plumbed yet.
+    activation: str = 'swish'
+
+    # ── Per-(central-type, angular-momentum) ANN heads ───────────────────────
+    # When True, each central atom type's ANN is split into L = l_max+1
+    # separate heads, one per l value. Each head sees only the descriptor
+    # channels at its l (Q_l ≈ Q/L channels) and produces a partial per-atom
+    # scalar; the heads' outputs are summed to give the final U_i:
+    #     U_i = Σ_l ANN_{Z[i], l}(q_i restricted to l-channels)
+    #
+    # Per head structure: W0_l[T, Q_l, H], b0_l[T, H], W1_l[T, H], b1_l[1].
+    # Total param count is approximately preserved vs the single-ANN baseline
+    # (the W0 fold across all l values has the same total size Σ_l Q_l = Q),
+    # but the first linear layer becomes BLOCK-DIAGONAL across l rather than
+    # dense — preventing premature mixing of angular-momentum components.
+    #
+    # Inspired by NequIP/MACE/PaiNN's per-l processing pattern. Adds extra
+    # biases (L · 2H + L per type) compared to single-ANN.
+    #
+    # RESTRICTIONS (first implementation):
+    #   - Cannot be combined with descriptor_mixing=True (raise on init).
+    #   - num_neurons_layer_2 must be None (no second hidden layer support).
+    #   - Gating IS compatible (gates apply before per-l partitioning).
+    #
+    # See docs/superpowers/plans/2026-06-02-per-l-ann-heads.md for plan.
+    descriptor_per_l_ann_heads: bool = False
 
     # When True, insert a learnable per-species-pair linear mixing
     # layer between the (fixed) SOAP-turbo descriptor and the ANN.
@@ -281,6 +365,24 @@ class TNEPconfig:
     # c_nk (which mix fixed Chebyshev primitives into learned radial
     # functions per species pair).
     descriptor_mixing: bool = True
+    # Number of STACKED mixing layers. When N > 1, the descriptor passes
+    # through N independent mixing layers sequentially:
+    #     q → V_1 · q → V_2 · (V_1 · q) → ... → V_N · ... → ANN
+    # Each layer has its own learned U_pair (and bias if nonlinear). Adds
+    # N× the U_pair param count. For linear layers this is over-parametrised
+    # (composes to a single Q×Q), but the literature on deep linear nets
+    # (Saxe et al. 2014) shows stacking changes optimisation dynamics even
+    # when the effective function is the same. Combined with nonlinear
+    # mixing below, each layer becomes a genuine extra non-linear hidden
+    # layer ahead of the per-type ANN. Default 1 preserves single-layer.
+    descriptor_mixing_n_layers: int = 1
+    # When True (and descriptor_mixing=True), each mixing layer applies
+    # tanh(V·q + b) instead of plain V·q. Adds a per-layer per-type bias
+    # b of shape [num_types, dim_q] (or [dim_q] when per_type=False). Turns
+    # each stacked mixing layer into a real non-linear hidden layer ahead
+    # of the per-type ANN, adding genuine capacity rather than just basis
+    # rotation. Default False preserves linear (rotation-only) mixing.
+    descriptor_mixing_nonlinear: bool = False
     # When True (and descriptor_mixing=True), U_pair becomes
     # per-central-atom-type: shape [T, num_pairs, max_bs, max_bs]
     # instead of [num_pairs, max_bs, max_bs]. Each central type t
@@ -344,42 +446,283 @@ class TNEPconfig:
     #                  variants. Zero λ to tune; the "regularisation"
     #                  is via the bijection between A's space and the
     #                  rotation group. Reflections (det = −1) excluded.
-    descriptor_mixing_regularizer: str = "cayley"
+    #                  Cannot represent rotations with −1 eigenvalues
+    #                  except in the limit ‖A‖ → ∞ — Jacobian becomes
+    #                  singular near that boundary, which forces SNES to
+    #                  push parameters to large magnitudes if the optimal
+    #                  U is near a 180° rotation in some 2D sub-block.
+    #   "expm"       : STRUCTURAL constraint. Same skew layout as cayley
+    #                  (bs·(bs−1)/2 free params per block) but uses the
+    #                  matrix exponential as the parameter map:
+    #                      U_p = exp(A_p)
+    #                  exp is surjective onto SO(bs) — every rotation is
+    #                  reachable with a finite skew, so no Jacobian
+    #                  singularity and ‖A_p‖_F ≈ rotation angle (geodesic
+    #                  parameterisation, vs Cayley's rational chord).
+    #                  Forward cost is a few Padé matmuls per block —
+    #                  comparable to Cayley's solve for bs ≤ 8. Use this
+    #                  if you suspect the optimal mixing involves large
+    #                  rotation angles (e.g. radial-angular trade-offs
+    #                  in SOAP-turbo channels) where Cayley would have to
+    #                  push parameters toward its boundary singularity.
+    #                  See Lezcano-Casado, NeurIPS 2019 (arXiv:1909.09501).
+    descriptor_mixing_regularizer: str = "expm"
+
+    # ── Output-side (hidden-layer) orthogonal mixing ─────────────────────────
+    # When True, insert a learnable per-type orthogonal R ∈ ℝ^{H × H} between
+    # the first and second hidden-layer linear operations of the per-type ANN.
+    # The forward becomes:
+    #   single-hidden : U_i = (tanh(q W0_eff + b0) · R^T) · W1 + b1
+    #   two-hidden    : a2  = (tanh(q W0_eff + b0) · R^T) · W0_2 + b0_2; ...
+    # R is parameterised by the same Cayley / expm machinery as the input-
+    # side U_pair (residual V_R, V_R init = 0 → R = I → identity forward at
+    # gen 0; off-path is bit-identical to legacy single-side mixing).
+    # Adds T · H · (H − 1) / 2 SNES dims under cayley/expm, T · H² under "off".
+    # Rationale: decorrelating hidden-layer activations is a documented win
+    # for deep nets (Saxe et al. 2014, Lezcano-Casado 2019). The input-side
+    # U_pair only decorrelates the descriptor; R does the same at hidden layer.
+    # Shared across target_mode=2's two ANNs (energy/polarisability) for now.
+    descriptor_mixing_output_layer: bool = False
+    # Init scheme for R (only consulted when descriptor_mixing_output_layer
+    # is True). "zero" → V_R = 0 → R = I (legacy off-path equivalence at
+    # gen 0). "pca" is reserved for a future warm-start from train hidden-
+    # layer activations.
+    descriptor_mixing_output_init: str = "zero"
+
+    # ── Cross-channel mixing layer (applied AFTER the existing arch) ─────────
+    # When True, a single learnable orthogonal [Q × Q] rotation is applied
+    # AFTER the existing arch's mixing — i.e. the forward becomes
+    #     q' = U_cross · U_existing · q
+    # The existing l_aware / linear / cross_pair_l arches mix only WITHIN
+    # block boundaries (within a (pair, l) sub-block for l_aware, within a
+    # species-pair block for linear). They cannot mix channels ACROSS block
+    # boundaries no matter how many N layers are stacked — stacking only
+    # explores a gauge orbit of the same block-diagonal hypothesis class.
+    #
+    # U_cross is a Q×Q rotation that breaks the block-diagonal constraint,
+    # genuinely expanding the hypothesis class. Parameterised by Cayley/expm
+    # on a Q×Q skew-symmetric matrix A (Q(Q-1)/2 free parameters for
+    # Cayley/expm, Q² for unconstrained — only Cayley/expm supported here).
+    #
+    # Init: V_cross = 0 → U_cross = I → bit-identical to off-path at gen 0.
+    # Always SHARED across central atom types in this initial implementation;
+    # decouple via a future flag if needed.
+    #
+    # Cost: Q(Q-1)/2 extra SNES dims (typically ~10⁴ at Q=165), plus one
+    # Q×Q matrix-exponential (or Cayley solve) per candidate per generation.
+    # Rationale: paired with PCA warm-start / ZCA whitening, the existing
+    # arch handles within-block decorrelation while U_cross learns the
+    # task-driven inter-block coupling that block-diagonal mixing can't reach.
+    descriptor_mixing_cross_layer: bool = False
+    # Cayley vs expm for the cross-channel A → U map. Defaults to expm
+    # (bounded ‖A‖ ≤ √Q·π, surjective onto SO(Q), well-conditioned
+    # gradients) — same reasoning that motivated the per-block expm default.
+    # Cayley accepted as legacy compatibility option only.
+    descriptor_mixing_cross_regularizer: str = "expm"
+    # Shape of the cross-channel rotation:
+    #   "full"       : R ∈ SO(Q). Mixes every per-component entry against
+    #                  every other. Q(Q-1)/2 parameters (~13k at Q=165).
+    #                  Maximally expressive cross-block coupling.
+    #   "block_unit" : Per-component-slot R_k matrices mixing (pair, l) units
+    #                  IRRESPECTIVE of l value. So a slot-3 channel in a
+    #                  pair-(0,0)-l=0 unit CAN mix with a slot-3 channel in
+    #                  a pair-(0,1)-l=4 unit. Crosses angular momentum
+    #                  boundaries — physically a bit unusual since different
+    #                  l values represent distinct SO(3) irreps.
+    #                  Total params: Σ_k N_k(N_k-1)/2 (~6k for CHO+N).
+    #   "per_l"      : For each l value INDEPENDENTLY, per-slot R_{l,k}
+    #                  matrices mixing pair-units AT THAT l only. The l=0
+    #                  rotation never touches l=1 channels and vice-versa.
+    #                  Preserves the angular-momentum symmetry that l_aware
+    #                  mixing already respects within sub-blocks. Natural
+    #                  stacked architecture: l_aware (untangles components
+    #                  WITHIN each (pair, l)) → per_l cross (untangles
+    #                  pair-units AT each l). Handles non-uniform α via
+    #                  per-(l, k) R sizing. Total params:
+    #                  Σ_l Σ_k N_{l,k}(N_{l,k}-1)/2 (~1.1k for CHO+N —
+    #                  about 6× more constrained than block_unit).
+    # All three modes share descriptor_mixing_cross_regularizer.
+    descriptor_mixing_cross_mode: str = "full"
+
+    # ── Per-(species-pair, l, central-type) gating ───────────────────────────
+    # When True, multiplies each descriptor channel by a learnable scalar
+    # gate g_{t, p, l} that depends on the CENTRAL atom's type t, the
+    # species-pair p the channel belongs to, and its angular momentum l.
+    # The gate is folded into the first-layer weight via
+    #     W0[t, c, h] := g_{t, pair(c), l(c)} · W0[t, c, h]
+    # so the forward pass cost is unchanged.
+    #
+    # Adds num_types · num_pairs · (l_max+1) extra SNES dims
+    # (~90 for CHO at default). Init: all gates = 1.0 (identity gating —
+    # bit-equivalent to no-gating at gen 0).
+    #
+    # Mechanism: lets each central atom type independently amplify/suppress
+    # each (species-pair, l) block. Acts as channel attention at the
+    # (pair, l) sub-block granularity. Compatible with the mixing layer
+    # (gating happens BEFORE the orthogonal rotation U conceptually:
+    # q' = U · diag(g) · q, folded into the W0_eff identity).
+    descriptor_gating_enabled: bool = False
+    descriptor_gating_init: float = 1.0
+    # Regularisation on the gating tail. Both penalise (g − descriptor_gating_init):
+    #   L1 → encourages SPARSE deviations: most gates stay at the identity
+    #        init, a few learn to amplify or suppress. Useful if you suspect
+    #        only a handful of (type, pair, l) blocks matter and want
+    #        per-block feature selection.
+    #   L2 → encourages SMALL deviations across all gates: rotates more
+    #        smoothly away from identity, prefers many tiny adjustments
+    #        over a few large ones.
+    # Default 0.0 = no regularisation (gates evolve freely under SNES).
+    # Both are computed per-type (slab t covers num_pairs · (l_max+1)
+    # gates) and added to the per-type fitness, mirroring the existing
+    # ANN per-type lambda_1 / lambda_2 pattern.
+    descriptor_gating_lambda_1: float = 0.0
+    descriptor_gating_lambda_2: float = 0.0
+    # Anti-sparsity floor penalty on the gating tail. Acts as a one-sided
+    # barrier that pushes |g| BACK UP whenever it dips below the floor,
+    # but is zero (no force) for gates above the floor. Form per type t:
+    #   Floor_g[t] = λ_floor · Σ_pl max(0, floor − |g[t, pl]|)² / n_gates_per_type
+    # Unlike λ_1 / λ_2 which penalise *deviation from g_init* (and so pull
+    # toward 1.0 from both sides), the floor penalty does NOT constrain
+    # gates that grow large — it only prevents a channel from being killed
+    # off (|g| → 0). Use this when you want feature-selection style gating
+    # but want to forbid any input channel being fully zeroed. Penalises
+    # |g| so it is symmetric in sign — a strongly negative gate is still
+    # an informative channel and is not penalised.
+    descriptor_gating_lambda_floor: float = 0.0
+    descriptor_gating_floor: float = 0.2
+    # Multiplicative σ scale for the gating tail entries only (analogous to
+    # `mixing_sigma_scale` for the V_pair tail). At cfg.init_sigma = 0.1
+    # and ~50 gates per type, the per-gate σ = 0.1 means SNES samples
+    # gates with ‖Δg‖ ~ 0.1·√50 ≈ 0.7 around the current μ each generation —
+    # far larger than the equilibrium deviation a sensible regulariser
+    # wants gates to settle at (~0.05–0.20). A smaller σ on gates lets
+    # the regulariser drive the equilibrium without first fighting per-gen
+    # noise. Default 1.0 preserves legacy behaviour. Recommend 0.1 when
+    # gating is enabled with finite regularisation.
+    gating_sigma_scale: float = 1.0
+
+    # Descriptor preprocessing contraction layer. Sits BEFORE the W0 layer
+    # of the per-type ANN; output becomes the new descriptor input. A
+    # learned per-(centre type, raw channel) scalar coefficient table
+    # contracts the chosen axis of the raw SOAP descriptor down to a
+    # smaller feature vector. NEP-inspired but applied AFTER the SOAP
+    # power-spectrum squaring (vs NEP's pre-squaring projection on the
+    # density coefficients) — strictly less expressive than NEP's c-table
+    # but the same parameter-pattern (per-type, per-pair).
+    #
+    # Modes:
+    #   "off"          : (default) no preprocessing; W0 sees raw Q.
+    #   "angular"      : per-(pair, n_pair), produce TWO output channels —
+    #                    one for l=0 alone (single contributor) and one
+    #                    for l=1..l_max summed. Output dim
+    #                    Q_new = 2 · Σ_pair α_eff_per_pair. Coefficients
+    #                    shape [T, Q_raw] (one scalar per (centre type,
+    #                    raw q); init "mean" → 1.0 for l=0 entries,
+    #                    1/(L-1) for l>0).
+    #   "species_pair" : per-central-type contraction into TWO blocks:
+    #                    SELF (the (t,t) pair) and OTHER (all (t, j ≠ t)
+    #                    pairs summed). Output dim Q_new = 2 · max_α · L.
+    #                    Coefficients shape [T, Q_raw] (per (centre type,
+    #                    raw q); entries whose pair doesn't involve t are
+    #                    silently masked at the fold step).
+    #   "both"         : collapses BOTH axes. Output indexed by (block ∈
+    #                    {self, other}, l_group ∈ {l=0, l>0}, n_pair) for
+    #                    Q_new = 4 · max_α. Smallest Q_new of the four
+    #                    modes; biggest information loss if per-block
+    #                    contraction is too aggressive. "mean" init is
+    #                    per-(t, q_raw) — each of the four (block,
+    #                    l_group) slot types gets its own init magnitude
+    #                    (1.0 for self+l=0, 1/(L-1) for self+l>0,
+    #                    1/(T-1) for other+l=0, 1/((T-1)(L-1)) for
+    #                    other+l>0).
+    #   "nep4_radial"  : NEP4-faithful learned-basis fold. Applies the
+    #                    rank-1 outer-product weighting
+    #                      g[t, n'', l] = Σ_{n,n'} c[t, s(n), n'', k(n)]
+    #                                            · c[t, s(n'), n'', k(n')]
+    #                                            · p[n, n', l]
+    #                    to the SOAP power spectrum, mathematically
+    #                    equivalent to a NEP4 descriptor with the SOAP-
+    #                    turbo radial basis as primitives. Output dim
+    #                    Q_new = n_max_out · L; n_max_out defaults to
+    #                    Q_raw / L so the descriptor dim is PRESERVED
+    #                    (pure non-linear transformation). Coefficients
+    #                    shape [T_centre, T_neighbour, n_max_out, α] —
+    #                    rank-4 tensor; same indexing as NEP4's
+    #                    c^{Z_i,Z_j}_{n'',k}. Requires
+    #                    compress_mode='trivial'.
+    #
+    # MUTUALLY EXCLUSIVE in this first pass with descriptor_mixing,
+    # descriptor_gating_enabled, and descriptor_per_l_ann_heads (the
+    # latter only for modes that collapse the l axis, i.e. "angular"
+    # and "both"). Enabling any combination raises NotImplementedError
+    # at TNEP construction.
+    descriptor_preprocess_contract: str = "angular"
+    # NEP4 learned-basis fold output radial-channel count. Only consulted
+    # when descriptor_preprocess_contract == "nep4_radial". When None
+    # (default), the layout auto-picks n_max_out = Q_raw / L so that
+    # Q_new = Q_raw (descriptor dim is preserved — pure non-linear
+    # transformation). Set explicitly to reduce / expand the descriptor
+    # — small values (≈ α or 2α) match NEP4's typical "compact learned
+    # basis" setting and give the strongest inductive bias.
+    descriptor_nep4_n_max_out: int | None = None
+    # Initialisation for preprocess coefficients:
+    #   "mean"   : (default) 1/N where N is the contracted-axis size.
+    #              For angular mode N = l_max+1, so each coefficient is
+    #              1/(l_max+1); gen-0 output ≈ mean across l per channel.
+    #              Output magnitude similar to inputs — well conditioned.
+    #   "sum"    : 1.0. Gen-0 output = sum across the contracted axis.
+    #              Output magnitude grows with N; W0 has to re-scale.
+    #   "glorot" : Glorot-uniform: U(-√(6/(fan_in+fan_out)), +√(...)).
+    descriptor_preprocess_init: str = "mean"
+    # Per-tail σ scaling for preprocess coefficients (analogous to
+    # mixing_sigma_scale, gating_sigma_scale). Default 1.0 = same as the
+    # ANN. Reduce (e.g. 0.1) if SNES sampling noise on preprocess
+    # coefficients overwhelms the optimisation signal.
+    preprocess_sigma_scale: float = 1.0
+    # Angular contraction threshold: l < angular_l_keep are kept as
+    # passthrough output channels (no learnable coefficient — the
+    # descriptor channel goes straight to its own W0 row). l ≥
+    # angular_l_keep are summed into ONE output channel per
+    # (pair, n_pair) with L − angular_l_keep learnable coefficients.
+    # Default 1 reproduces the original behaviour (l=0 kept, l>0 summed).
+    #   0      : all l summed; no kept channels.
+    #   L      : all l kept; no summed channel. (Equivalent to "off" for
+    #            the angular axis.)
+    # Only consulted in modes that collapse the l axis ("angular", "both").
+    descriptor_preprocess_angular_l_keep: int = 2
+    # When True (default), W_pre coefficients are per central-atom type
+    # (shape [T, n_summed_q_raw, N]). When False, coefficients are
+    # GLOBAL across centre types (shape [n_summed_q_raw, N]) — the same
+    # weight is applied regardless of which species the centre atom is.
+    # For species_pair / both modes a global coefficient ties together
+    # the contributions of, e.g., the (0, 1) cross-pair regardless of
+    # whether the centre is type 0 or type 1 — symmetric coupling,
+    # smallest parameter count.
+    descriptor_preprocess_per_type: bool = True
+    # L1/L2 regularisation strengths on (coefficient − init). Penalises
+    # deviation from the mean/sum/glorot init. Per-type slab routes to
+    # type t for per-type SNES ranking. Both default 0.0 (no penalty).
+    descriptor_preprocess_lambda_1: float = 0.0005
+    descriptor_preprocess_lambda_2: float = 0.0005
+
+    # Multiplicative scaling on init_sigma for the V_pair tail entries
+    # (descriptor-mixing parameters) only. The ANN's σ is unchanged.
+    #
+    # Mixing has fundamentally different dynamics than the ANN: residual
+    # init (V=0 if mixing_init="zero", or PCA-rotation if "pca") vs the
+    # ANN's Glorot/uniform init. The exploration rate that works for the
+    # ANN may under- or over-explore the orthogonal manifold. This flag
+    # lets the mixing tail be explored at a different per-coord σ scale
+    # without touching the main `init_sigma`.
+    #
+    # Typical values: 0.5–2.0. Default 1.0 preserves the legacy single-σ
+    # behaviour exactly. Larger than 1.0 broadens the mixing search at
+    # gen 0; smaller damps it.
+    mixing_sigma_scale: float = 1.0
 
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION
     # ═══════════════════════════════════════════════════════════════════
-
-    # Training loss function (controls what SNES ranks against — NOT what
-    # is reported in history; RMSE / RRMSE are always computed alongside
-    # and recorded regardless of this setting).
-    #   "mse"   : Σ r_k²              standard squared error
-    #   "mae"   : Σ |r_k|             absolute error
-    #   "huber" : Σ huber(r_k; δ)     quadratic for |r| ≤ δ, linear beyond.
-    #             Robust to outlier structures with large residuals.
-    #             Does NOT specifically help small-target structures —
-    #             use inverse_weight_mode for that.
-    loss_type: str = "mse"
-    # Transition point between quadratic and linear regimes of Huber loss.
-    # Only used when loss_type == "huber". Sensible default ~ expected
-    # final RMSE for the dataset (run the loss-tuning sweep to confirm).
-    huber_delta: float = 1e-3
-
-    # Inverse-magnitude weighting: upweight small-target structures /
-    # components so they aren't dominated by large-target structures in
-    # the gradient.
-    #   "none"             : uniform (current default)
-    #   "vector_magnitude" : w_b ∝ 1 / max(||target_b||², eps)
-    #                         — one weight per structure (legacy path).
-    #   "per_component"    : w_{b,k} ∝ 1 / max(target_{b,k}², eps)
-    #                         — separate weight per (structure, component).
-    #                         Useful when individual axes of vector
-    #                         targets have systematically small magnitudes.
-    inverse_weight_mode: str = "vector_magnitude"
-    # Epsilon floor for the inverse-weight denominator. Smaller eps
-    # → stronger small-target emphasis but more numerical instability.
-    # Only used when inverse_weight_mode != "none".
-    inverse_weight_eps: float = 1e-4
 
     # L1/L2 regularization strengths.
     #   None  : auto = sqrt(dim * 1e-6 / num_types)
@@ -388,8 +731,8 @@ class TNEPconfig:
     #           of the data RMSE. Starts from the auto value.
     #   float : fixed scalar
     toggle_regularization: bool = True
-    lambda_1: float | None = 0.03
-    lambda_2: float | None = 0.03
+    lambda_1: float | None = 0.0005
+    lambda_2: float | None = 0.0005
     # Dynamic-λ controls (only used when lambda_1 or lambda_2 == -1).
     # `target_ratio`: target ratio of reg-penalty to data RMSE. 0.05
     #   means "keep regularisation at ~5% of the data loss." GPUMD
@@ -492,8 +835,7 @@ class TNEPconfig:
     # generation's median; expands σ if more than `snes_msr_z_target` of
     # the new population beats that reference, contracts otherwise.
     #
-    # SILENTLY DISABLED under: cov_mode="crfmnes" (CR-FM-NES owns σ);
-    # Adam phases of hybrid mode (no SNES update fires that gen).
+    # SILENTLY DISABLED under cov_mode="crfmnes" (CR-FM-NES owns σ).
     #
     # The log-step is clipped to ±snes_msr_clip per gen as a defence-in-
     # depth measure matching snes_sigma_cumulation's clip pattern. Default
@@ -503,28 +845,42 @@ class TNEPconfig:
     snes_msr_c_sigma: float = 0.3          # damping on the log-σ step
     snes_msr_clip: float = 0.3             # max |log-step| per generation
 
-    # --- Guided Evolutionary Strategies (gradient-biased sampling) -----
-    # When enabled, bias the SNES sampling covariance toward the subspace
-    # spanned by the last `guided_es_k` surrogate gradients (from
-    # _loss_and_grad). Extra variance is added ALONG that subspace; the
-    # per-dim σ and the rank-based update are unchanged. alpha=0 => vanilla.
-    guided_es_enabled: bool = False
-    guided_es_k: int = 4                 # subspace rank (2-20)
-    guided_es_alpha: float = 0.5         # subspace exploration scale (gamma = sqrt(alpha)*mean(sigma))
-    guided_es_grad_interval: int = 20    # refresh U every N gens (surrogate cost control)
+    # --- Active utilities (Jastrebski & Arnold 2006, Hansen 2016 active CMA) -
+    # Standard Hansen utilities throw away the bottom half of the population
+    # (they all get weight = -1/lambda — uniform, no ranking info inside the
+    # bottom half). Active utilities give the bottom half MIRRORED negative
+    # log-rank weights, so the worst sample carries the strongest negative
+    # signal. This tells sigma to shrink along directions where bad samples
+    # SPREAD — directly addresses the per-coord sigma-spread that signals a
+    # conditioning bottleneck (sigma_max stuck at ~1, sigma_min at ~1e-5 after
+    # many generations). Doubles the per-generation information density.
+    # snes_active_alpha scales the negative weights (1.0 = symmetric magnitude;
+    # < 1.0 = damped, safer for high-d; Hansen recommends min(1, mu_eff- / mu_eff)
+    # — for our setup 1.0 works in practice).
+    # CMA path computation (rank-1 / CR-FM-NES) uses positive Hansen weights
+    # only regardless of this flag, so mu_eff and downstream constants are
+    # unchanged. Vanilla SNES mean and sigma updates DO use the active weights.
+    snes_active_utilities: bool = False
+    snes_active_alpha: float = 1.0
+
     snes_cumulation_c: float | None = None   # path EMA constant; None -> (mu_eff+2)/(dim+mu_eff+5)
     snes_cumulation_rate: float = 0.05       # damping on the per-dim log-sigma step
 
-    # --- Low-rank covariance (CMA-style learned correction) ------------
-    #   "none"   : vanilla per-dim diagonal SNES (bit-identical).
-    #   "rank1"  : add a single learned evolution-path direction p_c to the
-    #              sampling covariance (CMA-ES rank-1 update; O(d)).
-    #   "lowrank": LM-CMA rank-k (future; treated as "rank1" until implemented).
-    #   The sigma (diagonal) update is UNCHANGED — the rank correction is added
-    #   to the displacement delta, not s_iso, so the diagonal can't absorb the
-    #   injected directional variance (same isolation guided-ES uses). Default "none".
+    # --- Covariance correction option ----------------------------------
+    #   "none"    : vanilla per-dim diagonal SNES (bit-identical, default).
+    #   "crfmnes" : full CR-FM-NES algorithm (Nomura & Ono, CEC 2022,
+    #               arXiv:2201.11422). Scalar σ + per-dim D representation,
+    #               sampling shape δ = σ_scalar · D ⊙ y with
+    #               y = z + (√(1+‖v‖²)−1)·v̄(v̄ᵀz); v/D updated jointly by a
+    #               Fisher closed form; distance-weighted utilities with a
+    #               ‖p_σ‖ regime switch; three-regime η_σ; det(A) shape/scale
+    #               renormalisation. All constants ported verbatim from the
+    #               reference impl (crfmnes/alg.py). Vanilla `self.sigma` is
+    #               unused under this mode (active scale lives in
+    #               `_cr_sig` × `_cr_D`).
+    # Empirically, "none" is the recommended default — CR-FM-NES has not
+    # improved val_RMSE on this problem.
     snes_cov_mode: str = "none"
-    snes_cma_c1_scale: float = 1.0   # multiplies the ported rank-1 rate c_1
 
     # --- validation ----------------------------------------------------
     # Number of structures in each validation step (None = use entire val set)
@@ -588,41 +944,27 @@ class TNEPconfig:
     # (or just continue if patience is None).
     max_sigma_resets: int | None = None
 
-    # --- hybrid Adam/SNES optimizer ------------------------------------
-    # Optimizer driver:
-    #   "snes"   : SNES only (default; bit-identical to legacy behaviour)
-    #   "adam"   : Adam only (gradient descent on self.mu; per-type
-    #              ranking inactive — minimises the plain global loss)
-    #   "hybrid" : alternate Adam and SNES on a plateau-triggered FSM.
-    # In hybrid mode Adam descends fast into a basin; when it plateaus
-    # (adam_plateau_patience val-ticks without improvement) control
-    # swaps to SNES, which explores/escapes until IT plateaus
-    # (snes_plateau_patience), then swaps back to Adam — repeating.
-    # Plateau is measured PHASE-LOCALLY (reset on each swap) so neither
-    # optimizer thrashes against a stale global best; the global best_mu
-    # is tracked separately for the returned model.
-    optimizer_mode: str = "snes"
-    hybrid_start: str = "adam"            # "adam" | "snes" — which phase first
-    adam_plateau_patience: int = 100      # Adam->SNES swap (val-ticks; * val_interval for gens)
-    snes_plateau_patience: int = 3000     # SNES->Adam swap (val-ticks)
-    hybrid_max_cycles: int | None = None  # cap alternations (None = until num_generations)
-    # Sigma to (re)initialise when entering an SNES phase. Too small ->
-    # SNES can't escape Adam's basin; too large -> discards Adam's work.
-    # None = use cfg.init_sigma.
-    hybrid_handoff_sigma: float | None = None
-    # Reset Adam moments (m, v, t) on each entry into an Adam phase.
-    # Stale moments from a different basin mislead the first steps.
-    adam_reset_moments_on_entry: bool = True
-    # Adam hyperparameters.
-    adam_lr: float = 1e-3
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_epsilon: float = 1e-8
-    adam_clipnorm: float | None = None    # optional global-norm gradient clip
-    # Final generations forced to SNES regardless of the FSM, so a hybrid
-    # run never ends mid-Adam (SNES owns the tail — the returned model
-    # gets exploration, not just Adam's last basin floor). 0 disables.
-    hybrid_tail_polish_gens: int = 200
+    # --- IPOP / BIPOP restart strategy (Auger & Hansen 2005, Hansen 2009) -
+    # On plateau (triggered by plateau_reset_patience), in addition to
+    # broadening σ and resetting evolution paths, RESIZE the population:
+    #   "none"  : no resize (default; existing plateau behaviour).
+    #   "ipop"  : double pop_size on every restart (Auger & Hansen 2005,
+    #             IPOP-CMA-ES; BBOB-2009 winner family).
+    #   "bipop" : alternate IPOP (large) with small-pop restarts ≈ pop/4
+    #             (Hansen 2009; BBOB-2012 winner family). Two independent
+    #             "regimes" share the run budget; the large-pop regime
+    #             gets evaluations proportional to its prior performance.
+    # The new pop_size is capped at cfg.restart_max_pop (None = unlimited).
+    # μ is reset to the best-val μ so accumulated learning is preserved;
+    # σ is reset to init_sigma; evolution paths are zeroed; for crfmnes,
+    # _cr_v and _cr_D are PRESERVED but _cr_psg / _cr_pc / _cr_lf reset.
+    # utilities + _recomb_w + _mu_eff are
+    # rebuilt automatically to match the new pop_size.
+    restart_strategy: str = "none"
+    restart_pop_factor: float = 2.0          # IPOP: multiplier per restart
+    restart_max_pop: int | None = 400        # cap on grown pop_size (None = unlimited)
+    restart_min_pop: int | None = 50         # floor on resized pop_size (None = no floor)
+    restart_bipop_small_factor: float = 0.25 # BIPOP small-regime λ_small / λ_default
 
     # ═══════════════════════════════════════════════════════════════════
     # 6. MEMORY & I/O STAGING
@@ -635,7 +977,7 @@ class TNEPconfig:
     population_chunk_size: int | None = 10
     # Number of structures to process per GPU chunk during evaluation
     # (None = all at once)
-    batch_chunk_size: int | None = 1000
+    batch_chunk_size: int | None = 2000
     # XLA-compile the per-chunk eval (`_evaluate_chunk`). Fuses the
     # dipole-kernel pre-compute and the per-type matmul + reduction ops
     # into a single GPU kernel — typically 1.5-2× faster on Ada/Hopper.
@@ -751,7 +1093,7 @@ class TNEPconfig:
     # Show plots interactively (True = plt.show(), False = close after saving)
     show_plots: bool = False
     # Periodic plotting interval (None = disabled; int = plot every N generations)
-    plot_interval: int | None = None
+    plot_interval: int | None = 10000
 
     # Periodic training checkpoint interval. None = no checkpointing.
     # int = write a rolling checkpoint to `{save_path}/checkpoint.h5`
