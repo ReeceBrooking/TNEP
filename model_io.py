@@ -36,18 +36,6 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     # (Xu et al. JCTC 2024). Today's class default is 0 (experimental
     # self-pair-only).
     "dipole_rij_power": 2,
-    # Inverse-magnitude loss reweighting. Pre-existence: uniform weights.
-    # Optimizer extensions added this session — all opt-in, off by
-    # default in the original SNES. Pin to OFF so an old SNES model
-    # loads as plain SNES regardless of any live default flips.
-    "snes_mean_optimizer": "vanilla",
-    "snes_sigma_cumulation": False,
-    "snes_cov_mode": "none",
-    # Rank-1 c1 scale: pre-existence implicit value is 1.0 (the field's
-    # own intent — no extra scaling). Pinned per policy precedent so a
-    # future TNEPconfig class-default flip can't silently regress old
-    # loads. Same forward-compat rationale as `snes_cov_mode` above.
-    "snes_cma_c1_scale": 1.0,
     "deterministic": False,
     # --- Architecture-affecting fields (the silent-mismatch danger zone). ---
     # Descriptor mixing layer (V_pair). Class default is True, but a
@@ -58,12 +46,6 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "descriptor_mixing_arch": "linear",
     "descriptor_mixing_per_type": False,
     "descriptor_mixing_regularizer": "off",
-    # Multi-layer + nonlinear mixing + second hidden layer all default to
-    # legacy single-layer-linear / single-hidden so old models load with
-    # their original architecture.
-    "descriptor_mixing_n_layers": 1,
-    "descriptor_mixing_nonlinear": False,
-    "num_neurons_layer_2": None,
     # Target / descriptor preprocessing toggles. Pre-existence: identity.
     "target_centering": False,
     "skip_h_centers": False,
@@ -72,11 +54,6 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     # (no extra (r+σ√(2/π))^N factor). Today's class default is 1.
     # Old models lacking the field were trained without enhancement.
     "radial_enhancement": 0,
-    # --- Recently-added architectural toggles. Class defaults may now
-    #     be "on" or experimental; legacy pre-existence is OFF/identity.
-    #     Without these pins, an old model would be reconstructed with
-    #     extra layers / contractions that didn't exist at save time
-    #     and W0 / U_pair shapes wouldn't match the saved arrays.
     # Descriptor preprocess contraction (per_type W_pre, l-channel
     # collapse, species_pair / both modes). Pre-existence: no contraction
     # — W0 lives at raw Q.
@@ -91,26 +68,6 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     # == "nep4_radial"). Pre-existence: not present. Default None preserves
     # Q_raw automatically — only consulted in the nep4_radial mode.
     "descriptor_nep4_n_max_out": None,
-    # Output-side mixing R between the ANN's hidden layers. Pre-existence:
-    # not present — h1' = h1 unchanged.
-    "descriptor_mixing_output_layer": False,
-    "descriptor_mixing_output_init": "zero",
-    # Cross-channel mixing layer (Q × Q rotation after the per-pair
-    # mixing). Pre-existence: not present.
-    "descriptor_mixing_cross_layer": False,
-    "descriptor_mixing_cross_regularizer": "expm",
-    "descriptor_mixing_cross_mode": "full",
-    # Per-channel gating (g_pair_l). Pre-existence: not present.
-    "descriptor_gating_enabled": False,
-    "descriptor_gating_init": 1.0,
-    "descriptor_gating_lambda_1": 0.0,
-    "descriptor_gating_lambda_2": 0.0,
-    "descriptor_gating_lambda_floor": 0.0,
-    "descriptor_gating_floor": 0.2,
-    # Per-l ANN heads. Pre-existence: single ANN per centre type sees all l.
-    "descriptor_per_l_ann_heads": False,
-    # MSR σ controller, default OFF for legacy.
-    "snes_msr_enabled": False,
 }
 
 

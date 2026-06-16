@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import sys
 import time
@@ -872,44 +871,9 @@ class SNES:
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
         # Effective selection mass mu_eff = 1 / Σ w_i² over the POSITIVE
-        # recombination weights (CMA convention; Hansen 2016 Eq. 5). The
-        # cached `_recomb_w` (set inside compute_utilities) is exactly that
-        # quantity regardless of `snes_active_utilities` — using
-        # `self.utilities` directly would silently change mu_eff when
-        # active utilities are enabled, which breaks every downstream
-        # constant that depends on mu_eff (c_c, c_1, eta_B, etc.).
+        # recombination weights (CMA convention; Hansen 2016 Eq. 5).
         recomb_w_np = self._recomb_w.numpy()
         self._mu_eff = float(1.0 / np.sum(recomb_w_np ** 2))
-
-        # ES-upgrade state (lazy — only allocated when the opt-in branches fire).
-        # Adam preconditioning of the ES mean gradient (Feature A):
-        self._es_m = None
-        self._es_v = None
-        self._es_t = None
-        # Per-coordinate evolution-path cumulation for sigma (Feature B):
-        self._grad_sigma_ema = None
-
-        # MSR state (lazy — only materialised when snes_msr_enabled).
-        # Paper-faithful (Ait ElHara, Auger, Hansen, GECCO 2013):
-        #   z_t = (2/λ)·(K_succ − (λ+1)/2)              # success signal, ∈[−1,1]
-        #   p_s ← (1−c_σ)·p_s + c_σ·z_t                  # EMA smoothing
-        #   σ   ← σ·exp(p_s / d_σ)                       # exponentiate smoothed
-        # d_σ ≈ 2 − 2/n damping, c_σ ≈ 0.3 EMA decay (paper recommendations).
-        # `_msr_z_target` is retained for backward compatibility but UNUSED
-        # — paper's z formula centers at 0 automatically.
-        self._msr_f_prev = None
-        self._msr_z_target = float(getattr(cfg, "snes_msr_z_target", 0.5))  # deprecated
-        self._msr_c_sigma = float(getattr(cfg, "snes_msr_c_sigma", 0.3))    # EMA decay
-        self._msr_clip = float(getattr(cfg, "snes_msr_clip", 0.3))
-        self._msr_ps = 0.0          # EMA-smoothed success signal
-        self._msr_initialised = False
-
-        # NB: self._recomb_w (CMA recombination weights, sum 1) is populated by
-        # compute_utilities() above — do NOT reset it here or the cache is lost.
-        # Active CR-FM-NES distance regime needs the MIRRORED negative log-rank
-        # weights (sum-1, absolute-value form). Lazy-built on first use in
-        # _crfmnes_weights to avoid populating it for non-active-non-crfmnes runs.
-        self._neg_recomb_abs = None
 
         # IPOP / BIPOP restart state.
         # _initial_pop_size : the configured pop_size at __init__ time, used
@@ -921,17 +885,6 @@ class SNES:
         self._initial_pop_size = int(self.pop_size)
         self._restart_count = 0
         self._bipop_use_large = True
-
-        # CR-FM-NES state (lazy — only materialised when cov_mode="crfmnes").
-        # NB: NO `_cr_lf` state — λ_F is per-gen feasible count, recomputed in
-        # update() each generation (C0 finding, crfmnes/alg.py:138).
-        self._cr_v   = None    # tf.Variable [dim]
-        self._cr_D   = None    # tf.Variable [dim]
-        self._cr_psg = None    # tf.Variable [dim]  — conjugate path p_σ
-        self._cr_pc  = None    # tf.Variable [dim]  — evolution path p_c
-        self._cr_sig = None    # tf.Variable scalar — overall step size σ
-        self._cr_chi = None    # cached χ_d
-        self._cr_h_inv = None  # cached dim-dependent Newton root (see C0)
 
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray
                                ) -> tuple[float, float, float]:
@@ -1578,45 +1531,17 @@ class SNES:
         eta_sigma = ((3.0 + np.log(num)) / (5.0 * np.sqrt(num))) / 2.0
         return float(eta_sigma)
 
-    @property
-    def _cov_mode_str(self) -> str:
-        """Lowercase `snes_cov_mode` string. A `@property` (not a cached
-        snapshot) so tests that mutate `cfg.snes_cov_mode` after construction
-        keep working, while still avoiding the `str(getattr(...)).lower()`
-        round-trip that used to be repeated ~14× per generation across
-        `ask()` / `update()` / `fit()`.
-        """
-        return str(getattr(self.cfg, "snes_cov_mode", "none")).lower()
-
     def compute_utilities(self) -> np.ndarray:
         """Precompute rank-based utility weights for the population.
 
-        Two modes (selected by `cfg.snes_active_utilities`):
-
-        Vanilla Hansen (default, snes_active_utilities=False):
+        Vanilla Hansen log-rank weights:
           - Top half: positive log-rank weights summing to 1.
-          - Bottom half: weight = -1/λ (uniform negative).
+          - Bottom half: weight = −1/λ (uniform negative).
           - Zero-mean by construction.
-          - Throws away the actual *ranking* of bad samples — they all get
-            the same small negative weight.
 
-        Active (snes_active_utilities=True; Jastrebski & Arnold 2006,
-        Hansen 2016 active CMA, Eqs. 49-53):
-          - Top half: same positive log-rank weights as vanilla.
-          - Bottom half: MIRRORED log-rank weights with NEGATIVE sign, scaled
-            by `cfg.snes_active_alpha` (default 1.0 = symmetric magnitude).
-            The worst-ranked sample gets the most-negative weight.
-          - Re-centred to zero mean (only changes utilities if alpha != 1).
-          - Effect: σ also shrinks along directions where BAD samples spread.
-            Half the population now carries useful signal (vs zero info under
-            Hansen's floor-at-zero), doubling per-gen information density —
-            directly addresses the per-coord σ-spread that signals a
-            conditioning bottleneck.
-
-        `self._recomb_w` (cached for CMA path computation) is ALWAYS the
-        positive Hansen weights regardless of mode — CMA recombination by
-        convention uses positive weights only, so μ_eff and downstream
-        constants are unchanged.
+        Also caches ``self._recomb_w`` (positive Hansen weights only,
+        sum 1) for any downstream consumer that needs the un-shifted
+        weights — μ_eff is computed from this.
 
         Returns:
             utilities : ndarray [pop_size] — weights indexed by rank (0 = best).
@@ -1625,9 +1550,6 @@ class SNES:
         ranks = np.arange(lam) + 1
         raw = np.log((lam * 0.5) + 1.0) - np.log(ranks)
         raw_positive = np.maximum(0.0, raw)
-
-        # Recombination weights for CMA paths — always the positive Hansen
-        # weights (sum to 1), used by p_c / p_σ updates in rank-1 + CR-FM-NES.
         total_pos = np.sum(raw_positive)
         if total_pos > 0:
             recomb_w = raw_positive / total_pos
@@ -1636,29 +1558,8 @@ class SNES:
                 print("Utility calc failed due to negative total")
             recomb_w = raw_positive
         self._recomb_w = tf.constant(recomb_w.astype(np.float32))
-        # Invalidate the active-distance-regime negative cache so a pop_size
-        # change (e.g. IPOP restart) triggers a rebuild on next use.
-        self._neg_recomb_abs = None
 
-        active = bool(getattr(self.cfg, "snes_active_utilities", False))
-        if not active:
-            # Vanilla Hansen: positives sum to 1, all entries shifted by -1/λ.
-            # Bottom samples all get -1/λ (no ranking info inside the bottom half).
-            utilities = recomb_w - 1.0 / lam
-        else:
-            # Active mode: bottom half gets MIRRORED negative log-rank weights.
-            # raw[i] = log(λ/2+1) - log(i+1) — strictly decreasing; negative for i > λ/2-1.
-            # We use |raw| on the bottom half, normalise to sum α, then negate.
-            alpha = float(getattr(self.cfg, "snes_active_alpha", 1.0))
-            neg_abs = -np.minimum(0.0, raw)   # |bottom-half values|; zeros on top
-            total_neg = np.sum(neg_abs)
-            neg_w = (alpha * neg_abs / total_neg) if total_neg > 0 else neg_abs
-            utilities = recomb_w - neg_w
-            # Zero-mean enforcement: if alpha=1 and λ even, sum is already
-            # exactly 0; for any other alpha or odd λ this re-centres without
-            # affecting CMA paths (which read `_recomb_w` directly, not `utilities`).
-            utilities = utilities - np.mean(utilities)
-
+        utilities = recomb_w - 1.0 / lam
         if self.cfg.debug:
             print("utilities = ", utilities)
         return utilities
@@ -1683,621 +1584,49 @@ class SNES:
         return tf.concat([s_half, -s_half, s_extra], axis=0)
 
     def ask(self) -> tuple[tf.Tensor, dict[str, tf.Tensor]]:
-        """Sample pop_size candidate parameter vectors from the search
-        distribution.
+        """Sample pop_size candidate parameter vectors via mirrored
+        (antithetic) sampling — see `_mirrored_normal`.
 
-        Uses **mirrored (antithetic) sampling** — see `_mirrored_normal`.
-
-        Sampling covariance:
-          - default (snes_cov_mode='none'): isotropic
-                delta = sigma * s_iso          (samples = μ + delta)
-          - 'crfmnes': CR-FM-NES samples δ = σ_scalar · (D ⊙ y) with
-                y = z + (√(1+‖v‖²)−1)·v̄(v̄ᵀz). See `_ensure_crfmnes_state`.
-
-        The returned `delta` is the ACTUAL displacement (samples − μ).
-        The natural-gradient mean step Σ_p u_p · delta_p is correct for
-        ANY sampling covariance (it's the utility-weighted displacement
-        sum), so update() uses delta directly for the mean. The per-dim
-        sigma update, by contrast, must use ONLY the isotropic component
-        `s_iso` (else sigma absorbs the injected subspace variance and
-        drifts) — hence we return both.
+        Vanilla separable-NES sampling: ``delta = sigma * s_iso`` per
+        coordinate, ``samples = μ + delta``.
 
         Returns:
             samples : [pop_size, dim] float32 — candidate parameter vectors
             aux     : dict with
                 "s_iso" : [pop_size, dim] standard-normal isotropic noise
-                "delta" : [pop_size, dim] actual displacement (samples − μ)
+                "delta" : [pop_size, dim] actual displacement (= sigma·s_iso)
         """
         s_iso = self._mirrored_normal((self.pop_size, self.dim))
-        # `y` is the v-twisted pre-scale shape sample used by CR-FM-NES; it is
-        # only populated in the crfmnes branch below and is returned in `aux`
-        # solely when crfmnes is active (update() needs it for the Fisher step).
-        y = None
-        crfmnes_active = (
-            self._cov_mode_str == "crfmnes"
-            and self._cr_v is not None
-        )
-        if crfmnes_active:
-            # CR-FM-NES sampling: y = z + (√(1+‖v‖²) − 1)·v̄·(v̄ᵀz);
-            # δ = σ_scalar · (D ⊙ y). Mirroring is at z-level (`s_iso`); the
-            # v-twist runs after, so y-pairs are NOT exact antithetes — only z
-            # is. This matches upstream crfmnes/alg.py:107-114.
-            self._ensure_crfmnes_state()
-            v = self._cr_v
-            v_norm2 = tf.reduce_sum(v * v)
-            scale = tf.sqrt(1.0 + v_norm2) - 1.0
-            # v̄·(v̄ᵀz) = v·(vᵀz)/‖v‖²; guard against v_norm2 ≈ 0 (then scale → 0
-            # and proj is multiplied by 0, so the numerator dominates).
-            v_norm2_safe = tf.maximum(v_norm2, 1e-30)
-            proj = tf.einsum("pd,d->p", s_iso, v)[:, None] * v[None, :] / v_norm2_safe
-            y = s_iso + scale * proj
-            delta = self._cr_sig * (self._cr_D * y)
-        else:
-            delta = s_iso * self.sigma
+        delta = s_iso * self.sigma
         samples = self.mu + delta
-        aux = {"s_iso": s_iso, "delta": delta}
-        if y is not None:
-            aux["y"] = y
-        return samples, aux
-
-    def _ensure_es_mean_state(self) -> None:
-        """Lazily allocate Adam moment buffers for the ES mean gradient.
-        Only materialised the first time snes_mean_optimizer == "adam" fires.
-        """
-        if self._es_m is None:
-            self._es_m = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
-                                     trainable=False, name="es_mean_m")
-            self._es_v = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
-                                     trainable=False, name="es_mean_v")
-            self._es_t = tf.Variable(0, dtype=tf.int64, trainable=False,
-                                     name="es_mean_t")
-
-    def _ensure_es_sigma_state(self) -> None:
-        """Lazily allocate the EMA buffer for the step-size gradient.
-
-        Only materialised the first time snes_sigma_cumulation is on.
-        """
-        if self._grad_sigma_ema is None:
-            self._grad_sigma_ema = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
-                                               trainable=False, name="es_grad_sigma_ema")
-
-    @staticmethod
-    def _solve_h_inv(dim: float) -> float:
-        """Newton solve of f(a) = ((1+a²)·exp(a²/2))/0.24 − 10 − dim = 0.
-
-        Ported verbatim from crfmnes/alg.py:12-22 — damped Newton (step
-        scale 0.5), tolerance |f(a)| ≤ 1e-10, early-exit if a step moves
-        less than 1e-16. The root `a = h_inv(dim)` is dim-dependent and
-        enters the distance-weighting α(λ_F) coefficient.
-        """
-        import math as _math
-        f       = lambda a: ((1.0 + a * a) * _math.exp(a * a / 2.0) / 0.24) - 10.0 - dim
-        f_prime = lambda a: (1.0 / 0.24) * a * _math.exp(a * a / 2.0) * (3.0 + a * a)
-        h = 6.0
-        while abs(f(h)) > 1e-10:
-            last = h
-            h = h - 0.5 * (f(h) / f_prime(h))
-            if abs(h - last) < 1e-16:
-                break
-        return float(h)
-
-    def _ensure_crfmnes_state(self) -> None:
-        """Lazily allocate CR-FM-NES Variables and cache the dim-dependent
-        constants (χ_d, h_inv).
-
-        Only materialised when cov_mode="crfmnes"; vanilla / rank-1 / guided
-        leave these None so the search state stays byte-identical.
-        """
-        if self._cr_v is None:
-            d = float(self.dim)
-            self._cr_v   = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
-                                       trainable=False, name="cr_v")
-            self._cr_D   = tf.Variable(tf.ones([self.dim], dtype=tf.float32),
-                                       trainable=False, name="cr_D")
-            self._cr_psg = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
-                                       trainable=False, name="cr_psg")
-            self._cr_pc  = tf.Variable(tf.zeros([self.dim], dtype=tf.float32),
-                                       trainable=False, name="cr_pc")
-            self._cr_sig = tf.Variable(float(self.cfg.init_sigma), dtype=tf.float32,
-                                       trainable=False, name="cr_sig")
-            self._cr_chi = float(np.sqrt(d) * (1.0 - 1.0 / (4.0 * d) + 1.0 / (21.0 * d * d)))
-            self._cr_h_inv = float(self._solve_h_inv(d))
-
-    def _crfmnes_constants(self, lambda_F: int, ps_norm: float) -> dict:
-        """All CR-FM-NES rates ported verbatim from crfmnes/alg.py.
-
-        Pure function of (dim, λ, λ_F, ‖p_σ‖) so it can be unit-tested
-        against the upstream reference. λ_F-dependent rates (c_1, η_B,
-        α, η_stag, η_conv) all read `lambda_F`; the three-regime η_σ
-        branches on `ps_norm` vs χ_d and 0.1·χ_d.
-
-        Reads cached `self._cr_h_inv` and `self._cr_chi` from
-        `_ensure_crfmnes_state()`; reads `self._recomb_w` (populated by
-        `compute_utilities()` — same recombination weights the rank-1
-        update uses).
-
-        Returns dict with keys:
-            mu_eff, eta_m, c_sigma, c_c, c1_cma, c_1,
-            eta_B, alpha_dist, eta_sigma, h_inv, chi_d.
-
-        Line refs (crfmnes/alg.py):
-            mu_eff   line 60       c_sigma  line 61      c_c      line 62
-            c1_cma   line 63       c_1      line 78      eta_B    line 79
-            eta_m    line 74       alpha    line 70-71   χ_d      line 65
-            η_σ regimes: lines 75-77, branching 150-151
-        """
-        d   = float(self.dim)
-        lam = float(self.pop_size)
-        lf  = float(lambda_F)
-
-        # Recompute the CMA recombination weights `w_rank_hat / sum(w_rank_hat)`
-        # in float64 (matches upstream crfmnes/alg.py:57-60). The cached
-        # self._recomb_w stores the same quantity but in float32 — using it
-        # here would inject ~1e-7 relative error into mu_eff and every
-        # downstream rate, breaking the 1e-10 tolerance against the
-        # upstream-generated reference fixture.
-        ranks    = np.arange(1, int(lam) + 1, dtype=np.float64)
-        w_hat    = np.log(lam * 0.5 + 1.0) - np.log(ranks)
-        w_hat    = np.maximum(0.0, w_hat)
-        w64      = w_hat / np.sum(w_hat)
-        mu_eff   = float(1.0 / np.sum(w64 * w64))
-
-        c_sigma = (mu_eff + 2.0) / (d + mu_eff + 5.0)
-        c_c     = (4.0 + mu_eff / d) / (d + 4.0 + 2.0 * mu_eff / d)
-        c1_cma  = 2.0 / ((d + 1.3) ** 2 + mu_eff)
-
-        # λ_F-scaled rates (crfmnes/alg.py:78-79):
-        c_1   = c1_cma * (d - 5.0) / 6.0 * (lf / lam)
-        eta_B = float(np.tanh((min(0.02 * lf, 3.0 * np.log(d)) + 5.0)
-                              / (0.23 * d + 25.0)))
-
-        # α(λ_F) (crfmnes/alg.py:70-71). Cached h_inv is dim-dependent.
-        h_inv = self._cr_h_inv
-        chi_d = self._cr_chi
-        alpha_dist = h_inv * min(1.0, np.sqrt(lam / d)) * np.sqrt(lf / lam)
-
-        # Three-regime η_σ (crfmnes/alg.py:75-77 + branching 150-151):
-        if ps_norm >= chi_d:
-            eta_sigma = 1.0
-        elif ps_norm >= 0.1 * chi_d:
-            eta_sigma = float(np.tanh((0.024 * lf + 0.7 * d + 20.0) / (d + 12.0)))
-        else:
-            eta_sigma = 2.0 * float(np.tanh((0.025 * lf + 0.75 * d + 10.0) / (d + 4.0)))
-
-        return {
-            "mu_eff":     mu_eff,
-            "eta_m":      1.0,
-            "c_sigma":    float(c_sigma),
-            "c_c":        float(c_c),
-            "c1_cma":     float(c1_cma),
-            "c_1":        float(c_1),
-            "eta_B":      float(eta_B),
-            "alpha_dist": float(alpha_dist),
-            "eta_sigma":  float(eta_sigma),
-            "h_inv":      float(h_inv),
-            "chi_d":      float(chi_d),
-        }
-
-    def _crfmnes_weights(self, s_iso_sorted: tf.Tensor, lambda_F: int,
-                         ps_norm: float) -> tf.Tensor:
-        """Return the active length-λ weight vector for a CR-FM-NES generation.
-
-        Implements the binary regime switch on `‖p_σ‖` (crfmnes/alg.py:149):
-            weights = w_dist  if  ps_norm >= χ_d
-                      w_rank  otherwise
-
-        Where:
-          * `w_rank` is the existing zero-mean log-rank utility set
-            (`self.utilities`) — same shaping vanilla SNES uses, and what
-            upstream stores as `self.w_rank` (alg.py:59).
-          * `w_dist` is `w_rank_hat[i] * exp(α(λ_F) * ‖zᵢ‖)`, renormalised
-            to sum-1 and zero-shifted by 1/λ (alg.py:144-147). Upstream's
-            `w_rank_hat / sum(w_rank_hat)` is exactly our cached
-            `self._recomb_w`, so we multiply the exponential factor in
-            BEFORE renormalising (an unnormalised global scalar cancels in
-            the renorm anyway, but doing it this way matches the upstream
-            structure verbatim).
-
-        Args:
-            s_iso_sorted : [pop, dim] — globally-fitness-sorted s_iso (i.e.
-                upstream's `z` AFTER the line-127 reorder). In TNEP this is
-                supplied by `fit()` as `aux["s_iso_global"]`.
-            lambda_F     : per-gen feasible count (= pop_size for
-                unconstrained problems). Drives α(λ_F).
-            ps_norm      : ‖self._cr_psg‖ — the conjugate-path norm AFTER
-                this generation's p_σ update.
-
-        Returns:
-            tf.Tensor [pop] float32 — the active (zero-mean) weight vector.
-
-        Note on eager Python-`if`: we deliberately use a host-side `if` on
-        `ps_norm` (a Python float) rather than `tf.cond`. This keeps the
-        weight build readable and matches how `update()` will consume it
-        in C4 (where ps_norm is computed eagerly from `tf.norm(...)`).
-        If/when this method is wrapped in `tf.function(jit_compile=True)`,
-        revisit and replace with `tf.cond`.
-        """
-        if self._recomb_w is None:
-            self.compute_utilities()
-        chi_d = float(self._cr_chi)
-        active = bool(getattr(self.cfg, "snes_active_utilities", False))
-        if ps_norm < chi_d:
-            # Stagnation/early regime → log-rank weights.
-            # self.utilities already includes active negatives if cfg enables
-            # it (negative recombination on v flows through the Fisher (s,t)
-            # update naturally — the bottom samples now SHRINK v along their
-            # direction, mirroring how active utilities shrink σ).
-            return tf.cast(self.utilities, tf.float32)
-
-        # Move regime → distance-weighted recombination.
-        K = self._crfmnes_constants(int(lambda_F), float(ps_norm))
-        alpha_dist = tf.constant(float(K["alpha_dist"]), dtype=tf.float32)
-        # ‖zᵢ‖ per sample (row-norm); upstream computes ‖z[:,i]‖ over the
-        # dim-axis which corresponds to axis=1 here.
-        z_norms = tf.norm(tf.cast(s_iso_sorted, tf.float32), axis=1)         # [pop]
-        # w_rank_hat / sum cached as self._recomb_w (sum-1, NOT zero-shifted).
-        # exp-factor multiplied in before renormalisation matches alg.py:144-147.
-        exp_factor = tf.exp(alpha_dist * z_norms)
-        w_raw = self._recomb_w * exp_factor
-
-        if not active:
-            # Vanilla CR-FM-NES: positive distance weights, zero-mean shift.
-            w_dist = w_raw / tf.reduce_sum(w_raw) - (1.0 / float(self.pop_size))
-            return tf.cast(w_dist, tf.float32)
-
-        # ACTIVE distance regime: also build mirrored negative distance
-        # weights from the Hansen-negative raw log-rank values. The bottom
-        # samples that took LARGE steps (high ‖z‖) and were BAD get extra
-        # exp-amplified negative weight — directly shrinking _cr_v along the
-        # worst-case directions (the "negative recombination" half of full
-        # active CMA, ported into CR-FM-NES's distance regime).
-        if self._neg_recomb_abs is None:
-            # Lazy-build the mirrored absolute negative log-rank weights:
-            # |min(0, log(λ/2+1) - log(i))|, normalized to sum to 1.
-            lam = self.pop_size
-            ranks_np = np.arange(lam) + 1
-            raw_np = np.log((lam * 0.5) + 1.0) - np.log(ranks_np)
-            neg_abs_np = -np.minimum(0.0, raw_np)
-            total_neg = float(neg_abs_np.sum())
-            if total_neg > 0.0:
-                neg_abs_np = neg_abs_np / total_neg
-            self._neg_recomb_abs = tf.constant(neg_abs_np.astype(np.float32))
-        active_alpha = float(getattr(self.cfg, "snes_active_alpha", 1.0))
-        w_neg_raw = self._neg_recomb_abs * exp_factor
-        w_neg_sum = tf.reduce_sum(w_neg_raw)
-        # Guard: if all neg_recomb_abs are zero (lambda=2), skip negative half.
-        if float(w_neg_sum.numpy()) > 0.0:
-            w_pos = w_raw / tf.reduce_sum(w_raw)
-            w_neg = active_alpha * w_neg_raw / w_neg_sum
-            weights = w_pos - w_neg
-            # Zero-mean enforcement.
-            weights = weights - tf.reduce_mean(weights)
-            return tf.cast(weights, tf.float32)
-        # Fallback to vanilla form if no negative entries exist.
-        w_dist = w_raw / tf.reduce_sum(w_raw) - (1.0 / float(self.pop_size))
-        return tf.cast(w_dist, tf.float32)
-
-    def _active_sigma_vec(self) -> tf.Tensor:
-        """Return the active per-coordinate sampling scale, length [dim].
-
-        Under `cov_mode == "crfmnes"` the per-dim `self.sigma` is dead — the
-        active sampling scale lives in `_cr_sig * _cr_D`. Under any other
-        mode it's just `self.sigma`. Used by σ-reporting, plateau-reset,
-        and any future inference-time σ read.
-        """
-        if (self._cov_mode_str == "crfmnes"
-                and self._cr_sig is not None and self._cr_D is not None):
-            return self._cr_sig * self._cr_D
-        return self.sigma
+        return samples, {"s_iso": s_iso, "delta": delta}
 
     def update(self, utilities: tf.Tensor, aux: dict[str, tf.Tensor]) -> None:
-        """Update mu and sigma using fitness-ranked samples.
-
-        All operations run on GPU via TensorFlow.
+        """Vanilla separable-NES mean / per-coord sigma update.
 
         Args:
-            utilities : [pop_size] float32 tensor — rank-based weights (best first)
-            aux       : dict from ask(), already sorted by fitness, with
+            utilities : [pop_size] float32 — log-rank weights (best first)
+            aux       : dict from ask(), already sorted by fitness:
                 "s_iso" : [pop_size, dim] isotropic standard-normal noise
-                          (s_iso[0] = best individual, s_iso[-1] = worst)
-                "delta" : [pop_size, dim] actual displacement (samples − μ),
-                          same fitness ordering as s_iso
+                "delta" : [pop_size, dim] actual displacement (= sigma·s_iso)
 
-        Mean step is COVARIANCE-AGNOSTIC: it is the utility-weighted sum of
-        actual displacements `Σ_p u_p · delta_p`, which is the natural-
-        gradient mean step for any sampling covariance (isotropic OR
-        guided). When delta = sigma·s_iso (guided off) this is bit-
-        identical to the old `mu += sigma·Σ u_p s_iso`.
-
-        Sigma step uses ONLY the isotropic component s_iso (grad_sigma =
-        Σ u_p (s_iso² − 1)): if it used the guided displacement, sigma
-        would absorb the injected gradient-subspace variance and drift.
-
-        Mutates self.mu and self.sigma tf.Variables in place. Sigma is
-        clamped to a small floor (cfg.sigma_floor, default 1e-5) after
-        the multiplicative update so a near-collapse of the search
-        distribution can't silently kill exploration on long runs.
+        Mutates ``self.mu`` and ``self.sigma`` in place. Sigma is clamped
+        to ``cfg.sigma_floor`` after the multiplicative update so a
+        near-collapse can't silently kill exploration on long runs.
         """
         s_iso = aux["s_iso"]
-        delta = aux["delta"]
-        # Kept for the mean-Adam branch, which preconditions the ES mean
-        # gradient (the standard-normal natural gradient, not displacements).
         grad_mu = tf.einsum('p,pd->d', utilities, s_iso)
-
-        # Detect CR-FM-NES mode early. CR-FM-NES owns the mean update (uses
-        # regime-switched weights, not static log-rank utilities), so the
-        # parent mean dispatch is skipped under crfmnes — the crfmnes branch
-        # below advances μ with the active weights.
-        crfmnes_mode = (
-            self._cov_mode_str == "crfmnes"
-        )
-
-        # --- mean update (Feature A: optional Adam preconditioning) ---
-        if crfmnes_mode:
-            # μ-step deferred to the crfmnes branch (uses regime-switched weights).
-            pass
-        elif str(getattr(self.cfg, "snes_mean_optimizer", "vanilla")).lower() == "adam":
-            self._ensure_es_mean_state()
-            b1 = float(self.cfg.snes_mean_beta1); b2 = float(self.cfg.snes_mean_beta2)
-            eps = float(self.cfg.snes_mean_epsilon)
-            lr = self.cfg.snes_mean_lr
-            # None -> 1e-2. Adam normalises the per-dim step magnitude, so the
-            # learning rate is decoupled from init_sigma (tying it to init_sigma
-            # overshoots ~100x in high dim). ~1e-2 matches the per-dim vanilla
-            # step scale empirically; tune per problem.
-            lr = float(lr) if lr is not None else 1e-2
-            self._es_t.assign_add(1)
-            t = tf.cast(self._es_t, tf.float32)
-            self._es_m.assign(b1 * self._es_m + (1.0 - b1) * grad_mu)
-            self._es_v.assign(b2 * self._es_v + (1.0 - b2) * tf.square(grad_mu))
-            m_hat = self._es_m / (1.0 - tf.pow(b1, t))
-            v_hat = self._es_v / (1.0 - tf.pow(b2, t))
-            self.mu.assign_add(lr * m_hat / (tf.sqrt(v_hat) + eps))
-        elif self._cov_mode_str != "none":
-            # Rank-1 CMA inflated delta beyond sigma·s_iso, so the
-            # covariance-agnostic mean step (utility-weighted sum of actual
-            # displacements) is required for the correct natural gradient.
-            # (With the rank-1 correction delta != sigma·s_iso, so the
-            # vanilla sigma·grad_mu form would be wrong.)
-            self.mu.assign_add(tf.einsum('p,pd->d', utilities, delta))
-        else:
-            # Vanilla path: keep the exact original reduction order
-            # (sigma · Σ u_p s_iso) so behaviour is BIT-identical.
-            # Algebraically equal to the displacement form above
-            # (delta == sigma·s_iso here).
-            self.mu.assign_add(self.sigma * grad_mu)
-
-        # --- rank-1 CMA covariance (evolution path + amplitude) ---
-        # --- CR-FM-NES (v, D) Fisher update + paths + σ_scalar step ---
-        # Ported verbatim from crfmnes/alg.py:138-190.  When active this
-        # branch owns the mean, p_σ, p_c, (v, D), det(A) renorm, and σ_scalar
-        # updates — the per-dim σ update below is bypassed via early return.
-        # f64 internally: the Fisher loop accumulates rounding faster than the
-        # constants, and the upstream reference is f64.
-        if crfmnes_mode:
-            self._ensure_crfmnes_state()
-            if "y_global" not in aux:
-                raise RuntimeError(
-                    "fit() must supply aux['y_global'] for cov_mode='crfmnes'")
-            # λ_F = per-gen feasible count (NOT a persistent success counter).
-            # crfmnes/alg.py:138. Falls back to pop_size for unit tests that
-            # don't supply a "fitness" tensor.
-            fitness_t = aux.get("fitness")
-            if fitness_t is not None:
-                lf = int(tf.reduce_sum(
-                    tf.cast(tf.math.is_finite(fitness_t), tf.int32)).numpy())
-            else:
-                lf = int(self.pop_size)
-
-            # Promote state to f64 for the Fisher loop. We need mu_eff and c_sigma
-            # to update psg before evaluating the regime — so first build a
-            # "rate-only" K probe with ps_norm=0 (mu_eff, c_sigma, c_c are
-            # ps_norm-independent), update psg, then build the real K against
-            # POST-update ps_norm (upstream alg.py:141→149 ordering).
-            chi_d = float(self._cr_chi)
-            v64    = tf.cast(self._cr_v, tf.float64)
-            D64    = tf.cast(self._cr_D, tf.float64)
-            psg64  = tf.cast(self._cr_psg, tf.float64)
-            pc64   = tf.cast(self._cr_pc, tf.float64)
-            sig64  = tf.cast(self._cr_sig, tf.float64)
-            s_iso_g = aux["s_iso_global"]
-            s_iso_g64 = tf.cast(s_iso_g, tf.float64)
-            y_g64     = tf.cast(aux["y_global"], tf.float64)
-            delta_g64 = tf.cast(aux.get("s_eff_global"), tf.float64) * sig64  # delta = sig * (D*y); s_eff_global = delta/sig
-
-            # ---- 1. p_σ (z-coords, log-rank weighted) — crfmnes/alg.py:141 ----
-            # All rates here are ps_norm-independent so a probe with ps_norm=0 works.
-            K_probe = self._crfmnes_constants(lf, 0.0)
-            c_sigma = tf.constant(K_probe["c_sigma"], dtype=tf.float64)
-            mu_eff64 = tf.constant(K_probe["mu_eff"], dtype=tf.float64)
-            # CR-FM-NES p_σ uses STANDARD Hansen log-rank utilities
-            # (crfmnes/alg.py:141 — upstream w_rank, NOT the active variant).
-            # Construct from _recomb_w (positive Hansen, sum=1) shifted by
-            # -1/λ. Doing this independently of `self.utilities` insulates
-            # CR-FM-NES from `cfg.snes_active_utilities=True`, which would
-            # otherwise leak into the p_σ path and break the spec.
-            recomb_w64 = tf.cast(self._recomb_w, tf.float64)
-            w_rank = recomb_w64 - tf.constant(1.0 / float(self.pop_size),
-                                              dtype=tf.float64)
-            # z @ w_rank in upstream notation == s_iso_g.T @ w_rank as (dim,) vec
-            #   z is (dim, lamb); w_rank is (lamb,). Our s_iso_g is (lamb, dim).
-            z_at_w = tf.einsum("p,pd->d", w_rank, s_iso_g64)
-            new_psg = (1.0 - c_sigma) * psg64 + tf.sqrt(c_sigma * (2.0 - c_sigma) * mu_eff64) * z_at_w
-
-            # ---- 2. ps_norm (POST-update) drives the regime switch ----
-            ps_norm = float(tf.norm(new_psg).numpy())
-            K = self._crfmnes_constants(lf, ps_norm)
-            # Active weights (regime-switched) — uses POST-update ps_norm.
-            weights_f32 = self._crfmnes_weights(s_iso_g, lf, ps_norm)
-            weights = tf.cast(weights_f32, tf.float64)
-
-            # ---- 3. mean step + p_c (uses regime-switched weights) ----
-            # wxm = (x - m) @ weights — in our notation: einsum('p,pd->d', weights, delta)
-            wxm = tf.einsum("p,pd->d", weights, delta_g64)
-            c_c = tf.constant(K["c_c"], dtype=tf.float64)
-            new_pc = (1.0 - c_c) * pc64 + tf.sqrt(c_c * (2.0 - c_c) * mu_eff64) * wxm / sig64
-            eta_m = tf.constant(K["eta_m"], dtype=tf.float64)
-            new_mu = tf.cast(self.mu, tf.float64) + eta_m * wxm
-
-            # ---- 4. Fisher (s, t) closed form — crfmnes/alg.py:158-179 ----
-            # Build everything column-major to match upstream's (dim, lamb+1)
-            # exY shape. Our tensors live as (lamb, dim) so transpose y_g to
-            # (dim, lamb), then concat pc/D as the (lamb+1)-th column.
-            y_col   = tf.transpose(y_g64)                                       # (dim, lamb)
-            pc_over_D = (new_pc / D64)[:, None]                                 # (dim, 1)
-            exY     = tf.concat([y_col, pc_over_D], axis=1)                     # (dim, lamb+1)
-
-            # OLD normv, captured BEFORE the v update (crfmnes/alg.py:183).
-            normv2 = tf.reduce_sum(v64 * v64)
-            normv  = tf.sqrt(normv2)
-            normv4 = normv2 * normv2
-            normv_safe = tf.maximum(normv, tf.constant(1e-300, dtype=tf.float64))
-            vbar = v64 / normv_safe                                              # (dim,)
-            vbar_col = vbar[:, None]                                             # (dim, 1)
-            gammav  = 1.0 + normv2
-            vbarbar = vbar * vbar                                                # (dim,)
-            vbarbar_col = vbarbar[:, None]
-
-            yy        = exY * exY                                                # (dim, lamb+1)
-            ip_yvbar  = tf.matmul(vbar_col, exY, transpose_a=True)               # (1, lamb+1)
-            yvbar     = exY * vbar_col                                           # (dim, lamb+1)
-            max_vbarbar = tf.reduce_max(vbarbar)
-            max_vbarbar_safe = tf.maximum(max_vbarbar, tf.constant(1e-300, dtype=tf.float64))
-            alphavd_inner = tf.sqrt(normv4 + (2.0 * gammav - tf.sqrt(gammav)) / max_vbarbar_safe) / (2.0 + normv2)
-            alphavd = tf.minimum(tf.constant(1.0, dtype=tf.float64), alphavd_inner)
-
-            t_mat = exY * ip_yvbar - vbar_col * (ip_yvbar * ip_yvbar + gammav) / 2.0
-            b     = -(1.0 - alphavd * alphavd) * normv4 / gammav + 2.0 * alphavd * alphavd
-            H     = 2.0 * tf.ones_like(vbar_col) - (b + 2.0 * alphavd * alphavd) * vbarbar_col
-            invH  = 1.0 / H
-            s_step1 = yy - normv2 / gammav * (yvbar * ip_yvbar) - tf.ones_like(exY)
-            ip_vbart = tf.matmul(vbar_col, t_mat, transpose_a=True)              # (1, lamb+1)
-            s_step2 = s_step1 - alphavd / gammav * (
-                (2.0 + normv2) * (t_mat * vbar_col)
-                - normv2 * vbarbar_col @ ip_vbart
-            )
-            invHvbarbar = invH * vbarbar_col                                     # (dim, 1)
-            ip_s_step2invHvbarbar = tf.matmul(invHvbarbar, s_step2, transpose_a=True)  # (1, lamb+1)
-            denom_scalar = 1.0 + b * tf.matmul(vbarbar_col, invHvbarbar, transpose_a=True)  # (1,1)
-            s_mat = (s_step2 * invH) - b / denom_scalar * (invHvbarbar @ ip_s_step2invHvbarbar)
-            ip_svbarbar = tf.matmul(vbarbar_col, s_mat, transpose_a=True)        # (1, lamb+1)
-            t_mat = t_mat - alphavd * (
-                (2.0 + normv2) * (s_mat * vbar_col)
-                - vbar_col @ ip_svbarbar
-            )
-
-            # ---- 5. exw = concat([eta_B * weights, c_1]) ----
-            eta_B = tf.constant(K["eta_B"], dtype=tf.float64)
-            c_1   = tf.constant(K["c_1"],   dtype=tf.float64)
-            exw = tf.concat([eta_B * weights, [c_1]], axis=0)                    # (lamb+1,)
-
-            # ---- 6. v, D update — uses OLD normv ----
-            normv_old_safe = tf.maximum(normv, tf.constant(1e-300, dtype=tf.float64))
-            new_v = v64 + tf.linalg.matvec(t_mat, exw) / normv_old_safe          # (dim,)
-            new_D = D64 + tf.linalg.matvec(s_mat, exw) * D64                     # (dim,)
-
-            # ---- 7. det(A) renorm POST-update, with NEW v — crfmnes/alg.py:186 ----
-            new_v_norm2 = tf.reduce_sum(new_v * new_v)
-            d_f = tf.cast(self.dim, tf.float64)
-            log_root = tf.reduce_sum(tf.math.log(new_D)) / d_f \
-                + tf.math.log(1.0 + new_v_norm2) / (2.0 * d_f)
-            nthrootdetA = tf.exp(log_root)
-            new_D = new_D / nthrootdetA
-
-            # ---- 8. σ update — G_σ = sum((z²-1)·weights) / d ----
-            G_s = tf.reduce_sum((s_iso_g64 * s_iso_g64 - 1.0) * weights[:, None]) / d_f
-            eta_sigma_cr = tf.constant(K["eta_sigma"], dtype=tf.float64)
-            new_sig = sig64 * tf.exp(eta_sigma_cr / 2.0 * G_s)
-            floor = getattr(self.cfg, "sigma_floor", 1e-5)
-            if floor is not None and floor > 0.0:
-                new_sig = tf.maximum(new_sig, tf.constant(float(floor), dtype=tf.float64))
-
-            # ---- Cast back to f32 and assign ----
-            self._cr_psg.assign(tf.cast(new_psg, tf.float32))
-            self._cr_pc.assign(tf.cast(new_pc, tf.float32))
-            self.mu.assign(tf.cast(new_mu, tf.float32))
-            self._cr_v.assign(tf.cast(new_v, tf.float32))
-            self._cr_D.assign(tf.cast(new_D, tf.float32))
-            self._cr_sig.assign(tf.cast(new_sig, tf.float32))
-            return  # SKIP the per-dim σ update below — CR-FM-NES owns σ.
-
-        # --- sigma update (Feature B: optional cumulation) ---
-        # grad_sigma = Σ u_i (s_i² − 1) is the NES natural gradient on log-sigma.
-        # It is self-equilibrating (too-small sigma → best samples are the
-        # larger-step ones → grad_sigma>0 → grow; too-large → shrink), which is
-        # exactly why the vanilla `sigma *= exp(eta·grad_sigma)` update is
-        # stable. Cumulation low-pass-filters THIS signal (an EMA) and feeds it
-        # through the SAME exp(eta·.) update, so it inherits vanilla's
-        # equilibrium and bounded per-gen growth — it adds temporal smoothing
-        # without a runaway.
-        #
-        # (The original separable-CSA law exp(rate·(p²−1)) drove sigma off the
-        # MEAN-gradient path grad_mu, which accumulates monotonically downhill
-        # with NO negative feedback → sigma compounded to float overflow. Fixed
-        # by switching the driving signal to grad_sigma and reusing eta.)
+        self.mu.assign_add(self.sigma * grad_mu)
+        # NES natural gradient on log-sigma: Σ_p u_p · (s² − 1). This signal
+        # is self-equilibrating (too-small σ → best samples are larger-step
+        # ones → grad_sigma > 0 → grow; too-large → shrink), which is what
+        # makes the multiplicative update stable on long runs.
         grad_sigma = tf.einsum('p,pd->d', utilities, s_iso ** 2 - 1.0)
-        if bool(getattr(self.cfg, "snes_sigma_cumulation", False)):
-            self._ensure_es_sigma_state()
-            c = self.cfg.snes_cumulation_c
-            c = float(c) if c is not None else 0.2   # EMA decay (smooth ~1/c gens)
-            g_ema = (1.0 - c) * self._grad_sigma_ema + c * grad_sigma
-            self._grad_sigma_ema.assign(g_ema)
-            # Defense-in-depth: clamp the per-gen log-sigma step so no step-size
-            # law can blow sigma up in a single generation (≤ e¹ ≈ 2.7× / gen).
-            log_step = tf.clip_by_value(self.eta_sigma * g_ema, -1.0, 1.0)
-            new_sigma = self.sigma * tf.exp(log_step)
-        else:
-            new_sigma = self.sigma * tf.exp(self.eta_sigma * grad_sigma)   # canonical vanilla
+        new_sigma = self.sigma * tf.exp(self.eta_sigma * grad_sigma)
         floor = getattr(self.cfg, "sigma_floor", 1e-5)
         if floor is not None and floor > 0.0:
             new_sigma = tf.maximum(new_sigma, float(floor))
         self.sigma.assign(new_sigma)
-
-        # --- MSR global σ rescale (Ait ElHara, Auger, Hansen, GECCO 2013) ---
-        # Paper-faithful Algorithm 1, applied AFTER the per-coord σ update.
-        # Silently no-ops:
-        #   - cov_mode="crfmnes" (CR-FM-NES owns σ; early-returned above).
-        #   - snes_msr_enabled=False (default).
-        # Fitness signal: prefer self._last_rmse_per_cand (always pure RMSE,
-        # unaffected by regularisation or per-type fitness composition) over
-        # aux["fitness"] which may include L1/L2 penalties.
-        if bool(getattr(self.cfg, "snes_msr_enabled", False)):
-            fitness_msr_src = getattr(self, "_last_rmse_per_cand", None)
-            if fitness_msr_src is None:
-                if "fitness" not in aux:
-                    raise KeyError(
-                        "MSR requires either self._last_rmse_per_cand "
-                        "(set by evaluate_population) or aux['fitness'].")
-                fitness_msr_src = aux["fitness"]
-            fitness_sorted = tf.sort(tf.cast(fitness_msr_src, tf.float32))
-            idx_lo = (self.pop_size - 1) // 2
-            idx_hi = self.pop_size // 2
-            f_med_curr = float(tf.reduce_mean(
-                tf.gather(fitness_sorted, [idx_lo, idx_hi])).numpy())
-            if self._msr_initialised:
-                K_succ = float(tf.reduce_sum(
-                    tf.cast(fitness_sorted < self._msr_f_prev, tf.float32)).numpy())
-                # Paper's z: centered at 0 under stationarity, range ≈ [−1, 1].
-                # E[K_succ] under H0 (i.i.d. populations) = (λ+1)/2 — so the
-                # (λ+1)/2 offset removes the Beta-median asymmetry bias.
-                lam = float(self.pop_size)
-                z = (2.0 / lam) * (K_succ - (lam + 1.0) / 2.0)
-                # EMA smoothing (paper Algorithm 1 line 3) — low-pass filter
-                # on z. Without this the controller chases noise at full
-                # variance every gen.
-                c_s = self._msr_c_sigma
-                self._msr_ps = (1.0 - c_s) * self._msr_ps + c_s * z
-                # Damped exponential update. d_σ ≈ 2 − 2/n in the paper;
-                # max(1, ...) guards d=1 corner.
-                d_s = max(1.0, 2.0 - 2.0 / float(self.dim))
-                log_step = float(np.clip(
-                    self._msr_ps / d_s, -self._msr_clip, self._msr_clip))
-                self.sigma.assign(self.sigma * float(np.exp(log_step)))
-                floor_msr = getattr(self.cfg, "sigma_floor", 1e-5)
-                if floor_msr is not None and floor_msr > 0.0:
-                    self.sigma.assign(tf.maximum(self.sigma, float(floor_msr)))
-            self._msr_f_prev = f_med_curr
-            self._msr_initialised = True
 
     def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor], plot_callback: Callable | None = None, resume_state: dict | None = None) -> dict:
         """Run the SNES training loop using GPU-batched population evaluation.
@@ -2329,11 +1658,8 @@ class SNES:
             self.mu.assign(resume_state["mu"])
             self.sigma.assign(resume_state["sigma"])
             best_mu = tf.constant(resume_state["best_mu"], dtype=tf.float32)
-            # `best_sigma` is legitimately absent under cov_mode="crfmnes"
-            # (snapshot skipped — see best_sigma lifecycle under crfmnes).
-            # Fall back to self.sigma; the end-of-run restore is also gated on
-            # crfmnes so the fallback value is never actually written back to a
-            # dead variable when crfmnes is on.
+            # `best_sigma` may be absent in pre-2026 checkpoints; fall back
+            # to the current self.sigma in that case.
             bsi = resume_state.get("best_sigma")
             best_sigma = (tf.constant(bsi, dtype=tf.float32)
                           if bsi is not None else tf.identity(self.sigma))
@@ -2348,25 +1674,6 @@ class SNES:
                     # fall back to keeping the freshly-seeded generator
                     # rather than aborting the resume.
                     pass
-            # Restore CR-FM-NES learned state when present. Guarded so
-            # pure-SNES checkpoints (no cr_v) resume exactly as before.
-            # Dim-mismatch drops the state with a warning (arch changed).
-            if resume_state.get("cr_v") is not None:
-                cr_v = np.asarray(resume_state["cr_v"], dtype=np.float32)
-                if cr_v.shape[0] == self.dim:
-                    self._ensure_crfmnes_state()
-                    self._cr_v.assign(cr_v)
-                    self._cr_D.assign(
-                        np.asarray(resume_state["cr_D"], dtype=np.float32))
-                    self._cr_psg.assign(
-                        np.asarray(resume_state["cr_psg"], dtype=np.float32))
-                    self._cr_pc.assign(
-                        np.asarray(resume_state["cr_pc"], dtype=np.float32))
-                    self._cr_sig.assign(float(resume_state["cr_sig"]))
-                else:
-                    print(f"  WARNING: checkpoint cr_v dim "
-                          f"{cr_v.shape[0]} != model dim {self.dim}; "
-                          f"dropping CR-FM-NES state on resume.")
             start_gen = int(resume_state["last_gen"]) + 1
             # Offset train_start so the displayed elapsed continues from
             # the checkpointed wall-time rather than restarting at zero.
@@ -2402,14 +1709,7 @@ class SNES:
             }
             best_val_loss = float('inf')
             best_mu = tf.identity(self.mu)
-            # Skip the σ snapshot under cov_mode="crfmnes" — self.sigma is
-            # frozen at init_sigma, so snapshotting it is meaningless. The
-            # active scale (_cr_sig·_cr_D) has no "best" snapshot in this
-            # design: best_μ alone reproduces the best-val model.
-            if self._cov_mode_str != "crfmnes":
-                best_sigma = tf.identity(self.sigma)
-            else:
-                best_sigma = tf.identity(self.sigma)  # carries the (dead) init value; never restored under crfmnes
+            best_sigma = tf.identity(self.sigma)
             gens_without_improvement = 0
             start_gen = 0
             train_start = time.perf_counter()
@@ -2419,32 +1719,6 @@ class SNES:
         # restored from checkpoint — a fresh attempt to escape any
         # plateau seen so far is fine on resume).
         n_sigma_resets = 0
-
-        # Eagerly materialise CR-FM-NES state when active so ask() takes
-        # the crfmnes branch from gen 0 (and update() sees a valid `y` in
-        # aux). Without this, the lazy `self._cr_v is not None` check in
-        # ask() short-circuits to vanilla sampling on the first gen, and
-        # the fit() y_global gather hits a KeyError. The plateau-reset
-        # test materialised state itself; this makes a fresh fit() work.
-        if self._cov_mode_str == "crfmnes":
-            self._ensure_crfmnes_state()
-
-        # One-time warning: CR-FM-NES co-features. Each of mean-Adam and
-        # sigma-cumulation is an UNTESTED combination with cov_mode="crfmnes"
-        # — CR-FM-NES owns its own σ_scalar update and Fisher (v, D) state,
-        # and stacking another mean/sigma adapter on top of it is not
-        # validated by the paper or by any test in this repo.
-        if self._cov_mode_str == "crfmnes":
-            untested = []
-            if str(getattr(cfg, "snes_mean_optimizer", "vanilla")).lower() == "adam":
-                untested.append("mean-Adam")
-            if bool(getattr(cfg, "snes_sigma_cumulation", False)):
-                untested.append("sigma-cumulation")
-            if untested:
-                print(f"  WARNING: snes_cov_mode='crfmnes' + {', '.join(untested)} "
-                      "is an UNTESTED combination (CR-FM-NES owns σ_scalar and "
-                      "the v/D Fisher update; stacking another mean/sigma "
-                      "adapter on top of it is not validated).")
 
         gen_l1, gen_l2, gen_lorth = 0.0, 0.0, 0.0
         val_fitness = float('inf')
@@ -2459,6 +1733,27 @@ class SNES:
         # Last finite RRMSE values, carried into Adam gens (which don't compute
         # a population RRMSE) so the history series stays finite for plotting.
         last_best_rrmse = last_avg_rrmse = 0.0
+
+        # SIGTERM handler: Slurm sends SIGTERM `--time-min` seconds (default
+        # 30 s on Mahti) before walltime hits. We flip a flag rather than
+        # exiting from the handler so the in-flight generation completes
+        # cleanly, then save a final checkpoint at the bottom of the loop
+        # and break out. Hooks in only when there's a save_path configured
+        # (otherwise nowhere to checkpoint to). The handler is restored at
+        # fit() exit so repeated fit() calls don't accumulate handlers.
+        import signal as _signal
+        _term_requested = {"flag": False}
+        _prev_term_handler = None
+        if cfg.save_path:
+            def _on_term(_sig, _frm):
+                _term_requested["flag"] = True
+            try:
+                _prev_term_handler = _signal.signal(
+                    _signal.SIGTERM, _on_term)
+            except (ValueError, OSError):
+                # signal.signal only works in the main thread; skip the
+                # hook in subthreads (e.g. notebook environments).
+                _prev_term_handler = None
 
         for gen in range(start_gen, cfg.num_generations):
             t0 = time.perf_counter()
@@ -2528,11 +1823,10 @@ class SNES:
             # per gen, not the previous every-100-gen sampling.
             # Median uses tf.sort which is O(d log d); at d ≈ 50k this
             # is microseconds on GPU.
-            sigma_active = self._active_sigma_vec()  # [dim]
-            sigma_sorted = tf.sort(sigma_active)
             sigma_med_tf = 0.5 * (
                 sigma_sorted[(self.dim - 1) // 2]
                 + sigma_sorted[self.dim // 2])
+            sigma_active = self.sigma  # alias kept for downstream stats below
             metrics_gpu = tf.stack([
                 tf.reduce_mean(fitness),
                 tf.reduce_min(rmse_pc),
@@ -2609,27 +1903,6 @@ class SNES:
                 # of redundant argsort + gather per gen otherwise.
                 aux2 = {"s_iso": s_iso_sorted, "delta": delta_sorted,
                         "fitness": fitness}
-                cov_mode_str = self._cov_mode_str
-                if cov_mode_str != "none":
-                    # In the non-per-type case `global_ranks == ranks`, so
-                    # the sorted tensors above already match global rank
-                    # order — no extra gather needed.
-                    if cfg.per_type_regularization:
-                        global_ranks = tf.argsort(fitness)
-                        delta_global = tf.gather(aux["delta"], global_ranks)
-                        s_iso_global = tf.gather(aux["s_iso"], global_ranks)
-                    else:
-                        global_ranks = ranks
-                        delta_global = delta_sorted
-                        s_iso_global = s_iso_sorted
-                    active_sigma = (self._cr_sig
-                                    if cov_mode_str == "crfmnes"
-                                    and self._cr_sig is not None
-                                    else self.sigma)
-                    aux2["s_eff_global"] = delta_global / active_sigma
-                    aux2["s_iso_global"] = s_iso_global
-                    if cov_mode_str == "crfmnes":
-                        aux2["y_global"] = tf.gather(aux["y"], global_ranks)
                 self.update(self.utilities, aux2)
 
             t3 = time.perf_counter()
@@ -2705,9 +1978,7 @@ class SNES:
                 if val_fitness < best_val_loss:
                     best_val_loss = val_fitness
                     best_mu = tf.identity(self.mu)
-                    # Skip σ snapshot under crfmnes — see best_sigma lifecycle.
-                    if self._cov_mode_str != "crfmnes":
-                        best_sigma = tf.identity(self.sigma)
+                    best_sigma = tf.identity(self.sigma)
                     gens_without_improvement = 0
                 else:
                     gens_without_improvement += 1
@@ -2745,28 +2016,13 @@ class SNES:
                     and (max_resets is None or n_sigma_resets < int(max_resets))):
                 factor = float(getattr(cfg, "sigma_reset_factor", 2.0))
                 to_init = bool(getattr(cfg, "sigma_reset_to_init", False))
-                cov_mode_now = self._cov_mode_str
-                if cov_mode_now == "crfmnes" and self._cr_sig is not None:
-                    # CR-FM-NES restart: σ_scalar broadens; p_σ and p_c
-                    # restart; (v, D) PRESERVED — the learned shape is
-                    # still locally informative.
-                    self._cr_sig.assign(self._cr_sig * factor)
-                    self._cr_psg.assign(tf.zeros([self.dim], dtype=tf.float32))
-                    self._cr_pc.assign(tf.zeros([self.dim], dtype=tf.float32))
-                    mode_str = (f"crfmnes restart: _cr_sig·={factor:.2f}, "
-                                "paths zeroed (v/D preserved)")
-                elif to_init:
+                if to_init:
                     self.sigma.assign(
                         tf.fill([self.dim], float(cfg.init_sigma) * factor))
                     mode_str = f"σ ← init·{factor:.2f}"
                 else:
                     self.sigma.assign(self.sigma * factor)
                     mode_str = f"σ ← σ·{factor:.2f} (preserves per-dim scale)"
-                # Reset MSR state — the broadened σ samples a different
-                # neighbourhood than _msr_f_prev was computed from.
-                self._msr_f_prev = None
-                self._msr_ps = 0.0
-                self._msr_initialised = False
                 restore_mu = bool(getattr(cfg, "plateau_restore_best_mu", False))
                 if restore_mu:
                     self.mu.assign(best_mu)
@@ -2782,10 +2038,8 @@ class SNES:
                 gens_without_improvement = 0
                 n_sigma_resets += 1
                 # Read back current σ stats for the log line so the user can
-                # see what actually happened. Use `_active_sigma_vec()` so the
-                # CR-FM-NES restart reports `_cr_sig*_cr_D`, not the dead
-                # `self.sigma`.
-                s_now = np.asarray(self._active_sigma_vec().numpy()).reshape(-1)
+                # see what actually happened.
+                s_now = np.asarray(self.sigma.numpy()).reshape(-1)
                 s_min = float(np.min(s_now))
                 s_mean = float(np.mean(s_now))
                 s_max = float(np.max(s_now))
@@ -2809,8 +2063,7 @@ class SNES:
                     if val_fitness < best_val_loss:
                         best_val_loss = val_fitness
                         best_mu = tf.identity(self.mu)
-                        if self._cov_mode_str != "crfmnes":
-                            best_sigma = tf.identity(self.sigma)
+                        best_sigma = tf.identity(self.sigma)
                 # IMPORTANT: do NOT overwrite self.mu/sigma with best
                 # here. The post-loop code (after the for-loop) needs
                 # the genuine final-gen self.mu to build `final_model`
@@ -2862,26 +2115,42 @@ class SNES:
                     "gens_without_improvement": gens_without_improvement,
                     "tf_rng_state": self.tf_rng.state,
                 }
-                # Omit best_sigma under cov_mode="crfmnes" — see best_sigma
-                # lifecycle. Old checkpoints with a stray best_sigma resume
-                # gracefully via the `.get("best_sigma")` fallback above.
-                if self._cov_mode_str != "crfmnes":
-                    ckpt_state["best_sigma"] = best_sigma
-                # CR-FM-NES learned state (guarded — absent for pure-SNES /
-                # cov_mode="none" runs, so those checkpoints stay byte-identical).
-                # No `cr_lf` — C0 found λ_F is per-gen feasible count, not
-                # persistent state.
-                if self._cr_v is not None:
-                    ckpt_state["cr_v"]   = self._cr_v
-                    ckpt_state["cr_D"]   = self._cr_D
-                    ckpt_state["cr_psg"] = self._cr_psg
-                    ckpt_state["cr_pc"]  = self._cr_pc
-                    ckpt_state["cr_sig"] = float(self._cr_sig.numpy())
+                ckpt_state["best_sigma"] = best_sigma
                 save_checkpoint(ckpt_path, cfg, ckpt_state, history, gen)
                 # Print a one-line note above the in-place progress bar.
                 sys.stdout.write(
                     f"\n  checkpoint saved at gen {gen + 1} → {ckpt_path}\n")
                 sys.stdout.flush()
+
+            # SIGTERM received (Slurm walltime imminent): flush a final
+            # checkpoint regardless of cfg.checkpoint_interval cadence
+            # and exit the loop cleanly so the model wrap-up still runs.
+            if _term_requested["flag"] and cfg.save_path:
+                from model_io import save_checkpoint
+                run_dir = os.path.dirname(cfg.save_path) or "."
+                os.makedirs(run_dir, exist_ok=True)
+                ckpt_path = os.path.join(run_dir, "checkpoint.h5")
+                ckpt_state = {
+                    "mu": self.mu, "sigma": self.sigma,
+                    "best_mu": best_mu, "best_sigma": best_sigma,
+                    "best_val_loss": best_val_loss,
+                    "gens_without_improvement": gens_without_improvement,
+                    "tf_rng_state": self.tf_rng.state,
+                }
+                save_checkpoint(ckpt_path, cfg, ckpt_state, history, gen)
+                sys.stdout.write(
+                    f"\n  SIGTERM received — flushed checkpoint at gen "
+                    f"{gen + 1} → {ckpt_path}\n")
+                sys.stdout.flush()
+                break
+
+        # Restore prior SIGTERM handler so a subsequent fit() call (e.g.
+        # in a notebook session) starts clean.
+        if _prev_term_handler is not None:
+            try:
+                _signal.signal(_signal.SIGTERM, _prev_term_handler)
+            except (ValueError, OSError):
+                pass
 
         print()  # newline after progress bar
 
@@ -2898,12 +2167,7 @@ class SNES:
 
         # Restore best into self.model for backward compatibility
         self.mu.assign(best_mu)
-        # Under cov_mode="crfmnes" self.sigma is dead (frozen at init_sigma);
-        # there is no "best_cr_sig" snapshot in this design — the active scale
-        # state lives in _cr_sig/_cr_D and is already at its best value via
-        # the path machinery.
-        if self._cov_mode_str != "crfmnes":
-            self.sigma.assign(best_sigma)
+        self.sigma.assign(best_sigma)
         _set_model_params(self.model, *best_val_params)
 
         return history, final_model, best_val_model
@@ -3007,7 +2271,7 @@ class SNES:
 
     def _perform_pop_resize_restart(self) -> tuple[int, int, str]:
         """Resize pop_size per the IPOP/BIPOP strategy and rebuild dependent
-        state (utilities, _recomb_w, _mu_eff, _neg_recomb_abs cache).
+        state (utilities, _recomb_w, _mu_eff).
 
         Does NOT touch σ / evolution paths / μ — those are handled by the
         existing plateau-reset block in fit() so this helper is composable.
@@ -3029,19 +2293,11 @@ class SNES:
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
         recomb_w_np = self._recomb_w.numpy()
         self._mu_eff = float(1.0 / np.sum(recomb_w_np ** 2))
-        # _neg_recomb_abs auto-invalidated by compute_utilities (cleared to None).
         self._restart_count += 1
         return old_pop, new_pop, f"{strategy.upper()}{regime_label}"
 
     def validate(self, val_data: dict[str, tf.Tensor], mu_tf: tf.Tensor | None = None) -> float:
         """Compute mean RMSE on a subset of validation structures using batched predict.
-
-        σ-read-site note (C4 audit): this method does NOT read `self.sigma` —
-        inference goes through `self.model.predict_batch(... mu ...)` only,
-        with no sampling step. A future refactor that introduces a σ-read on
-        the inference path MUST route through `self._active_sigma_vec()` so
-        the read is correct under `cov_mode="crfmnes"` (where `self.sigma` is
-        dead and the active scale lives in `_cr_sig * _cr_D`).
 
         Args:
             val_data : dict with padded tensors from pad_and_stack()
@@ -3261,7 +2517,8 @@ class SNES:
                 sub_idx = val_idx_tf[s_start:s_end]
                 chunk = slice_and_complete_chunk(val_data, sub_idx)
                 if self.cfg.pin_data_to_cpu:
-                    with tf.device('/GPU:0'):
+                    from data import _gpu_device_ctx
+                    with _gpu_device_ctx():
                         chunk = {k: (tf.identity(v) if not k.startswith("_") else v)
                                  for k, v in chunk.items()}
                 _consume(chunk, _ci)

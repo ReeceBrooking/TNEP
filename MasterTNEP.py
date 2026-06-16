@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import os
 import shutil
+import signal
 import tempfile
 
 _slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
@@ -11,14 +12,34 @@ _cpu_threads = int(_slurm_cpus) if _slurm_cpus else max(os.cpu_count() // 2, 1)
 _cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
 _has_gpu = (_cuda_visible not in ('', '-1')) or os.path.exists('/dev/nvidiactl')
 
-os.environ['OMP_NUM_THREADS'] = str(_cpu_threads)
-os.environ['MKL_NUM_THREADS'] = str(_cpu_threads)
-os.environ['TF_NUM_INTRAOP_THREADS'] = str(_cpu_threads)
+# Threading budget. On a GPU run the heavy work happens on-device — the
+# main process's TF/OpenMP threads only handle data prep + small CPU
+# fallbacks, where >4 threads costs more in scheduler overhead than it
+# saves. On a CPU-only run (Mahti CPU partition: 128 EPYC cores) the
+# matmul-heavy forward pass executes on CPU and needs the full SLURM
+# allocation. NUMEXPR / OPENBLAS pinned so NumPy paths in data.py and
+# the q_scaler don't quietly oversubscribe on Mahti's shared CPU node.
+_main_threads = 4 if _has_gpu else _cpu_threads
+os.environ['OMP_NUM_THREADS'] = str(_main_threads)
+os.environ['MKL_NUM_THREADS'] = str(_main_threads)
+os.environ['OPENBLAS_NUM_THREADS'] = str(_main_threads)
+os.environ['NUMEXPR_NUM_THREADS'] = str(_main_threads)
+os.environ['TF_NUM_INTRAOP_THREADS'] = str(_main_threads)
 os.environ['TF_NUM_INTEROP_THREADS'] = '2'
 if _has_gpu:
     os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 
 import tensorflow as tf
+
+# Memory growth: stops TF from grabbing the whole GPU at startup, so
+# shared queue nodes (Mahti gpusmall/gpumedium) can coexist with other
+# tenants. No-op on CPU-only runs. Wrapped in try because the call
+# fails if TF has already initialised the device.
+for _gpu in tf.config.list_physical_devices('GPU'):
+    try:
+        tf.config.experimental.set_memory_growth(_gpu, True)
+    except RuntimeError:
+        pass
 
 from TNEP import TNEP
 from TNEPconfig import TNEPconfig
@@ -64,26 +85,87 @@ def _resolve_scratch_dir(cfg: TNEPconfig) -> str:
 
 
 def _apply_csc_overrides(cfg: TNEPconfig) -> None:
-    """When `cfg.csc_enable=True`, force every gradient-caching
-    option off. Grad_values then stays in host RAM as a normal
-    tf.constant; the chunk-staging path uses the in-RAM passthrough
-    branch with no NVMe scratch, no pinned pool, no cuFile.
+    """When `cfg.csc_enable=True`, retune the cfg to the actual Mahti
+    hardware the job is running on. Two profiles:
+
+    GPU partition (A100 40 GB, ~32 cores per GPU):
+        - kill the disk-cache / pinned-pool / cuFile pipeline (grad_values
+          is small enough to live in host RAM as a tf.constant)
+        - drop population/batch chunking down to the natural minimum since
+          the A100 trivially fits the entire population on-device
+        - keep tf.constant grad path
+
+    CPU partition (128 EPYC cores, no GPU):
+        - same caching kills (no GPU → no point pinning host buffers or
+          using cuFile)
+        - pin data to host explicitly (`pin_data_to_cpu=True`) so the
+          chunk-staging branch doesn't try to upload to a phantom GPU
+        - keep chunk sizes modest because forward passes execute on CPU,
+          where larger chunks just inflate per-op latency without the
+          GPU's batching amortisation
+
+    All overrides are no-ops outside csc_enable mode (local development
+    config is untouched).
     """
     if not getattr(cfg, "csc_enable", False):
         return
-    overrides = {
+
+    # Pick profile: explicit cfg.csc_profile override, else hardware
+    # auto-detection. "auto" picks GPU when /dev/nvidiactl exists or
+    # CUDA_VISIBLE_DEVICES is set (computed at module import time).
+    requested = str(getattr(cfg, "csc_profile", "auto")).lower()
+    if requested not in ("auto", "cpu", "gpu"):
+        raise ValueError(
+            f"cfg.csc_profile={requested!r} not recognised; expected "
+            f"one of 'auto', 'cpu', 'gpu'.")
+    if requested == "gpu":
+        use_gpu_profile = True
+    elif requested == "cpu":
+        use_gpu_profile = False
+    else:
+        use_gpu_profile = _has_gpu
+
+    # Common (both partitions): kill the disk + pinned + cuFile pipeline.
+    overrides: dict[str, object] = {
         "cache_gradients_to_disk": False,
         "chunk_prefetch": False,
         "use_pinned_buffers": False,
         "use_cufile": False,
     }
+    if use_gpu_profile:
+        # Mahti GPU partition tuning. These match the user's empirical
+        # finding (population_chunk_size=None, batch_chunk_size=2000)
+        # captured in the project_mahti_speedup memory.
+        overrides.update({
+            "population_chunk_size": None,
+            "batch_chunk_size": 2000,
+            "pin_data_to_cpu": False,
+        })
+        profile = "GPU"
+    else:
+        # CPU partition: no device-side batching benefit, and the chunk-
+        # staging code path assumes a GPU. Force the data to live in
+        # host RAM (pin_data_to_cpu=True) so the forward path doesn't
+        # try to copy to a non-existent device. Smaller batch_chunk_size
+        # keeps per-op latency reasonable on the CPU executor.
+        overrides.update({
+            "population_chunk_size": 10,
+            "batch_chunk_size": 500,
+            "pin_data_to_cpu": True,
+        })
+        profile = "CPU"
+
+    # Annotate the profile string when forced via cfg.csc_profile so the
+    # log line distinguishes auto-detected vs explicit overrides.
+    if requested != "auto":
+        profile = f"{profile} (forced via cfg.csc_profile={requested!r})"
     changed = []
     for k, v in overrides.items():
         if getattr(cfg, k, None) != v:
             changed.append(f"{k}={getattr(cfg, k, None)!r}→{v!r}")
             setattr(cfg, k, v)
-    print(f"  csc_enable=True — caching options disabled"
-          + (f" ({', '.join(changed)})" if changed else ""))
+    print(f"  csc_enable=True ({profile} profile, OMP={_main_threads})"
+          + (f" — {', '.join(changed)}" if changed else " — no changes needed"))
 
 
 def train_model(cfg: TNEPconfig | None = None,

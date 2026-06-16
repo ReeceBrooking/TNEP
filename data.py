@@ -1124,7 +1124,11 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     # is *not* a TF tensor: it's written to disk and replaced by a numpy
     # memmap. slice_and_complete_chunk reads the per-chunk slice on
     # demand. Everything else stays as TF tensors as before.
-    with tf.device('/CPU:0' if pin_to_cpu else '/GPU:0'):
+    # When pin_to_cpu, always pin to CPU. Otherwise pin to GPU when one
+    # exists; CPU-only nodes fall back to the implicit CPU placement.
+    _dev_ctx = (tf.device('/CPU:0') if pin_to_cpu
+                else _gpu_device_ctx())
+    with _dev_ctx:
         result = {}
         result["descriptors"] = tf.constant(desc_np);    del desc_np
         if prebuilt_gv is not None:
@@ -1574,7 +1578,7 @@ def prestage_chunk_indices(data: dict, ranges: list,
     pa_np = pa_full.numpy() if hasattr(pa_full, "numpy") else np.asarray(pa_full)
     pg_np = pg_full.numpy() if hasattr(pg_full, "numpy") else np.asarray(pg_full)
     idx_cache = get_chunk_index_cache()
-    with tf.device('/GPU:0'):
+    with _gpu_device_ctx():
         for s, e in ranges:
             key = (int(s), int(e))
             if key in cache:
@@ -1763,8 +1767,10 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
                   "forces", "virials")
-    device = '/GPU:0' if pin_to_cpu else None
-    ctx = tf.device(device) if device is not None else _NullCtx()
+    # pin_to_cpu=True ⇒ raw data is in host RAM; staging uploads each
+    # chunk to GPU when one is present (no-op on CPU-only). False ⇒
+    # raw data already lives on-device; no device context needed.
+    ctx = _gpu_device_ctx() if pin_to_cpu else _NullCtx()
     pair_idx_cache = data.get("_pair_idx_gpu_cache")
     pair_idx_entry = None
     if pair_idx_cache is not None and s_start is not None and s_end is not None:
@@ -1859,6 +1865,22 @@ class _NullCtx:
     def __exit__(self, *a): return False
 
 
+def _gpu_device_ctx():
+    """Return `tf.device('/GPU:0')` when a GPU is visible, else a no-op
+    context. Used by chunk-staging code paths that historically used a
+    bare `with tf.device('/GPU:0'):` block. On a CPU-only run (Mahti CPU
+    partition) that bare device pin would otherwise raise — TF defaults
+    to hard placement, so requesting `/GPU:0` with no GPU registered
+    fails immediately. This helper lets the same code path execute
+    unchanged on either node type."""
+    try:
+        if tf.config.list_physical_devices('GPU'):
+            return tf.device('/GPU:0')
+    except Exception:
+        pass
+    return _NullCtx()
+
+
 _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                          "targets", "atom_mask", "types_contained",
                          "forces", "virials")
@@ -1875,7 +1897,7 @@ def move_data_to_gpu(data: dict) -> None:
     keys = list(_RESIDENT_SMALL_KEYS) + [
         "descriptors", "pair_atom", "pair_gidx", "pair_struct",
         "struct_ptr", "grad_values"]
-    with tf.device('/GPU:0'):
+    with _gpu_device_ctx():
         for k in keys:
             v = data.get(k)
             if v is None:
@@ -1905,7 +1927,7 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int,
     pair_idx_cache = data.get("_pair_idx_gpu_cache")
     pair_idx_entry = (pair_idx_cache.get((s_lo, s_hi))
                        if pair_idx_cache is not None else None)
-    with tf.device('/GPU:0'):
+    with _gpu_device_ctx():
         idx_tf = tf.range(s_lo, s_hi, dtype=tf.int32)
         for k in _RESIDENT_SMALL_KEYS:
             v = data.get(k)

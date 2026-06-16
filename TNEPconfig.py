@@ -45,7 +45,7 @@ class TNEPconfig:
     # None : uses entire dataset, int : defines maximum structures to use in training
     total_N: int | None = None
     # Seed for randomisation (dataset shuffle, SNES sampling, etc.)
-    seed: int | None = 1284760333973115944
+    seed: int | None = 128476055
     # Bitwise-reproducible runs. cfg.seed alone makes runs reproducible on
     # CPU, but GPU reductions (unsorted_segment_sum / atomic adds in the
     # dipole kernel) are non-deterministic across runs even with a fixed
@@ -271,7 +271,7 @@ class TNEPconfig:
     # NotImplementedError at the first force / dipole prediction.
     # Energy training (target_mode = 0) doesn't use the hand-coded
     # backward and works with any Keras activation.
-    activation: str = 'tanh'
+    activation: str = 'swish'
 
     # When True, insert a learnable per-species-pair linear mixing
     # layer between the (fixed) SOAP-turbo descriptor and the ANN.
@@ -374,10 +374,9 @@ class TNEPconfig:
     #                    c^{Z_i,Z_j}_{n'',k}. Requires
     #                    compress_mode='trivial'.
     #
-    # Mutually exclusive with descriptor_gating_enabled and (for
-    # angular / both modes) descriptor_per_l_ann_heads. l_aware
-    # mixing composes with all preprocess modes; other mixing archs
-    # raise NotImplementedError when preprocess is on.
+    # l_aware mixing composes with all preprocess modes; other mixing
+    # archs (linear, cross_pair_l) raise NotImplementedError when
+    # preprocess is on.
     descriptor_preprocess_contract: str = "angular"
     # NEP4 learned-basis fold output radial-channel count. Only consulted
     # when descriptor_preprocess_contract == "nep4_radial". When None
@@ -414,9 +413,11 @@ class TNEPconfig:
     # GLOBAL across centre types — symmetric coupling, smallest param count.
     descriptor_preprocess_per_type: bool = False
     # L1/L2 regularisation strengths on (coefficient − init). Penalises
-    # deviation from the mean/sum/glorot init. Both default 0.0 (no penalty).
-    descriptor_preprocess_lambda_1: float = 0.0
-    descriptor_preprocess_lambda_2: float = 0.0
+    # deviation from the mean/sum/glorot init (not from zero). Set both
+    # to 0.0 to disable; defaults below give a mild soft prior toward
+    # the chosen init.
+    descriptor_preprocess_lambda_1: float = 0.0005
+    descriptor_preprocess_lambda_2: float = 0.0005
 
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION
@@ -467,8 +468,8 @@ class TNEPconfig:
     #           the L1 (or L2) penalty stays at `lambda_target_ratio`
     #           of the data RMSE. Starts from the auto value.
     #   float : fixed scalar
-    lambda_1: float | None = 0.03
-    lambda_2: float | None = 0.03
+    lambda_1: float | None = 0.0005
+    lambda_2: float | None = 0.0005
     # Dynamic-λ controls (only used when lambda_1 or lambda_2 == -1).
     # `target_ratio`: target ratio of reg-penalty to data RMSE. 0.05
     #   means "keep regularisation at ~5% of the data loss." GPUMD
@@ -557,6 +558,12 @@ class TNEPconfig:
     # ~1.3M gens — too long to be useful. A more aggressive
     # 200–500 val ticks is more practical on NN training problems
     # where val_interval = 10. None = disabled.
+    #
+    # Interaction with cfg.patience: plateau resets fire FIRST (they
+    # broaden σ and reset the no-improvement counter), so a run that
+    # hits plateau_reset_patience repeatedly never reaches early-stop.
+    # Setting patience < plateau_reset_patience disables the reset
+    # path entirely. cfg.max_sigma_resets caps the number of resets.
     plateau_reset_patience: int | None = None
     # Multiplier applied to the **current** sigma vector at every
     # plateau reset (default 2.0 — broadens each dimension's search
@@ -592,7 +599,8 @@ class TNEPconfig:
     # Useful with cfg.patience to bound total wall-time: first hits
     # plateau_reset_patience trigger resets; once max_sigma_resets is
     # reached, subsequent plateaus fall through to early stopping
-    # (or just continue if patience is None).
+    # (or just continue if patience is None). No-op when
+    # plateau_reset_patience is None — there are no resets to cap.
     max_sigma_resets: int | None = None
 
     # ═══════════════════════════════════════════════════════════════════
@@ -600,13 +608,20 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- per-chunk compute ---------------------------------------------
-    # Number of SNES candidates to evaluate per GPU chunk (limits VRAM usage).
-    # None = no chunking (recommended for A100 at typical molecular sizes).
-    # For very large systems (>50k edges per structure), start at 50 and reduce if OOM.
+    # Number of SNES candidates to evaluate per GPU chunk (limits VRAM).
+    # Defaults:
+    #   10    : Safe baseline that fits a 12 GB consumer GPU (the dev
+    #           box) without OOM under typical molecule sizes. Shipping
+    #           default since "VRAM-safe" beats "fastest" for new users.
+    #   None  : No chunking — the whole population is evaluated in one
+    #           shot. Use on A100 40 GB and similar; auto-applied when
+    #           cfg.csc_enable=True and the GPU profile is selected.
     population_chunk_size: int | None = 10
-    # Number of structures to process per GPU chunk during evaluation
-    # (None = all at once)
-    batch_chunk_size: int | None = 1000
+    # Number of structures to process per GPU chunk during evaluation.
+    # None = all at once. Default 2000 fits the dev box; the CPU CSC
+    # profile drops this to 500 because CPU forward passes prefer
+    # smaller chunks (per-op latency >> per-FLOP rate vs GPU).
+    batch_chunk_size: int | None = 2000
     # XLA-compile the per-chunk eval (`_evaluate_chunk`). Fuses the
     # dipole-kernel pre-compute and the per-type matmul + reduction ops
     # into a single GPU kernel — typically 1.5-2× faster on Ada/Hopper.
@@ -655,6 +670,34 @@ class TNEPconfig:
     # Default False keeps non-HPC behaviour identical.
     csc_enable: bool = False
 
+    # Force which CSC profile (`_apply_csc_overrides`) applies. Only
+    # consulted when `csc_enable=True`.
+    #   "auto" (default) — pick the profile from runtime hardware
+    #                      detection (`_has_gpu` in MasterTNEP).
+    #   "cpu"            — force the CPU profile even if a GPU is
+    #                      visible. Useful for benchmarking the CPU
+    #                      path on a GPU-equipped dev box.
+    #   "gpu"            — force the GPU profile. Useful when the
+    #                      detection heuristic fails (e.g. cuda
+    #                      visible but the GPU is reserved).
+    #
+    # Profile overrides applied (both share the same disk/pinned/cuFile
+    # disabled common base):
+    #
+    #   GPU profile (A100 40 GB, ~32 cores):
+    #       population_chunk_size = None    (no chunking)
+    #       batch_chunk_size      = 2000
+    #       pin_data_to_cpu       = False
+    #
+    #   CPU profile (Mahti 128-core EPYC, no GPU):
+    #       population_chunk_size = 10
+    #       batch_chunk_size      = 500     (CPU latency-sensitive)
+    #       pin_data_to_cpu       = True    (no GPU to upload to)
+    #
+    # See `_apply_csc_overrides` in MasterTNEP.py for the canonical
+    # implementation — when these defaults are tuned, update both sides.
+    csc_profile: str = "auto"
+
     # --- disk-backed grad cache + prefetch ring ------------------------
     # When True, the bulky grad_values COO tensor is written to a
     # temporary directory on disk (created next to the working directory
@@ -676,7 +719,7 @@ class TNEPconfig:
     # compute; depth=3 helps further only when GPU compute > 2× disk
     # pipe. Memory cost: depth × per-chunk grad slice (~few hundred MB
     # at full-batch chunk_size=500 each). Set chunk_prefetch=False to
-    # bisect threading issues.
+    # bisect threading issues. Force-disabled when csc_enable=True.
     chunk_prefetch: bool = True
     prefetch_depth: int = 2
 
@@ -686,7 +729,8 @@ class TNEPconfig:
     # async cudaMemcpyAsync (no driver bounce buffer), saturating PCIe
     # at ~12-16 GB/s instead of the ~6-8 GB/s pageable rate. Buffers
     # are allocated via cudaMallocHost. Set False if cudart is not
-    # loadable (rare) or to bisect a regression.
+    # loadable (rare) or to bisect a regression. Force-disabled when
+    # csc_enable=True (see _apply_csc_overrides).
     use_pinned_buffers: bool = True
     # Number of pinned host buffers in the pool. Must be >=
     # prefetch_depth + 1 (one for the chunk currently held by the
@@ -705,6 +749,8 @@ class TNEPconfig:
     # CUDA-managed copy) which still saturates PCIe at ~17 GB/s once the
     # page cache is warm — well above the ~3-5 GB/s pinned-host path.
     # Falls back to the pinned path silently if cuFile isn't usable.
+    # Force-disabled when csc_enable=True (Lustre on Mahti has
+    # unreliable GDS support; see _apply_csc_overrides).
     use_cufile: bool = True
     # Number of GPU buffers in the cuFile pool. Each is sized to the
     # worst-case chunk grad slice; total VRAM cost is
