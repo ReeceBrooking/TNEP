@@ -651,9 +651,16 @@ class TNEP(layers.Layer):
                 tf.zeros([T_, H_out, H_out], dtype=tf.float32),
                 trainable=False, name="R_pair")
             self._R_H = H_out
+            # Precompute the H_out × H_out identity once. `_R_full` was
+            # allocating a fresh `tf.eye(self._R_H)` on every forward
+            # call inside predict_batch_candidates' @tf.function trace —
+            # a per-candidate eager allocation that adds up at λ=100.
+            self._eye_H = tf.constant(
+                np.eye(H_out, dtype=np.float32), name="eye_H")
         else:
             self.R_pair = None
             self._R_H = 0
+            self._eye_H = None
 
         # Optional per-(species-pair, l, central-type) gating: g[t, p·L+l]
         # is folded into W0 as a per-channel multiplier (channel attention).
@@ -1087,7 +1094,11 @@ class TNEP(layers.Layer):
           R = I + V_R of shape [(C,) T, H, H].
         """
         V = self.R_pair if R_pair is None else R_pair
-        I = tf.eye(self._R_H, dtype=V.dtype)
+        # Precomputed identity (see __init__). Always-cached at the
+        # right dtype since R_pair is allocated as fp32; cast if a
+        # caller passes a different-dtype override.
+        I = (self._eye_H if (self._eye_H is not None and V.dtype == self._eye_H.dtype)
+             else tf.eye(self._R_H, dtype=V.dtype))
         return I + V
 
     def _W0_eff(self, W0: tf.Tensor,

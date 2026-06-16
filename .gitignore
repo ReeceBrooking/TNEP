@@ -1186,3 +1186,6 @@ plots/Ethanol/Ethanol_tgap/thermoplot.png
 models/n30_q165_pop100_20260615_212615/config.txt
 models/n30_q165_pop100_20260615_214157/checkpoint.h5
 models/n30_q165_pop100_20260615_214157/config.txt
+models/n30_q300_pop100_20260615_221140/checkpoint.h5
+models/n30_q300_pop100_20260615_221140/config.txt
+models/n30_q300_pop100_20260616_113346/config.txt

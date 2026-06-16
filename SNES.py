@@ -4087,7 +4087,7 @@ class SNES:
         T = self.cfg.num_types
         T_dim_f = tf.cast(T_dim, tf.float32)
         B_f = tf.cast(B, tf.float32)
-        loss_type = "mse"
+        loss_type = str(getattr(self.cfg, "loss_type", "mse")).lower()
         # Pick between the standard and XLA-compiled chunk evaluator.
         # XLA fuses the per-chunk eval into a single GPU kernel and is
         # typically 1.5-2× faster, but compiles per unique (B, P) shape
@@ -4354,9 +4354,16 @@ class SNES:
         W1_per_l_cand = named.get("W1_per_l")
         b1_per_l_cand = named.get("b1_per_l")
 
-        loss_type = "mse"
-        huber_delta = 0.0
-        comp_w = None
+        # Loss / weighting hyperparameters from cfg + batch context. Reading
+        # these dynamically (instead of hardcoding mse) restores parity with
+        # the original SNES — huber/mae plus per-component inverse-magnitude
+        # weights drive a different fitness signal than plain MSE.
+        loss_type = str(getattr(self.cfg, "loss_type", "mse")).lower()
+        huber_delta = float(getattr(self.cfg, "huber_delta", 1e-3))
+        # Per-component inverse-magnitude weights, applied to the training
+        # loss only — squared-error reporting stays unweighted so RMSE
+        # remains comparable across weighting schemes.
+        comp_w = batch_data.get("_inv_comp_weights")
 
         if self.cfg.target_mode == 2:
             pol_weights = self._pol_weights  # [6] component weights

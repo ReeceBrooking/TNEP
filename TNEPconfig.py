@@ -143,7 +143,7 @@ class TNEPconfig:
 
     # --- geometric parameters ------------------------------------------
     l_max: int = 4
-    alpha_max: int = 4
+    alpha_max: int = 7
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5
     basis: str = "poly3"
@@ -408,11 +408,11 @@ class TNEPconfig:
     # (pair, n_pair) with L − angular_l_keep learnable coefficients.
     # Default 1 reproduces the original behaviour (l=0 kept, l>0 summed).
     # Only consulted in modes that collapse the l axis ("angular", "both").
-    descriptor_preprocess_angular_l_keep: int = 1
+    descriptor_preprocess_angular_l_keep: int = 2
     # When True (default), W_pre coefficients are per central-atom type
     # (shape [T, n_summed_q_raw, N]). When False, coefficients are
     # GLOBAL across centre types — symmetric coupling, smallest param count.
-    descriptor_preprocess_per_type: bool = True
+    descriptor_preprocess_per_type: bool = False
     # L1/L2 regularisation strengths on (coefficient − init). Penalises
     # deviation from the mean/sum/glorot init. Both default 0.0 (no penalty).
     descriptor_preprocess_lambda_1: float = 0.0
