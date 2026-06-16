@@ -634,7 +634,16 @@ class SNES:
             W_pre_init = self.model.W_pre_angular.numpy().reshape(-1)
             flat_idx = self.model._preprocess_summed_flat_idx.numpy()
             summed_init = W_pre_init[flat_idx]
-            if self._preprocess_init_scheme == "glorot":
+            # "glorot" jitter override: only for the LINEAR preprocess modes
+            # (angular / species_pair / both). For nep4_radial the TNEP-side
+            # init already applies Glorot on the c tensor with the right
+            # fan_in (see DescriptorBuilderGPU.descriptor_preprocess_layout
+            # nep4 branch); clobbering it here would zero-out c and collapse
+            # g to ~0 at gen 0, leaving SNES with no gradient signal.
+            preprocess_mode = str(getattr(
+                self.cfg, "descriptor_preprocess_contract", "off"))
+            if (self._preprocess_init_scheme == "glorot"
+                    and preprocess_mode != "nep4_radial"):
                 limit = 1e-3
                 summed_init = rng.uniform(
                     -limit, limit, size=summed_init.size).astype(np.float32)
@@ -1999,28 +2008,38 @@ class SNES:
         if self.n_preprocess > 0:
             pre_flat = param_vectors[..., offset:offset + self.n_preprocess]
             offset += self.n_preprocess
-            # All static, precomputed at TNEP.__init__:
-            #   M    : [n_summed, base_size] one-hot scatter (tf.constant)
-            #   base : [..., kept template shape] (tf.constant, kept=1.0,
-            #          summed=0)
             base = self.model._preprocess_kept_template
-            M = self.model._preprocess_summed_scatter_M
-            base_flat = tf.reshape(base, [-1])
-            base_static_shape = base.shape  # static — no tf.shape() call
-            if is_batched:
-                # pre_flat: [C, n_summed] → summed_contrib [C, base_size]
-                summed_contrib = tf.matmul(pre_flat, M)
-                full_flat = base_flat[tf.newaxis, :] + summed_contrib
-                # Use STATIC base shape so downstream ops can constant-fold
-                # the gather/scatter in _W0_preprocess_eff. The leading
-                # candidate dim stays dynamic (only -1 needed).
-                W_pre = tf.reshape(
-                    full_flat,
-                    [-1] + base_static_shape.as_list())
+            base_static_shape = base.shape
+            # Fast path for nep4_radial: every c entry is "summed" (no
+            # kept-passthrough slots), and `_preprocess_summed_scatter_M`
+            # is a `[n_summed, n_summed]` identity. The matmul is a no-op
+            # and `base` is all zeros, so the full reconstruction is just
+            # a reshape of pre_flat into the c tensor shape.
+            preprocess_mode = str(getattr(
+                self.cfg, "descriptor_preprocess_contract", "off"))
+            if preprocess_mode == "nep4_radial":
+                if is_batched:
+                    W_pre = tf.reshape(
+                        pre_flat, [-1] + base_static_shape.as_list())
+                else:
+                    W_pre = tf.reshape(pre_flat, base_static_shape)
             else:
-                summed_contrib = tf.matmul(pre_flat[tf.newaxis, :], M)[0]
-                full_flat = base_flat + summed_contrib
-                W_pre = tf.reshape(full_flat, base_static_shape)
+                # Linear modes (angular / species_pair / both): keep the
+                # scatter-matmul + base-template path. kept positions in
+                # `base` hold 1.0 passthrough; summed positions get
+                # scattered in via M.
+                M = self.model._preprocess_summed_scatter_M
+                base_flat = tf.reshape(base, [-1])
+                if is_batched:
+                    summed_contrib = tf.matmul(pre_flat, M)
+                    full_flat = base_flat[tf.newaxis, :] + summed_contrib
+                    W_pre = tf.reshape(
+                        full_flat,
+                        [-1] + base_static_shape.as_list())
+                else:
+                    summed_contrib = tf.matmul(pre_flat[tf.newaxis, :], M)[0]
+                    full_flat = base_flat + summed_contrib
+                    W_pre = tf.reshape(full_flat, base_static_shape)
             tail = tail + (W_pre,)
 
         return tail
@@ -2319,6 +2338,36 @@ class SNES:
             l2 = self.lambda_2 * tf.sqrt(
                 tf.reduce_sum(tf.square(ann), axis=1) / ann_n)
             reg = l1 + l2
+
+        # Preprocess-tail regulariser (cfg.descriptor_preprocess_lambda_1/2).
+        # Penalises deviation of the c / W_pre coefficients from their
+        # init value. Important under nep4_radial where the c⁴ scale
+        # amplification means a naive L1/L2 on the ANN params under-
+        # constrains the preprocess block.
+        if self.n_preprocess > 0:
+            lp1 = float(getattr(self.cfg,
+                                "descriptor_preprocess_lambda_1", 0.0) or 0.0)
+            lp2 = float(getattr(self.cfg,
+                                "descriptor_preprocess_lambda_2", 0.0) or 0.0)
+            if lp1 > 0.0 or lp2 > 0.0:
+                pre_start = self.n_anns_total + self.n_U_pair
+                pre_slab = param_vectors[
+                    :, pre_start:pre_start + self.n_preprocess]
+                # Reference value: the model's gen-0 c (init), broadcast
+                # across the population dim. Reads from W_pre_angular at
+                # the summed indices that mu actually tracks.
+                W_pre_init = tf.reshape(
+                    self.model.W_pre_angular, [-1])
+                flat_idx = self.model._preprocess_summed_flat_idx
+                ref = tf.gather(W_pre_init, flat_idx)
+                dev = pre_slab - ref[tf.newaxis, :]
+                if lp1 > 0.0:
+                    reg = reg + lp1 * tf.reduce_sum(
+                        tf.abs(dev), axis=1) / float(self.n_preprocess)
+                if lp2 > 0.0:
+                    reg = reg + lp2 * tf.sqrt(
+                        tf.reduce_sum(tf.square(dev), axis=1)
+                        / float(self.n_preprocess))
 
         return reg
 
@@ -2663,6 +2712,15 @@ class SNES:
             if U_pair_cand is not None:
                 W0 = self.model._W0_eff(W0, U_pair_cand)
                 W0p = self.model._W0_eff(W0p, U_pair_cand)
+            # Preprocess fold: identical structure for the polarisability
+            # candidate path. Without this, mode-2 training ranks against a
+            # different forward than `validate()` deploys — SNES learns one
+            # surface and serves another.
+            if (W_pre_angular_cand is not None
+                    and getattr(self.model, "descriptor_preprocess_contract",
+                                "off") != "off"):
+                W0 = self.model._W0_preprocess_eff(W0, W_pre_angular_cand)
+                W0p = self.model._W0_preprocess_eff(W0p, W_pre_angular_cand)
 
             # Combined per-component weights for the training loss:
             # pol_weights × per-component inverse weights (if active).

@@ -142,7 +142,7 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- geometric parameters ------------------------------------------
-    l_max: int = 4
+    l_max: int = 7
     alpha_max: int = 7
     rcut_hard: float = 6.0
     rcut_soft: float = 5.5

@@ -486,6 +486,35 @@ class TNEP(layers.Layer):
                     _lay["nep4_n_to_species"], dtype=tf.int32)
                 self._nep4_n_to_local = tf.constant(
                     _lay["nep4_n_to_local"], dtype=tf.int32)
+                # Layout invariant locked in for the L-batched matmul fast
+                # path in `_W0_preprocess_eff_nep4`. The trivial-compression
+                # walk in DescriptorBuilderGPU emits (n, n', l) with the
+                # inner loop over l, so every kept (n, n') pair contributes
+                # exactly L consecutive q entries — meaning Q_raw factors
+                # exactly as Q_pair_kept · L. We stash Q_pair_kept and
+                # check the invariant here so any future layout change
+                # surfaces as an assertion fail at __init__, not as a
+                # silent reshape mis-alignment in the hot path.
+                _l_of_q_np = np.asarray(_lay["nep4_l_of_q"])
+                _q_raw = int(_l_of_q_np.size)
+                if _q_raw % self._nep4_L != 0:
+                    raise AssertionError(
+                        f"nep4_radial layout invariant broken: Q_raw={_q_raw}"
+                        f" not divisible by L={self._nep4_L}. The L-batched"
+                        " matmul fast path assumes l_of_q has period L"
+                        " (inner-loop-over-l emit order).")
+                _expected_l_of_q = np.tile(
+                    np.arange(self._nep4_L, dtype=_l_of_q_np.dtype),
+                    _q_raw // self._nep4_L)
+                if not np.array_equal(_l_of_q_np, _expected_l_of_q):
+                    raise AssertionError(
+                        "nep4_radial layout invariant broken: l_of_q is"
+                        " not the expected cyclic [0..L-1] pattern. The"
+                        " L-batched matmul fast path in"
+                        " _W0_preprocess_eff_nep4 requires the inner-loop"
+                        "-over-l emit order produced by"
+                        " descriptor_preprocess_layout.")
+                self._nep4_Q_pair_kept = _q_raw // self._nep4_L
                 # Linear-fold-only attributes left at None — branch-checked
                 # in `_W0_preprocess_eff`.
                 self._preprocess_q_to_q_new = None
@@ -851,6 +880,8 @@ class TNEP(layers.Layer):
         n_max_out = int(self._nep4_n_max_out)
         L_ = int(self._nep4_L)
         alpha = int(self._nep4_alpha_max)
+        Q_pair_kept = int(self._nep4_Q_pair_kept)
+        # ── Build AB = c[..,n(q)] · c[..,n'(q)] (the rank-1 cc piece) ────────
         # Rearrange c so the (T_neighbour, α) axes become a single flat
         # axis aligned with the precomputed `nep4_n_global` index map.
         # c [..., T_c, T_n, n_max_out, α] → [..., T_c, T_n, α, n_max_out]
@@ -862,31 +893,50 @@ class TNEP(layers.Layer):
         else:
             c_perm = tf.transpose(c, perm=[0, 1, 3, 2])
             c_flat = tf.reshape(c_perm, [T_c, T_n * alpha, n_max_out])
-        # Gather along the flattened (T_n, α) axis using global-n indices.
-        # A_a[..., t, q, n''] = c_flat[..., t, n_global(q), n'']
-        # A_b[..., t, q, n''] = c_flat[..., t, n'_global(q), n'']
         A_a = tf.gather(c_flat, self._nep4_n_global, axis=-2)
         A_b = tf.gather(c_flat, self._nep4_np_global, axis=-2)
-        AB = A_a * A_b   # [..., T_c, Q_raw, n_max_out]   (rank-1 outer product)
-        # Reshape W0 to expose (n_max_out, L). W0 [..., T, n_max_out·L, H].
+        AB = A_a * A_b   # [..., T_c, Q_raw, n_max_out]
+
+        # ── L-batched matmul (memory-light) ──────────────────────────────────
+        # The layout walk in descriptor_preprocess_layout("nep4_radial") emits
+        # (n, n', l) with l as the inner loop, so the q axis factors exactly
+        # as Q_raw = Q_pair_kept · L (locked in by the assertion at __init__).
+        # That lets us reshape AB's q axis to [Q_pair_kept, L] and contract
+        # n'' AND l in a single einsum, without ever materialising the
+        # ~Q_raw/L-fold replicated `W0_at_q` intermediate. For the legacy
+        # gather path that intermediate was the dominant memory cost (e.g.
+        # ~650 MB f32 at C=100, T=3, n_max_out=60, Q_raw=300, H=30); this
+        # path peaks at the W0_eff_pl result which is ~Q_pair_kept × L × H /
+        # (n_max_out × Q_raw) ≈ 30× smaller.
         W0_shape = tf.shape(W0)
         H_ = W0_shape[-1]
-        # Build new shape preserving any leading batch (e.g. candidate) axes.
-        # The [n_max_out, L] middle slice is precomputed at __init__ as
-        # `self._nep4_mid_shape` so this concat doesn't allocate a fresh
-        # tf.constant per call in the @tf.function-traced path.
         leading = W0_shape[:-2]
+        # W0:    [..., T, n_max_out·L, H]
+        # W0_NLH: [..., T, n_max_out, L, H]   (l is its own axis, no gather)
         new_shape = tf.concat(
             [leading, self._nep4_mid_shape, tf.reshape(H_, [1])], axis=0)
-        W0_NLH = tf.reshape(W0, new_shape)   # [..., T, n_max_out, L, H]
-        # Gather along the l axis using l_of_q:
-        # W0_at_q[..., t, n'', q, h] = W0_NLH[..., t, n'', l_of_q(q), h]
-        W0_at_q = tf.gather(W0_NLH, self._nep4_l_of_q, axis=-2)
-        # Combine: sum over n''.
-        # AB         [..., T_c, Q_raw, n_max_out]      (no h axis)
-        # W0_at_q    [..., T,   n_max_out, Q_raw, H]   (no h axis on n'')
-        # Want W0_eff[..., T, Q_raw, H] = Σ_{n''} AB[t, q, n''] · W0_at_q[t, n'', q, h]
-        W0_eff = tf.einsum('...tqN,...tNqh->...tqh', AB, W0_at_q)
+        W0_NLH = tf.reshape(W0, new_shape)
+        # AB:    [..., T_c, Q_raw, n_max_out]
+        # AB_pl: [..., T_c, Q_pair_kept, L, n_max_out]   (q axis factored)
+        ab_shape = tf.concat(
+            [tf.shape(AB)[:-2],
+             tf.constant([Q_pair_kept, L_], dtype=tf.int32),
+             tf.reshape(tf.shape(AB)[-1], [1])], axis=0)
+        AB_pl = tf.reshape(AB, ab_shape)
+        # Sum over n'' (index N) for each l; l is shared between operands
+        # so the einsum treats it as a batch dim (L independent matmuls).
+        #   AB_pl    [..., t, p, l, N]
+        #   W0_NLH   [..., t, N, l, h]
+        # → W0_eff_pl[..., t, p, l, h]
+        W0_eff_pl = tf.einsum('...tplN,...tNlh->...tplh', AB_pl, W0_NLH)
+        # Reshape q_pair · L back to flat Q_raw (no copy). `leading` is
+        # tf.shape(W0)[:-2] which already includes the T axis (W0 is
+        # [..., T, Q_new, H]) — we only need to append [Q_raw, H].
+        eff_shape = tf.concat(
+            [leading,
+             tf.constant([Q_pair_kept * L_], dtype=tf.int32),
+             tf.reshape(H_, [1])], axis=0)
+        W0_eff = tf.reshape(W0_eff_pl, eff_shape)
         return W0_eff
 
     def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,

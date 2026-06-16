@@ -898,12 +898,20 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         coef_shape = (T, T, n_max_out, alpha_max)
         full_coef_size = int(np.prod(coef_shape))
         summed_mask = np.ones(coef_shape, dtype=bool)
-        # Initialisation: Glorot-style fan-in (= α_max for each c sum;
-        # see fold algebra). Scalar applied uniformly; the per-q_raw
-        # init slot is not used (the c tensor lives in n''/k-space, not
-        # q_raw-space).
-        fan_in = max(1, alpha_max)
-        init_norm = float(np.sqrt(1.0 / fan_in))
+        # Initialisation: the fold is g[t,n'',l] = Σ_{n,n'} c·c·p, so each
+        # output channel is a c⁴ × p² variance amplifier. The (n, n') sum
+        # spans Q_pair_kept_per_l pairs (upper-triangle of the kept slab
+        # at this l). We want g ~ p at gen 0, which gives
+        #     var(c²·p) · Q_pair_kept_per_l = var(p)
+        #     ⇒ var(c²) = 1 / Q_pair_kept_per_l
+        #     ⇒ var(c)  ≈ 1 / sqrt(Q_pair_kept_per_l)
+        #     ⇒ |c|     ≈ (1 / Q_pair_kept_per_l) ** 0.25
+        # The legacy `sqrt(1/alpha_max)` undershoots by a factor of
+        # ~sqrt(Q_pair_kept_per_l / alpha_max). For typical CHO + alpha=7
+        # that's ~3x too small a c at init, which (under c⁴) gives a g
+        # that's ~80x too small — SNES starts in a near-flat surface.
+        Q_pair_kept_per_l = max(1, Q_pair_kept)
+        init_norm = float((1.0 / float(Q_pair_kept_per_l)) ** 0.25)
         return dict(
             dim_q_new=Q_new,
             q_raw_to_q_new=None,           # not used by the bilinear fold
