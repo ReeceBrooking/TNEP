@@ -45,7 +45,7 @@ class TNEPconfig:
     # None : uses entire dataset, int : defines maximum structures to use in training
     total_N: int | None = None
     # Seed for randomisation (dataset shuffle, SNES sampling, etc.)
-    seed: int | None = 128476055
+    seed: int | None = 928375439201
     # Bitwise-reproducible runs. cfg.seed alone makes runs reproducible on
     # CPU, but GPU reductions (unsorted_segment_sum / atomic adds in the
     # dipole kernel) are non-deterministic across runs even with a fixed

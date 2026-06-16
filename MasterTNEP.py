@@ -835,37 +835,23 @@ def _print_param_breakdown(model) -> None:
     rows: list[tuple[str, int]] = []
 
     # Primary ANN — per-layer breakdown.
-    rows.append(("ANN  W0  [T·Q·H]",        int(opt._n_W0)))
-    rows.append(("ANN  b0  [T·H]",          int(opt._n_b0)))
-    if int(opt._n_W0_2) > 0:
-        rows.append(("ANN  W0_2 [T·H·H2]",  int(opt._n_W0_2)))
-        rows.append(("ANN  b0_2 [T·H2]",    int(opt._n_b0_2)))
-    rows.append(("ANN  W1  [T·H_final]",    int(opt._n_W1)))
-    rows.append(("ANN  b1",                 int(opt._n_b1)))
+    rows.append(("ANN  W0  [T·Q·H]", int(opt._n_W0)))
+    rows.append(("ANN  b0  [T·H]",   int(opt._n_b0)))
+    rows.append(("ANN  W1  [T·H]",   int(opt._n_W1)))
+    rows.append(("ANN  b1",          int(opt._n_b1)))
 
     # Polarisability ANN — same per-layer shape, mirrored doubling.
     if cfg.target_mode == 2:
-        rows.append(("ANN_pol  W0  [T·Q·H]",     int(opt._n_W0)))
-        rows.append(("ANN_pol  b0  [T·H]",       int(opt._n_b0)))
-        if int(opt._n_W0_2) > 0:
-            rows.append(("ANN_pol  W0_2 [T·H·H2]", int(opt._n_W0_2)))
-            rows.append(("ANN_pol  b0_2 [T·H2]",   int(opt._n_b0_2)))
-        rows.append(("ANN_pol  W1  [T·H_final]",  int(opt._n_W1)))
-        rows.append(("ANN_pol  b1",               int(opt._n_b1)))
+        rows.append(("ANN_pol  W0  [T·Q·H]", int(opt._n_W0)))
+        rows.append(("ANN_pol  b0  [T·H]",   int(opt._n_b0)))
+        rows.append(("ANN_pol  W1  [T·H]",   int(opt._n_W1)))
+        rows.append(("ANN_pol  b1",          int(opt._n_b1)))
 
     # Optional add-ons.
     if int(opt.n_U_pair) > 0:
         rows.append(("input-side mixing  U_pair", int(opt.n_U_pair)))
-    if int(opt.n_U_bias_total) > 0:
-        rows.append(("mixing biases  b_mix",     int(opt.n_U_bias_total)))
-    if int(opt.n_U_cross) > 0:
-        rows.append(("cross-channel mixing  V_cross", int(opt.n_U_cross)))
-    if int(opt.n_gates) > 0:
-        rows.append(("gating  g[T·P·L]",         int(opt.n_gates)))
     if int(opt.n_preprocess) > 0:
         rows.append(("preprocess  W_pre (summed only)", int(opt.n_preprocess)))
-    if int(opt.n_R_pair) > 0:
-        rows.append(("output-side mixing  R_pair", int(opt.n_R_pair)))
 
     accounted = sum(n for _, n in rows)
     if accounted != total:

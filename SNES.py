@@ -51,17 +51,10 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
         model.b0_pol.assign(params[idx]); idx += 1
         model.W1_pol.assign(params[idx]); idx += 1
         model.b1_pol.assign(params[idx]); idx += 1
-    if getattr(model, "descriptor_mixing", False) and idx < len(params):
-        U_pair_entry = params[idx]; idx += 1
-        # Pre-Stage-6 the TNEP model still stores U_pair as the head of
-        # a 1-element list (U_pair_list); accept either shape here.
-        if isinstance(U_pair_entry, list):
-            U_pair_entry = U_pair_entry[0]
-        U_target = getattr(model, "U_pair", None)
-        if U_target is None and getattr(model, "U_pair_list", None) is not None:
-            U_target = model.U_pair_list[0]
-        if U_target is not None:
-            U_target.assign(U_pair_entry)
+    if (getattr(model, "descriptor_mixing", False)
+            and getattr(model, "U_pair", None) is not None
+            and idx < len(params)):
+        model.U_pair.assign(params[idx]); idx += 1
     if (idx < len(params)
             and getattr(model, "descriptor_preprocess_contract", "off") != "off"
             and getattr(model, "W_pre_angular", None) is not None):
@@ -102,15 +95,6 @@ class SNES:
 
         # Total number of trainable parameters
         self.H = int(self.cfg.num_neurons)
-        # Stage-5 / Stage-1 legacy stubs — kept for downstream methods
-        # whose consumer-side cleanup is staged separately.
-        self.H2 = None
-        self.H_final = self.H
-        self._n_W0_2 = 0
-        self._n_b0_2 = 0
-        self._per_l_heads = False
-        self._per_l_L = 0
-        self._per_l_Q_l = []
         n_W0 = self.cfg.num_types * self.cfg.dim_q * self.H
         n_b0 = self.cfg.num_types * self.H
         n_W1 = self.cfg.num_types * self.H
@@ -212,25 +196,9 @@ class SNES:
                     f"descriptor_mixing_arch={self._mix_arch!r} not in "
                     "('linear', 'l_aware', 'cross_pair_l')")
             if self._mix_per_type:
-                self.n_U_pair_per_layer = self.cfg.num_types * per_T_block
+                self.n_U_pair = self.cfg.num_types * per_T_block
             else:
-                self.n_U_pair_per_layer = per_T_block
-            # Stacked mixing (N layers) multiplies the per-layer count.
-            self._mix_n_layers = int(getattr(
-                self.cfg, "descriptor_mixing_n_layers", 1))
-            self._mix_nonlinear = bool(getattr(
-                self.cfg, "descriptor_mixing_nonlinear", False))
-            self.n_U_pair = self._mix_n_layers * self.n_U_pair_per_layer
-            self._mix_n_U_pair_per_layer = self.n_U_pair_per_layer
-            # Optional per-layer descriptor bias for nonlinear mixing.
-            if self._mix_nonlinear:
-                # b_mix_k shape: [T, dim_q] (per-type) or [dim_q] (shared).
-                n_b_per_layer = (self.cfg.num_types if self._mix_per_type else 1) \
-                    * self.dim_q
-            else:
-                n_b_per_layer = 0
-            self._mix_n_bias_per_layer = n_b_per_layer
-            self.n_U_bias_total = self._mix_n_layers * n_b_per_layer
+                self.n_U_pair = per_T_block
             # Pre-build the Cayley scatter matrices (one per unique block
             # size used by this arch). Doing it at init keeps the
             # construction out of the @tf.function-traced
@@ -372,197 +340,6 @@ class SNES:
                             _k += 1
                     self._cayley_scatter_cache[_bs] = tf.constant(_scat)
             self.n_U_pair = 0
-            self.n_U_pair_per_layer = 0
-            self._mix_n_layers = 1
-            self._mix_nonlinear = False
-            self._mix_n_U_pair_per_layer = 0
-            self._mix_n_bias_per_layer = 0
-            self.n_U_bias_total = 0
-
-        # Cross-channel mixing layer (a single orthogonal rotation applied
-        # AFTER the existing arch). Two modes selected by
-        # cfg.descriptor_mixing_cross_mode:
-        #   "full"       : R ∈ SO(Q), full per-component rotation.
-        #   "block_unit" : R ∈ SO(N_units), rotates (pair, l) units while
-        #                  keeping each unit's α components in their slot.
-        # Shared across central atom types in both modes.
-        self._cross_enabled = (
-            bool(getattr(self.cfg, "descriptor_mixing", False))
-            and bool(getattr(self.cfg, "descriptor_mixing_cross_layer", False)))
-        if self._cross_enabled:
-            self._cross_orth_map = str(getattr(
-                self.cfg, "descriptor_mixing_cross_regularizer", "expm")).lower()
-            if self._cross_orth_map not in ("cayley", "expm"):
-                raise ValueError(
-                    f"descriptor_mixing_cross_regularizer="
-                    f"{self._cross_orth_map!r} must be 'cayley' or 'expm'")
-            self._cross_mode = str(getattr(
-                self.cfg, "descriptor_mixing_cross_mode", "full")).lower()
-            if self._cross_mode not in ("full", "block_unit", "per_l"):
-                raise ValueError(
-                    f"descriptor_mixing_cross_mode={self._cross_mode!r} "
-                    "must be 'full', 'block_unit', or 'per_l'")
-            Q = int(self.dim_q)
-            self._cross_Q = Q
-            if self._cross_mode == "full":
-                # Cayley/expm parameterisation: upper-triangle of Q×Q skew.
-                self._cross_R_size = Q
-                self.n_U_cross = Q * (Q - 1) // 2
-            elif self._cross_mode == "block_unit":
-                # block_unit: per-component-slot R_k matrices. Each (pair, l)
-                # sub-block is a UNIT; for each component slot k, R_k is an
-                # orthogonal rotation on the subset of units that have slot
-                # k (i.e. α_unit > k). Total parameters:
-                #   n_U_cross = Σ_k N_k(N_k-1)/2
-                # where N_k = number of units with α > k. Handles non-uniform
-                # α correctly (each R_k is exactly orthogonal on its slot).
-                from DescriptorBuilderGPU import descriptor_block_layout
-                layout = descriptor_block_layout(self.cfg)
-                # Sort units in deterministic order: pair-major, l-minor.
-                units = []  # list of (pair, l, [q_indices])
-                for pair in layout["pair_keys"]:
-                    for l, q_idx_list in sorted(
-                            layout["pair_ln_index"][pair].items()):
-                        units.append((pair, l, list(q_idx_list)))
-                max_alpha = max(len(u[2]) for u in units)
-                slot_q_indices = [[] for _ in range(max_alpha)]
-                for u_idx, (_, _, q_idx) in enumerate(units):
-                    for k, q in enumerate(q_idx):
-                        slot_q_indices[k].append(q)
-                self._cross_slot_N = [len(s) for s in slot_q_indices]
-                self._cross_slot_n_payload = [
-                    n * (n - 1) // 2 for n in self._cross_slot_N]
-                self._cross_slot_offsets = []
-                cursor = 0
-                for n_pay in self._cross_slot_n_payload:
-                    self._cross_slot_offsets.append(cursor)
-                    cursor += n_pay
-                self.n_U_cross = cursor
-                self._cross_slot_q_indices = [
-                    tf.constant(np.asarray(s, dtype=np.int64))
-                    for s in slot_q_indices]
-                self._cross_slot_upper = []
-                for n in self._cross_slot_N:
-                    if n >= 2:
-                        ii, jj = np.triu_indices(n, k=1)
-                        self._cross_slot_upper.append((
-                            tf.constant(ii.astype(np.int64)),
-                            tf.constant(jj.astype(np.int64))))
-                    else:
-                        self._cross_slot_upper.append((None, None))
-                self._cross_max_alpha = max_alpha
-                self._cross_R_size = max(self._cross_slot_N)
-            else:
-                # per_l: rotate pair-units AT EACH l independently, with
-                # per-(l, k) R matrices for non-uniform α within an l.
-                # Preserves angular-momentum boundaries — the rotation at
-                # l=0 never touches l=1 channels and vice-versa.
-                #   For each l ∈ {0..l_max}:
-                #     For each component slot k ∈ {0..max_α_l−1}:
-                #       N_{l,k} = number of pairs at l with α_p > k
-                #       R_{l,k} ∈ SO(N_{l,k})
-                #   Total params: Σ_l Σ_k N_{l,k}(N_{l,k}−1)/2
-                # Flattened representation reuses the per-slot machinery,
-                # just with one "slot" per (l, k) pair.
-                from DescriptorBuilderGPU import descriptor_block_layout
-                layout = descriptor_block_layout(self.cfg)
-                pair_keys = layout["pair_keys"]
-                # Determine the full l range across all pairs.
-                all_ls = sorted({l for p in pair_keys
-                                 for l in layout["pair_ln_index"][p]})
-                self._cross_per_l_ls = all_ls
-                # Per (l, k) bookkeeping — same structure as block_unit's
-                # per-slot, but flattened over both l and k.
-                slot_q_indices = []         # list of [q_indices] per (l, k)
-                slot_meta = []              # list of (l, k) labels for diag
-                for l in all_ls:
-                    # Pairs that have channels at this l, and their slot
-                    # sizes at this l.
-                    pairs_at_l = [p for p in pair_keys
-                                  if l in layout["pair_ln_index"][p]]
-                    max_alpha_l = max(
-                        len(layout["pair_ln_index"][p][l])
-                        for p in pairs_at_l)
-                    for k in range(max_alpha_l):
-                        qs = []
-                        for p in pairs_at_l:
-                            block = layout["pair_ln_index"][p][l]
-                            if k < len(block):
-                                qs.append(block[k])
-                        slot_q_indices.append(qs)
-                        slot_meta.append((l, k))
-                self._cross_slot_N = [len(s) for s in slot_q_indices]
-                self._cross_slot_n_payload = [
-                    n * (n - 1) // 2 for n in self._cross_slot_N]
-                self._cross_slot_offsets = []
-                cursor = 0
-                for n_pay in self._cross_slot_n_payload:
-                    self._cross_slot_offsets.append(cursor)
-                    cursor += n_pay
-                self.n_U_cross = cursor
-                self._cross_slot_q_indices = [
-                    tf.constant(np.asarray(s, dtype=np.int64))
-                    for s in slot_q_indices]
-                self._cross_slot_upper = []
-                for n in self._cross_slot_N:
-                    if n >= 2:
-                        ii, jj = np.triu_indices(n, k=1)
-                        self._cross_slot_upper.append((
-                            tf.constant(ii.astype(np.int64)),
-                            tf.constant(jj.astype(np.int64))))
-                    else:
-                        self._cross_slot_upper.append((None, None))
-                self._cross_per_l_meta = slot_meta
-                self._cross_R_size = max(self._cross_slot_N) if self._cross_slot_N else 0
-            # full-mode upper-tri (only used in full mode).
-            if self._cross_mode == "full":
-                R_size = self._cross_R_size
-                i_idx, j_idx = np.triu_indices(R_size, k=1)
-                self._cross_upper_i = tf.constant(i_idx.astype(np.int64))
-                self._cross_upper_j = tf.constant(j_idx.astype(np.int64))
-        else:
-            self._cross_orth_map = None
-            self._cross_mode = "full"
-            self.n_U_cross = 0
-            self._cross_Q = 0
-            self._cross_R_size = 0
-
-        # Per-(species-pair, l, central-type) gating (descriptor_gating_enabled).
-        # Folded into the first-layer W0 via W0_eff[t, c, h] *= g_{t, pair(c), l(c)}.
-        self._gating_enabled = bool(getattr(
-            self.cfg, "descriptor_gating_enabled", False))
-        if self._gating_enabled:
-            from DescriptorBuilderGPU import descriptor_block_layout
-            layout = descriptor_block_layout(self.cfg)
-            pair_keys = layout["pair_keys"]
-            L = int(self.cfg.l_max) + 1
-            self._gating_num_pairs = len(pair_keys)
-            self._gating_L = L
-            self.n_gates = (int(self.cfg.num_types)
-                            * self._gating_num_pairs * L)
-            # Build the q-index → (pair_idx · L + l_idx) lookup once.
-            # gate_per_channel[t, q] = gates_flat[t, q_to_pair_l[q]].
-            pair_idx_of = {p: i for i, p in enumerate(pair_keys)}
-            q_to_pair_l = np.full(int(self.dim_q), -1, dtype=np.int64)
-            for p in pair_keys:
-                pi = pair_idx_of[p]
-                for l, q_idx_list in layout["pair_ln_index"][p].items():
-                    for q in q_idx_list:
-                        q_to_pair_l[int(q)] = pi * L + int(l)
-            if (q_to_pair_l < 0).any():
-                missing = int((q_to_pair_l < 0).sum())
-                raise RuntimeError(
-                    f"descriptor_gating: {missing} q-channels not covered "
-                    "by pair_ln_index; layout / dim_q mismatch.")
-            self._gating_q_to_pair_l = tf.constant(q_to_pair_l)
-            self._gating_init_value = float(getattr(
-                self.cfg, "descriptor_gating_init", 1.0))
-        else:
-            self.n_gates = 0
-            self._gating_num_pairs = 0
-            self._gating_L = 0
-            self._gating_q_to_pair_l = None
-            self._gating_init_value = 1.0
 
         # Preprocessing contraction tail (descriptor_preprocess_contract).
         # Per-(centre type, raw channel) scalar coefficients fold into W0
@@ -635,25 +412,7 @@ class SNES:
             self._preprocess_init_scheme = "mean"
             self._preprocess_init_per_q_raw = None
 
-        # Output-side mixing R tail: per-type orthogonal [H, H] matrix
-        # parameterised by skew upper-triangle (T · H · (H − 1) / 2 dims
-        # under cayley/expm). Residual V_R = R − I; SNES walks the skew
-        # params, _cayley_blocks_batched reconstructs V_R each candidate.
-        if bool(getattr(self.model, "descriptor_mixing_output_layer", False)):
-            self._R_H = int(self.model._R_H)
-            self._R_per_T = int(self.cfg.num_types)
-            # Skew param count per block of size H.
-            self._R_skew_per_block = self._R_H * (self._R_H - 1) // 2
-            self.n_R_pair = self._R_per_T * self._R_skew_per_block
-        else:
-            self._R_H = 0
-            self._R_per_T = 0
-            self._R_skew_per_block = 0
-            self.n_R_pair = 0
-
-        self.dim = (self.n_anns_total + self.n_U_pair
-                    + self.n_U_bias_total + self.n_U_cross
-                    + self.n_gates + self.n_preprocess + self.n_R_pair)
+        self.dim = self.n_anns_total + self.n_U_pair + self.n_preprocess
 
         # Search distribution parameters as tf.Variables (stay on GPU).
         # Initialisation scheme is configurable:
@@ -674,26 +433,14 @@ class SNES:
         mix_scale = float(getattr(self.cfg, "mixing_sigma_scale", 1.0))
         if self.n_U_pair > 0 and mix_scale != 1.0:
             mix_start = self.n_anns_total
-            mix_end = mix_start + self.n_U_pair + self.n_U_bias_total
-            sigma_init_vec[mix_start:mix_end] *= mix_scale
-        # Per-block σ for the gating tail (cfg.gating_sigma_scale). Lets
-        # gates be explored at a smaller σ than the ANN — important when
-        # regularisation is supposed to drive the equilibrium but per-gen
-        # noise at the default σ would dominate.
-        gate_scale = float(getattr(self.cfg, "gating_sigma_scale", 1.0))
-        if self.n_gates > 0 and gate_scale != 1.0:
-            g_start = (self.n_anns_total + self.n_U_pair
-                       + self.n_U_bias_total + self.n_U_cross)
-            sigma_init_vec[g_start:g_start + self.n_gates] *= gate_scale
+            sigma_init_vec[mix_start:mix_start + self.n_U_pair] *= mix_scale
         # Per-block σ for the preprocess tail (cfg.preprocess_sigma_scale).
-        # Same rationale as gating: SNES per-gen noise on coefficients
-        # near 1/L can overwhelm the optimisation signal at the legacy σ.
+        # SNES per-gen noise on coefficients near 1/L can overwhelm the
+        # optimisation signal at the legacy σ; scaling here decouples it.
         preprocess_scale = float(getattr(
             self.cfg, "preprocess_sigma_scale", 1.0))
         if self.n_preprocess > 0 and preprocess_scale != 1.0:
-            pre_start = (self.n_anns_total + self.n_U_pair
-                         + self.n_U_bias_total + self.n_U_cross
-                         + self.n_gates)
+            pre_start = self.n_anns_total + self.n_U_pair
             sigma_init_vec[pre_start:pre_start + self.n_preprocess] *= preprocess_scale
         self.sigma = tf.Variable(sigma_init_vec, trainable=False, name="snes_sigma")
 
@@ -733,23 +480,6 @@ class SNES:
         #   L1_g[t] = λ_g1 · ‖g[t, :] − g_init‖_1 / n_gates_per_type
         #   L2_g[t] = λ_g2 · √(‖g[t, :] − g_init‖_2² / n_gates_per_type)
         # Both default to 0.0; gating is only regularised if either is > 0.
-        self._lambda_gate_1 = tf.Variable(
-            float(getattr(cfg, "descriptor_gating_lambda_1", 0.0)),
-            dtype=tf.float32, trainable=False, name="lambda_gate_1")
-        self._lambda_gate_2 = tf.Variable(
-            float(getattr(cfg, "descriptor_gating_lambda_2", 0.0)),
-            dtype=tf.float32, trainable=False, name="lambda_gate_2")
-        # Anti-sparsity floor barrier: hinge penalty on max(0, floor − |g|)².
-        # Active only when |g| dips below `floor`; zero otherwise. Prevents
-        # input channels from being killed off without constraining gates
-        # that grow above the floor.
-        self._lambda_gate_floor = tf.Variable(
-            float(getattr(cfg, "descriptor_gating_lambda_floor", 0.0)),
-            dtype=tf.float32, trainable=False, name="lambda_gate_floor")
-        self._gating_floor = tf.constant(
-            float(getattr(cfg, "descriptor_gating_floor", 0.2)),
-            dtype=tf.float32, name="gating_floor")
-
         # Polarizability shear weight: scale off-diagonal components [xy, yz, zx]
         # Targets are [xx, yy, zz, xy, yz, zx] — indices 3,4,5 are off-diagonal
         if cfg.target_mode == 2:
@@ -890,49 +620,25 @@ class SNES:
         else:
             raise ValueError(
                 f"mu_init_scheme={scheme!r} not in ('uniform', 'glorot')")
-        # V_pair tail (including all N stacked layers) + nonlinear biases:
-        # always zero (residual mixing layer; U_full = I at init; biases = 0).
-        if self.n_U_pair > 0 or self.n_U_bias_total > 0 or self.n_U_cross > 0:
-            mu[self.n_anns_total:self.n_anns_total + self.n_U_pair
-               + self.n_U_bias_total + self.n_U_cross] = 0.0
-        # Gating tail: init at cfg.descriptor_gating_init (default 1.0)
-        # so the gates are identity at gen 0 — model behaviour at gen 0
-        # is bit-identical to the no-gating baseline.
-        if self.n_gates > 0:
-            g_start = (self.n_anns_total + self.n_U_pair
-                       + self.n_U_bias_total + self.n_U_cross)
-            mu[g_start:g_start + self.n_gates] = self._gating_init_value
+        # V_pair tail: residual mixing layer initialised at zero so
+        # U_full = I at gen 0 (mu starts from the no-mixing baseline).
+        if self.n_U_pair > 0:
+            mu[self.n_anns_total:self.n_anns_total + self.n_U_pair] = 0.0
         # Preprocess tail: init per cfg.descriptor_preprocess_init
         # ("mean" → 1/L, "sum" → 1.0, "glorot" → 0.0 with σ providing the
-        # spread). Per-type ranking uses the [t, q_raw] interleaved layout
-        # (t-major, q-inner) so consecutive blocks of Q_raw entries belong
-        # to a single type — matches the _set_model_params reshape.
+        # spread). μ holds ONLY the summed entries (n_preprocess = number
+        # of learnable W_pre slots); the per-summed init values are read
+        # off the model's W_pre Variable, which TNEP populated at init.
         if self.n_preprocess > 0:
-            pre_start = (self.n_anns_total + self.n_U_pair
-                         + self.n_U_bias_total + self.n_U_cross
-                         + self.n_gates)
-            # μ holds ONLY the summed entries (n_preprocess = number of
-            # learnable W_pre slots). Read the per-summed init values
-            # straight off the model's W_pre Variable, which TNEP already
-            # populated with kept positions at 1.0 and summed positions
-            # at the per-(t, q_raw)/per-q_raw "mean" / "sum" / "glorot"
-            # init. For "glorot" SNES adds a small uniform jitter on top.
+            pre_start = self.n_anns_total + self.n_U_pair
             W_pre_init = self.model.W_pre_angular.numpy().reshape(-1)
             flat_idx = self.model._preprocess_summed_flat_idx.numpy()
             summed_init = W_pre_init[flat_idx]
             if self._preprocess_init_scheme == "glorot":
-                # μ starts near 0; σ provides the spread at gen 0.
                 limit = 1e-3
                 summed_init = rng.uniform(
                     -limit, limit, size=summed_init.size).astype(np.float32)
             mu[pre_start:pre_start + self.n_preprocess] = summed_init
-        # Output-side R tail: residual init at zero → R = I at gen 0.
-        # (The np.zeros background already sets these — explicit for clarity.)
-        if self.n_R_pair > 0:
-            r_start = (self.n_anns_total + self.n_U_pair
-                       + self.n_U_bias_total + self.n_U_cross
-                       + self.n_gates + self.n_preprocess)
-            mu[r_start:r_start + self.n_R_pair] = 0.0
         return mu
 
     def _maybe_adapt_lambda(self, gen: int, data_loss: float,
@@ -1067,8 +773,6 @@ class SNES:
         T = self.cfg.num_types
         Q = self.dim_q
         H = self.H
-        H2 = self.H2
-        H_final = self.H_final
 
         # W0 block: [T, Q, H]
         w0_start = t * Q * H
@@ -1079,26 +783,16 @@ class SNES:
         b0_start = b0_offset + t * H
         b0_end = b0_start + H
 
-        parts = [pv[w0_start:w0_end], pv[b0_start:b0_end]]
+        # W1 block: after all b0
+        w1_offset = b0_offset + T * H
+        w1_start = w1_offset + t * H
+        w1_end = w1_start + H
 
-        # Optional second hidden layer
-        if H2 is not None:
-            w0_2_offset = b0_offset + T * H
-            w0_2_start = w0_2_offset + t * H * H2
-            w0_2_end = w0_2_start + H * H2
-            b0_2_offset = w0_2_offset + T * H * H2
-            b0_2_start = b0_2_offset + t * H2
-            b0_2_end = b0_2_start + H2
-            parts.extend([pv[w0_2_start:w0_2_end], pv[b0_2_start:b0_2_end]])
-            w1_offset = b0_2_offset + T * H2
-        else:
-            w1_offset = b0_offset + T * H
-
-        w1_start = w1_offset + t * H_final
-        w1_end = w1_start + H_final
-        parts.append(pv[w1_start:w1_end])
-
-        return tf.concat(parts, axis=0)
+        return tf.concat([
+            pv[w0_start:w0_end],
+            pv[b0_start:b0_end],
+            pv[w1_start:w1_end],
+        ], axis=0)
 
     def _build_type_of_variable(self) -> np.ndarray:
         """Build array mapping each parameter index to its atom type.
@@ -1115,8 +809,6 @@ class SNES:
         T = self.cfg.num_types
         Q = self.dim_q
         H = self.H
-        H2 = self.H2
-        H_final = self.H_final
 
         def _ann_types() -> np.ndarray:
             tov = np.empty(self.n_primary, dtype=np.int32)
@@ -1129,10 +821,10 @@ class SNES:
             for t in range(T):
                 tov[offset:offset + H] = t
                 offset += H
-            # W1: [T, H_final]
+            # W1: [T, H]
             for t in range(T):
-                tov[offset:offset + H_final] = t
-                offset += H_final
+                tov[offset:offset + H] = t
+                offset += H
             # b1: global (label = T)
             tov[offset] = T
             return tov
@@ -1157,48 +849,20 @@ class SNES:
         # evaluate_population to emit pair-specific RMSE columns on
         # top of the per-type columns.
         tail_labels_parts = []
-        # U_pair tail: N consecutive layer slabs. Within a layer, the
-        # per-type slab pattern is reused.
+        # U_pair tail: single layer. With per-type V_pair, T contiguous
+        # slabs (one per central type); with shared V_pair, the whole
+        # tail routes to the global label T.
         if self.n_U_pair > 0:
-            n_per_layer = self.n_U_pair_per_layer
-            for _ in range(self._mix_n_layers):
-                if self._mix_per_type:
-                    per_T = n_per_layer // T
-                    layer_labels = np.empty(n_per_layer, dtype=np.int32)
-                    for t_idx in range(T):
-                        layer_labels[t_idx * per_T:(t_idx + 1) * per_T] = t_idx
-                else:
-                    layer_labels = np.full(n_per_layer, T, dtype=np.int32)
-                tail_labels_parts.append(layer_labels)
-        # Nonlinear mixing biases (one per layer). Per-type: T slabs
-        # of dim_q each; shared: all global label.
-        if self.n_U_bias_total > 0:
-            n_b_per_layer = self._mix_n_bias_per_layer
-            for _ in range(self._mix_n_layers):
-                if self._mix_per_type:
-                    per_T = n_b_per_layer // T
-                    layer_labels = np.empty(n_b_per_layer, dtype=np.int32)
-                    for t_idx in range(T):
-                        layer_labels[t_idx * per_T:(t_idx + 1) * per_T] = t_idx
-                else:
-                    layer_labels = np.full(n_b_per_layer, T, dtype=np.int32)
-                tail_labels_parts.append(layer_labels)
-        # Cross-channel mixing layer: a single rotation shared across all
-        # central types, so all entries route to the global label.
-        if self.n_U_cross > 0:
-            tail_labels_parts.append(
-                np.full(self.n_U_cross, T, dtype=np.int32))
-        # Gating tail: g[t, :] is the slab for type t, contiguous
-        # PL = num_pairs · (l_max+1) entries each. Per-type labels.
-        if self.n_gates > 0:
-            PL = self._gating_num_pairs * self._gating_L
-            gate_labels = np.empty(self.n_gates, dtype=np.int32)
-            for t_idx in range(T):
-                gate_labels[t_idx * PL:(t_idx + 1) * PL] = t_idx
-            tail_labels_parts.append(gate_labels)
+            if self._mix_per_type:
+                per_T = self.n_U_pair // T
+                u_labels = np.empty(self.n_U_pair, dtype=np.int32)
+                for t_idx in range(T):
+                    u_labels[t_idx * per_T:(t_idx + 1) * per_T] = t_idx
+            else:
+                u_labels = np.full(self.n_U_pair, T, dtype=np.int32)
+            tail_labels_parts.append(u_labels)
         # Preprocess tail: W_pre[t, q_raw] stored t-major in the mu vector
-        # → blocks of Q_raw entries belong to a single type. Per-type
-        # labels mirror the gating layout.
+        # → blocks of Q_raw entries belong to a single type.
         if self.n_preprocess > 0:
             # μ holds only summed W_pre entries. Derive per-entry type
             # labels from the flat indices into the W_pre tensor.
@@ -1245,32 +909,6 @@ class SNES:
         H = self.cfg.num_neurons
         n_per_type = self._n_per_type
 
-        # Optional V_pair tail routing. With per-type V_pair, slab t
-        # is owned by label t (per-type ranking); with shared V_pair,
-        # the whole tail is owned by the global label T. Dispatched on
-        # V_pair has no soft regulariser now — cayley/expm own the
-        # constraint structurally, off leaves V_pair unconstrained.
-        # Per-type gating regulariser (L1 / L2 on g − g_init, plus a one-
-        # sided anti-sparsity hinge on max(0, floor − |g|)²).
-        lg1 = float(self._lambda_gate_1.numpy())
-        lg2 = float(self._lambda_gate_2.numpy())
-        lgf = float(self._lambda_gate_floor.numpy())
-        reg_gate = self.n_gates > 0 and (lg1 > 0.0 or lg2 > 0.0 or lgf > 0.0)
-        if reg_gate:
-            PL = self._gating_num_pairs * self._gating_L
-            g_start = (self.n_anns_total + self.n_U_pair
-                       + self.n_U_bias_total + self.n_U_cross)
-            g_tail = samples[:, g_start:g_start + self.n_gates]      # [P, T·PL]
-            g_init = float(self._gating_init_value)
-            g_dev = g_tail - g_init                                  # [P, T·PL]
-            # Symmetric in sign: |g| sits inside the hinge, so g = -1.0
-            # gets no penalty (still an informative channel) but g ≈ 0
-            # does. Squared hinge keeps the penalty smooth at the boundary.
-            g_floor_slack = tf.nn.relu(
-                self._gating_floor - tf.abs(g_tail))                 # [P, T·PL]
-            g_floor_sq = tf.square(g_floor_slack)
-            n_per_t = PL
-
         # Add per-type regularization to per-type RMSE → [T+1] fitness values
         fitness_per_type = []
         for t in range(T):
@@ -1278,20 +916,6 @@ class SNES:
             l1 = self.lambda_1 * tf.reduce_sum(tf.abs(type_params), axis=1) / n_per_type
             l2 = self.lambda_2 * tf.sqrt(
                 tf.reduce_sum(tf.square(type_params), axis=1) / n_per_type)
-            if reg_gate:
-                # Per-type gating slab: gates[t, :] lives at
-                #   g_tail[:, t·PL : (t+1)·PL]
-                g_slab = g_dev[:, t * PL:(t + 1) * PL]
-                if lg1 > 0.0:
-                    l1 = l1 + self._lambda_gate_1 * tf.reduce_sum(
-                        tf.abs(g_slab), axis=1) / n_per_t
-                if lg2 > 0.0:
-                    l2 = l2 + self._lambda_gate_2 * tf.sqrt(
-                        tf.reduce_sum(tf.square(g_slab), axis=1) / n_per_t)
-                if lgf > 0.0:
-                    floor_slab = g_floor_sq[:, t * PL:(t + 1) * PL]
-                    l2 = l2 + self._lambda_gate_floor * tf.reduce_sum(
-                        floor_slab, axis=1) / n_per_t
             fitness_per_type.append(fitness_per_type_rmse[:, t] + l1 + l2)
 
         # Global ranking (type T): regularize over all typed params, excluding b1
@@ -1303,19 +927,6 @@ class SNES:
         global_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed), axis=1) / n_typed_total
         global_l2 = self.lambda_2 * tf.sqrt(
             tf.reduce_sum(tf.square(typed), axis=1) / n_typed_total)
-        if reg_gate:
-            # Global gating reg: aggregate (g − g_init) penalty across all
-            # types/blocks. Normalised by total entries n_gates to match
-            # the per-type penalty scale.
-            if lg1 > 0.0:
-                global_l1 = global_l1 + self._lambda_gate_1 * tf.reduce_sum(
-                    tf.abs(g_dev), axis=1) / self.n_gates
-            if lg2 > 0.0:
-                global_l2 = global_l2 + self._lambda_gate_2 * tf.sqrt(
-                    tf.reduce_sum(tf.square(g_dev), axis=1) / self.n_gates)
-            if lgf > 0.0:
-                global_l2 = global_l2 + self._lambda_gate_floor * tf.reduce_sum(
-                    g_floor_sq, axis=1) / self.n_gates
         fitness_per_type.append(fitness_per_type_rmse[:, T] + global_l1 + global_l2)
 
         # Sort each type's fitness independently → [T+1, P] rank indices
@@ -1644,13 +1255,14 @@ class SNES:
             rrmse_pc = self._last_rrmse_per_cand
             # σ stats are computed on the GPU and folded into the same
             # batched pull as the fitness/RMSE metrics — one device sync
-            # per gen, not the previous every-100-gen sampling.
-            # Median uses tf.sort which is O(d log d); at d ≈ 50k this
-            # is microseconds on GPU.
+            # per gen, not the previous every-100-gen sampling. Median
+            # uses tf.sort which is O(d log d); at d ≈ 50k this is
+            # microseconds on GPU.
+            sigma_active = self.sigma
+            sigma_sorted = tf.sort(sigma_active)
             sigma_med_tf = 0.5 * (
                 sigma_sorted[(self.dim - 1) // 2]
                 + sigma_sorted[self.dim // 2])
-            sigma_active = self.sigma  # alias kept for downstream stats below
             metrics_gpu = tf.stack([
                 tf.reduce_mean(fitness),
                 tf.reduce_min(rmse_pc),
@@ -2157,38 +1769,18 @@ class SNES:
             named = self._split_reconstructed(params)
             W0 = named.get("W0"); b0 = named.get("b0")
             W1 = named.get("W1"); b1 = named.get("b1")
-            W0_2, b0_2 = named.get("W0_2"), named.get("b0_2")
             W0p = named.get("W0_pol")
             b0p = named.get("b0_pol")
             W1p = named.get("W1_pol")
             b1p = named.get("b1_pol")
-            W0_2_pol = named.get("W0_2_pol")
-            b0_2_pol = named.get("b0_2_pol")
-            U_pair_val = named["U_pair_list"]
-            # Gates and V_cross must reach _W0_eff in the validate path too
-            # — otherwise the train/val mismatch causes val_RMSE to rise
-            # while train improves under the same gates.
-            gates_val = named.get("gates")
-            V_cross_val = named.get("V_cross")
+            U_pair_val = named.get("U_pair")
             W_pre_angular_val = named.get("W_pre_angular")
-            # Absorb U_pair^T into W0 (and W0_pol) once when LINEAR. For
-            # nonlinear mixing we cannot fold; the forward path would need
-            # explicit per-layer descriptor mixing — out of scope here.
-            if (U_pair_val is not None
-                    or gates_val is not None
-                    or V_cross_val is not None) and not getattr(
-                    self.model, "descriptor_mixing_nonlinear", False):
-                W0 = self.model._W0_eff(
-                    W0, U_pair_val,
-                    V_cross_override=V_cross_val,
-                    gates_override=gates_val)
+            # Absorb U_pair^T into W0 (and W0_pol).
+            if U_pair_val is not None:
+                W0 = self.model._W0_eff(W0, U_pair_val)
                 if W0p is not None:
-                    W0p = self.model._W0_eff(
-                        W0p, U_pair_val,
-                        V_cross_override=V_cross_val,
-                        gates_override=gates_val)
-            # Preprocessing fold (mutually exclusive with mixing/gating, so
-            # this never composes with the W0_eff fold above).
+                    W0p = self.model._W0_eff(W0p, U_pair_val)
+            # Preprocessing fold (composes with mixing under l_aware).
             if (getattr(self.model, "descriptor_preprocess_contract", "off")
                     != "off"):
                 W0 = self.model._W0_preprocess_eff(
@@ -2199,33 +1791,20 @@ class SNES:
             # Stash the folded tensors for the next validate() call this gen.
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
-                "fold": (W0, b0, W1, b1, W0_2, b0_2,
-                         W0p, b0p, W1p, b1p, W0_2_pol, b0_2_pol),
+                "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p),
             }
         elif _cache_hit:
-            # Reuse the fold from the previous validate() call this gen.
-            (W0, b0, W1, b1, W0_2, b0_2,
-             W0p, b0p, W1p, b1p, W0_2_pol, b0_2_pol) = _cache["fold"]
+            (W0, b0, W1, b1, W0p, b0p, W1p, b1p) = _cache["fold"]
         else:
             W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
-            W0_2 = getattr(self.model, "W0_2", None)
-            b0_2 = getattr(self.model, "b0_2", None)
             W0p = getattr(self.model, 'W0_pol', None)
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
             b1p = getattr(self.model, 'b1_pol', None)
-            W0_2_pol = getattr(self.model, "W0_2_pol", None)
-            b0_2_pol = getattr(self.model, "b0_2_pol", None)
-            # If the model has mixing OR gating active, fold the appropriate
-            # transforms into W0 / W0_pol for the validate forward.
-            if (getattr(self.model, "descriptor_mixing", False)
-                    or getattr(self.model, "descriptor_gating_enabled", False)
-                    ) and not getattr(self.model, "descriptor_mixing_nonlinear", False):
+            if getattr(self.model, "descriptor_mixing", False):
                 W0 = self.model._W0_eff(W0)
                 if W0p is not None:
                     W0p = self.model._W0_eff(W0p)
-            # Preprocessing fold for the no-override branch — uses the
-            # current self.model.W_pre_angular Variable implicitly.
             if (getattr(self.model, "descriptor_preprocess_contract", "off")
                     != "off"):
                 W0 = self.model._W0_preprocess_eff(W0)
@@ -2282,8 +1861,6 @@ class SNES:
                 chunk["atom_mask"],
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
                 W_atom=W_atom_v,
-                W0_2=W0_2, b0_2=b0_2,
-                W0_2_pol=W0_2_pol, b0_2_pol=b0_2_pol,
             )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
                 num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
@@ -2323,25 +1900,15 @@ class SNES:
 
     def _split_reconstructed(self, params: tuple) -> dict:
         """Parse the heterogeneous tuple returned by reconstruct_params_tf
-        into a named dict. Order of fields per ANN is:
-            single hidden  : W0, b0, W1, b1
-            two hidden     : W0, b0, W0_2, b0_2, W1, b1
-        Optionally followed (in order) by:
-            U_pair         : single tensor (N==1) OR list (N>1)
-            b_mix          : list of N tensors (nonlinear mixing only)
-        Returns dict keys:
-            W0, b0, W0_2, b0_2, W1, b1                       (always)
-            W0_pol, b0_pol, W0_2_pol, b0_2_pol, W1_pol, b1_pol (mode==2)
-            U_pair, U_pair_list, b_mix_list                  (when mixing)
+        into a named dict.
+
+        Tail order:
+            W0, b0, W1, b1                         (always)
+            W0_pol, b0_pol, W1_pol, b1_pol         (target_mode == 2)
+            U_pair                                 (descriptor_mixing on)
+            W_pre_angular                          (preprocess_contract != "off")
         """
-        out: dict = {
-            "W0_2": None, "b0_2": None,
-            "W0_2_pol": None, "b0_2_pol": None,
-            "U_pair": None, "U_pair_list": None,
-            "b_mix_list": None,
-            "V_cross": None, "gates": None, "R_pair": None,
-            "W_pre_angular": None,
-        }
+        out: dict = {"U_pair": None, "W_pre_angular": None}
         idx = 0
         out["W0"] = params[idx]; idx += 1
         out["b0"] = params[idx]; idx += 1
@@ -2353,15 +1920,7 @@ class SNES:
             out["W1_pol"] = params[idx]; idx += 1
             out["b1_pol"] = params[idx]; idx += 1
         if self.n_U_pair > 0 and idx < len(params):
-            entry = params[idx]; idx += 1
-            # Either a single tensor (canonical) or a 1-element list
-            # (pre-Stage-6 multi-layer fallthrough).
-            if isinstance(entry, list):
-                out["U_pair_list"] = entry
-                out["U_pair"] = entry[0]
-            else:
-                out["U_pair"] = entry
-                out["U_pair_list"] = [entry]
+            out["U_pair"] = params[idx]; idx += 1
         if self.n_preprocess > 0 and idx < len(params):
             out["W_pre_angular"] = params[idx]; idx += 1
         return out
@@ -2381,11 +1940,10 @@ class SNES:
         T = self.cfg.num_types
         Q = self.dim_q
         H = self.H
-        H_final = self.H_final
 
         n_W0 = T * Q * H
         n_b0 = T * H
-        n_W1 = T * H_final
+        n_W1 = T * H
         n_b1 = 1
 
         is_batched = len(param_vectors.shape) == 2
@@ -2402,7 +1960,7 @@ class SNES:
                             [-1, T, H] if is_batched else [T, H])
             offset += n_b0
             W1 = tf.reshape(pv[..., offset:offset + n_W1],
-                            [-1, T, H_final] if is_batched else [T, H_final])
+                            [-1, T, H] if is_batched else [T, H])
             offset += n_W1
             b1 = pv[..., offset]
             offset += n_b1
@@ -2427,68 +1985,11 @@ class SNES:
             #   "linear"  : [V_p=0 (bs²) | V_p=1 (bs²) | ... ]
             #   "l_aware" : [V_{p=0,l=0} (α²) | V_{p=0,l=1} (α²) | ...
             #                | V_{p=1,l=0} (α²) | ... ]
-            #
-            # For N stacked layers the per-layer payload is contiguous:
-            #   [layer_0 (n_per_layer) | layer_1 (n_per_layer) | ... ]
-            # We iterate N times, each pass extracting one layer's worth.
-            U_pair_list: list = []
-            n_per_layer = self.n_U_pair_per_layer
-            per_type = self._mix_per_type
-            for layer_k in range(self._mix_n_layers):
-                U_flat = param_vectors[
-                    ...,
-                    offset + layer_k * n_per_layer:
-                    offset + (layer_k + 1) * n_per_layer]
-                U_pair_k = self._reconstruct_one_mixing_layer(
-                    U_flat, is_batched, per_type, T)
-                U_pair_list.append(U_pair_k)
+            U_flat = param_vectors[..., offset:offset + self.n_U_pair]
+            U_pair_k = self._reconstruct_one_mixing_layer(
+                U_flat, is_batched, self._mix_per_type, T)
             offset += self.n_U_pair
-            # Backward-compat: N==1 returns a single tensor (legacy API).
-            if self._mix_n_layers == 1:
-                tail = tail + (U_pair_list[0],)
-            else:
-                tail = tail + (U_pair_list,)
-            # Optional per-layer mixing biases (nonlinear path).
-            if self.n_U_bias_total > 0:
-                b_mix_list: list = []
-                n_b_per_layer = self._mix_n_bias_per_layer
-                for layer_k in range(self._mix_n_layers):
-                    b_flat = param_vectors[
-                        ...,
-                        offset + layer_k * n_b_per_layer:
-                        offset + (layer_k + 1) * n_b_per_layer]
-                    if per_type:
-                        shape = [-1, T, self.dim_q] if is_batched else [T, self.dim_q]
-                    else:
-                        shape = [-1, self.dim_q] if is_batched else [self.dim_q]
-                    b_mix_list.append(tf.reshape(b_flat, shape))
-                offset += self.n_U_bias_total
-                tail = tail + (b_mix_list,)
-
-        # Optional cross-channel mixing layer (single [Q × Q] rotation).
-        # Lives at the very end of the parameter vector — after U_pair and
-        # any nonlinear bias tail. Reconstructed via the existing Cayley/
-        # expm forward map but at Q-sized blocks, so the scatter-cache
-        # trick (memory O(Q⁴)) is replaced with a direct scatter_nd into
-        # a [Q, Q] tensor.
-        if self.n_U_cross > 0:
-            cross_flat = param_vectors[..., offset:offset + self.n_U_cross]
-            offset += self.n_U_cross
-            V_cross = self._reconstruct_cross_layer(cross_flat, is_batched)
-            tail = tail + (V_cross,)
-
-        # Optional per-(species-pair, l, central-type) gating tail.
-        # Stored as a flat [T · num_pairs · L] block, reshaped on read.
-        if self.n_gates > 0:
-            T_ = int(self.cfg.num_types)
-            PL = self._gating_num_pairs * self._gating_L
-            gates_flat = param_vectors[..., offset:offset + self.n_gates]
-            offset += self.n_gates
-            if is_batched:
-                gates = tf.reshape(gates_flat, [-1, T_, PL])
-            else:
-                gates = tf.reshape(gates_flat, [T_, PL])
-            tail = tail + (gates,)
+            tail = tail + (U_pair_k,)
 
         # Optional preprocess tail: W_pre summed entries. μ holds only
         # the learnable (summed) coefficients. Reconstruct the full W_pre
@@ -2522,119 +2023,7 @@ class SNES:
                 W_pre = tf.reshape(full_flat, base_static_shape)
             tail = tail + (W_pre,)
 
-        # Output-side mixing R tail: skew upper-triangle params per type
-        # → V_R = R − I of shape [(C,) T, H, H] via _cayley_blocks_batched.
-        if self.n_R_pair > 0:
-            r_flat = param_vectors[..., offset:offset + self.n_R_pair]
-            offset += self.n_R_pair
-            T_ = int(self._R_per_T)
-            H_ = int(self._R_H)
-            skew_per = int(self._R_skew_per_block)
-            # Reshape r_flat to [..., T, skew_per] so the batched Cayley
-            # reconstruction treats the T types as the inner block index.
-            if is_batched:
-                r_stacked = tf.reshape(r_flat, [-1, T_, skew_per])
-            else:
-                r_stacked = tf.reshape(r_flat, [T_, skew_per])
-            V_R = self._cayley_blocks_batched(r_stacked, H_)
-            tail = tail + (V_R,)
-
         return tail
-
-    def _reconstruct_cross_layer(self, A_upper_flat: tf.Tensor,
-                                  is_batched: bool) -> tf.Tensor:
-        """Reconstruct V_cross = U_cross − I as a [Q, Q] residual.
-
-        Three modes:
-          "full"       : R is [Q, Q]; A is upper-tri of skew(Q); V = expm(A) − I.
-          "block_unit" : Per-component-slot R_k matrices (one per slot k
-                         across all l), each orthogonal on its participating
-                         units. The [Q, Q] W is scattered slot-by-slot.
-          "per_l"      : Per-(l, k) R_{l,k} matrices, one per "slot"
-                         in the FLATTENED (l, k) index. Uses the same per-
-                         slot infrastructure as block_unit, just with the
-                         slots defined per-l. Preserves angular-momentum
-                         separation: l=0 rotation never touches l>0 channels.
-        A_upper_flat shape: [P, n_U_cross] or [n_U_cross].
-        Returns V_cross shape: [P, Q, Q] or [Q, Q].
-        """
-        Q = self._cross_Q
-        if self._cross_mode == "full":
-            R_size = self._cross_R_size
-            flat_upper = self._cross_upper_i * R_size + self._cross_upper_j
-            if is_batched:
-                def _per_cand(payload):
-                    buf = tf.scatter_nd(
-                        indices=tf.reshape(flat_upper, [-1, 1]),
-                        updates=payload,
-                        shape=[R_size * R_size])
-                    A = tf.reshape(buf, [R_size, R_size])
-                    return A - tf.transpose(A)
-                A = tf.map_fn(_per_cand, A_upper_flat)
-            else:
-                buf = tf.scatter_nd(
-                    indices=tf.reshape(flat_upper, [-1, 1]),
-                    updates=A_upper_flat,
-                    shape=[R_size * R_size])
-                A = tf.reshape(buf, [R_size, R_size])
-                A = A - tf.transpose(A)
-            if self._cross_orth_map == "expm":
-                R = tf.linalg.expm(A)
-            else:
-                I_R = tf.eye(R_size, dtype=A.dtype)
-                R = tf.linalg.solve(I_R - A, I_R + A)
-            return R - tf.eye(Q, dtype=R.dtype)
-
-        # block_unit and per_l modes: build W slot-by-slot from the
-        # per-slot R matrices. Both modes share this runtime; they only
-        # differ in how "slots" are defined at init time (across-l vs
-        # per-l flattened over (l, k)).
-        def _build_W(payload):
-            """payload: [n_U_cross] flat skew payload."""
-            W = tf.eye(Q, dtype=payload.dtype)
-            for k, (N_k, n_pay, off, q_idx, upper) in enumerate(zip(
-                    self._cross_slot_N,
-                    self._cross_slot_n_payload,
-                    self._cross_slot_offsets,
-                    self._cross_slot_q_indices,
-                    self._cross_slot_upper)):
-                if N_k < 2:
-                    continue
-                ii, jj = upper
-                A_pay = payload[off:off + n_pay]
-                flat_upper = ii * N_k + jj
-                buf = tf.scatter_nd(
-                    indices=tf.reshape(flat_upper, [-1, 1]),
-                    updates=A_pay,
-                    shape=[N_k * N_k])
-                A_k = tf.reshape(buf, [N_k, N_k])
-                A_k = A_k - tf.transpose(A_k)
-                if self._cross_orth_map == "expm":
-                    R_k = tf.linalg.expm(A_k)
-                else:
-                    I_k = tf.eye(N_k, dtype=A_k.dtype)
-                    R_k = tf.linalg.solve(I_k - A_k, I_k + A_k)
-                # Scatter R_k into W at positions (q_idx[i], q_idx[j]).
-                # The scatter REPLACES the corresponding identity entries.
-                ii_q, jj_q = tf.meshgrid(q_idx, q_idx, indexing="ij")
-                idx_pairs = tf.stack(
-                    [tf.reshape(ii_q, [-1]),
-                     tf.reshape(jj_q, [-1])], axis=1)            # [N_k², 2]
-                # First zero out the diagonal entries at these slot
-                # positions so the eventual W has the right block in place
-                # of the identity row(s).
-                W = tf.tensor_scatter_nd_update(
-                    W,
-                    indices=tf.stack([q_idx, q_idx], axis=1),
-                    updates=tf.zeros([N_k], dtype=W.dtype))
-                W = tf.tensor_scatter_nd_add(
-                    W, idx_pairs, tf.reshape(R_k, [-1]))
-            return W - tf.eye(Q, dtype=W.dtype)
-        if is_batched:
-            V_cross = tf.map_fn(_build_W, A_upper_flat)
-        else:
-            V_cross = _build_W(A_upper_flat)
-        return V_cross
 
     def _reconstruct_one_mixing_layer(self, U_flat: tf.Tensor,
                                         is_batched: bool,
@@ -2931,45 +2320,6 @@ class SNES:
                 tf.reduce_sum(tf.square(ann), axis=1) / ann_n)
             reg = l1 + l2
 
-        # Gating regularisation. Mirrors the per-type gating path in
-        # `_build_per_type_gradients` (the per-type slab block and the
-        # global slab block — search for `g_dev` / `g_floor_sq`) so the
-        # main-fitness reg used at evolution time (this function is
-        # called from `evaluate_population`, see `reg = self.compute_
-        # regularization_tf(samples_tf)`) includes the same penalty as
-        # the per-type-ranking gradient. Without this, enabling
-        # `descriptor_gating_enabled=True` with non-zero gating lambdas
-        # silently leaves the gates unregularised in the canonical
-        # (non per-type-ranking) SNES path.
-        if self.n_gates > 0:
-            lg1 = float(self._lambda_gate_1.numpy())
-            lg2 = float(self._lambda_gate_2.numpy())
-            lgf = float(self._lambda_gate_floor.numpy())
-            if lg1 > 0.0 or lg2 > 0.0 or lgf > 0.0:
-                PL = self._gating_num_pairs * self._gating_L
-                g_start = (self.n_anns_total + self.n_U_pair
-                           + self.n_U_bias_total + self.n_U_cross)
-                g_tail = param_vectors[:, g_start:g_start + self.n_gates]    # [P, T·PL]
-                g_init = float(self._gating_init_value)
-                g_dev = g_tail - g_init                                       # [P, T·PL]
-                # Symmetric in sign — see _build_per_type_gradients for the
-                # rationale on the squared hinge over (floor − |g|).
-                g_floor_slack = tf.nn.relu(
-                    self._gating_floor - tf.abs(g_tail))                      # [P, T·PL]
-                g_floor_sq = tf.square(g_floor_slack)
-                # Per-type slab routes — match _build_per_type_gradients's
-                # `n_per_t = PL` and average over T to match its per-type
-                # accumulation pattern.
-                if lg1 > 0.0:
-                    reg = reg + self._lambda_gate_1 * tf.reduce_sum(
-                        tf.abs(g_dev), axis=1) / (self.n_gates)
-                if lg2 > 0.0:
-                    reg = reg + self._lambda_gate_2 * tf.sqrt(
-                        tf.reduce_sum(tf.square(g_dev), axis=1) / self.n_gates)
-                if lgf > 0.0:
-                    reg = reg + self._lambda_gate_floor * tf.reduce_sum(
-                        g_floor_sq, axis=1) / self.n_gates
-
         return reg
 
     def _extract_type_params_batched(self, param_vectors: tf.Tensor, t: int) -> tf.Tensor:
@@ -2980,8 +2330,6 @@ class SNES:
         T = self.cfg.num_types
         Q = self.dim_q
         H = self.H
-        H2 = self.H2
-        H_final = self.H_final
 
         w0_start = t * Q * H
         w0_end = w0_start + Q * H
@@ -2990,31 +2338,15 @@ class SNES:
         b0_start = b0_offset + t * H
         b0_end = b0_start + H
 
-        parts = [
+        w1_offset = b0_offset + T * H
+        w1_start = w1_offset + t * H
+        w1_end = w1_start + H
+
+        return tf.concat([
             param_vectors[:, w0_start:w0_end],
             param_vectors[:, b0_start:b0_end],
-        ]
-
-        if H2 is not None:
-            w0_2_offset = b0_offset + T * H
-            w0_2_start = w0_2_offset + t * H * H2
-            w0_2_end = w0_2_start + H * H2
-            b0_2_offset = w0_2_offset + T * H * H2
-            b0_2_start = b0_2_offset + t * H2
-            b0_2_end = b0_2_start + H2
-            parts.extend([
-                param_vectors[:, w0_2_start:w0_2_end],
-                param_vectors[:, b0_2_start:b0_2_end],
-            ])
-            w1_offset = b0_2_offset + T * H2
-        else:
-            w1_offset = b0_offset + T * H
-
-        w1_start = w1_offset + t * H_final
-        w1_end = w1_start + H_final
-        parts.append(param_vectors[:, w1_start:w1_end])
-
-        return tf.concat(parts, axis=1)
+            param_vectors[:, w1_start:w1_end],
+        ], axis=1)
 
     def evaluate_population(self, samples_tf: tf.Tensor, batch_data: dict[str, tf.Tensor],
                             return_per_type: bool = False) -> tf.Tensor:
@@ -3296,26 +2628,19 @@ class SNES:
             inv_num_atoms = inv_num_atoms[:, tf.newaxis]  # [B, 1]
 
         # Reconstruct weights for all candidates in chunk. Tail may
-        # include a U_pair tensor (or list) when cfg.descriptor_mixing=True.
+        # include a U_pair tensor when cfg.descriptor_mixing=True.
         params = self.reconstruct_params_tf(chunk_samples)
         named = self._split_reconstructed(params)
         W0 = named.get("W0"); b0 = named.get("b0")
         W1 = named.get("W1"); b1 = named.get("b1")
-        W0_2_cand, b0_2_cand = named.get("W0_2"), named.get("b0_2")
         W0p = named.get("W0_pol")
         b0p = named.get("b0_pol")
         W1p = named.get("W1_pol")
         b1p = named.get("b1_pol")
-        W0_2_pol_cand = named.get("W0_2_pol")
-        b0_2_pol_cand = named.get("b0_2_pol")
-        # U_pair_cand: the multi-layer list (or None when no mixing).
-        U_pair_cand = named["U_pair_list"]
-        # V_cross_cand: per-candidate cross-channel V (or None if disabled).
-        V_cross_cand = named.get("V_cross")
-        # gates_cand: per-(candidate, type, pair·L+l) gates (or None if disabled).
-        gates_cand = named.get("gates")
-        # W_pre_angular_cand: per-(candidate, type, q_raw) preprocess
-        # coefficients (or None when descriptor_preprocess_contract='off').
+        # U_pair_cand: the per-candidate mixing tensor (None when no mixing).
+        U_pair_cand = named.get("U_pair")
+        # W_pre_angular_cand: per-candidate preprocess coefficients (None
+        # when descriptor_preprocess_contract='off').
         W_pre_angular_cand = named.get("W_pre_angular")
 
         # Loss / weighting hyperparameters from cfg + batch context. Reading
@@ -3334,65 +2659,33 @@ class SNES:
             # Pre-absorb U_pair^T into W0 / W0_pol per candidate so the
             # vectorized_map loop body uses raw descriptors and no
             # gradient pull-back. Works because _W0_eff is linear and
-            # broadcasts over the leading candidate axis. Skipped for
-            # nonlinear mixing (cannot fold tanh).
-            if (U_pair_cand is not None
-                    and not getattr(self.model, "descriptor_mixing_nonlinear", False)):
-                W0 = self.model._W0_eff(W0, U_pair_cand,
-                                        V_cross_override=V_cross_cand,
-                                        gates_override=gates_cand)
-                W0p = self.model._W0_eff(W0p, U_pair_cand,
-                                         V_cross_override=V_cross_cand,
-                                         gates_override=gates_cand)
+            # broadcasts over the leading candidate axis.
+            if U_pair_cand is not None:
+                W0 = self.model._W0_eff(W0, U_pair_cand)
+                W0p = self.model._W0_eff(W0p, U_pair_cand)
 
             # Combined per-component weights for the training loss:
             # pol_weights × per-component inverse weights (if active).
-            # For MAE the legacy code used sqrt(pol_weights), preserved
-            # by using sqrt-weighted per_structure_error in mae path.
             fitness_comp_w = pol_weights[tf.newaxis]  # [1, 6]
             if comp_w is not None:
                 fitness_comp_w = fitness_comp_w * comp_w
-            # Squared-error reporting always uses pol_weights only
-            # (so the polarisability metric's shear emphasis is fixed
-            # but the per-component-inverse-weighting is ablated).
+            # Squared-error reporting always uses pol_weights only.
             sq_comp_w = pol_weights[tf.newaxis]
 
-            if W0_2_cand is None:
-                def _forward_one_candidate(args):
-                    w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
-                    preds = self.model.predict_batch(
-                        desc, grad_values, pair_atom, pair_gidx, pair_struct,
-                        pos, Z, boxes, amask,
-                        w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
-                    )
-                    diff = preds - targets  # [B, 6]
-                    fitness = per_structure_error(
-                        diff, loss_type, huber_delta, component_weights=fitness_comp_w)
-                    sq = squared_error_per_structure(diff, component_weights=sq_comp_w)
-                    return tf.stack([fitness, sq], axis=0)  # [2, B]
+            def _forward_one_candidate(args):
+                w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
+                preds = self.model.predict_batch(
+                    desc, grad_values, pair_atom, pair_gidx, pair_struct,
+                    pos, Z, boxes, amask,
+                    w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
+                )
+                diff = preds - targets  # [B, 6]
+                fitness = per_structure_error(
+                    diff, loss_type, huber_delta, component_weights=fitness_comp_w)
+                sq = squared_error_per_structure(diff, component_weights=sq_comp_w)
+                return tf.stack([fitness, sq], axis=0)  # [2, B]
 
-                stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
-            else:
-                def _forward_one_candidate(args):
-                    (w0, bb0, w0_2, bb0_2,
-                     w1, bb1, w0p, bb0p,
-                     w0_2_p, bb0_2_p, w1p, bb1p) = args
-                    preds = self.model.predict_batch(
-                        desc, grad_values, pair_atom, pair_gidx, pair_struct,
-                        pos, Z, boxes, amask,
-                        w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
-                        W0_2=w0_2, b0_2=bb0_2,
-                        W0_2_pol=w0_2_p, b0_2_pol=bb0_2_p,
-                    )
-                    diff = preds - targets
-                    fitness = per_structure_error(
-                        diff, loss_type, huber_delta, component_weights=fitness_comp_w)
-                    sq = squared_error_per_structure(diff, component_weights=sq_comp_w)
-                    return tf.stack([fitness, sq], axis=0)
-
-                stacked = (W0, b0, W0_2_cand, b0_2_cand,
-                           W1, b1, W0p, b0p,
-                           W0_2_pol_cand, b0_2_pol_cand, W1p, b1p)
+            stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
             both = tf.vectorized_map(_forward_one_candidate, stacked)  # [C, 2, B]
             return both[:, 0, :], both[:, 1, :]
 
@@ -3422,11 +2715,7 @@ class SNES:
             preds = self.model.predict_batch_candidates(
                 desc, W_atom, Z, amask, W0, b0, W1, b1,
                 U_pair=U_pair_cand,
-                W0_2=W0_2_cand, b0_2=b0_2_cand,
-                V_cross=V_cross_cand,
-                gates=gates_cand,
-                W_pre_angular=W_pre_angular_cand,
-                R_pair=named.get("R_pair"))  # [C, B, T_dim]
+                W_pre_angular=W_pre_angular_cand)  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]

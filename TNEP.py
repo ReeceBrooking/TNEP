@@ -107,9 +107,6 @@ class TNEP(layers.Layer):
             self.dim_q_forward = int(cfg.dim_q)
         self.num_types = cfg.num_types
         self.num_neurons = cfg.num_neurons
-        # Single-hidden-layer ANN. _H_final is the input dim of W1.
-        self.num_neurons_layer_2 = None
-        self._H2 = None
         self._H_final = cfg.num_neurons
         # Resolve the Keras activation callable. Any name supported by
         # `tf.keras.activations.get` is accepted at construction; the
@@ -137,12 +134,7 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        self.W0_2 = None
-        self.b0_2 = None
-
-        # W1 : [num_types, H_final] — hidden-to-scalar weights per type
-        # H_final == num_neurons in the legacy single-hidden case; H2 when
-        # a second hidden layer is configured.
+        # W1 : [num_types, H_final] — hidden-to-scalar weights per type.
         self.W1 = self.add_weight(
             name="W1",
             shape=(cfg.num_types, self._H_final),
@@ -186,8 +178,6 @@ class TNEP(layers.Layer):
                 initializer="zeros",
                 trainable=True,
             )
-            self.W0_2_pol = None
-            self.b0_2_pol = None
             self.W1_pol = self.add_weight(
                 name="W1_pol",
                 shape=(cfg.num_types, self._H_final),
@@ -223,12 +213,6 @@ class TNEP(layers.Layer):
             getattr(cfg, "descriptor_mixing_per_type", False))
         self.descriptor_mixing_arch = str(
             getattr(cfg, "descriptor_mixing_arch", "linear")).lower()
-        # Stacked mixing (N independent layers in series) + optional nonlinearity.
-        # N=1 + linear (the legacy defaults) is bit-identical to the original
-        # single-shared-V_pair path; in particular self.U_pair remains a single
-        # tf.Variable referenced by save/load and by _U_full.
-        self.descriptor_mixing_n_layers = 1
-        self.descriptor_mixing_nonlinear = False
         if self.descriptor_mixing_arch not in ("linear", "l_aware", "cross_pair_l"):
             raise ValueError(
                 f"descriptor_mixing_arch={self.descriptor_mixing_arch!r} not in "
@@ -305,7 +289,6 @@ class TNEP(layers.Layer):
                     initializer="zeros",
                     trainable=True,
                 )
-                self.U_pair_list = [self.U_pair]
             elif self.descriptor_mixing_arch == "l_aware":
                 # Per-(pair, l) residual blocks. Within a pair, only
                 # radial channels at the same l mix; cross-l mixing is
@@ -371,7 +354,6 @@ class TNEP(layers.Layer):
                     initializer="zeros",
                     trainable=True,
                 )
-                self.U_pair_list = [self.U_pair]
             else:  # cross_pair_l
                 # One [N_l × N_l] residual matrix per angular momentum,
                 # where N_l = Σ_p α_eff_p. Mixes radial channels at the
@@ -411,34 +393,10 @@ class TNEP(layers.Layer):
                     initializer="zeros",
                     trainable=True,
                 )
-                self.U_pair_list = [self.U_pair]
-
-            self.b_mix_list = []
         else:
             self.U_pair = None
-            self.U_pair_list = []
-            self.b_mix_list = []
             self._mix_P = []
             self._mix_block_sizes = []
-
-        # Optional cross-channel mixing layer: a single [Q × Q] V tensor
-        # stored as the residual V_cross = U_cross − I. SNES populates this
-        # each candidate via _set_model_params. Zero-initialised so
-        # U_cross = I at gen 0 (off-path bit-equivalence).
-        self.descriptor_mixing_cross_layer = False
-        self.V_cross = None
-        self._eye_Q = None
-
-        # Output-side mixing R was removed; stubs kept so downstream
-        # consumer branches still resolve False at runtime.
-        self.descriptor_mixing_output_layer = False
-        self.R_pair = None
-        self._R_H = 0
-        self._eye_H = None
-
-        self.descriptor_gating_enabled = False
-        self.gates_pair_l = None
-        self._gating_q_to_pl = None
 
         # Preprocessing contraction (phase 2 of 2): Variable allocation
         # and mutual-exclusion guards. cfg.dim_q has already been
@@ -781,79 +739,12 @@ class TNEP(layers.Layer):
             U_running = tf.matmul(I_block + V_list[k], U_running)
         return U_running - I_block
 
-    def _U_full_composed(self, U_pair: tf.Tensor | list | None = None) -> tf.Tensor:
-        """Compose the per-layer effective Q×Q mixing matrices into one.
-
-        Accepts either:
-          - None: use self.U_pair_list (the per-layer variables).
-          - a tf.Tensor of single-layer V shape: legacy single-layer path
-            (used when callers explicitly pass a candidate's V_pair).
-          - a list / tuple of tf.Tensors (one per layer): the multi-layer
-            candidate-supplied path.
-
-        For a single layer this returns _U_full(U_pair) unchanged so the
-        N=1 linear path is bit-identical to the legacy code. For N>1
-        linear layers the layers compose:
-            q_final = V_N · ... · V_1 · q
-            U_composed = V_N · ... · V_1
-        Per-type mixing keeps the per-type Q×Q product per central type.
-        """
-        if not self.descriptor_mixing:
-            raise RuntimeError("_U_full_composed called with mixing disabled")
-        if U_pair is None:
-            U_list_input = self.U_pair_list
-        elif isinstance(U_pair, (list, tuple)):
-            U_list_input = list(U_pair)
-        else:
-            # Single tensor — legacy single-layer fold path.
-            return self._U_full(U_pair)
-        if len(U_list_input) == 1:
-            return self._U_full(U_list_input[0])
-        # Build per-layer U_full, then multiply right-to-left.
-        # Each U_full has shape [..., (T?), Q, Q]; matmul composes on Q.
-        U_total = self._U_full(U_list_input[0])
-        for k in range(1, len(U_list_input)):
-            U_k = self._U_full(U_list_input[k])
-            # U_total ← U_k · U_total (apply layer 0 first, then 1, etc.).
-            U_total = tf.matmul(U_k, U_total)
-        return U_total
-
-    def _R_full(self, R_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Assemble the per-type output-side mixing R = I + V_R.
-
-        R_pair stores the residual V_R = R − I that SNES reconstructs
-        each candidate. V_R has shape [(C,) T, H, H]; the returned R has
-        the same shape. With V_R initialised at zero, R == I_H at gen 0.
-
-        Args:
-          R_pair: residual V_R (defaults to self.R_pair). May carry a
-                  leading candidate axis.
-
-        Returns:
-          R = I + V_R of shape [(C,) T, H, H].
-        """
-        V = self.R_pair if R_pair is None else R_pair
-        # Precomputed identity (see __init__). Always-cached at the
-        # right dtype since R_pair is allocated as fp32; cast if a
-        # caller passes a different-dtype override.
-        I = (self._eye_H if (self._eye_H is not None and V.dtype == self._eye_H.dtype)
-             else tf.eye(self._R_H, dtype=V.dtype))
-        return I + V
-
     def _W0_eff(self, W0: tf.Tensor,
-                U_pair: tf.Tensor | list | None = None,
-                V_cross_override: tf.Tensor | None = None,
-                gates_override: tf.Tensor | None = None) -> tf.Tensor:
-        """Pre-multiply W0 by U_full^T along the Q axis. Equivalent
-        to mixing the descriptor (desc' = U_full · desc) but absorbs
-        the mixing into the weights so the rest of the forward / the
-        backprop / the dipole sum use raw descriptors and raw
-        grad_values unchanged.
-
-        For N>1 stacked LINEAR layers the layers compose into a single
-        Q×Q matrix, which is then folded as usual. NONLINEAR mixing
-        cannot be folded — callers using that path must mix descriptors
-        explicitly via `_mix_descriptors`.
+                U_pair: tf.Tensor | None = None) -> tf.Tensor:
+        """Pre-multiply W0 by U_full^T along the Q axis. Equivalent to
+        mixing the descriptor (desc' = U_full · desc) but absorbs the
+        mixing into the weights so the rest of the forward / backprop /
+        dipole sum use raw descriptors and raw grad_values unchanged.
 
         Shapes (shared U_pair):
             U_pair [num_pairs, bs, bs]       + W0 [T, Q, H]
@@ -869,86 +760,12 @@ class TNEP(layers.Layer):
         With the residual V parameterisation (V init = 0 ⇒ U_full = I),
         W0_eff == W0 exactly at generation 0.
         """
-        # Resolve effective per-(type, channel) gates, if gating is enabled.
-        # Shape will be [..., T, Q] after the gather; broadcasts over H.
-        gates_q = None
-        if self.descriptor_gating_enabled:
-            gates_src = (gates_override
-                         if gates_override is not None
-                         else self.gates_pair_l)
-            if gates_src is not None and self._gating_q_to_pl is not None:
-                gates_q = tf.gather(gates_src, self._gating_q_to_pl, axis=-1)
-
         if not self.descriptor_mixing:
-            # No mixing — if gating is on, fold gate into W0; else passthrough.
-            if gates_q is not None:
-                return W0 * gates_q[..., :, :, tf.newaxis]
             return W0
-        if self.descriptor_mixing_nonlinear:
-            raise NotImplementedError(
-                "Nonlinear descriptor mixing has no forward path: "
-                "`descriptor_mixing_nonlinear=True` allocates a `b_mix_list` "
-                "and packs N stacked layers into the SNES parameter vector, "
-                "but no consumer applies tanh(U·q + b) in predict / "
-                "predict_batch / predict_batch_candidates. Enabling this "
-                "flag inflates `dim` with dead-gradient entries that hurt "
-                "SNES capacity without contributing to the loss. Implement "
-                "an explicit nonlinear mixing layer in the forward pass "
-                "before flipping this flag.")
-        # Resolve the per-layer V tensors. For N>1 stacked LINEAR layers
-        # we compose in the small sub-block space (see `_compose_V_blocks`)
-        # so the expensive `_U_full` Q×Q assembly runs ONCE — not N times —
-        # and the Q×Q@Q×Q composition matmul disappears entirely. At Q=165
-        # this is the difference between ~825M and ~1.85B FLOPs per gen.
-        if U_pair is None:
-            U_list = self.U_pair_list
-        elif isinstance(U_pair, (list, tuple)):
-            U_list = list(U_pair)
-        else:
-            U_list = [U_pair]
-        V_eff = U_list[0] if len(U_list) == 1 else self._compose_V_blocks(U_list)
-        U_full = self._U_full(V_eff)
-        # Optional cross-channel layer: apply U_cross AFTER U_existing.
-        # Mathematically: q' = U_cross · U_existing · q
-        # In terms of the W0_eff fold: W0_eff = (U_cross · U_existing)^T · W0
-        # which we compute as U_combined = U_cross @ U_full and reuse the
-        # existing einsum. Q×Q@Q×Q matmul is ~5 MFLOPs at Q=165 — small.
-        if (self.descriptor_mixing_cross_layer
-                and self.V_cross is not None
-                and V_cross_override is None):
-            U_cross = self._eye_Q + self.V_cross
-            if U_full.shape.rank == 3 and self.descriptor_mixing_per_type:
-                # Per-type: U_full has shape [..., T, Q, Q]; broadcast cross.
-                U_full = tf.einsum("qp,...tpr->...tqr", U_cross, U_full)
-            else:
-                U_full = tf.matmul(U_cross, U_full)
-        elif V_cross_override is not None:
-            # Override path (candidate eval): _eye_Q may be None if
-            # cross_layer is configured off — fall back to tf.eye on
-            # demand (cold path, rarely taken).
-            _eye = (self._eye_Q if self._eye_Q is not None
-                    else tf.eye(self.cfg.dim_q, dtype=V_cross_override.dtype))
-            U_cross = _eye + V_cross_override
-            U_full = tf.matmul(U_cross, U_full)
+        U_full = self._U_full(U_pair)
         if self.descriptor_mixing_per_type:
-            W0_eff = tf.einsum('...tqp,...tqh->...tph', U_full, W0)
-        else:
-            W0_eff = tf.einsum('...qp,...tqh->...tph', U_full, W0)
-        # Apply per-(type, q) gating to the post-mixing W0.
-        # Order does not matter here: U is block-diagonal in the (pair, l)
-        # basis and the gate g_{t, (pair, l)} is constant within each
-        # bs×bs block, so the gate is a scalar times the identity inside
-        # every block. Scalar × identity commutes with the block rotation
-        # (U_block · (g·I) = g · U_block = (g·I) · U_block), hence
-        #     U · diag(g_t) = diag(g_t) · U
-        # and `gate then rotate` = `rotate then gate` produce identical q'.
-        # Folded into W0_eff:
-        #     W0_eff = diag(g_t) · Uᵀ · W0 = Uᵀ · diag(g_t) · W0.
-        # We multiply by gates_q AFTER the Uᵀ·W0 einsum because it cheaply
-        # broadcasts along H; the math is invariant to the order.
-        if gates_q is not None:
-            W0_eff = W0_eff * gates_q[..., :, :, tf.newaxis]
-        return W0_eff
+            return tf.einsum('...tqp,...tqh->...tph', U_full, W0)
+        return tf.einsum('...qp,...tqh->...tph', U_full, W0)
 
     def _W0_preprocess_eff(self, W0: tf.Tensor,
                             W_pre_override: tf.Tensor | None = None) -> tf.Tensor:
@@ -1092,11 +909,6 @@ class TNEP(layers.Layer):
             target_mode 1: [3]  dipole vector
             target_mode 2: [6]  polarizability tensor
         """
-        if self.descriptor_mixing_output_layer:
-            raise NotImplementedError(
-                "predict() (single-structure inference path) does not yet "
-                "support descriptor_mixing_output_layer. Use predict_batch() / "
-                "score() instead, or disable output-side mixing for this call.")
         # Absorb U_pair^T into W0 (and W0_pol below) once per call so
         # both the forward and calc_forces use the U-folded weights.
         # When descriptor_mixing is disabled, _W0_eff is a no-op.
@@ -1382,10 +1194,6 @@ class TNEP(layers.Layer):
                 getattr(self, 'b0_pol', None),
                 getattr(self, 'W1_pol', None),
                 getattr(self, 'b1_pol', None),
-                W0_2=getattr(self, "W0_2", None),
-                b0_2=getattr(self, "b0_2", None),
-                W0_2_pol=getattr(self, "W0_2_pol", None),
-                b0_2_pol=getattr(self, "b0_2_pol", None),
             ))
             del chunk
         raw_preds = tf.concat(pred_parts, axis=0)
@@ -1767,10 +1575,7 @@ class TNEP(layers.Layer):
                       W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor, b1: tf.Tensor,
                       W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
                       W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
-                      W_atom: tf.Tensor | None = None,
-                      W0_2: tf.Tensor | None = None, b0_2: tf.Tensor | None = None,
-                      W0_2_pol: tf.Tensor | None = None,
-                      b0_2_pol: tf.Tensor | None = None) -> tf.Tensor:
+                      W_atom: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
         Weights are passed explicitly (not read from self) so this method can
@@ -1822,37 +1627,8 @@ class TNEP(layers.Layer):
         h1 = self.activation(z1)
         h1 = h1 * atom_mask[:, :, tf.newaxis]
 
-        # Output-side mixing: h1_R = h1 · R^T (per-type rotation). Init at
-        # zero → R = I → off-path equivalence. h1 (pre-rotation) preserved
-        # for the backward chain's activation_grad.
-        if self.descriptor_mixing_output_layer:
-            R_eff = self._R_full()   # uses self.R_pair, shape [T, H, H]
-            h1_R_terms = []
-            for t in range(self.num_types):
-                R_t = R_eff[t, :, :]                            # [H, H]
-                h1_R_t = tf.einsum('bah,Kh->baK', h1, R_t)      # [B, A, H]
-                h1_R_terms.append(h1_R_t * type_masks[t])
-            h1_R = tf.add_n(h1_R_terms)
-        else:
-            R_eff = None
-            h1_R = h1
-
-        # Optional second hidden layer: a2 = h1_R @ W0_2 + b0_2; h2 = f(a2).
-        # Falls back to h2 = h1_R when W0_2 is None (legacy single-hidden path).
-        z2 = None
-        if W0_2 is not None and b0_2 is not None:
-            b0_2_t = tf.gather(b0_2, Z)   # [B, A, H2]
-            z2 = tf.add_n([
-                tf.einsum('bah,hk->bak', h1_R, W0_2[t]) * type_masks[t]
-                for t in range(self.num_types)
-            ]) + b0_2_t
-            h2 = self.activation(z2)
-            h2 = h2 * atom_mask[:, :, tf.newaxis]
-        else:
-            h2 = h1_R
-
         if self.cfg.target_mode == 0:
-            E = tf.reduce_sum(h2 * W1_t, axis=2) + b1  # [B, A]
+            E = tf.reduce_sum(h1 * W1_t, axis=2) + b1  # [B, A]
             E = E * atom_mask
             # H-center skip (see comment in predict): exclude H atoms.
             if bool(getattr(self.cfg, "skip_h_centers", False)):
@@ -1860,44 +1636,9 @@ class TNEP(layers.Layer):
             E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
             return -E
 
-        # de_dq: energy derivative w.r.t. *raw* descriptor (because we
-        # absorbed U into W0). No pull-back needed — dipole/pol path
-        # below uses raw grad_values directly.
-        # Chain rule (two hidden layers):
-        #   de/dh2 = W1
-        #   de/da2 = f'(z2) * de/dh2
-        #   de/dh1_R = de/da2 @ W0_2^T
-        #   de/dh1 = de/dh1_R @ R                  ← R-rotation backward
-        #   de/da1 = f'(z1) * de/dh1
-        #   de/dq  = de/da1 @ W0^T
-        if W0_2 is not None and b0_2 is not None:
-            de_da2 = self._activation_grad(h2, z2) * W1_t                     # [B, A, H2]
-            de_dh1_R = tf.add_n([
-                tf.einsum('bak,hk->bah', de_da2, W0_2[t]) * type_masks[t]
-                for t in range(self.num_types)
-            ])
-            if self.descriptor_mixing_output_layer:
-                de_dh1_terms = []
-                for t in range(self.num_types):
-                    R_t = R_eff[t, :, :]
-                    de_dh1_t = tf.einsum('baK,Kh->bah', de_dh1_R, R_t)
-                    de_dh1_terms.append(de_dh1_t * type_masks[t])
-                de_dh1 = tf.add_n(de_dh1_terms)
-            else:
-                de_dh1 = de_dh1_R
-            de_da = self._activation_grad(h1, z1) * de_dh1                    # [B, A, H]
-        else:
-            # Single-hidden: U = h1_R · W1 + b1, so ∂U/∂h1 = W1 · R.
-            if self.descriptor_mixing_output_layer:
-                W1_eff_terms = []
-                for t in range(self.num_types):
-                    R_t = R_eff[t, :, :]
-                    W1_eff_t = tf.einsum('baK,Kh->bah', W1_t, R_t)
-                    W1_eff_terms.append(W1_eff_t * type_masks[t])
-                W1_eff = tf.add_n(W1_eff_terms)
-            else:
-                W1_eff = W1_t
-            de_da = self._activation_grad(h1, z1) * W1_eff
+        # Single-hidden backward chain (∂U/∂q):
+        #   ∂U/∂h1 = W1, ∂U/∂a1 = activation'(h1, z1)·W1, ∂U/∂q = ∂U/∂a1·W0^T
+        de_da = self._activation_grad(h1, z1) * W1_t
         de_dq = tf.add_n([
             tf.einsum('bah,qh->baq', de_da, W0_use[t]) * type_masks[t]
             for t in range(self.num_types)
@@ -1927,8 +1668,7 @@ class TNEP(layers.Layer):
             return self._polarizability_coo(
                 descriptors, forces_per_pair, pair_struct, pair_atom, pair_gidx,
                 positions, boxes, box_inv, Z, atom_mask,
-                W0_pol_use, b0_pol, W1_pol, b1_pol, B,
-                W0_2_pol=W0_2_pol, b0_2_pol=b0_2_pol)
+                W0_pol_use, b0_pol, W1_pol, b1_pol, B)
 
         else:
             tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
@@ -1941,13 +1681,8 @@ class TNEP(layers.Layer):
                                   atom_mask: tf.Tensor,
                                   W0: tf.Tensor, b0: tf.Tensor,
                                   W1: tf.Tensor, b1: tf.Tensor,
-                                  U_pair: tf.Tensor | list | None = None,
-                                  W0_2: tf.Tensor | None = None,
-                                  b0_2: tf.Tensor | None = None,
-                                  V_cross: tf.Tensor | None = None,
-                                  gates: tf.Tensor | None = None,
-                                  W_pre_angular: tf.Tensor | None = None,
-                                  R_pair: tf.Tensor | None = None) -> tf.Tensor:
+                                  U_pair: tf.Tensor | None = None,
+                                  W_pre_angular: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
         Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
@@ -1979,7 +1714,6 @@ class TNEP(layers.Layer):
         Q = self.dim_q_forward
         H = self.num_neurons
         H_final = self._H_final
-        H2 = self._H2
         T = self.num_types
 
         B = tf.shape(descriptors)[0]
@@ -1997,10 +1731,8 @@ class TNEP(layers.Layer):
         # the de_dq we produce is already in raw-desc space (ready to
         # combine with raw grad_values in the dipole sum). See _W0_eff
         # for the algebraic identity.
-        if (self.descriptor_mixing and U_pair is not None) \
-                or (self.descriptor_gating_enabled and gates is not None):
-            W0 = self._W0_eff(W0, U_pair, V_cross_override=V_cross,
-                              gates_override=gates)
+        if self.descriptor_mixing and U_pair is not None:
+            W0 = self._W0_eff(W0, U_pair)
 
         # Preprocessing contraction: fold the per-type per-channel
         # coefficients into W0 along the Q_new axis, producing a W0_eff
@@ -2030,94 +1762,22 @@ class TNEP(layers.Layer):
         b0_t_all = tf.reshape(tf.gather(b0, Z_flat, axis=1), [C, B, A, H])
         W1_t_all = tf.reshape(tf.gather(W1, Z_flat, axis=1), [C, B, A, H_final])
 
-        # ── Activation (first hidden layer) ───────────────────────────────────
+        # ── Activation (single hidden layer) ──────────────────────────────────
         # z1 = pre_h + b0  is the pre-activation; preserve it for the
         # swish-side backward chain rule below.
         z1 = pre_h + b0_t_all
         h1 = self.activation(z1)
         h1 = h1 * atom_mask[tf.newaxis, :, :, tf.newaxis]
 
-        # ── Output-side mixing: h1' = h1 · R^T (per-type rotation) ─────────────
-        # R = I + V_R where V_R is the per-type residual stored in R_pair.
-        # Init at zero → R = I → bit-identical to the off-path. h1 (pre-
-        # rotation) is preserved so the backward chain's activation_grad
-        # still receives the right (h1, z1) pair.
-        if self.descriptor_mixing_output_layer:
-            R_eff = self._R_full(R_pair)  # [C, T, H, H]
-            h1_R_terms = []
-            for t in range(T):
-                R_t = R_eff[:, t, :, :]
-                h1_R_t = tf.einsum('cbah,cKh->cbaK', h1, R_t)
-                h1_R_terms.append(h1_R_t * type_masks[t][tf.newaxis])
-            h1_R = tf.add_n(h1_R_terms)
-        else:
-            R_eff = None
-            h1_R = h1
-
-        # ── Optional second hidden layer ───────────────────────────────────────
-        z2 = None
-        if W0_2 is not None and b0_2 is not None:
-            # h1_R: [C, B, A, H]; W0_2: [C, T, H, H2]. The layer-1 [Q,C*H]
-            # GEMM-flatten trick doesn't transfer here — the per-type mass is
-            # already on the C axis of h1_R, so a per-type einsum + mask sum is
-            # the natural fused form (and ditto for the backward chain).
-            pre_h2_terms = []
-            for t in range(T):
-                W0_2_t = W0_2[:, t, :, :]                                         # [C, H, H2]
-                ph2 = tf.einsum('cbah,chk->cbak', h1_R, W0_2_t)                  # [C,B,A,H2]
-                pre_h2_terms.append(ph2 * type_masks[t][tf.newaxis])
-            pre_h2 = tf.add_n(pre_h2_terms)
-            b0_2_t_all = tf.reshape(tf.gather(b0_2, Z_flat, axis=1),
-                                    [C, B, A, H2])
-            z2 = pre_h2 + b0_2_t_all
-            h2 = self.activation(z2)
-            h2 = h2 * atom_mask[tf.newaxis, :, :, tf.newaxis]
-        else:
-            h2 = h1_R
-
         # ── PES ───────────────────────────────────────────────────────────────
         if self.cfg.target_mode == 0:
-            E = tf.reduce_sum(h2 * W1_t_all, axis=3) + b1[:, tf.newaxis, tf.newaxis]
+            E = tf.reduce_sum(h1 * W1_t_all, axis=3) + b1[:, tf.newaxis, tf.newaxis]
             E = E * atom_mask[tf.newaxis]
             return -tf.reduce_sum(E, axis=2, keepdims=True)  # [C, B, 1]
 
         # ── Dipole: backward matmul ───────────────────────────────────────────
-        # Chain rule through both hidden layers when H2 is set.
-        if W0_2 is not None and b0_2 is not None:
-            de_da2 = self._activation_grad(h2, z2) * W1_t_all                     # [C,B,A,H2]
-            # de_dh1_R = ∂U / ∂h1_R via the W0_2 chain.
-            de_dh1R_terms = []
-            for t in range(T):
-                W0_2_t = W0_2[:, t, :, :]                                         # [C, H, H2]
-                dh1R = tf.einsum('cbak,chk->cbah', de_da2, W0_2_t)               # [C,B,A,H]
-                de_dh1R_terms.append(dh1R * type_masks[t][tf.newaxis])
-            de_dh1_R = tf.add_n(de_dh1R_terms)                                    # [C,B,A,H]
-            # Apply R rotation in the backward direction:
-            #   de_dh1[h] = Σ_K de_dh1_R[K] · R[K, h]
-            if self.descriptor_mixing_output_layer:
-                de_dh1_terms = []
-                for t in range(T):
-                    R_t = R_eff[:, t, :, :]
-                    de_dh1_t = tf.einsum('cbaK,cKh->cbah', de_dh1_R, R_t)
-                    de_dh1_terms.append(de_dh1_t * type_masks[t][tf.newaxis])
-                de_dh1 = tf.add_n(de_dh1_terms)
-            else:
-                de_dh1 = de_dh1_R
-            de_da = self._activation_grad(h1, z1) * de_dh1                        # [C,B,A,H]
-        else:
-            # Single-hidden path: U = h1_R · W1 + b1; ∂U/∂h1_R = W1, so
-            # ∂U/∂h1 = W1 · R (per-type). Fuse with W1 by computing
-            # an effective W1_eff per atom.
-            if self.descriptor_mixing_output_layer:
-                W1_eff_terms = []
-                for t in range(T):
-                    R_t = R_eff[:, t, :, :]
-                    W1_eff_t = tf.einsum('cbaK,cKh->cbah', W1_t_all, R_t)
-                    W1_eff_terms.append(W1_eff_t * type_masks[t][tf.newaxis])
-                W1_eff = tf.add_n(W1_eff_terms)
-            else:
-                W1_eff = W1_t_all
-            de_da    = self._activation_grad(h1, z1) * W1_eff   # [C, B, A, H]
+        # U = h1 · W1 + b1 ⇒ ∂U/∂h1 = W1, ∂U/∂a1 = activation'(h1, z1)·W1.
+        de_da    = self._activation_grad(h1, z1) * W1_t_all   # [C, B, A, H]
         de_da_flat = tf.reshape(de_da, [C, B * A, H])         # [C, B*A, H]
 
         # Per type: [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]  (batched GEMM over C)
@@ -2366,9 +2026,7 @@ class TNEP(layers.Layer):
                             Z: tf.Tensor, atom_mask: tf.Tensor,
                             W0_pol: tf.Tensor, b0_pol: tf.Tensor,
                             W1_pol: tf.Tensor, b1_pol: tf.Tensor,
-                            B: tf.Tensor,
-                            W0_2_pol: tf.Tensor | None = None,
-                            b0_2_pol: tf.Tensor | None = None) -> tf.Tensor:
+                            B: tf.Tensor) -> tf.Tensor:
         """Batched polarizability via dual ANN using COO forces.
 
         Args:
@@ -2403,16 +2061,6 @@ class TNEP(layers.Layer):
         ]) + b0p_t
         h_pol = self.activation(h_pol)
         h_pol = h_pol * atom_mask[:, :, tf.newaxis]
-        # Optional second hidden layer for the polarizability scalar ANN.
-        if W0_2_pol is not None and b0_2_pol is not None:
-            b0_2p_t = tf.gather(b0_2_pol, Z)
-            h_pol2 = tf.add_n([
-                tf.einsum('bah,hk->bak', h_pol, W0_2_pol[t]) * type_masks_p[t]
-                for t in range(self.num_types)
-            ]) + b0_2p_t
-            h_pol2 = self.activation(h_pol2)
-            h_pol2 = h_pol2 * atom_mask[:, :, tf.newaxis]
-            h_pol = h_pol2
         F_pol = tf.reduce_sum(h_pol * W1p_t, axis=2) + b1_pol  # [B, A]
         F_pol = F_pol * atom_mask
         # H-center skip: zero F_pol for H atoms (descriptor is zero,
