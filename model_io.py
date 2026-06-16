@@ -326,6 +326,16 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             wg.attrs["mixing_arch"] = getattr(
                 model, "descriptor_mixing_arch", "linear")
 
+        # Optional preprocess contraction tail. Stored only when the
+        # model was trained with cfg.descriptor_preprocess_contract != "off".
+        # Loaders fall back to None (W_pre kept at init values) when absent.
+        if (getattr(model, "descriptor_preprocess_contract", "off") != "off"
+                and getattr(model, "W_pre_angular", None) is not None):
+            wg.create_dataset(
+                "W_pre_angular", data=model.W_pre_angular.numpy())
+            wg.attrs["preprocess_contract"] = str(
+                model.descriptor_preprocess_contract)
+
         # Per-channel descriptor scaler (cfg.descriptor_scaling="q_scaler").
         # Persisted alongside W0 etc. so inference scripts can replay
         # the same scaling at descriptor-build time without recomputing.
@@ -591,7 +601,7 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
-                  U_pair=None) -> None:
+                  U_pair=None, W_pre_angular=None) -> None:
     model.W0.assign(W0)
     model.b0.assign(b0)
     model.W1.assign(W1)
@@ -623,6 +633,18 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                 f"the new arch, or rebuild the cfg to match the "
                 f"saved model's arch.")
         model.U_pair.assign(U_pair)
+    # Optional preprocess W_pre_angular restore. Pre-preprocess
+    # checkpoints don't have this dataset → keep the init-time values.
+    if (W_pre_angular is not None
+            and getattr(model, "descriptor_preprocess_contract", "off") != "off"
+            and getattr(model, "W_pre_angular", None) is not None):
+        if tuple(W_pre_angular.shape) != tuple(model.W_pre_angular.shape):
+            raise ValueError(
+                f"saved W_pre_angular shape {tuple(W_pre_angular.shape)} != "
+                f"model.W_pre_angular shape {tuple(model.W_pre_angular.shape)}. "
+                f"descriptor_preprocess_contract mode or alpha_max likely "
+                f"changed between save and load.")
+        model.W_pre_angular.assign(W_pre_angular)
 
 
 def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
@@ -658,6 +680,8 @@ def _load_model_h5(path: str) -> TNEP:
             "W1_pol": wg["W1_pol"][:] if "W1_pol" in wg else None,
             "b1_pol": wg["b1_pol"][:] if "b1_pol" in wg else None,
             "U_pair": wg["U_pair"][:] if "U_pair" in wg else None,
+            "W_pre_angular": (wg["W_pre_angular"][:]
+                              if "W_pre_angular" in wg else None),
         }
         # mixing_arch attribute is the authoritative record of which
         # arch produced the U_pair tensor. Used below to validate
@@ -809,6 +833,7 @@ def _load_model_npz(path: str) -> TNEP:
         data.get("W0_pol"), data.get("b0_pol"),
         data.get("W1_pol"), data.get("b1_pol"),
         U_pair=(data["U_pair"] if has_U_pair else None),
+        W_pre_angular=data.get("W_pre_angular"),
     )
 
     _print_load_summary(path, cfg)

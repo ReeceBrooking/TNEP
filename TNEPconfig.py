@@ -378,7 +378,7 @@ class TNEPconfig:
     # angular / both modes) descriptor_per_l_ann_heads. l_aware
     # mixing composes with all preprocess modes; other mixing archs
     # raise NotImplementedError when preprocess is on.
-    descriptor_preprocess_contract: str = "off"
+    descriptor_preprocess_contract: str = "angular"
     # NEP4 learned-basis fold output radial-channel count. Only consulted
     # when descriptor_preprocess_contract == "nep4_radial". When None
     # (default), the layout auto-picks n_max_out = Q_raw / L so that
