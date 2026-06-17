@@ -32,7 +32,7 @@ class TNEPconfig:
     test_data_path: str | None = "datasets/test.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
-    allowed_species: list[int | str] | None = [6, 1, 8]
+    allowed_species: list[int | str] | None = None #[6, 1, 8]
     # Species filter mode: "subset" = keep structures with only allowed species,
     # "exact" = keep structures containing exactly all allowed species
     filter_mode: str = "subset"
@@ -377,7 +377,7 @@ class TNEPconfig:
     # l_aware mixing composes with all preprocess modes; other mixing
     # archs (linear, cross_pair_l) raise NotImplementedError when
     # preprocess is on.
-    descriptor_preprocess_contract: str = "nep4_radial"
+    descriptor_preprocess_contract: str = "angular"
     # NEP4 learned-basis fold output radial-channel count. Only consulted
     # when descriptor_preprocess_contract == "nep4_radial". When None
     # (default), the layout auto-picks n_max_out = Q_raw / L so that
@@ -436,7 +436,7 @@ class TNEPconfig:
     #   - "l_block_pca" with l_block_hidden_dims = ()
     #   - "willatt" (always linear in u)
     #   - "willatt_l_block" with l_block_hidden_dims = ()
-    encoder_path: str | None = None
+    encoder_path: str | None = "models/autoencoder/20260618_011211_willattlblock_Ks4_Kl64/encoder.npz"
 
     # Controls how the encoder is applied during training:
     #   False (default): STATIC preprocess. After data load, encode the
@@ -586,7 +586,7 @@ class TNEPconfig:
 
     # --- core ----------------------------------------------------------
     # Number of samples made in each train generation
-    pop_size: int | None = 200
+    pop_size: int | None = 100
     # Number of training generations (number of updates to the model).
     # When `optimizer == "adam"` this is the number of Adam epochs.
     num_generations: int = 60000

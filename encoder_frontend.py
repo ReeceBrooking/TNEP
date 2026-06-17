@@ -195,13 +195,24 @@ def setup_encoder_frontend(cfg) -> None:
 
 
 def apply_encoder_to_lists(descriptors_list, gradients_list,
-                            jacobian, encoder, progress: bool = True
+                            jacobian, encoder, progress: bool = True,
+                            chunk_rows: int = 4096
                             ) -> tuple:
     """Transform a split's per-structure (descriptors, gradients) lists.
 
     Used by the data pipeline to apply the encoder once after the
     descriptor builder runs and before pad_and_stack converts the
     lists into batched tensors.
+
+    **Batched implementation** — concatenates all per-structure
+    descriptors into a single [N_total, Q_raw] array (and all per-atom
+    gradients into a single [P_total, 3, Q_raw] array), encodes them in
+    chunks of `chunk_rows` rows, then splits back into per-structure
+    lists. The previous per-structure loop launched ~N_struct kernel
+    calls for descriptors and ~N_struct·A_avg calls for gradients;
+    on a 5768-structure × 30-atom dataset that was ~170k GPU op
+    launches, which churns the allocator and stalls VS Code's IO.
+    Batched, the same workload reduces to ~80 chunked encodes total.
 
     Parameters
     ----------
@@ -210,42 +221,142 @@ def apply_encoder_to_lists(descriptors_list, gradients_list,
     gradients_list : list of (list of tf.Tensor / np.ndarray)
         Per-structure, per-atom gradients. Each inner element has
         shape [M, 3, Q_raw] for the standard COO layout. Empty inner
-        lists are honoured (e.g. when streaming-to-disk has stashed
-        the gradient tensor elsewhere — but see the caller-side
-        guard below; the disk-backed path is not supported here).
+        elements are passed through unchanged.
     jacobian : np.ndarray
         [Z, Q_raw] linear-encoder Jacobian.
     encoder : tf.keras.Model
         The loaded encoder. Used for the affine descriptor encode.
     progress : bool
-        Whether to log periodic progress (every 500 structures).
+        Whether to log periodic progress.
+    chunk_rows : int
+        Encoder row-chunk size. Bounds peak VRAM in the bilinear
+        scatter to ~N · G_T² · L floats per chunk. 4096 ≈ 470 MB for
+        T=6, αmax=10, L=8.
 
     Returns
     -------
     descriptors_out : list of tf.Tensor [N_i, Z]
     gradients_out :  list of (list of tf.Tensor [M, 3, Z])
     """
-    J_tf = tf.constant(jacobian, dtype=tf.float32)
     n = len(descriptors_list)
-    descriptors_out: list = []
-    gradients_out: list = []
-    for i, d_i in enumerate(descriptors_list):
-        d_tf = (tf.constant(d_i, dtype=tf.float32)
-                if isinstance(d_i, np.ndarray) else tf.cast(d_i, tf.float32))
-        d_enc = encoder.encode(d_tf)                 # [N_i, Z]
-        descriptors_out.append(d_enc)
-        gi_in = gradients_list[i] if i < len(gradients_list) else []
-        gi_out: list = []
-        for g_a in gi_in:
-            if g_a is None or (hasattr(g_a, "shape") and 0 in g_a.shape):
-                gi_out.append(g_a)
+    if n == 0:
+        return [], []
+
+    # ── Descriptors: concat → encode in chunks → split per structure ──
+    desc_arrays: list = []
+    desc_atom_counts: list = []
+    for d_i in descriptors_list:
+        if isinstance(d_i, np.ndarray):
+            d_np = d_i.astype(np.float32, copy=False)
+        else:
+            d_np = d_i.numpy().astype(np.float32, copy=False)
+        desc_arrays.append(d_np)
+        desc_atom_counts.append(int(d_np.shape[0]))
+    desc_concat = np.concatenate(desc_arrays, axis=0) if desc_arrays else \
+        np.zeros((0, jacobian.shape[1]), dtype=np.float32)
+    del desc_arrays
+    N_total = int(desc_concat.shape[0])
+    Z = int(jacobian.shape[0])
+
+    if progress:
+        print(f"  encoder front-end: encoding {N_total} atom descriptors "
+              f"in chunks of {chunk_rows} …")
+
+    # Chunked encode. The encoder's bilinear scatter is the OOM hot
+    # path; bounded chunks keep peak VRAM under ~500 MB regardless of
+    # dataset size.
+    enc_chunks: list = []
+    for start in range(0, N_total, chunk_rows):
+        end = min(start + chunk_rows, N_total)
+        z = encoder.encode(tf.constant(desc_concat[start:end])).numpy()
+        enc_chunks.append(z)
+    desc_enc_flat = (np.concatenate(enc_chunks, axis=0)
+                      if enc_chunks else
+                      np.zeros((0, Z), dtype=np.float32))
+    del enc_chunks, desc_concat
+
+    # Split per structure (numpy view splits — no copy).
+    desc_offsets = np.cumsum([0] + desc_atom_counts).astype(np.int64)
+    descriptors_out: list = [
+        tf.constant(desc_enc_flat[desc_offsets[i]:desc_offsets[i + 1]])
+        for i in range(n)]
+    del desc_enc_flat
+
+    # ── Gradients: concat ALL per-atom pair blocks → matmul-chunked ──
+    # The gradient is a Jacobian-vector product (Jacobian only, no
+    # affine offset because the constant mean's derivative vanishes).
+    # `J · gv` is a single GEMM along the Q axis — no bilinear scatter,
+    # so the per-chunk memory ceiling is much lower than for
+    # descriptors and we can use a larger chunk.
+    J_tf = tf.constant(jacobian, dtype=tf.float32)
+    grad_chunks_per_struct: list = []
+    flat_grad_arrays: list = []
+    flat_grad_atom_lens: list = []   # number of (m·3) rows contributed per atom
+    structure_atom_counts: list = []   # how many atoms per structure
+    structure_pair_offsets: list = []  # per-structure flat-row offsets
+    cur_offset = 0
+    for i in range(n):
+        gi = gradients_list[i] if i < len(gradients_list) else []
+        n_atoms_i = len(gi)
+        structure_atom_counts.append(n_atoms_i)
+        structure_pair_offsets.append(cur_offset)
+        for g_a in gi:
+            if (g_a is None
+                    or (hasattr(g_a, "shape") and 0 in tuple(g_a.shape))):
+                flat_grad_atom_lens.append(0)
                 continue
-            gv_tf = (tf.constant(g_a, dtype=tf.float32)
-                     if isinstance(g_a, np.ndarray) else tf.cast(g_a, tf.float32))
-            gi_out.append(tf.einsum('zq,mcq->mcz', J_tf, gv_tf))
+            g_np = (g_a if isinstance(g_a, np.ndarray)
+                    else g_a.numpy())
+            g_np = g_np.astype(np.float32, copy=False)
+            M, C, Q = int(g_np.shape[0]), int(g_np.shape[1]), int(g_np.shape[2])
+            # Flatten (M·C) so we can stack everything into one [P_total·3, Q]
+            # tensor and matmul it as a single GEMM.
+            flat_grad_arrays.append(g_np.reshape(M * C, Q))
+            flat_grad_atom_lens.append(M * C)
+            cur_offset += M * C
+    structure_pair_offsets.append(cur_offset)  # sentinel for last split
+
+    if flat_grad_arrays:
+        gv_concat = np.concatenate(flat_grad_arrays, axis=0)
+        del flat_grad_arrays
+        P_flat_total = int(gv_concat.shape[0])
+        if progress:
+            print(f"  encoder front-end: projecting {P_flat_total} "
+                  f"gradient rows through Jacobian …")
+        # Single chunked matmul: out = gv @ J.T  (shape [P_flat_total, Z]).
+        # Chunked along the pair axis so peak transient is bounded.
+        gv_z_chunks: list = []
+        gv_chunk_rows = max(chunk_rows * 8, 32_768)
+        for start in range(0, P_flat_total, gv_chunk_rows):
+            end = min(start + gv_chunk_rows, P_flat_total)
+            gv_z_chunks.append(
+                tf.linalg.matmul(
+                    tf.constant(gv_concat[start:end]), J_tf,
+                    transpose_b=True).numpy())
+        gv_z_flat = np.concatenate(gv_z_chunks, axis=0)
+        del gv_z_chunks, gv_concat
+    else:
+        gv_z_flat = np.zeros((0, Z), dtype=np.float32)
+
+    # Split back per-(structure, atom).
+    gradients_out: list = []
+    gv_row_cursor = 0
+    atom_cursor = 0
+    for i in range(n):
+        n_atoms_i = structure_atom_counts[i]
+        gi_out: list = []
+        for _ in range(n_atoms_i):
+            n_rows = flat_grad_atom_lens[atom_cursor]
+            atom_cursor += 1
+            if n_rows == 0:
+                gi_out.append(tf.zeros([0, 3, Z], dtype=tf.float32))
+                continue
+            sl = gv_z_flat[gv_row_cursor:gv_row_cursor + n_rows]
+            gv_row_cursor += n_rows
+            gi_out.append(
+                tf.constant(sl.reshape(n_rows // 3, 3, Z)))
         gradients_out.append(gi_out)
-        if progress and (i + 1) % 500 == 0:
-            print(f"  encoder front-end: transformed {i + 1}/{n} structures")
+
     if progress:
         print(f"  encoder front-end: transformed {n}/{n} structures.")
     return descriptors_out, gradients_out

@@ -1064,6 +1064,26 @@ def _train_model_inner(cfg: TNEPconfig,
             print(f"[encoder] iterative mode: dim_q overridden to "
                   f"{cfg.dim_q}; encoder applied per-batch by TNEP.")
 
+    # Iterative-encoder + q_scaler is shape-broken: train_data lists
+    # still hold Q_raw rows but cfg.dim_q is Z, so `_compute_q_scaler`
+    # would crash on the first row. (The static path is fine — lists
+    # were rewritten to Z above.) The encoder's own Standardizer
+    # already mean-centres and rescales the Q_raw input by its training
+    # std before projecting to Z, so an additional q_scaler is
+    # redundant in iterative mode regardless.
+    if (str(getattr(cfg, "descriptor_scaling", "none")) == "q_scaler"
+            and bool(getattr(cfg, "train_encoder", False))
+            and getattr(cfg, "_encoder", None) is not None):
+        raise NotImplementedError(
+            "descriptor_scaling='q_scaler' is incompatible with "
+            "train_encoder=True: the q_scaler is computed against the "
+            "Z-dim encoded descriptors, but iterative mode keeps the "
+            "training tensors in raw Q_raw space (they're encoded "
+            "per-batch instead). The encoder's Standardizer layer "
+            "already provides per-channel normalisation in its training "
+            "space, so q_scaler is redundant in this mode. Either set "
+            "descriptor_scaling='none' or use train_encoder=False.")
+
     # Per-channel descriptor scaling. Computed ONCE over the training-
     # set per-atom descriptors (before padding) and applied identically
     # to train/val/test/trajectory inputs so the scaler is a frozen

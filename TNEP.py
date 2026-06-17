@@ -1361,22 +1361,27 @@ class TNEP(layers.Layer):
         without changing the result. The output is a tf.concat over the
         chunked results; gradients flow back through every chunk to all
         encoder variables, so the iterative-encoder backprop is exact.
+
+        REQUIRES eager mode. If this function is called inside a traced
+        `@tf.function`, the chunk loop silently disables itself (N is
+        a symbolic tensor with no .numpy()), and the unchunked encode
+        OOMs at first batch. Raise loudly instead.
         """
         N = tf.shape(x_flat)[0]
         if chunk_rows is None or chunk_rows <= 0:
             return encoder.encode(x_flat)
-        # Static chunking via python int — `chunk_rows` is a fixed knob,
-        # not data-dependent, so a python loop is fine and keeps each
-        # encode call shape-stable for the tape.
-        chunks: list = []
-        start = 0
         # We need a python-int total to drive the loop; the typical
         # caller (`_forward_loss`) reshapes to a known-eager N.
-        N_py = int(N.numpy()) if tf.executing_eagerly() else None
-        if N_py is None:
-            # Fallback: single shot (shouldn't happen in eager TNEP fit
-            # but guards XLA paths that might add reduce_retracing).
-            return encoder.encode(x_flat)
+        if not tf.executing_eagerly():
+            raise RuntimeError(
+                "_encode_chunked must run in eager mode (Python chunk "
+                "loop needs a concrete N). If you've wrapped a caller "
+                "in `@tf.function` for graph speed, either move the "
+                "encoder application outside the function or replace "
+                "this with a `tf.while_loop` over chunks.")
+        N_py = int(N.numpy())
+        chunks: list = []
+        start = 0
         while start < N_py:
             end = min(start + int(chunk_rows), N_py)
             chunks.append(encoder.encode(x_flat[start:end]))
@@ -2070,15 +2075,45 @@ class TNEP(layers.Layer):
                     f"species set, or filter the test set.") from exc
 
         # Build descriptors using the model's training-time SOAP layout.
+        # The builder always emits at the raw SOAP dim (Q_raw); for
+        # encoder-front-end runs we then rewrite to Z below.
         print(f"  building descriptors for {len(dataset)} structures ...")
         builder = make_descriptor_builder(cfg_for_load)
+        # In encoder mode, ensure the builder sees the raw Q layout (T,
+        # alpha_max, l_max, compress_mode) — these have already been
+        # cfg-restored from the checkpoint. The builder doesn't know
+        # about the encoder; we apply it post-build.
         descs, grads, gidx = builder.build_descriptors(dataset)
 
-        # Assemble + pad. Descriptors are now [N_i, TRAIN_DIM_Q] per structure.
+        # Encoder front-end: if a pretrained encoder is configured on
+        # cfg, apply it to the raw builder output BEFORE pad_and_stack.
+        # `setup_encoder_frontend` is idempotent; static or iterative
+        # mode is irrelevant here because at score time the encoder is
+        # frozen (no training co-adaptation).
+        if getattr(cfg_for_load, "encoder_path", None) is not None:
+            from encoder_frontend import (
+                setup_encoder_frontend, apply_encoder_to_lists)
+            setup_encoder_frontend(cfg_for_load)
+            descs, grads = apply_encoder_to_lists(
+                descs, grads,
+                cfg_for_load._encoder_J, cfg_for_load._encoder,
+                progress=False)
+            # cfg_for_load.dim_q is already TRAIN_DIM_Q (= Z because we
+            # restored from the model's trained cfg) — no override
+            # needed.
+
+        # Assemble + pad. Descriptors are now [N_i, TRAIN_DIM_Q] per
+        # structure (Z when encoder is on, Q_raw otherwise). Pass through
+        # q_scaler / target_mean so the test inputs land in the same
+        # standardised space the model was trained on — without this,
+        # any descriptor_scaling="q_scaler" model silently scores in the
+        # wrong space.
         data_dict = assemble_data_dict(
             dataset, ti, descs, grads, gidx, cfg_for_load)
         test_data = pad_and_stack(
-            data_dict, num_types=TRAIN_NUM_TYPES, pin_to_cpu=pin_to_cpu)
+            data_dict, num_types=TRAIN_NUM_TYPES, pin_to_cpu=pin_to_cpu,
+            q_scaler=getattr(cfg_for_load, "_q_scaler", None),
+            target_mean=getattr(cfg_for_load, "_target_mean", None))
 
         print(f"  scoring on {test_data['descriptors'].shape[0]} structures ...")
         try:
