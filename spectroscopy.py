@@ -1095,6 +1095,20 @@ def predict_trajectory_batch(
     except ImportError:
         prefers_tf = False
 
+    # Encoder front-end is incompatible with the fused @tf.function
+    # trajectory path: the fused graph captures cfg.dim_q (= Z) into its
+    # input_signature at trace time, but the descriptor builder always
+    # emits Q_raw arrays — they need to flow through the encoder before
+    # reaching the fused graph, which would require a fresh trace with
+    # Q_raw input shapes plus an in-graph encode. Out of scope for now.
+    # Force the legacy NumPy path, which handles the encoder application
+    # inline below.
+    _has_encoder = (getattr(cfg, "_encoder", None) is not None)
+    if _has_encoder and prefers_tf:
+        print("[spectroscopy] encoder_path set → forcing legacy NumPy "
+              "trajectory path (fused TF graph not yet wired for encoder).")
+        prefers_tf = False
+
     if prefers_tf:
         # GPU descriptor builder → fused pack+predict graph (Phase 3).
         # The fused @tf.function pads descriptors, builds pair_struct, runs
@@ -1157,8 +1171,15 @@ def predict_trajectory_batch(
             batch_frames=descriptor_batch_frames,
             memory_budget_bytes=descriptor_memory_budget_bytes,
         )
+        # Encoder front-end: pack at Q_raw (the builder's native dim),
+        # encode descriptors + grad_values, then continue with predict
+        # batch which has W0 sized at Z. If encoder is absent, this
+        # collapses to the pre-encoder behaviour (cfg.dim_q is already
+        # the unencoded Q).
+        _pack_dim = (int(cfg._encoder_q_raw)
+                     if _has_encoder else int(cfg.dim_q))
         batch = _pack_traj_batch_from_flat(frame_results, batch_frames, batch_types,
-                                           cfg.dim_q, pin_to_cpu=pin_to_cpu)
+                                           _pack_dim, pin_to_cpu=pin_to_cpu)
         del frame_results
 
         # Apply per-channel scaling and mixing absorption in the same
@@ -1169,8 +1190,47 @@ def predict_trajectory_batch(
         if (str(getattr(cfg, "descriptor_scaling", "none")) != "none"
                 and getattr(cfg, "_q_scaler", None) is not None):
             s = tf.constant(cfg._q_scaler, dtype=tf.float32)
-            batch["descriptors"] = batch["descriptors"] * s[tf.newaxis, tf.newaxis, :]
-            batch["grad_values"] = batch["grad_values"] * s[tf.newaxis, tf.newaxis, :]
+            # _q_scaler shape depends on space (Z for encoder mode,
+            # Q_raw without). Both apply over the descriptor's last
+            # axis; the encoder application below converts Q_raw → Z
+            # afterward, so we apply q_scaler in the SAME space the
+            # train pipeline used. With encoder static-mode the
+            # q_scaler was computed in Z space (per the train-time
+            # ordering in MasterTNEP.py:999 → q_scaler block), so we
+            # MUST encode FIRST and then apply q_scaler. Reorder:
+            if _has_encoder:
+                # Apply encoder first (Q_raw → Z), then q_scaler in Z.
+                pass
+            else:
+                batch["descriptors"] = batch["descriptors"] * s[tf.newaxis, tf.newaxis, :]
+                batch["grad_values"] = batch["grad_values"] * s[tf.newaxis, tf.newaxis, :]
+
+        # Encoder forward: descriptors via affine encode, gradients via
+        # J·v = encode(v) − encode(0). Reshapes mirror score()'s
+        # _encode_chunk_for_inference but here on a single padded batch.
+        if _has_encoder:
+            enc = cfg._encoder
+            q_raw_enc = int(cfg._encoder_q_raw)
+            enc_chunk = int(getattr(cfg, "encoder_chunk_rows", 4096))
+            d_raw = batch["descriptors"]
+            gv_raw = batch["grad_values"]
+            S_b = int(tf.shape(d_raw)[0])
+            A_b = int(tf.shape(d_raw)[1])
+            P_b = int(tf.shape(gv_raw)[0])
+            d_flat = tf.reshape(d_raw, [S_b * A_b, q_raw_enc])
+            z_flat = model._encode_chunked(enc, d_flat, q_raw_enc, enc_chunk)
+            Z_b = int(tf.shape(z_flat)[-1])
+            batch["descriptors"] = tf.reshape(z_flat, [S_b, A_b, Z_b])
+            gv_flat = tf.reshape(gv_raw, [P_b * 3, q_raw_enc])
+            gv_z = model._encode_chunked(enc, gv_flat, q_raw_enc, enc_chunk)
+            b_off = enc.encode(tf.zeros([1, q_raw_enc], dtype=tf.float32))
+            batch["grad_values"] = tf.reshape(gv_z - b_off, [P_b, 3, Z_b])
+            # Now apply q_scaler in Z space (matching train-time order).
+            if (str(getattr(cfg, "descriptor_scaling", "none")) != "none"
+                    and getattr(cfg, "_q_scaler", None) is not None):
+                s = tf.constant(cfg._q_scaler, dtype=tf.float32)
+                batch["descriptors"] = batch["descriptors"] * s[tf.newaxis, tf.newaxis, :]
+                batch["grad_values"] = batch["grad_values"] * s[tf.newaxis, tf.newaxis, :]
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             W0_pred = model._W0_eff(model.W0)
             W0p_pred = (model._W0_eff(model.W0_pol)

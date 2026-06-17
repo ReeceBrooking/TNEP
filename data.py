@@ -640,6 +640,18 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
         test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(
             test_dataset, **_kw)
 
+    # Static encoder preprocess: apply the same Z-dim rewrite the train
+    # / val splits got in MasterTNEP.py. Iterative mode is a no-op here
+    # because TNEP applies the encoder online; the encoder bundle's
+    # presence on cfg is the static / iterative selector.
+    if (getattr(cfg, "_encoder_J", None) is not None
+            and not bool(getattr(cfg, "train_encoder", False))
+            and test_streamed is None):
+        from encoder_frontend import apply_encoder_to_lists
+        test_descriptors, test_gradients = apply_encoder_to_lists(
+            test_descriptors, test_gradients,
+            cfg._encoder_J, cfg._encoder, progress=False)
+
     test_data = assemble_data_dict(
         test_dataset, test_types_int,
         test_descriptors, test_gradients, test_grad_index, cfg)

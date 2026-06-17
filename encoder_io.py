@@ -69,6 +69,11 @@ def setup_encoder_run_directory(cfg: AutoencoderConfig) -> Path:
     elif arch == "l_block_pca":
         K = cfg.l_block_K if cfg.l_block_K is not None else f"z{int(cfg.latent_dim)}"
         run_name = f"{timestamp}_lblockpca_K{K}"
+    elif arch == "willatt_l_block":
+        Ks = cfg.willatt_K if cfg.willatt_K is not None else "auto"
+        Kl = cfg.l_block_K if cfg.l_block_K is not None else f"z{int(cfg.latent_dim)}"
+        tied = "_tied" if getattr(cfg, "tied_weights", False) else ""
+        run_name = f"{timestamp}_willattlblock_Ks{Ks}_Kl{Kl}{tied}"
     else:
         run_name = (f"{timestamp}_z{int(cfg.latent_dim)}"
                     f"_h{_hidden_signature(cfg.hidden_dims)}")
@@ -215,18 +220,35 @@ class _DecoderWrapper(tf.keras.Model):
         return self.decoder(x, training=training)
 
 
+def _is_willatt_l_block(model) -> bool:
+    """The composed Willatt + l_block AE has BOTH the species projection
+    `u` and the per-l Dense list. Detected by its K-species attribute,
+    which neither of the standalone backbones expose.
+    """
+    return (getattr(model, "u", None) is not None
+            and getattr(model, "per_l_encoders", None) is not None
+            and getattr(model, "K_species", None) is not None)
+
+
 def _is_willatt(model) -> bool:
     """The Willatt AE is identified by its `u` species-projection matrix.
 
     Using attribute presence rather than isinstance to avoid a circular
     import (encoder_io is imported by the SoapAutoencoder __main__ block).
+    Must run AFTER the willatt_l_block check, which also exposes `u`.
     """
-    return getattr(model, "u", None) is not None
+    return (getattr(model, "u", None) is not None
+            and getattr(model, "per_l_encoders", None) is None)
 
 
 def _is_l_block_pca(model) -> bool:
-    """The l-block PCA AE is identified by its per-l Dense encoder list."""
-    return getattr(model, "per_l_encoders", None) is not None
+    """The l-block PCA AE is identified by its per-l Dense encoder list.
+
+    Must run AFTER the willatt_l_block check, which also exposes
+    per_l_encoders.
+    """
+    return (getattr(model, "per_l_encoders", None) is not None
+            and getattr(model, "u", None) is None)
 
 
 def save_encoder(model, out_dir: Path) -> Path:
@@ -239,6 +261,33 @@ def save_encoder(model, out_dir: Path) -> Path:
         load time, so only the trained matrix needs to live on disk.
     """
     out_dir = Path(out_dir)
+    if _is_willatt_l_block(model):
+        path = out_dir / "encoder.npz"
+        hidden_dims = tuple(int(h) for h in
+                            getattr(model, "l_block_hidden_dims", ()))
+        save: dict = {
+            "T": int(model.T),
+            "K_species": int(model.K_species),
+            "alpha_max": int(model.alpha_max),
+            "l_max": int(model.l_max),
+            "L": int(model.L),
+            "q_raw_T": int(model.q_raw_T),
+            "q_raw_K": int(model.q_raw_K),
+            "latent_dim": int(model.latent_dim),
+            "per_l_Q_K": np.asarray(model._per_l_Q_K, dtype=np.int32),
+            "per_l_K": np.asarray(model._per_l_K, dtype=np.int32),
+            "compress_mode": str(model.compress_mode),
+            "l_block_hidden_dims": np.asarray(list(hidden_dims), dtype=np.int32),
+            "tied": bool(model.tied_weights),
+            "u": model.u.numpy().astype(np.float32),
+        }
+        for l in range(model.L):
+            branch = model.per_l_encoders[l]
+            for li, layer in enumerate(branch.layers):
+                save[f"enc_l{l}_layer{li}_W"] = layer.kernel.numpy().astype(np.float32)
+                save[f"enc_l{l}_layer{li}_b"] = layer.bias.numpy().astype(np.float32)
+        np.savez(path, **save)
+        return path
     if _is_willatt(model):
         path = out_dir / "encoder.npz"
         np.savez(
@@ -293,6 +342,34 @@ def save_decoder(model, out_dir: Path) -> Path:
         when tied so v = uᵀ).
     """
     out_dir = Path(out_dir)
+    if _is_willatt_l_block(model):
+        path = out_dir / "decoder.npz"
+        hidden_dims = tuple(int(h) for h in
+                            getattr(model, "l_block_hidden_dims", ()))
+        save: dict = {
+            "T": int(model.T),
+            "K_species": int(model.K_species),
+            "alpha_max": int(model.alpha_max),
+            "l_max": int(model.l_max),
+            "L": int(model.L),
+            "q_raw_T": int(model.q_raw_T),
+            "q_raw_K": int(model.q_raw_K),
+            "latent_dim": int(model.latent_dim),
+            "per_l_Q_K": np.asarray(model._per_l_Q_K, dtype=np.int32),
+            "per_l_K": np.asarray(model._per_l_K, dtype=np.int32),
+            "compress_mode": str(model.compress_mode),
+            "l_block_hidden_dims": np.asarray(list(hidden_dims), dtype=np.int32),
+            "tied": bool(model.tied_weights),
+        }
+        if not model.tied_weights:
+            save["v"] = model.v.numpy().astype(np.float32)
+        for l in range(model.L):
+            branch = model.per_l_decoders[l]
+            for li, layer in enumerate(branch.layers):
+                save[f"dec_l{l}_layer{li}_W"] = layer.kernel.numpy().astype(np.float32)
+                save[f"dec_l{l}_layer{li}_b"] = layer.bias.numpy().astype(np.float32)
+        np.savez(path, **save)
+        return path
     if _is_willatt(model):
         path = out_dir / "decoder.npz"
         common = dict(T=int(model.T), K=int(model.K),
@@ -543,6 +620,71 @@ def _load_full_l_block_pca(out_dir: Path, cfg: AutoencoderConfig
     return model
 
 
+def _load_full_willatt_l_block(out_dir: Path, cfg: AutoencoderConfig
+                                ) -> tf.keras.Model:
+    """Rebuild a `WillattLBlockAutoencoder` and load u, v (if untied),
+    every per-l Dense, and the standardiser.
+
+    Layout knobs come from the encoder.npz; the per-l kernels and biases
+    are populated from both npz files.
+    """
+    from SoapAutoencoder import WillattLBlockAutoencoder
+    enc_npz = np.load(out_dir / "encoder.npz", allow_pickle=False)
+    dec_npz = np.load(out_dir / "decoder.npz", allow_pickle=False)
+    T = int(enc_npz["T"])
+    K_species = int(enc_npz["K_species"])
+    alpha_max = int(enc_npz["alpha_max"])
+    l_max = int(enc_npz["l_max"])
+    L = int(enc_npz["L"])
+    q_raw_T = int(enc_npz["q_raw_T"])
+    per_l_K = enc_npz["per_l_K"].tolist()
+    compress_mode = str(enc_npz["compress_mode"])
+    tied = (bool(enc_npz["tied"]) if "tied" in enc_npz.files
+            else bool(dec_npz["tied"]))
+    if "l_block_hidden_dims" in enc_npz.files:
+        hidden_dims = tuple(int(h) for h in enc_npz["l_block_hidden_dims"])
+    else:
+        hidden_dims = ()
+    cfg.architecture = "willatt_l_block"
+    cfg.willatt_K = K_species
+    cfg.tied_weights = tied
+    cfg.alpha_max = alpha_max
+    cfg.l_max = l_max
+    cfg.compress_mode = compress_mode
+    cfg.l_block_hidden_dims = hidden_dims
+    cfg.l_block_K = None
+    cfg.latent_dim = int(sum(per_l_K))
+    model = WillattLBlockAutoencoder(
+        q_raw_T=q_raw_T, T=T, alpha_max=alpha_max,
+        l_max=l_max, cfg=cfg)
+    saved_per_l_K = [int(k) for k in per_l_K]
+    if model._per_l_K != saved_per_l_K:
+        raise ValueError(
+            f"Loaded per_l_K={saved_per_l_K} does not match the rebuilt "
+            f"model's per_l_K={model._per_l_K}. The saved config likely "
+            "used l_block_K with a different cap; explicitly set "
+            "cfg.l_block_K before calling the loader.")
+    model(tf.zeros([1, q_raw_T], dtype=tf.float32))
+    _load_standardizer_into(model.standardizer, out_dir)
+    model.u.assign(enc_npz["u"].astype(np.float32))
+    if not tied:
+        model.v.assign(dec_npz["v"].astype(np.float32))
+    for l in range(L):
+        enc_branch = model.per_l_encoders[l]
+        dec_branch = model.per_l_decoders[l]
+        for li, layer in enumerate(enc_branch.layers):
+            layer.kernel.assign(
+                enc_npz[f"enc_l{l}_layer{li}_W"].astype(np.float32))
+            layer.bias.assign(
+                enc_npz[f"enc_l{l}_layer{li}_b"].astype(np.float32))
+        for li, layer in enumerate(dec_branch.layers):
+            layer.kernel.assign(
+                dec_npz[f"dec_l{l}_layer{li}_W"].astype(np.float32))
+            layer.bias.assign(
+                dec_npz[f"dec_l{l}_layer{li}_b"].astype(np.float32))
+    return model
+
+
 def load_encoder(out_dir: Path, cfg: AutoencoderConfig | None = None
                   ) -> tf.keras.Model:
     """Rebuild a callable encoder model from disk.
@@ -563,6 +705,8 @@ def load_encoder(out_dir: Path, cfg: AutoencoderConfig | None = None
         return _load_full_willatt(out_dir, cfg)
     if arch == "l_block_pca":
         return _load_full_l_block_pca(out_dir, cfg)
+    if arch == "willatt_l_block":
+        return _load_full_willatt_l_block(out_dir, cfg)
     # MLP path — encoder-only thin wrapper, as before.
     q_raw = int(np.load(out_dir / "standardizer.npz")["mean"].shape[0])
     encoder, standardizer = _build_encoder_only(cfg, q_raw)
@@ -607,6 +751,8 @@ def load_decoder(out_dir: Path, cfg: AutoencoderConfig | None = None
         return _load_full_willatt(out_dir, cfg)
     if arch == "l_block_pca":
         return _load_full_l_block_pca(out_dir, cfg)
+    if arch == "willatt_l_block":
+        return _load_full_willatt_l_block(out_dir, cfg)
     q_raw = int(np.load(out_dir / "standardizer.npz")["mean"].shape[0])
     decoder = _build_decoder_only(cfg, q_raw)
     standardizer = Standardizer(q_raw=q_raw)
@@ -647,6 +793,8 @@ def load_full_autoencoder(out_dir: Path) -> tf.keras.Model:
         return _load_full_willatt(out_dir, cfg)
     if arch == "l_block_pca":
         return _load_full_l_block_pca(out_dir, cfg)
+    if arch == "willatt_l_block":
+        return _load_full_willatt_l_block(out_dir, cfg)
     q_raw = int(np.load(out_dir / "standardizer.npz")["mean"].shape[0])
     model = SoapAutoencoder(q_raw=q_raw, cfg=cfg)
     model(tf.zeros([1, q_raw], dtype=tf.float32))

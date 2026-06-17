@@ -16,7 +16,7 @@ class TNEPconfig:
         2. Descriptor (SOAP-turbo: geometry, backend, preprocessing)
         3. Network architecture
         4. Loss & regularisation
-        5. SNES optimiser (core, plateau-reset, validation)
+        5. Optimiser (SNES or Adam; core, plateau-reset, validation)
         6. Memory & I/O staging
         7. Output & diagnostics
         8. Runtime state (auto-populated by data load)
@@ -419,6 +419,53 @@ class TNEPconfig:
     descriptor_preprocess_lambda_1: float = 0.0005
     descriptor_preprocess_lambda_2: float = 0.0005
 
+    # --- pretrained SOAP autoencoder (encoder front-end) ----------------
+    # Optional pretrained encoder applied to the SOAP descriptor before
+    # it reaches TNEP. None = disabled (TNEP sees raw SOAP). A string
+    # is interpreted as a run directory produced by `SoapAutoencoder.py`
+    # (i.e. a path under `models/autoencoder/...`) and is loaded via
+    # `encoder_io.load_encoder` at data-prep time.
+    #
+    # When set, the encoder MUST be linear (no hidden layers in the
+    # branches) — the descriptor gradient tensor `grad_values[P, 3, Q]`
+    # is propagated through the encoder's analytic Jacobian J[Z, Q] via
+    #     grad_values_new[p, 3, z] = Σ_q J[z, q] · grad_values[p, 3, q]
+    # which is exact only when the encoder is affine. Nonlinear
+    # encoders would require batched autodiff per training step and are
+    # rejected at load time. Compatible architectures:
+    #   - "l_block_pca" with l_block_hidden_dims = ()
+    #   - "willatt" (always linear in u)
+    #   - "willatt_l_block" with l_block_hidden_dims = ()
+    encoder_path: str | None = None
+
+    # Controls how the encoder is applied during training:
+    #   False (default): STATIC preprocess. After data load, encode the
+    #       descriptors AND grad_values once for every split (train /
+    #       val / test) and discard the raw versions. TNEP then sees a
+    #       Z-dimensional descriptor and a Z-dimensional gradient
+    #       tensor. Cheapest at training time; encoder is frozen by
+    #       construction (no path to update it).
+    #   True: ITERATIVE / live. Keep the encoder in memory; encode each
+    #       batch on the fly. The encoder's parameters become exposed
+    #       to the optimiser:
+    #         · Adam path: all encoder trainable variables join TNEP's
+    #           in `self.trainable_variables`; gradients flow back
+    #           through the encoder Jacobian to update both.
+    #         · SNES path: only the Willatt species projection `u`
+    #           (small, [T × K]) joins the μ vector. The per-l Dense
+    #           layers stay frozen — SNES can't realistically explore
+    #           their hundreds of thousands of dims. With a non-Willatt
+    #           encoder under SNES + train_encoder=True, this falls
+    #           back to frozen-encoder mode and prints a warning.
+    train_encoder: bool = False
+
+    # Row-chunk size for the iterative encoder forward pass. Bounds
+    # peak VRAM for the Willatt / bilinear scatter, which materialises
+    # an O(N · G_T² · L) dense tensor inside encode(). 4096 rows ≈
+    # 470 MB for T=6, αmax=10, L=8; reduce for larger T/αmax/L or
+    # smaller GPUs. Ignored when the encoder is absent or static.
+    encoder_chunk_rows: int = 4096
+
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION
     # ═══════════════════════════════════════════════════════════════════
@@ -491,15 +538,61 @@ class TNEPconfig:
     per_type_regularization: bool = True
 
     # ═══════════════════════════════════════════════════════════════════
-    # 5. SNES OPTIMISER
+    # 5. OPTIMISER (SNES or Adam)
     # ═══════════════════════════════════════════════════════════════════
+
+    # Which optimiser drives training. Two options:
+    #   "snes" — evolutionary; ranks a population of candidate weight
+    #            vectors by per-structure loss and updates μ / σ via the
+    #            SNES log-rank gradient. Required for non-smooth losses
+    #            (dipole sign-ambiguous contraction, polarisability
+    #            shear weighting) and for the population-based search
+    #            that escapes shallow basins. Heavy on candidate eval
+    #            (P forward passes per generation), light on per-step
+    #            memory (no autodiff buffers).
+    #   "adam" — gradient descent via tf.GradientTape + Adam(W). One
+    #            forward + one backward per epoch. Best for target
+    #            modes where the loss is smooth and small models that
+    #            train quickly. Skips ALL SNES-specific knobs below
+    #            (pop_size, init_sigma, mu_init_scheme, plateau resets,
+    #            etc.) and uses the `adam_*` fields below instead.
+    #
+    # When "adam" is selected, `num_generations` is interpreted as the
+    # number of Adam epochs, `batch_size` controls the minibatch size
+    # the same way (None = full batch), `val_interval` controls how
+    # often validation runs, and `loss_type` / `huber_delta` still
+    # select the differentiable training loss.
+    optimizer: str = "snes"
+
+    # ── Adam-specific knobs (ignored when optimizer == "snes") ─────────
+    # Peak learning rate. For finetuning a near-optimal init (e.g. PCA
+    # warm-start), drop to 1e-4 or 1e-5; from-scratch typically 1e-3.
+    adam_lr: float = 1e-3
+    # Optional decoupled L2 (AdamW). 0.0 disables; positive values
+    # apply the standard AdamW decoupled-decay update to all trainable
+    # weights (including biases). Note: this is independent of the
+    # SNES-side `l1_weight` / `l2_weight` regularisers, which are NOT
+    # applied in the Adam path (they're added to the SNES ranking
+    # fitness, not to a gradient).
+    adam_weight_decay: float = 0.0
+    # Global-norm gradient clipping threshold. None disables. Useful
+    # against rare large-update epochs when the dipole / polarisability
+    # nonlinearity produces sharp loss surface kinks.
+    adam_grad_clip: float | None = 1.0
+    # Adam β1, β2, ε — defaults match tf.keras.optimizers.Adam.
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-7
 
     # --- core ----------------------------------------------------------
     # Number of samples made in each train generation
     pop_size: int | None = 200
-    # Number of training generations (number of updates to the model)
+    # Number of training generations (number of updates to the model).
+    # When `optimizer == "adam"` this is the number of Adam epochs.
     num_generations: int = 60000
-    # Number of structures used in each train step (None = full batch)
+    # Number of structures used in each train step (None = full batch).
+    # Adam uses this as the minibatch size; SNES uses it as the per-
+    # generation candidate-evaluation batch.
     batch_size: int | None = None
     # Learning rate for sigma (None = auto from canonical SNES heuristic)
     eta_sigma: float | None = None

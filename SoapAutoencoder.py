@@ -121,14 +121,23 @@ class AutoencoderConfig:
     #                    inside each l-block). Same activation /
     #                    bottleneck_activation conventions as the "mlp"
     #                    backbone.
-    architecture: str = "l_block_pca"
+    #   "willatt_l_block" — composed two-stage compression. First applies
+    #                    Willatt species projection T → K (preserving the
+    #                    SOAP tensor structure with K pseudo-species), then
+    #                    applies l_block_pca's per-l SVD on the K-species
+    #                    SOAP. With `pca_init=True` AND linear branches,
+    #                    both stages are computed analytically in one
+    #                    chained closed-form solve (HOSVD then per-l SVD)
+    #                    — no training needed. Otherwise both `u` and the
+    #                    per-l weights are gradient-trained jointly.
+    architecture: str = "willatt_l_block"
     # Latent vector dimension Z (mlp architecture only). The compressed
     # descriptor sits here.
     latent_dim: int = 256
     # Encoder hidden dims for the mlp backbone (decoder mirrors in reverse).
     # Set to () for a single-layer linear projection Q_raw → Z → Q_raw —
     # the PCA-equivalent baseline at MSE loss. Ignored for "willatt".
-    hidden_dims: tuple[int, ...] = (256, 128, 64)
+    hidden_dims: tuple[int, ...] = ()
     activation: str = "tanh"
     # Latent activation. Default linear lets the latent take any real
     # value (unbounded codes); use 'tanh' for bounded codes in [-1, 1].
@@ -141,7 +150,15 @@ class AutoencoderConfig:
     # Willatt: number of pseudo-species K. None ⇒ auto = max(1, T-1) where
     # T is inferred from cfg.allowed_species. Smaller K = stronger species-
     # axis compression; K = T is no compression (only basis rotation).
-    willatt_K: int | None = 6
+    willatt_K: int | None = 4
+    # Willatt: initialise u[T, K] from HOSVD on the per-atom power
+    # spectrum's species-mode covariance. For the (current) linear
+    # bilinear backbone this is the closed-form MSE optimum — training
+    # is skipped entirely. SOAP power spectrum's symmetry in (α, β)
+    # makes the mode-α covariance equal the mode-β covariance, so a
+    # single SVD optimally seeds both species legs. Untied weights are
+    # seeded with v = uᵀ (also the symmetric optimum).
+    willatt_pca_init: bool = True
     # l_block_pca: per-l latent dimension K. Total latent dim = K · L.
     # Mirrors willatt_K's "per-axis output dim" semantics: set K small
     # for aggressive angular-block compression, K = Q_l (~60 for the
@@ -155,7 +172,7 @@ class AutoencoderConfig:
     # without violating the cross-l block-diagonality. The same hidden
     # signature is applied independently per l. Output (latent) layer
     # uses `bottleneck_activation`; decoder output is linear.
-    l_block_hidden_dims: tuple[int, ...] = (128, 64,)
+    l_block_hidden_dims: tuple[int, ...] = ()
     # l_block_pca: initialise weights from per-l SVD of the standardised
     # training data instead of Glorot random. For LINEAR per-l branches
     # (`l_block_hidden_dims = ()`) this yields the closed-form PCA optimum
@@ -167,11 +184,22 @@ class AutoencoderConfig:
     # in O(1) epochs vs O(100) for random init on linear AEs; for shallow
     # nonlinear it cuts the warm-up phase by ~half. Ignored for the mlp
     # and willatt backbones.
-    pca_init: bool = False
+    pca_init: bool = True
+
+    # When True, override the "skip training" short-circuit that the
+    # linear PCA / HOSVD paths normally take after analytic init. The
+    # model is warm-started from the closed-form SVD / HOSVD optimum,
+    # then continues gradient training for `cfg.epochs` from that
+    # initialisation. This closes the gap between the analytic
+    # ONE-axis optimum and the joint bilinear optimum (HOSVD is exact
+    # only one mode at a time; the (u uᵀ) ⊗ (u uᵀ) projection couples
+    # both species axes). Applies to `willatt`, `l_block_pca`, and
+    # `willatt_l_block`. Ignored by the MLP backbone (no PCA path).
+    pca_init_finetune: bool = True
 
     # ── Training ───────────────────────────────────────────────────────
     batch_size: int = 6000
-    epochs: int = 6000
+    epochs: int = 50
     learning_rate: float = 1e-3
     weight_decay: float = 0.0   # AdamW decoupled L2 on all dense weights
     grad_clip: float | None = 1.0
@@ -329,17 +357,19 @@ class SoapAutoencoder(tf.keras.Model):
         dominate and the angular-high slots (variance ~ 1e-3) are
         effectively ignored.
         """
+        # Centering is unconditional. `normalize_inputs` controls only
+        # whether per-channel std rescaling happens; centering is free
+        # (the decoder adds the mean back through the standardiser's
+        # inverse path) and strictly improves any linear/bilinear
+        # downstream stage (PCA, HOSVD, MLP first-layer bias).
         mean = np.mean(soap_train, axis=0).astype(np.float32)
-        if self.center_only:
-            std = np.ones_like(mean)
-        else:
+        if self.normalize_inputs and not self.center_only:
             std = np.std(soap_train, axis=0).astype(np.float32)
             # Floor against degenerate (constant) channels — they carry no
             # information; the encoder will learn to ignore them anyway.
             std = np.maximum(std, 1e-6)
-        if not self.normalize_inputs:
-            mean = np.zeros_like(mean)
-            std = np.ones_like(std)
+        else:
+            std = np.ones_like(mean)
         self.standardizer.mean.assign(mean)
         self.standardizer.std.assign(std)
 
@@ -608,15 +638,22 @@ class WillattAutoencoder(tf.keras.Model):
     # ── Normalisation ──────────────────────────────────────────────────
 
     def fit_normalizer(self, soap_train: np.ndarray) -> None:
+        # Always centre per channel — even when `normalize_inputs=False`.
+        # Centering is essentially free (the decoder adds the mean back
+        # through the standardiser's inverse path) and strictly improves
+        # the bilinear projection: an un-centered HOSVD wastes one
+        # species direction on the DC offset (the mean is a rank-1
+        # component of XᵀX) so only K−1 directions remain for actual
+        # species-to-species variation. With centering all K directions
+        # carry variation around the mean — directly comparable to R².
+        # `normalize_inputs` now controls only the per-channel std
+        # rescaling; centering is unconditional.
         mean = np.mean(soap_train, axis=0).astype(np.float32)
-        if self.center_only:
-            std = np.ones_like(mean)
-        else:
+        if self.normalize_inputs and not self.center_only:
             std = np.std(soap_train, axis=0).astype(np.float32)
             std = np.maximum(std, 1e-6)
-        if not self.normalize_inputs:
-            mean = np.zeros_like(mean)
-            std = np.ones_like(std)
+        else:
+            std = np.ones_like(mean)
         self.standardizer.mean.assign(mean)
         self.standardizer.std.assign(std)
 
@@ -641,6 +678,91 @@ class WillattAutoencoder(tf.keras.Model):
 
     def _unstandardize(self, x):
         return self.standardizer(x, inverse=True)
+
+    # ── HOSVD initialisation ──────────────────────────────────────────
+
+    def pca_initialize_weights(self, soap_train: np.ndarray) -> bool:
+        """HOSVD init of u[T, K] via the species-mode covariance.
+
+        Builds the [T, T] covariance of the standardised training
+        power spectrum along the first species axis (= the second
+        species axis by SOAP symmetry), then takes the top-K
+        eigenvectors as the species embedding. This IS the closed-form
+        Tucker-K Willatt optimum:
+
+            recon = (u uᵀ) · p · (u uᵀ)
+            argmin_u ‖p - recon‖²  ⇔  span(u) = top-K eigvec of mode-α cov
+
+        For the SOAP power spectrum (symmetric in (α, β)), the optimal
+        u for the unconstrained Tucker decomposition coincides with
+        Willatt's symmetric-bilinear constraint — no accuracy loss for
+        imposing v = uᵀ (the tied form). Untied weights are seeded
+        with v = uᵀ as well, by the same symmetry argument.
+
+        Chunked over atoms to keep peak memory at O(B · (T·α)² · L)
+        rather than O(N · (T·α)² · L) — fine for any realistic SOAP
+        knobs even on the GPU's ~10 GB budget.
+
+        Returns:
+            True — Willatt's current backbone is purely linear bilinear,
+                   so the HOSVD solution is the global MSE optimum and
+                   no training can improve on it. Caller skips train().
+        """
+        soap_train = np.asarray(soap_train, dtype=np.float32)
+        mean = self.standardizer.mean.numpy()
+        std = self.standardizer.std.numpy()
+        X_std = (soap_train - mean) / std                  # [N, Q_raw_T]
+        gather = self._gather_q_T.numpy()                  # [Q_raw_T]
+        L = self.L
+        T_ = self.T
+        alpha = self.alpha_max
+        dense_flat_dim = int(self._dense_T_flat)
+
+        # Accumulate the species-mode covariance C[α, α'] over chunks.
+        # Per-chunk dense tensor has shape [B, T, α, T, α, L]; the
+        # einsum 'bACBDl,bECBDl->AE' contracts every axis except the
+        # first species axis on each operand. C is the [T, T] Gram
+        # matrix of the row-space of M_α (the mode-α matricisation).
+        C = np.zeros((T_, T_), dtype=np.float64)
+        chunk = 512
+        N = X_std.shape[0]
+        for i in range(0, N, chunk):
+            xs = X_std[i:i + chunk]                        # [B, Q_raw]
+            B_ = xs.shape[0]
+            # Scatter into dense [B, dense_T_flat] then reshape. Use
+            # advanced indexing for cache-friendly placement.
+            dense = np.zeros((B_, dense_flat_dim), dtype=np.float32)
+            dense[:, gather] = xs
+            d6 = dense.reshape(B_, T_, alpha, T_, alpha, L)
+            C += np.einsum('bACBDl,bECBDl->AE', d6, d6,
+                           optimize=True).astype(np.float64)
+
+        # Symmetrise C (it is symmetric in exact arithmetic; tiny
+        # asymmetry can arise from float32 accumulation order).
+        C = 0.5 * (C + C.T)
+        # eigh returns eigenvalues ASCENDING. Pull the top K columns
+        # and reverse so column 0 is the most important component.
+        eigvals, eigvecs = np.linalg.eigh(C)
+        u_init = eigvecs[:, -self.K:][:, ::-1].astype(np.float32)
+        self._u_layer.W.assign(u_init)
+        if not self.tied_weights:
+            # By SOAP symmetry the optimal v also satisfies span(v) =
+            # span(u); the simplest fit is v = uᵀ (identical projection
+            # on the second leg). Training would only drift them apart
+            # if nonlinear capacity were present — which the current
+            # bilinear backbone doesn't have.
+            self._v_layer.W.assign(u_init.T)
+
+        # Report the captured-variance fraction so the user can sanity-
+        # check how much information K species retains.
+        var_top = float(np.sum(eigvals[-self.K:]))
+        var_total = float(np.sum(eigvals))
+        if var_total > 0:
+            ratio = var_top / var_total
+            print(f"[willatt] HOSVD init: top-{self.K} species components "
+                  f"capture {ratio:.4%} of total species-mode variance "
+                  f"(out of T={T_} species).")
+        return True
 
     # ── Bilinear scatter/gather hops ───────────────────────────────────
 
@@ -948,15 +1070,18 @@ class LBlockPCAAutoencoder(tf.keras.Model):
     # ── Normalisation ──────────────────────────────────────────────────
 
     def fit_normalizer(self, soap_train: np.ndarray) -> None:
+        # Centering is unconditional (see Willatt's fit_normalizer above
+        # for the full reasoning). `normalize_inputs` controls only the
+        # per-channel std rescaling. The per-l SVD inside
+        # pca_initialize_weights re-centers each l-block anyway and
+        # absorbs the residual mean into the Dense biases, so the
+        # standardiser's mean and the per-l means compose harmlessly.
         mean = np.mean(soap_train, axis=0).astype(np.float32)
-        if self.center_only:
-            std = np.ones_like(mean)
-        else:
+        if self.normalize_inputs and not self.center_only:
             std = np.std(soap_train, axis=0).astype(np.float32)
             std = np.maximum(std, 1e-6)
-        if not self.normalize_inputs:
-            mean = np.zeros_like(mean)
-            std = np.ones_like(std)
+        else:
+            std = np.ones_like(mean)
         self.standardizer.mean.assign(mean)
         self.standardizer.std.assign(std)
 
@@ -1018,42 +1143,73 @@ class LBlockPCAAutoencoder(tf.keras.Model):
             idx = self._per_l_gather[l].numpy()
             X_l = X_std[:, idx]                        # [N, Q_l]
             K_l = int(self._per_l_K[l])
-            # Centre the per-l slice (mean already ~0 from
-            # standardisation, but float-noise cleanup helps SVD).
-            X_l = X_l - X_l.mean(axis=0, keepdims=True)
+            # Per-l mean of WHAT THE ENCODER SEES. When normalize_inputs
+            # = True the Standardiser already subtracts the global mean
+            # so this is ≈ 0; when False this is the raw per-l mean,
+            # which must be absorbed into the biases for the model's
+            # forward pass to compute the genuine PCA reconstruction
+            # `(x − μ) V Vᵀ + μ`. Without these biases the linear AE
+            # is off the optimum by exactly that translation offset —
+            # which is exactly why a few gradient steps used to beat
+            # the bias-free PCA init.
+            X_l_mean = X_l.mean(axis=0).astype(np.float32)
+            X_l_c = X_l - X_l_mean                     # centred for SVD
             # Economy SVD: V columns are right singular vectors.
             # numpy returns Vt = Vᵀ with shape [min(N,Q_l), Q_l].
-            _, _, Vt = np.linalg.svd(X_l, full_matrices=False)
+            _, _, Vt = np.linalg.svd(X_l_c, full_matrices=False)
             top = Vt[:K_l].astype(np.float32)         # [K_l, Q_l]
             enc_branch = self.per_l_encoders[l]
             dec_branch = self.per_l_decoders[l]
             if is_linear:
-                # Single Dense per branch — fully PCA-initialised.
+                # Encoder: z = (X_l − μ_l) Vᵀ = X_l Vᵀ + b_enc
+                #   ⇒ b_enc = −μ_l Vᵀ
+                # Decoder: recon = z V + μ_l
+                #   ⇒ W_dec = V (i.e. `top`),  b_dec = μ_l
                 enc_branch.layers[0].kernel.assign(top.T)   # [Q_l, K_l]
                 enc_branch.layers[0].bias.assign(
-                    np.zeros(K_l, dtype=np.float32))
+                    (-X_l_mean @ top.T).astype(np.float32))
                 dec_branch.layers[0].kernel.assign(top)     # [K_l, Q_l]
-                dec_branch.layers[0].bias.assign(
-                    np.zeros(self._per_l_Q[l], dtype=np.float32))
+                dec_branch.layers[0].bias.assign(X_l_mean)
             else:
-                # Nonlinear warm-start: initialise the first encoder
-                # layer's first K_l columns from PCA components (rest
-                # stay Glorot); mirror on the decoder output layer.
-                # The hidden-layer activations bend the projection
-                # surface but the linear regime around 0 starts from
-                # the optimal directions.
+                # Nonlinear warm-start: the per-l branch is
+                #   Q_l → H_1 → … → K_l   (encoder)
+                #   K_l → … → H_1 → Q_l   (decoder)
+                # We can only place the first encoder layer and the
+                # last decoder layer at the PCA solution; the hidden
+                # middle layers stay at random Glorot init. The
+                # placement is "first K_l units of H_1 do PCA, the
+                # remaining H_1 − K_l units stay random features" —
+                # the optimiser then learns how the random features
+                # should be combined with the PCA features.
+                #
+                # In the LINEAR REGIME (small inputs / activations near
+                # zero where silu ≈ x), the model approximately computes
+                #   recon = (X_l − μ_l) V Vᵀ + μ_l
+                # — i.e. the genuine PCA reconstruction. As activations
+                # grow into silu's nonlinear region the bend gives
+                # additional capacity that training exploits.
+                #
+                # Encoder bias on the PCA channels = −μ_l · top.T,
+                # exactly mirroring the linear case so silu sees
+                # mean-zero inputs from the start.
                 enc_first = enc_branch.layers[0]
                 first_out = int(enc_first.kernel.shape[1])
                 K_emb = min(K_l, first_out)
                 W_enc = enc_first.kernel.numpy()
+                b_enc = enc_first.bias.numpy()
                 W_enc[:, :K_emb] = top[:K_emb].T
+                b_enc[:K_emb] = (-X_l_mean @ top[:K_emb].T).astype(np.float32)
                 enc_first.kernel.assign(W_enc)
+                enc_first.bias.assign(b_enc)
+                # Decoder output kernel: first K_l ROWS = PCA top.
+                # Output bias = per-l mean (the un-centring term).
                 dec_last = dec_branch.layers[-1]
                 last_in = int(dec_last.kernel.shape[0])
                 K_emb2 = min(K_l, last_in)
                 W_dec = dec_last.kernel.numpy()
                 W_dec[:K_emb2, :] = top[:K_emb2]
                 dec_last.kernel.assign(W_dec)
+                dec_last.bias.assign(X_l_mean)
         return is_linear
 
     # ── Forward ────────────────────────────────────────────────────────
@@ -1094,6 +1250,391 @@ class LBlockPCAAutoencoder(tf.keras.Model):
         z = self.encode(x)
         x_recon = self.decode(z)
         return x_recon, z
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Composed Willatt + l_block_pca (alchemical + dimensional)
+# ════════════════════════════════════════════════════════════════════════
+#
+# Two-stage hierarchical compression:
+#   1. Willatt species projection T → K (preserves SOAP tensor structure)
+#   2. Per-l SVD / MLP on the K-species SOAP (collapses each l-block to K_l)
+#
+# Order matters: Willatt is applied first because l_block_pca's per-l flat
+# axis MIXES species and radial — it can't preserve the species-block
+# structure that Willatt's alphabet relies on. By doing alchemical
+# compression first, the per-l blocks then operate on a clean K-species
+# SOAP whose channel layout is already alchemically reduced.
+#
+# When `pca_init = True` AND `l_block_hidden_dims = ()`, BOTH stages are
+# solved analytically in one chained closed-form:
+#   stage 1: HOSVD on species-mode covariance → u[T, K]
+#   stage 2: project all training data via u, then per-l SVD on the
+#            resulting K-species SOAP → per-l V_l matrices
+# Training is then skipped — both u and per-l weights are at the MSE
+# optimum. With nonlinear branches or pca_init=False, both stages are
+# trained jointly via gradient descent.
+
+class WillattLBlockAutoencoder(tf.keras.Model):
+    """Composed alchemical + dimensional autoencoder.
+
+    Encoder pipeline:
+        SOAP_T  →  standardise  →  Willatt(u) → SOAP_K  →
+        per-l projection (V_l)  →  latent
+
+    Decoder pipeline (reverse):
+        latent  →  per-l expansion → SOAP_K  →
+        Willatt(v or uᵀ) → SOAP_T  →  un-standardise
+
+    The `pca_init` flag toggles between:
+      • One-solve analytic mode: HOSVD on raw species axis followed by
+        per-l SVD on the K-species data. No gradient training.
+      • Joint gradient mode: both u and the per-l weights are trained
+        simultaneously via Adam on the reconstruction loss.
+    """
+
+    def __init__(self, q_raw_T: int, T: int, alpha_max: int, l_max: int,
+                 cfg: AutoencoderConfig):
+        super().__init__(name="willatt_l_block_autoencoder")
+        # ── Species side (Willatt) ──────────────────────────────────────
+        K_cfg = cfg.willatt_K if cfg.willatt_K is not None else max(1, T - 1)
+        if not 1 <= int(K_cfg) <= T:
+            raise ValueError(
+                f"willatt_K={K_cfg} out of range [1, T={T}].")
+        self.K_species = int(K_cfg)
+        self.T = int(T)
+        self.alpha_max = int(alpha_max)
+        self.l_max = int(l_max)
+        self.L = int(l_max) + 1
+        self.q_raw_T = int(q_raw_T)
+        self.q_raw = int(q_raw_T)     # alias used by save / encoder_io
+        self.tied_weights = bool(cfg.tied_weights)
+        self.normalize_inputs = bool(cfg.normalize_inputs)
+        self.center_only = bool(cfg.center_only)
+        self.compress_mode = str(getattr(cfg, "compress_mode", "trivial"))
+
+        # Layouts for T-species (input) and K-species (intermediate).
+        _, _, l_of_q_T_np, dq_T, q_T_check = _trivial_compress_indices(
+            self.T, self.alpha_max, self.l_max, self.compress_mode)
+        if q_T_check != self.q_raw_T:
+            raise ValueError(
+                f"Layout walk produced Q_T={q_T_check}, data has "
+                f"Q_T={self.q_raw_T}.")
+        _, _, l_of_q_K_np, dq_K, q_K_count = _trivial_compress_indices(
+            self.K_species, self.alpha_max, self.l_max, self.compress_mode)
+        self.q_raw_K = int(q_K_count)
+        # Per-l gather on the T-species INPUT layout. Used by `evaluate`
+        # to report input-side per-l R² — the bilinear projection
+        # preserves the l axis, so the input-side l-blocks are
+        # well-defined and directly comparable to l_block_pca's per-l
+        # R² breakdown. (The K-species intermediate's per-l gather lives
+        # on `_per_l_gather_K`, used by the model's own encode/decode.)
+        per_l_indices_T = [
+            np.where(l_of_q_T_np == l)[0].astype(np.int32)
+            for l in range(self.L)]
+        self._per_l_gather = [tf.constant(idx) for idx in per_l_indices_T]
+        self._per_l_Q_T = [int(idx.size) for idx in per_l_indices_T]
+
+        self._G_T = self.T * self.alpha_max
+        self._G_K = self.K_species * self.alpha_max
+        self._dense_T_flat = int(self._G_T * self._G_T * self.L)
+        self._dense_K_flat = int(self._G_K * self._G_K * self.L)
+        self._dense_q_T = tf.constant(dq_T[:, None], dtype=tf.int32)
+        self._dense_q_K = tf.constant(dq_K[:, None], dtype=tf.int32)
+        self._gather_q_T = tf.constant(dq_T, dtype=tf.int32)
+        self._gather_q_K = tf.constant(dq_K, dtype=tf.int32)
+
+        # Standardiser at the T-species level (input boundary).
+        self.standardizer = Standardizer(q_raw=self.q_raw_T)
+        self.standardizer.build((None, self.q_raw_T))
+
+        # Willatt u[T, K] (and v[K, T] if untied).
+        seed = int(getattr(cfg, "seed", 0))
+        self._u_layer = _SpeciesProjector(
+            shape=(self.T, self.K_species), seed=seed, name="encoder_u")
+        self._u_layer.build((None,))
+        if not self.tied_weights:
+            self._v_layer = _SpeciesProjector(
+                shape=(self.K_species, self.T), seed=seed ^ 0xC0DE,
+                name="decoder_v")
+            self._v_layer.build((None,))
+        else:
+            self._v_layer = None
+
+        # ── Per-l side (l_block_pca on K-species SOAP) ──────────────────
+        # Per-l index lists computed on the K-species layout. The l_aware
+        # operations work on the K-species SOAP's flat channels, not T's.
+        per_l_indices_K = [
+            np.where(l_of_q_K_np == l)[0].astype(np.int32)
+            for l in range(self.L)]
+        self._per_l_Q_K = [int(idx.size) for idx in per_l_indices_K]
+        self._per_l_gather_K = [tf.constant(idx) for idx in per_l_indices_K]
+        flat_scatter_idx_K = np.concatenate(per_l_indices_K, axis=0)[:, None]
+        self._flat_scatter_idx_K = tf.constant(
+            flat_scatter_idx_K, dtype=tf.int32)
+
+        # Per-l latent sizes (same logic as l_block_pca's: l_block_K
+        # preferred, fallback to latent_dim split).
+        l_block_K = getattr(cfg, "l_block_K", None)
+        if l_block_K is not None:
+            K_per_l = int(l_block_K)
+            if K_per_l < 1:
+                raise ValueError(
+                    f"l_block_K={K_per_l} must be ≥ 1.")
+            self._per_l_K = [
+                min(K_per_l, Q_l) for Q_l in self._per_l_Q_K]
+        else:
+            total_K = int(cfg.latent_dim)
+            if total_K < self.L:
+                raise ValueError(
+                    f"latent_dim={total_K} < L={self.L}.")
+            base = total_K // self.L
+            rem = total_K % self.L
+            self._per_l_K = [
+                base + (1 if l < rem else 0) for l in range(self.L)]
+        self.latent_dim = int(sum(self._per_l_K))
+        cfg.latent_dim = int(self.latent_dim)
+
+        # Per-l hidden_dims (accept None / int / iterable like l_block_pca).
+        _hd = getattr(cfg, "l_block_hidden_dims", ())
+        if _hd is None:
+            _hd = ()
+        elif isinstance(_hd, (int, np.integer)):
+            _hd = (int(_hd),)
+        _hd = tuple(int(h) for h in _hd)
+        if any(h < 1 for h in _hd):
+            raise ValueError(
+                f"l_block_hidden_dims={_hd} has non-positive entries.")
+        self.l_block_hidden_dims = _hd
+
+        act = tf.keras.activations.get(cfg.activation)
+        bn_act = tf.keras.activations.get(cfg.bottleneck_activation)
+
+        def _enc_branch(l):
+            layers: list[tf.keras.layers.Layer] = []
+            for k, h in enumerate(self.l_block_hidden_dims):
+                layers.append(tf.keras.layers.Dense(
+                    int(h), activation=act,
+                    kernel_initializer="glorot_uniform",
+                    name=f"enc_l{l}_h{k}"))
+            layers.append(tf.keras.layers.Dense(
+                self._per_l_K[l], activation=bn_act,
+                kernel_initializer="glorot_uniform",
+                name=f"enc_l{l}_out"))
+            return tf.keras.Sequential(layers, name=f"enc_l{l}")
+
+        def _dec_branch(l):
+            layers: list[tf.keras.layers.Layer] = []
+            for k, h in enumerate(reversed(self.l_block_hidden_dims)):
+                layers.append(tf.keras.layers.Dense(
+                    int(h), activation=act,
+                    kernel_initializer="glorot_uniform",
+                    name=f"dec_l{l}_h{k}"))
+            layers.append(tf.keras.layers.Dense(
+                self._per_l_Q_K[l], activation="linear",
+                kernel_initializer="glorot_uniform",
+                name=f"dec_l{l}_out"))
+            return tf.keras.Sequential(layers, name=f"dec_l{l}")
+
+        self.per_l_encoders = [_enc_branch(l) for l in range(self.L)]
+        self.per_l_decoders = [_dec_branch(l) for l in range(self.L)]
+
+    # ── Accessors ──────────────────────────────────────────────────────
+
+    @property
+    def u(self) -> tf.Variable:
+        return self._u_layer.W
+
+    @property
+    def v(self) -> tf.Variable | None:
+        return None if self._v_layer is None else self._v_layer.W
+
+    @property
+    def mean(self) -> tf.Variable:
+        return self.standardizer.mean
+
+    @property
+    def std(self) -> tf.Variable:
+        return self.standardizer.std
+
+    def fit_normalizer(self, soap_train: np.ndarray) -> None:
+        # Centering is unconditional (see Willatt's fit_normalizer for
+        # the full reasoning). `normalize_inputs` controls only the
+        # per-channel std rescaling. The downstream per-l SVD inside
+        # the composed pca_initialize_weights also centers, but on the
+        # K-species intermediate — different data, different mean.
+        mean = np.mean(soap_train, axis=0).astype(np.float32)
+        if self.normalize_inputs and not self.center_only:
+            std = np.std(soap_train, axis=0).astype(np.float32)
+            std = np.maximum(std, 1e-6)
+        else:
+            std = np.ones_like(mean)
+        self.standardizer.mean.assign(mean)
+        self.standardizer.std.assign(std)
+
+    # ── Willatt species hop ────────────────────────────────────────────
+
+    def _willatt_compress(self, x_std_T):
+        """SOAP_T [B, Q_T] → SOAP_K [B, Q_K] via bilinear u contraction."""
+        B = tf.shape(x_std_T)[0]
+        flat = tf.transpose(x_std_T)
+        dense_flat = tf.scatter_nd(
+            self._dense_q_T, flat, shape=[self._dense_T_flat, B])
+        dense_flat = tf.transpose(dense_flat)
+        dense_T = tf.reshape(
+            dense_flat, [B, self._G_T, self._G_T, self.L])
+        d_T = tf.reshape(
+            dense_T,
+            [B, self.T, self.alpha_max, self.T, self.alpha_max, self.L])
+        d_K = tf.einsum('bACBDl,AJ,BM->bJCMDl', d_T, self.u, self.u)
+        dense_K_flat = tf.reshape(d_K, [B, self._dense_K_flat])
+        return tf.gather(dense_K_flat, self._gather_q_K, axis=1)
+
+    def _willatt_expand(self, x_K):
+        """SOAP_K [B, Q_K] → SOAP_T [B, Q_T] via bilinear v contraction."""
+        B = tf.shape(x_K)[0]
+        flat = tf.transpose(x_K)
+        dense_flat = tf.scatter_nd(
+            self._dense_q_K, flat, shape=[self._dense_K_flat, B])
+        dense_flat = tf.transpose(dense_flat)
+        dense_K = tf.reshape(
+            dense_flat, [B, self._G_K, self._G_K, self.L])
+        d_K = tf.reshape(
+            dense_K,
+            [B, self.K_species, self.alpha_max,
+             self.K_species, self.alpha_max, self.L])
+        v = tf.transpose(self.u) if self.tied_weights else self.v
+        d_T = tf.einsum('bJCMDl,JA,MB->bACBDl', d_K, v, v)
+        dense_T_flat = tf.reshape(d_T, [B, self._dense_T_flat])
+        return tf.gather(dense_T_flat, self._gather_q_T, axis=1)
+
+    # ── Forward / inverse ──────────────────────────────────────────────
+
+    def encode(self, x):
+        x_std = self.standardizer(x, inverse=False)
+        x_K = self._willatt_compress(x_std)
+        per_l_z = []
+        for l in range(self.L):
+            x_l = tf.gather(x_K, self._per_l_gather_K[l], axis=1)
+            per_l_z.append(self.per_l_encoders[l](x_l))
+        return tf.concat(per_l_z, axis=1)
+
+    def decode(self, z):
+        per_l_x = []
+        offset = 0
+        for l in range(self.L):
+            K_l = self._per_l_K[l]
+            z_l = z[:, offset:offset + K_l]
+            per_l_x.append(self.per_l_decoders[l](z_l))
+            offset += K_l
+        x_K_concat = tf.concat(per_l_x, axis=1)
+        B = tf.shape(x_K_concat)[0]
+        flat = tf.transpose(x_K_concat)
+        x_K = tf.scatter_nd(
+            self._flat_scatter_idx_K, flat, shape=[self.q_raw_K, B])
+        x_K = tf.transpose(x_K)
+        x_recon_std = self._willatt_expand(x_K)
+        return self.standardizer(x_recon_std, inverse=True)
+
+    def call(self, x, training=None):
+        z = self.encode(x)
+        x_recon = self.decode(z)
+        return x_recon, z
+
+    # ── Composed PCA init (HOSVD → per-l SVD on K-species data) ────────
+
+    def pca_initialize_weights(self, soap_train: np.ndarray) -> bool:
+        """Chained two-stage closed-form solve.
+
+        Stage 1: HOSVD on the T-species mode-α covariance → u[T, K].
+        Stage 2: forward-pass training data through Willatt to get the
+                 K-species SOAP, then per-l SVD on that to seed V_l.
+
+        Returns True iff both stages are linear (no hidden layers) — in
+        which case the result is the closed-form MSE optimum and training
+        can be skipped.
+        """
+        soap_train = np.asarray(soap_train, dtype=np.float32)
+        mean = self.standardizer.mean.numpy()
+        std = self.standardizer.std.numpy()
+        X_std = (soap_train - mean) / std
+
+        # ── Stage 1: HOSVD species init ────────────────────────────────
+        gather_T = self._gather_q_T.numpy()
+        C = np.zeros((self.T, self.T), dtype=np.float64)
+        chunk = 512
+        N = X_std.shape[0]
+        for i in range(0, N, chunk):
+            xs = X_std[i:i + chunk]
+            B_ = xs.shape[0]
+            dense = np.zeros((B_, self._dense_T_flat), dtype=np.float32)
+            dense[:, gather_T] = xs
+            d6 = dense.reshape(B_, self.T, self.alpha_max,
+                                self.T, self.alpha_max, self.L)
+            C += np.einsum('bACBDl,bECBDl->AE', d6, d6,
+                           optimize=True).astype(np.float64)
+        C = 0.5 * (C + C.T)
+        eigvals, eigvecs = np.linalg.eigh(C)
+        u_init = eigvecs[:, -self.K_species:][:, ::-1].astype(np.float32)
+        self._u_layer.W.assign(u_init)
+        if not self.tied_weights:
+            self._v_layer.W.assign(u_init.T)
+        var_top = float(np.sum(eigvals[-self.K_species:]))
+        var_total = float(np.sum(eigvals))
+        if var_total > 0:
+            print(f"[willatt_l_block] HOSVD: top-{self.K_species} species "
+                  f"components capture {var_top / var_total:.4%} of total "
+                  f"species-mode variance.")
+
+        # ── Stage 2: project T → K, per-l SVD on K-species data ─────────
+        # Forward training data through Willatt to get the K-species SOAP
+        # that the per-l side actually sees. Chunked because
+        # `_willatt_compress` materialises an O(N · G_T² · L) dense
+        # tensor inside its scatter — the whole training set would OOM
+        # a 10 GB GPU at typical N (e.g. 71k atoms × 6² × 10² × 8 floats
+        # ≈ 11 GB in one batch).
+        chunk_compress = 4096
+        N_train = X_std.shape[0]
+        x_K_parts: list[np.ndarray] = []
+        for i in range(0, N_train, chunk_compress):
+            xb = tf.constant(X_std[i:i + chunk_compress], dtype=tf.float32)
+            x_K_parts.append(self._willatt_compress(xb).numpy())
+        x_K_train = np.concatenate(x_K_parts, axis=0)
+        del x_K_parts
+
+        is_linear = len(self.l_block_hidden_dims) == 0
+        for l in range(self.L):
+            idx = self._per_l_gather_K[l].numpy()
+            X_l = x_K_train[:, idx]
+            X_l_mean = X_l.mean(axis=0).astype(np.float32)
+            X_l_c = X_l - X_l_mean
+            _, _, Vt = np.linalg.svd(X_l_c, full_matrices=False)
+            K_l = int(self._per_l_K[l])
+            top = Vt[:K_l].astype(np.float32)
+            enc_branch = self.per_l_encoders[l]
+            dec_branch = self.per_l_decoders[l]
+            if is_linear:
+                enc_branch.layers[0].kernel.assign(top.T)
+                enc_branch.layers[0].bias.assign(
+                    (-X_l_mean @ top.T).astype(np.float32))
+                dec_branch.layers[0].kernel.assign(top)
+                dec_branch.layers[0].bias.assign(X_l_mean)
+            else:
+                enc_first = enc_branch.layers[0]
+                K_emb = min(K_l, int(enc_first.kernel.shape[1]))
+                W_enc = enc_first.kernel.numpy()
+                b_enc = enc_first.bias.numpy()
+                W_enc[:, :K_emb] = top[:K_emb].T
+                b_enc[:K_emb] = (-X_l_mean @ top[:K_emb].T).astype(np.float32)
+                enc_first.kernel.assign(W_enc)
+                enc_first.bias.assign(b_enc)
+                dec_last = dec_branch.layers[-1]
+                K_emb2 = min(K_l, int(dec_last.kernel.shape[0]))
+                W_dec = dec_last.kernel.numpy()
+                W_dec[:K_emb2, :] = top[:K_emb2]
+                dec_last.kernel.assign(W_dec)
+                dec_last.bias.assign(X_l_mean)
+        return is_linear
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1623,13 +2164,46 @@ def evaluate(model: SoapAutoencoder, cfg: AutoencoderConfig,
     ss_tot = float(np.sum((soap_test - mean_np) ** 2))
     r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else float("nan")
 
-    return {
+    out = {
         "n_atoms": N,
         "loss": loss_acc / max(1, n_chunks),
         "rmse_raw": rmse_raw,
         "rmse_standardised": rmse_std,
         "r2": r2,
     }
+
+    # Per-l R² — surfaces which angular-momentum block is the
+    # reconstruction bottleneck. Channels at l contribute different
+    # amounts to the global R² (large-variance radial channels dominate),
+    # so the global number can mask poor fits on the small-variance
+    # angular channels.
+    #
+    # Available for both `l_block_pca` (per-l SVD literally on input
+    # l-blocks) and `willatt_l_block` (Willatt preserves the l axis, so
+    # the input-side l-blocks are still well-defined even though the
+    # intermediate per-l SVD operates on the K-species SOAP). Both
+    # models expose `_per_l_gather` on the INPUT layout — distinct from
+    # `_per_l_gather_K` (K-species intermediate) used internally by
+    # willatt_l_block's encode/decode.
+    per_l_gather = getattr(model, "_per_l_gather", None)
+    if (getattr(model, "per_l_encoders", None) is not None
+            and per_l_gather is not None):
+        per_l_r2: list[float] = []
+        per_l_rmse_raw: list[float] = []
+        for l in range(int(model.L)):
+            idx = per_l_gather[l].numpy()
+            x_l = soap_test[:, idx]
+            r_l = recons[:, idx]
+            d_l = r_l - x_l
+            ss_res_l = float(np.sum(d_l ** 2))
+            ss_tot_l = float(np.sum((x_l - mean_np[idx]) ** 2))
+            r2_l = (1.0 - ss_res_l / ss_tot_l) if ss_tot_l > 0 else float("nan")
+            per_l_r2.append(r2_l)
+            per_l_rmse_raw.append(float(np.sqrt(np.mean(d_l ** 2))))
+        out["per_l_r2"] = per_l_r2
+        out["per_l_rmse_raw"] = per_l_rmse_raw
+
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1662,7 +2236,7 @@ if __name__ == "__main__":
     # Whitelist check: silent fallthrough to MLP on a typo
     # (e.g. cfg.architecture = "willat") would train the wrong model
     # without any error, so reject any unknown string up front.
-    _VALID_ARCHITECTURES = {"mlp", "willatt", "l_block_pca"}
+    _VALID_ARCHITECTURES = {"mlp", "willatt", "l_block_pca", "willatt_l_block"}
     if architecture not in _VALID_ARCHITECTURES:
         raise ValueError(
             f"cfg.architecture={architecture!r} not in "
@@ -1727,6 +2301,26 @@ if __name__ == "__main__":
               f"total Z={model.latent_dim}, "
               f"per-l hidden={hidden}")
         print(f"[ae] trainable params: {n_params:,d}")
+    elif architecture == "willatt_l_block":
+        T_real = _resolve_T("willatt_l_block")
+        model = WillattLBlockAutoencoder(
+            q_raw_T=q_raw, T=T_real,
+            alpha_max=int(cfg.alpha_max), l_max=int(cfg.l_max),
+            cfg=cfg)
+        model(tf.zeros([1, q_raw], dtype=tf.float32))
+        n_params = int(np.sum(
+            [np.prod(v.shape) for v in model.trainable_variables]))
+        per_l_Q = model._per_l_Q_K
+        per_l_K = model._per_l_K
+        hidden = tuple(model.l_block_hidden_dims)
+        kind = "linear" if not hidden else "MLP"
+        print(f"[ae] willatt_l_block ({kind}): T={model.T} → "
+              f"K_species={model.K_species}, L={model.L}, "
+              f"Q_T={q_raw} → Q_K={model.q_raw_K}, "
+              f"per-l Q_K={per_l_Q}, per-l K={per_l_K}, "
+              f"total Z={model.latent_dim}, "
+              f"per-l hidden={hidden}, tied={model.tied_weights}")
+        print(f"[ae] trainable params: {n_params:,d}")
     else:
         model = SoapAutoencoder(q_raw=q_raw, cfg=cfg)
         # Build sub-modules eagerly so trainable_variables and weight-saving
@@ -1739,7 +2333,122 @@ if __name__ == "__main__":
               f" tied={cfg.tied_weights}")
         print(f"[ae] trainable params: {n_params:,d}")
 
-    history = train(model, cfg, soap_train, soap_val)
+    # PCA-initialisation hook (only for l_block_pca). Saxe et al. 2014:
+    # a linear AE's MSE optimum is the closed-form per-l SVD of the
+    # training data. Pure-linear branches go straight to it — gradient
+    # descent can't improve on a global optimum, so training is skipped
+    # entirely. Nonlinear branches warm-start the first encoder layer
+    # and last decoder layer from PCA components, then training
+    # continues normally from a much-better-than-random starting point.
+    pca_init_used = (architecture == "l_block_pca"
+                     and bool(getattr(cfg, "pca_init", False)))
+    willatt_pca_init_used = (architecture == "willatt"
+                             and bool(getattr(cfg, "willatt_pca_init", False)))
+    # Composed init flag: any of the two parent flags being on enables the
+    # chained HOSVD + per-l SVD solve.
+    willatt_l_block_pca_init_used = (
+        architecture == "willatt_l_block"
+        and (bool(getattr(cfg, "pca_init", False))
+             or bool(getattr(cfg, "willatt_pca_init", False))))
+    # User-controlled override: continue gradient training from the
+    # analytic init instead of short-circuiting. Closes the gap between
+    # the one-axis HOSVD optimum and the joint bilinear optimum, at the
+    # cost of cfg.epochs of training.
+    finetune_after_pca = bool(getattr(cfg, "pca_init_finetune", False))
+    skip_training = False
+    if pca_init_used:
+        model.fit_normalizer(soap_train)
+        is_linear = model.pca_initialize_weights(soap_train)
+        if is_linear and not finetune_after_pca:
+            print("[ae] pca_init + linear l_block_pca: training skipped "
+                  "(analytic PCA solution IS the MSE optimum).")
+            skip_training = True
+        elif is_linear and finetune_after_pca:
+            print(f"[ae] pca_init + linear l_block_pca + finetune: "
+                  f"warm-started from analytic PCA; continuing gradient "
+                  f"training for {cfg.epochs} epochs.")
+        else:
+            print(f"[ae] pca_init + nonlinear l_block_pca: warm-started "
+                  f"first/last layers from per-l SVD; continuing training "
+                  f"for {cfg.epochs} epochs.")
+    elif willatt_pca_init_used:
+        # Willatt's current backbone is purely linear bilinear (no
+        # hidden layers between encoder and decoder bilinear hops), so
+        # the HOSVD species-projection is the closed-form ONE-AXIS MSE
+        # optimum. The JOINT bilinear (u uᵀ) ⊗ (u uᵀ) optimum couples
+        # both species axes and is generally tighter; with
+        # `pca_init_finetune=True`, Adam closes that gap.
+        model.fit_normalizer(soap_train)
+        model.pca_initialize_weights(soap_train)
+        if finetune_after_pca:
+            print(f"[ae] willatt_pca_init + finetune: HOSVD seeded u; "
+                  f"continuing gradient training for {cfg.epochs} epochs "
+                  f"to refine the joint bilinear projection.")
+        else:
+            print("[ae] willatt_pca_init: training skipped (HOSVD species "
+                  "projection IS the one-axis MSE optimum; enable "
+                  "`pca_init_finetune` to refine).")
+            skip_training = True
+    elif willatt_l_block_pca_init_used:
+        # Chained two-stage analytic solve: HOSVD on species axis then
+        # per-l SVD on the K-species SOAP. Closed-form MSE optimum iff
+        # the per-l branches are linear (no hidden layers); otherwise
+        # warm-start and continue gradient training.
+        model.fit_normalizer(soap_train)
+        is_linear = model.pca_initialize_weights(soap_train)
+        if is_linear and not finetune_after_pca:
+            print("[ae] pca_init + linear willatt_l_block: training "
+                  "skipped (chained HOSVD + per-l SVD IS the MSE "
+                  "optimum).")
+            skip_training = True
+        elif is_linear and finetune_after_pca:
+            print(f"[ae] pca_init + linear willatt_l_block + finetune: "
+                  f"chained HOSVD + per-l SVD seeded; continuing "
+                  f"gradient training for {cfg.epochs} epochs to refine "
+                  f"the joint bilinear / per-l coupling.")
+        else:
+            print(f"[ae] pca_init + nonlinear willatt_l_block: HOSVD "
+                  f"seeded u, warm-started per-l first/last layers; "
+                  f"continuing joint training for {cfg.epochs} epochs.")
+
+    if skip_training:
+        # Produce a one-row history with the analytic loss on train+val
+        # so save_history / downstream consumers see a populated file.
+        # Stream through the model in `cfg.batch_size` chunks — the
+        # bilinear Willatt backbones materialise an O(N·G²·L) dense
+        # tensor inside .call(), so a single full-tensor evaluation OOMs
+        # the GPU on realistic training-set sizes.
+        bs = int(cfg.batch_size)
+
+        def _streamed_mse(arr, divide_by_std):
+            std_use = model.std.numpy() if model.normalize_inputs else 1.0
+            sq_sum = 0.0
+            n_elem = 0
+            for i in range(0, arr.shape[0], bs):
+                xb = tf.constant(arr[i:i + bs], dtype=tf.float32)
+                xrb, _ = model(xb)
+                diff = (xrb - xb) / std_use if divide_by_std else (xrb - xb)
+                sq_sum += float(tf.reduce_sum(tf.square(diff)))
+                n_elem += int(tf.size(xb))
+            return sq_sum / max(1, n_elem)
+
+        history = {"epoch": [0], "train_loss": [], "val_loss": [],
+                   "val_rmse_raw": []}
+        for arr, key in ((soap_train, "train_loss"),
+                         (soap_val, "val_loss")):
+            if arr is None:
+                history[key].append(float("nan"))
+                continue
+            mse = _streamed_mse(arr, divide_by_std=True)
+            history[key].append(float(np.sqrt(mse))
+                                if cfg.loss_type == "rmse" else mse)
+        if soap_val is not None:
+            mse_raw = _streamed_mse(soap_val, divide_by_std=False)
+            history["val_rmse_raw"].append(float(np.sqrt(mse_raw)))
+        else:
+            history["val_rmse_raw"].append(float("nan"))
+    else:
+        history = train(model, cfg, soap_train, soap_val)
 
     encoder_io.save_encoder(model, out_dir)
     encoder_io.save_decoder(model, out_dir)
@@ -1765,4 +2474,13 @@ if __name__ == "__main__":
         print(f"[ae] test rmse_raw  = {metrics['rmse_raw']:.5e}")
         print(f"[ae] test rmse_std  = {metrics['rmse_standardised']:.5e}")
         print(f"[ae] test R²        = {metrics['r2']:.4f}")
+        if "per_l_r2" in metrics:
+            r2s = metrics["per_l_r2"]
+            rmses = metrics["per_l_rmse_raw"]
+            print(f"[ae] per-l R²       = "
+                  + "  ".join(f"l={l}:{r:.4f}" for l, r in enumerate(r2s)))
+            print(f"[ae] per-l RMSE_raw = "
+                  + "  ".join(f"l={l}:{r:.2e}" for l, r in enumerate(rmses)))
+            worst_l = int(np.argmin(r2s))
+            print(f"[ae] worst l = {worst_l} (R²={r2s[worst_l]:.4f})")
     print(f"[ae] artifacts written to {out_dir}")

@@ -1081,6 +1081,31 @@ class TNEP(layers.Layer):
             target_mode 1: [3]  dipole vector
             target_mode 2: [6]  polarizability tensor
         """
+        # Iterative-encoder front-end: under train_encoder=True, the
+        # caller-supplied descriptors/gradients are still Q_raw-shaped.
+        # Apply the live encoder before any W0 einsum so W0 (sized at
+        # Z) sees the right input. Static-mode callers pass pre-encoded
+        # tensors → no-op here.
+        _enc = getattr(self.cfg, "_encoder", None)
+        if _enc is not None and bool(getattr(self.cfg, "train_encoder", False)):
+            _q_raw_enc = int(getattr(self.cfg, "_encoder_q_raw"))
+            _enc_chunk = int(getattr(self.cfg, "encoder_chunk_rows", 4096))
+            # descriptors: [A, Q_raw] → [A, Z]; single batch is small
+            # (one structure), no chunking needed.
+            descriptors = _enc.encode(descriptors)
+            # gradients: [A, M, 3, Q_raw] → [A, M, 3, Z]. Flatten,
+            # chunked-encode (M·3 can be large for big neighbor lists),
+            # subtract affine offset, restore shape.
+            A_p = int(tf.shape(gradients)[0])
+            M_p = int(tf.shape(gradients)[1])
+            gv_flat = tf.reshape(gradients, [A_p * M_p * 3, _q_raw_enc])
+            gv_z_flat = self._encode_chunked(
+                _enc, gv_flat, _q_raw_enc, _enc_chunk)
+            b_offset = _enc.encode(
+                tf.zeros([1, _q_raw_enc], dtype=tf.float32))
+            Z_p = int(tf.shape(gv_z_flat)[-1])
+            gradients = tf.reshape(gv_z_flat - b_offset, [A_p, M_p, 3, Z_p])
+
         # Absorb U_pair^T into W0 (and W0_pol below) once per call so
         # both the forward and calc_forces use the U-folded weights.
         # When descriptor_mixing is disabled, _W0_eff is a no-op.
@@ -1287,7 +1312,15 @@ class TNEP(layers.Layer):
     def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor],
             plot_callback: Callable | None = None,
             resume_state: dict | None = None) -> dict:
-        """Train the model using the SNES evolutionary optimizer.
+        """Train the model.
+
+        Dispatches on `cfg.optimizer`:
+          - "snes" (default): population-based SNES, supports non-smooth
+            losses and high-dim search distributions. Delegates to the
+            SNES instance held on `self.optimizer`.
+          - "adam":  gradient-based Adam(W). One forward + one backward
+            per epoch via tf.GradientTape. Skips the SNES population
+            machinery entirely. See `_fit_adam` for the implementation.
 
         Args:
             train_data    : dict with keys descriptors, gradients, grad_index,
@@ -1297,17 +1330,410 @@ class TNEP(layers.Layer):
             resume_state  : optional dict from `model_io.load_checkpoint`,
                             carries SNES distribution + best-val + history +
                             RNG state. When provided, training continues from
-                            `resume_state['last_gen'] + 1`.
+                            `resume_state['last_gen'] + 1`. Not supported for
+                            the Adam path yet — will raise if both are set.
 
         Returns:
             history         : dict with keys generation, train_loss, val_loss (lists)
             final_model     : TNEP model with weights from the last generation
             best_val_model  : TNEP model with weights from the best validation generation
         """
+        optimizer = str(getattr(self.cfg, "optimizer", "snes")).lower()
+        if optimizer not in ("snes", "adam"):
+            raise ValueError(
+                f"cfg.optimizer={optimizer!r} not in ('snes', 'adam').")
+        if optimizer == "adam":
+            return self._fit_adam(train_data, val_data,
+                                   plot_callback=plot_callback,
+                                   resume_state=resume_state)
         history, final_model, best_val_model = self.optimizer.fit(
             train_data, val_data, plot_callback=plot_callback,
             resume_state=resume_state)
         return history, final_model, best_val_model
+
+    def _encode_chunked(self, encoder, x_flat, q_raw_enc, chunk_rows: int):
+        """Apply `encoder.encode` to a [N, q_raw_enc] tensor in chunks.
+
+        The Willatt / bilinear encoders materialise an O(N · G_T² · L)
+        dense scatter inside `encode`, which OOMs the GPU for the
+        grad_values flat tensor (N = P · 3, often 60k+). Chunking the
+        N-axis bounds peak memory to one chunk's worth of dense scatter
+        without changing the result. The output is a tf.concat over the
+        chunked results; gradients flow back through every chunk to all
+        encoder variables, so the iterative-encoder backprop is exact.
+        """
+        N = tf.shape(x_flat)[0]
+        if chunk_rows is None or chunk_rows <= 0:
+            return encoder.encode(x_flat)
+        # Static chunking via python int — `chunk_rows` is a fixed knob,
+        # not data-dependent, so a python loop is fine and keeps each
+        # encode call shape-stable for the tape.
+        chunks: list = []
+        start = 0
+        # We need a python-int total to drive the loop; the typical
+        # caller (`_forward_loss`) reshapes to a known-eager N.
+        N_py = int(N.numpy()) if tf.executing_eagerly() else None
+        if N_py is None:
+            # Fallback: single shot (shouldn't happen in eager TNEP fit
+            # but guards XLA paths that might add reduce_retracing).
+            return encoder.encode(x_flat)
+        while start < N_py:
+            end = min(start + int(chunk_rows), N_py)
+            chunks.append(encoder.encode(x_flat[start:end]))
+            start = end
+        return tf.concat(chunks, axis=0)
+
+    def _encode_chunk_for_inference(self, descriptors_raw, grad_values_raw,
+                                     encoder, q_raw_enc, chunk_rows: int):
+        """Apply the live encoder to a single chunk's descriptors and
+        grad_values. Used by `score()`, `predict()`, and trajectory
+        evaluators under iterative-encoder mode. No tape — these paths
+        are inference-only.
+        """
+        S = int(tf.shape(descriptors_raw)[0])
+        A = int(tf.shape(descriptors_raw)[1])
+        P = int(tf.shape(grad_values_raw)[0])
+        d_flat = tf.reshape(descriptors_raw, [S * A, q_raw_enc])
+        z_flat = self._encode_chunked(
+            encoder, d_flat, q_raw_enc, chunk_rows)
+        Z = int(tf.shape(z_flat)[-1])
+        d_enc = tf.reshape(z_flat, [S, A, Z])
+        gv_flat = tf.reshape(grad_values_raw, [P * 3, q_raw_enc])
+        gv_z_flat = self._encode_chunked(
+            encoder, gv_flat, q_raw_enc, chunk_rows)
+        b_offset = encoder.encode(
+            tf.zeros([1, q_raw_enc], dtype=tf.float32))
+        gv_enc = tf.reshape(gv_z_flat - b_offset, [P, 3, Z])
+        return d_enc, gv_enc
+
+    def _encode_val_data_iterative(self, val_data, encoder, q_raw_enc,
+                                    chunk_rows: int = 4096):
+        """Apply the live encoder to padded val_data once and return a
+        Z-dim version, for the iterative Adam path's validation pass.
+
+        Stateless on val_data — the input dict is not mutated. The
+        encoder Variables are read at call time, so subsequent encoder
+        updates produce a different result on the next validation tick.
+
+        `chunk_rows` bounds the N-axis of each encode call to avoid the
+        multi-GB Willatt scatter blow-up that the unchunked path
+        triggers on real val_data (S·A + P·3 rows in one go).
+        """
+        d_raw = val_data["descriptors"]
+        gv_raw = val_data["grad_values"]
+        S = int(tf.shape(d_raw)[0])
+        A = int(tf.shape(d_raw)[1])
+        P = int(tf.shape(gv_raw)[0])
+        # Run outside any tape — val is read-only and we want the lowest
+        # peak memory possible. The encoder still uses live trainable
+        # variables, so the val metric tracks each Adam step.
+        d_flat = tf.reshape(d_raw, [S * A, q_raw_enc])
+        z_flat = self._encode_chunked(
+            encoder, d_flat, q_raw_enc, chunk_rows)
+        Z = int(tf.shape(z_flat)[-1])
+        d_enc = tf.reshape(z_flat, [S, A, Z])
+        gv_flat = tf.reshape(gv_raw, [P * 3, q_raw_enc])
+        gv_z_flat = self._encode_chunked(
+            encoder, gv_flat, q_raw_enc, chunk_rows)
+        b_offset = encoder.encode(
+            tf.zeros([1, q_raw_enc], dtype=tf.float32))
+        gv_enc = tf.reshape(gv_z_flat - b_offset, [P, 3, Z])
+        new = dict(val_data)
+        new["descriptors"] = d_enc
+        new["grad_values"] = gv_enc
+        return new
+
+    def _fit_adam(self, train_data: dict[str, tf.Tensor],
+                  val_data: dict[str, tf.Tensor],
+                  plot_callback: Callable | None = None,
+                  resume_state: dict | None = None) -> tuple:
+        """Gradient-based training path. See `fit` for the public API.
+
+        The forward path is the standard `predict_batch` after folding
+        any descriptor-mixing and preprocessing into W0 via `_W0_eff` /
+        `_W0_preprocess_eff`. Loss = `per_structure_error` on the
+        target residual, summed and averaged. Adam updates only the
+        Keras-trainable variables (W0/b0/W1/b1, optionally W0_pol etc.,
+        and U_pair when descriptor_mixing is on). W_pre_angular is
+        registered as non-trainable (it's managed exclusively by SNES)
+        so Adam leaves it untouched — the preprocess fold uses the
+        frozen init in that case.
+        """
+        import time
+        from loss_functions import per_structure_error, squared_error_per_structure
+        from data import prefetched_chunks
+
+        if resume_state is not None:
+            raise NotImplementedError(
+                "Adam path does not yet support checkpoint resume; clear "
+                "resume_state or switch back to cfg.optimizer='snes'.")
+
+        cfg = self.cfg
+        n_epochs = int(cfg.num_generations)
+        loss_type = str(getattr(cfg, "loss_type", "mse")).lower()
+        huber_delta = float(getattr(cfg, "huber_delta", 1e-3))
+        val_interval = max(1, int(getattr(cfg, "val_interval", 1)))
+        batch_size = getattr(cfg, "batch_size", None)
+        S_train = int(train_data["num_atoms"].shape[0])
+
+        # Build Adam / AdamW from cfg.
+        wd = float(getattr(cfg, "adam_weight_decay", 0.0))
+        if wd > 0.0:
+            adam = tf.keras.optimizers.AdamW(
+                learning_rate=float(cfg.adam_lr),
+                weight_decay=wd,
+                beta_1=float(cfg.adam_beta1),
+                beta_2=float(cfg.adam_beta2),
+                epsilon=float(cfg.adam_epsilon),
+                clipnorm=cfg.adam_grad_clip)
+        else:
+            adam = tf.keras.optimizers.Adam(
+                learning_rate=float(cfg.adam_lr),
+                beta_1=float(cfg.adam_beta1),
+                beta_2=float(cfg.adam_beta2),
+                epsilon=float(cfg.adam_epsilon),
+                clipnorm=cfg.adam_grad_clip)
+
+        train_vars = list(self.trainable_variables)
+        if len(train_vars) == 0:
+            raise RuntimeError(
+                "Model has no trainable variables — Adam has nothing to "
+                "optimise. Check that W0/b0/W1/b1 were built.")
+
+        # Iterative encoder front-end: apply the encoder on each batch
+        # inside the GradientTape so its trainable variables (Willatt u,
+        # per-l Dense kernels, etc.) co-adapt with TNEP. The encoder's
+        # affine offset b = encode(0) is what makes the gradient-side
+        # contraction work — for any linear f(x) = J·x + b,
+        #   J · gv = f(gv) − f(0)
+        # which we evaluate exactly each step via a single extra forward
+        # pass on zeros. Static preprocess (train_encoder=False) skips
+        # this entire block; the descriptors/grad_values already arrived
+        # encoded.
+        encoder = getattr(cfg, "_encoder", None)
+        iterative_encoder = (encoder is not None
+                              and bool(getattr(cfg, "train_encoder", False)))
+        if iterative_encoder:
+            enc_vars = list(encoder.trainable_variables)
+            train_vars = train_vars + enc_vars
+            q_raw_enc = int(cfg._encoder_q_raw)
+            print(f"[adam] iterative encoder: {len(enc_vars)} encoder "
+                  f"variables ({int(sum(np.prod(v.shape) for v in enc_vars)):,d} "
+                  f"params) co-train with TNEP.")
+        else:
+            q_raw_enc = None
+
+        # Reuse SNES.validate for the validation pass. It already
+        # handles the descriptor-mixing / preprocess folds, target
+        # scaling, chunk streaming, and pol_weights — and runs against
+        # the model's live variables when called without mu_tf.
+        snes_helper = self.optimizer
+
+        # History schema mirrors SNES output so downstream consumers
+        # (plotting, csv, model_io) don't need to special-case.
+        history = {
+            "generation": [],
+            "train_loss": [],
+            "train_rmse": [],
+            "val_loss": [],
+            "L1": [], "L2": [],
+            "best_rmse": [], "worst_rmse": [],
+            "sigma_min": [], "sigma_max": [],
+            "sigma_mean": [], "sigma_median": [],
+            "timing": {
+                "sample_batch": [],
+                "evaluate": [],
+                "rank_update": [],
+                "validate": [],
+                "overhead": [],
+            },
+        }
+        best_val_loss = float("inf")
+        best_vars_snapshot: list | None = None
+        rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
+
+        def _sample_batch():
+            if batch_size is None:
+                return train_data
+            idx = rng.choice(S_train, size=int(batch_size), replace=False)
+            idx_tf = tf.constant(idx.astype(np.int32))
+            struct_keys = ["descriptors", "positions", "Z_int", "boxes",
+                           "num_atoms", "targets", "atom_mask"]
+            if "types_contained" in train_data:
+                struct_keys.append("types_contained")
+            batch = {k: tf.gather(train_data[k], idx_tf) for k in struct_keys}
+            pair_starts = tf.gather(train_data["struct_ptr"], idx_tf)
+            pair_ends = tf.gather(train_data["struct_ptr"], idx_tf + 1)
+            pair_ranges = tf.ragged.range(pair_starts, pair_ends)
+            flat_pair = tf.cast(pair_ranges.flat_values, tf.int32)
+            gv_full = train_data["grad_values"]
+            if train_data.get("_gv_disk_backed", False):
+                batch["grad_values"] = tf.constant(
+                    np.asarray(gv_full[flat_pair.numpy()]))
+            else:
+                batch["grad_values"] = tf.gather(gv_full, flat_pair)
+            batch["pair_atom"] = tf.gather(train_data["pair_atom"], flat_pair)
+            batch["pair_gidx"] = tf.gather(train_data["pair_gidx"], flat_pair)
+            batch["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
+            return batch
+
+        # Per-component weights for the training loss. SNES applies the
+        # polarisability shear-weights (mode 2) and an optional per-
+        # component inverse-magnitude weighting; the Adam loss MUST
+        # match or it ranks a different objective. Reuse the SNES
+        # helper's `_pol_weights` so both paths build them identically.
+        # `_inv_comp_weights` is not currently materialised by the SNES
+        # batch builder (cfg.inverse_weight_mode is dormant), but if it
+        # were, the same shape conventions would compose here.
+        pol_weights_tf = getattr(snes_helper, "_pol_weights", None)
+        loss_comp_w = (pol_weights_tf[tf.newaxis]
+                       if pol_weights_tf is not None else None)
+        sq_comp_w = loss_comp_w  # SNES uses pol_weights for sq reporting too
+
+        # Chunk size for the iterative encode of grad_values. The
+        # Willatt scatter materialises an O(N · G_T² · L) dense tensor
+        # per encode call (≈115 KB/row for T=6, αmax=10, L=8); at 4096
+        # rows that's ~470 MB before the tape stores activations for
+        # backprop. Larger chunks crash the 9.5 GB GPU on realistic P.
+        enc_chunk_rows = int(getattr(cfg, "encoder_chunk_rows", 4096))
+
+        def _forward_loss(batch):
+            # ── Iterative encoder application ─────────────────────────
+            # When train_encoder=True, batch descriptors/grad_values
+            # still live in raw Q_raw space — apply the encoder here so
+            # gradients flow back through it. Affine descriptors via
+            # encoder.encode (includes mean centering); gradients via
+            # the linear-part identity J·v = encode(v) − encode(0).
+            if iterative_encoder:
+                B_b = tf.shape(batch["descriptors"])[0]
+                A_b = tf.shape(batch["descriptors"])[1]
+                d_flat = tf.reshape(batch["descriptors"], [B_b * A_b, q_raw_enc])
+                # Descriptors: B·A typically a few thousand rows — fine
+                # in one shot, but chunk anyway to cover the worst case
+                # (large val_size or full-batch training).
+                z_flat = self._encode_chunked(
+                    encoder, d_flat, q_raw_enc, enc_chunk_rows)
+                descriptors_use = tf.reshape(
+                    z_flat, [B_b, A_b, tf.shape(z_flat)[-1]])
+                # Gradients: [P, 3, Q_raw] → [P, 3, Z]. P·3 can run to
+                # 100k+ rows; this is the OOM hot-path.
+                P_b = tf.shape(batch["grad_values"])[0]
+                gv_flat = tf.reshape(batch["grad_values"], [P_b * 3, q_raw_enc])
+                gv_enc_with_b = self._encode_chunked(
+                    encoder, gv_flat, q_raw_enc, enc_chunk_rows)
+                b_offset = encoder.encode(
+                    tf.zeros([1, q_raw_enc], dtype=tf.float32))   # [1, Z]
+                grad_values_use = tf.reshape(
+                    gv_enc_with_b - b_offset,
+                    [P_b, 3, tf.shape(gv_enc_with_b)[-1]])
+            else:
+                descriptors_use = batch["descriptors"]
+                grad_values_use = batch["grad_values"]
+
+            # Refold W0 / W0_pol inside the tape so gradients flow back
+            # through U_pair and W_pre_angular (if either is trainable).
+            W0_eff = self._W0_eff(self.W0)
+            W0p = getattr(self, "W0_pol", None)
+            b0p = getattr(self, "b0_pol", None)
+            W1p = getattr(self, "W1_pol", None)
+            b1p = getattr(self, "b1_pol", None)
+            if W0p is not None:
+                W0p = self._W0_eff(W0p)
+            if getattr(self, "descriptor_preprocess_contract", "off") != "off":
+                W0_eff = self._W0_preprocess_eff(W0_eff)
+                if W0p is not None:
+                    W0p = self._W0_preprocess_eff(W0p)
+            preds = self.predict_batch(
+                descriptors_use, grad_values_use,
+                batch["pair_atom"], batch["pair_gidx"], batch["pair_struct"],
+                batch["positions"], batch["Z_int"], batch["boxes"],
+                batch["atom_mask"],
+                W0_eff, self.b0, self.W1, self.b1,
+                W0p, b0p, W1p, b1p)
+            if cfg.scale_targets and cfg.target_mode == 1:
+                num_atoms = tf.reduce_sum(batch["atom_mask"], axis=1)
+                preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]
+            diff = preds - batch["targets"]
+            per_struct = per_structure_error(
+                diff, loss_type, huber_delta,
+                component_weights=loss_comp_w)
+            sq_per_struct = squared_error_per_structure(
+                diff, component_weights=sq_comp_w)
+            return tf.reduce_mean(per_struct), tf.reduce_mean(sq_per_struct), preds
+
+        train_start = time.perf_counter()
+        for epoch in range(n_epochs):
+            t0 = time.perf_counter()
+            batch = _sample_batch()
+            t_sample = time.perf_counter() - t0
+
+            t1 = time.perf_counter()
+            with tf.GradientTape() as tape:
+                loss, sq_loss, _preds = _forward_loss(batch)
+            grads = tape.gradient(loss, train_vars)
+            adam.apply_gradients(zip(grads, train_vars))
+            train_rmse = float(tf.sqrt(tf.maximum(sq_loss, 0.0)))
+            t_step = time.perf_counter() - t1
+
+            val_loss = float("inf")
+            t_val = 0.0
+            if epoch % val_interval == 0 or epoch == n_epochs - 1:
+                t2 = time.perf_counter()
+                if iterative_encoder:
+                    # Apply the CURRENT encoder to val_data so the
+                    # validation tracks the live encoder state.
+                    # Cheap relative to training: one extra encode
+                    # over all val structures per val tick.
+                    val_data_enc = self._encode_val_data_iterative(
+                        val_data, encoder, q_raw_enc)
+                    val_loss = float(snes_helper.validate(val_data_enc))
+                else:
+                    val_loss = float(snes_helper.validate(val_data))
+                t_val = time.perf_counter() - t2
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_vars_snapshot = [tf.identity(v) for v in train_vars]
+
+            history["generation"].append(epoch)
+            history["train_loss"].append(float(loss))
+            history["train_rmse"].append(train_rmse)
+            history["val_loss"].append(val_loss)
+            history["L1"].append(0.0)
+            history["L2"].append(0.0)
+            history["best_rmse"].append(train_rmse)
+            history["worst_rmse"].append(train_rmse)
+            history["sigma_min"].append(float("nan"))
+            history["sigma_max"].append(float("nan"))
+            history["sigma_mean"].append(float("nan"))
+            history["sigma_median"].append(float("nan"))
+            history["timing"]["sample_batch"].append(t_sample)
+            history["timing"]["evaluate"].append(t_step)
+            history["timing"]["rank_update"].append(0.0)
+            history["timing"]["validate"].append(t_val)
+            history["timing"]["overhead"].append(
+                time.perf_counter() - t0 - t_sample - t_step - t_val)
+
+            if (epoch + 1) % max(1, val_interval) == 0 or epoch == n_epochs - 1:
+                print(f"[adam] epoch {epoch + 1}/{n_epochs}  "
+                      f"loss={float(loss):.5e}  train_rmse={train_rmse:.5e}  "
+                      f"val={val_loss:.5e}  best_val={best_val_loss:.5e}  "
+                      f"({time.perf_counter() - train_start:.1f}s elapsed)")
+            if plot_callback is not None:
+                try:
+                    plot_callback(history, epoch)
+                except Exception as e:
+                    print(f"[adam] plot_callback raised: {e!r}")
+
+        # Restore best-val weights into the model so the returned
+        # best_val_model has them. final_model carries the last-epoch
+        # state — since the model is one Python object we have to pick:
+        # callers overwhelmingly want best_val_model, so we restore
+        # those weights and return the same instance for both.
+        if best_vars_snapshot is not None:
+            for var, snap in zip(train_vars, best_vars_snapshot):
+                var.assign(snap)
+
+        return history, self, self
 
     def score(self, test_data: dict[str, tf.Tensor]) -> tuple[dict[str, tf.Tensor], tf.Tensor]:
         """Evaluate RMSE, R², per-component R², and cosine similarity.
@@ -1332,6 +1758,18 @@ class TNEP(layers.Layer):
         S_test = test_data["num_atoms"].shape[0]
         chunk_sz = (self.cfg.batch_chunk_size
                     if self.cfg.batch_chunk_size is not None else S_test)
+        # Iterative-encoder front-end: test_data here was NOT rewritten
+        # by the static preprocess (data.materialize_test_data skips
+        # when train_encoder=True), so descriptors / grad_values are
+        # still Q_raw-shaped. Apply the live encoder per chunk so the
+        # W0 (sized at Z) sees the right input. Static mode already
+        # rewrote the data dict at materialize time → no-op here.
+        _enc = getattr(self.cfg, "_encoder", None)
+        _iter_enc = (_enc is not None
+                     and bool(getattr(self.cfg, "train_encoder", False)))
+        _q_raw_enc = (int(getattr(self.cfg, "_encoder_q_raw", 0))
+                      if _iter_enc else 0)
+        _enc_chunk = int(getattr(self.cfg, "encoder_chunk_rows", 4096))
         # Pre-fold U_pair^T into W0 (and W0_pol) once per score call
         # so every chunk forward uses the same already-absorbed
         # weights. No-op when descriptor mixing is disabled.
@@ -1356,8 +1794,15 @@ class TNEP(layers.Layer):
                 pin_to_cpu=self.cfg.pin_data_to_cpu,
                 enabled=getattr(self.cfg, "chunk_prefetch", True),
                 depth=getattr(self.cfg, "prefetch_depth", 1)):
+            if _iter_enc:
+                d_chunk, gv_chunk = self._encode_chunk_for_inference(
+                    chunk["descriptors"], chunk["grad_values"],
+                    _enc, _q_raw_enc, _enc_chunk)
+            else:
+                d_chunk = chunk["descriptors"]
+                gv_chunk = chunk["grad_values"]
             pred_parts.append(self.predict_batch(
-                chunk["descriptors"], chunk["grad_values"],
+                d_chunk, gv_chunk,
                 chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],

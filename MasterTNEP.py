@@ -940,6 +940,130 @@ def _train_model_inner(cfg: TNEPconfig,
     from DescriptorBuilderGPU import compute_dim_q
     cfg.dim_q = compute_dim_q(cfg)
 
+    # Optional pretrained encoder front-end. Loads the encoder bundle
+    # (model + analytic Jacobian) and either:
+    #   - static preprocess (train_encoder=False): rewrites train/val
+    #     descriptor + gradient lists in-place so downstream consumers
+    #     see a Z-dim descriptor. test_data is handled lazily inside
+    #     `materialize_test_data`, which reads the same cfg bundle.
+    #   - iterative (train_encoder=True): only loads + stashes; the
+    #     TNEP forward path applies the encoder on the fly.
+    # In both modes, cfg.dim_q is overridden to the encoder's latent
+    # dim so q_scaler, target_mean, pad_and_stack and TNEP's own
+    # parameter shapes are sized correctly.
+    if getattr(cfg, "encoder_path", None) is not None:
+        from encoder_frontend import (
+            setup_encoder_frontend, apply_encoder_to_lists)
+        # Mutual-exclusion: the encoder rewrites the descriptor axis at
+        # data-prep time, so any feature that operates on the raw SOAP
+        # block layout (descriptor_preprocess_contract, descriptor_mixing)
+        # would size its weights against the wrong axis. These features
+        # were not designed to compose; flag the combination loudly.
+        if str(getattr(cfg, "descriptor_preprocess_contract", "off")) != "off":
+            raise NotImplementedError(
+                f"encoder_path is incompatible with "
+                f"descriptor_preprocess_contract="
+                f"{cfg.descriptor_preprocess_contract!r}: the preprocess "
+                f"fold (W_pre_angular) operates on raw SOAP block "
+                f"layout, but the encoder rewrites the descriptor axis "
+                f"to a {cfg._encoder_latent_dim if hasattr(cfg, '_encoder_latent_dim') else 'Z'}-dim latent. "
+                f"Set descriptor_preprocess_contract='off' to use the "
+                f"encoder.")
+        if bool(getattr(cfg, "descriptor_mixing", False)):
+            raise NotImplementedError(
+                "encoder_path is incompatible with descriptor_mixing="
+                "True: U_pair is sized to raw SOAP per-pair blocks, but "
+                "the encoder rewrites the descriptor axis. Set "
+                "descriptor_mixing=False to use the encoder.")
+        if (str(getattr(cfg, "q_scaler_granularity", "per_component")).lower()
+                == "l_block"):
+            raise NotImplementedError(
+                "encoder_path is incompatible with "
+                "q_scaler_granularity='l_block': the l-block layout "
+                "is defined against raw SOAP, but the encoder rewrites "
+                "the descriptor axis. Use 'per_component' instead.")
+        setup_encoder_frontend(cfg)
+        # Tightened layout match — Q_raw alone can collide between
+        # different (T, αmax, l_max, compress_mode) combinations.
+        # Verify each axis-shaping cfg field against the encoder run's
+        # saved cfg so the per-channel ordering matches by construction.
+        from pathlib import Path as _Path
+        import encoder_io as _enc_io
+        _enc_cfg = _enc_io.load_config(_Path(cfg.encoder_path))
+        _checks = [
+            ("alpha_max", int(_enc_cfg.alpha_max), int(cfg.alpha_max)),
+            ("l_max", int(_enc_cfg.l_max), int(cfg.l_max)),
+            ("compress_mode", str(_enc_cfg.compress_mode),
+             str(cfg.compress_mode)),
+        ]
+        # T (num species) check via the encoder's stored T attribute.
+        _enc_T = (int(getattr(cfg._encoder, "T", 0))
+                  or int(getattr(_enc_cfg, "T", 0))
+                  or 0)
+        if _enc_T:
+            _checks.append(("num_types (T)", _enc_T, int(cfg.num_types)))
+        _mismatches = [(name, enc_v, cur_v) for name, enc_v, cur_v in _checks
+                       if enc_v != cur_v]
+        if _mismatches:
+            raise ValueError(
+                "Encoder SOAP layout does not match current cfg "
+                "(matching Q_raw is not sufficient — per-channel "
+                "ordering also depends on αmax, l_max, T, "
+                "compress_mode):\n" +
+                "\n".join(
+                    f"  {name}: encoder={enc_v}  cfg={cur_v}"
+                    for name, enc_v, cur_v in _mismatches))
+        if int(cfg._encoder_q_raw) != int(cfg.dim_q):
+            raise ValueError(
+                f"Encoder expects Q_raw={cfg._encoder_q_raw} but the "
+                f"current cfg resolves to dim_q={cfg.dim_q}. Re-train "
+                f"the encoder with the matching SOAP layout, or update "
+                f"cfg.alpha_max / l_max / compress_mode to match the "
+                f"encoder's training-time layout.")
+        # SNES + iterative is not yet wired (would need encoder
+        # application inside the SNES candidate-eval / validate path,
+        # plus exposing Willatt u to the μ vector). The user must
+        # either switch to Adam (which supports full encoder backprop)
+        # or set train_encoder=False to use the static preprocess.
+        if (str(getattr(cfg, "optimizer", "snes")).lower() == "snes"
+                and bool(getattr(cfg, "train_encoder", False))):
+            raise NotImplementedError(
+                "train_encoder=True is only supported under "
+                "cfg.optimizer='adam' (the Adam path backprops through "
+                "the encoder). For SNES, set train_encoder=False and "
+                "use the static preprocess.")
+        if not bool(getattr(cfg, "train_encoder", False)):
+            # Disk-backed gradient streaming is incompatible with the
+            # static rewrite (gradients live on disk as raw bytes, not
+            # in `train_data['gradients']`). Force in-memory mode for
+            # the static encoder pipeline; the iterative path keeps the
+            # raw stream and applies the encoder online instead.
+            if (getattr(cfg, "cache_gradients_to_disk", False)
+                    and train_data.get("_prebuilt_gv") is not None):
+                raise NotImplementedError(
+                    "cache_gradients_to_disk=True is incompatible with "
+                    "static encoder preprocess (train_encoder=False). "
+                    "Either disable disk-streaming or set "
+                    "train_encoder=True so the encoder is applied "
+                    "per-batch over the on-disk raw gradients.")
+            train_data["descriptors"], train_data["gradients"] = (
+                apply_encoder_to_lists(
+                    train_data["descriptors"], train_data["gradients"],
+                    cfg._encoder_J, cfg._encoder))
+            val_data["descriptors"], val_data["gradients"] = (
+                apply_encoder_to_lists(
+                    val_data["descriptors"], val_data["gradients"],
+                    cfg._encoder_J, cfg._encoder))
+            cfg.dim_q = int(cfg._encoder_latent_dim)
+            print(f"[encoder] static preprocess: dim_q overridden to "
+                  f"{cfg.dim_q} (Q_raw={cfg._encoder_q_raw}).")
+        else:
+            # Iterative path also overrides dim_q since TNEP sees Z, not
+            # Q_raw, when its inputs flow through the encoder.
+            cfg.dim_q = int(cfg._encoder_latent_dim)
+            print(f"[encoder] iterative mode: dim_q overridden to "
+                  f"{cfg.dim_q}; encoder applied per-batch by TNEP.")
+
     # Per-channel descriptor scaling. Computed ONCE over the training-
     # set per-atom descriptors (before padding) and applied identically
     # to train/val/test/trajectory inputs so the scaler is a frozen
