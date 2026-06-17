@@ -64,13 +64,11 @@ class TNEP(layers.Layer):
                     f"fold needs the (n, n', l) decomposition that only "
                     f"trivial compression preserves.")
             # nep4_radial collapses the (n, n', species_pair) structure
-            # into a flat (n'', l) axis, so the post-contraction block
-            # layout that descriptor_mixing assumes is undefined.
-            if bool(getattr(cfg, "descriptor_mixing", False)):
-                raise NotImplementedError(
-                    "descriptor_preprocess_contract='nep4_radial' is "
-                    "mutually exclusive with descriptor_mixing in this "
-                    "build. Disable mixing or run nep4_radial standalone.")
+            # into a flat (n'', l) axis at Q_new = n_max_out · L. Mixing
+            # is supported via the l_aware architecture: blocks of size
+            # n_max_out per angular momentum l, rotating radial channels
+            # within each l. The general preprocess+mixing arch gate
+            # below enforces arch='l_aware' (other archs raise).
         if self.descriptor_preprocess_contract != "off":
             # Mixing composes with preprocess only in the l_aware
             # architecture (where blocks are per (post-pair, l_post) and
@@ -423,22 +421,38 @@ class TNEP(layers.Layer):
                 alpha_max = int(_lay["nep4_alpha_max"])
                 coef_shape = tuple(_lay["coef_shape"])
                 full_coef_size = int(_lay["nep4_full_coef_size"])
-                # Init: Glorot-style with fan_in = α (one c-vector contracts
-                # over α primitives per centre/neighbour pair). Per-element
-                # σ on each c gives a roughly unit-scale bilinear product.
+                # Init policy for the c tensor: force GLOROT regardless of
+                # the cfg flag. The 'mean' / 'sum' schemes set c to a
+                # constant across all entries, which under the bilinear
+                # fold  g[t, n'', l] = Σ_{n,n'} c·c·p  collapses every
+                # n'' output channel to the SAME value (the n'' axis
+                # drops out of c·c when c is constant). The 60-wide
+                # compressed descriptor becomes rank-1 at gen 0 and SNES
+                # has no signal to break the symmetry. Glorot's random
+                # per-element init breaks that symmetry immediately.
+                # The cfg default 'mean' is right for the linear-fold
+                # modes (angular/species_pair/both) and for the w_l
+                # angular-summed weights below (linear weighted sum, no
+                # bilinear symmetry to collapse) — only the c init for
+                # nep4_radial gets force-overridden here.
+                if init_scheme in ("mean", "sum"):
+                    print(
+                        "[nep4_radial] forcing GLOROT init for c tensor "
+                        f"(cfg requested descriptor_preprocess_init="
+                        f"{init_scheme!r}). Constant c init causes "
+                        "bilinear-fold symmetry collapse — all n'' "
+                        "channels become identical at gen 0. The w_l "
+                        "angular-summed slab keeps the requested scheme.")
+                # c init is glorot unconditionally; w_l (later block)
+                # respects the cfg's init_scheme.
                 init_norm = float(_lay["coef_init_norm"])
-                if init_scheme == "glorot":
-                    fan_in = max(1, alpha_max)
-                    fan_out = max(1, n_max_out)
-                    limit = float(np.sqrt(6.0 / (fan_in + fan_out)))
-                    rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
-                    init_np = rng.uniform(
-                        -limit, limit, size=coef_shape).astype(np.float32)
-                elif init_scheme in ("mean", "sum"):
-                    # Uniform fan-in normalised init. Reasonable starting
-                    # point; SNES then searches.
-                    init_np = np.full(coef_shape, init_norm, dtype=np.float32)
-                else:
+                fan_in = max(1, alpha_max)
+                fan_out = max(1, n_max_out)
+                limit = float(np.sqrt(6.0 / (fan_in + fan_out)))
+                rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
+                init_np = rng.uniform(
+                    -limit, limit, size=coef_shape).astype(np.float32)
+                if init_scheme not in ("mean", "sum", "glorot"):
                     raise ValueError(
                         f"descriptor_preprocess_init={init_scheme!r} not "
                         f"recognised; expected 'mean', 'sum', or 'glorot'.")
@@ -469,13 +483,22 @@ class TNEP(layers.Layer):
                 self._nep4_n_max_out = n_max_out
                 self._nep4_alpha_max = alpha_max
                 self._nep4_L = int(_lay["L"])
-                # Precompute the [n_max_out, L] mid-shape constant used
+                # Optional angular contraction stacked on top of the
+                # bilinear fold. L_eff = l_keep + 1 collapses l ≥ l_keep
+                # into a single learnable summed channel (mirrors the
+                # linear "angular" preprocess mode). When l_keep ≥ L
+                # (default), L_eff = L and N_sum_l = 0 → no contraction
+                # and no extra learnable weights.
+                self._nep4_l_keep = int(_lay["nep4_l_keep"])
+                self._nep4_L_eff = int(_lay["nep4_L_eff"])
+                self._nep4_N_sum_l = int(_lay["nep4_N_sum_l"])
+                # Precompute the [n_max_out, L_eff] mid-shape constant used
                 # in `_W0_preprocess_eff_nep4` to reshape W0 from
-                # [..., T, n_max_out·L, H] → [..., T, n_max_out, L, H].
+                # [..., T, n_max_out·L_eff, H] → [..., T, n_max_out, L_eff, H].
                 # Without this the fold creates a fresh tf.constant per
                 # call inside the @tf.function-traced predict_batch path.
                 self._nep4_mid_shape = tf.constant(
-                    [self._nep4_n_max_out, self._nep4_L], dtype=tf.int32)
+                    [self._nep4_n_max_out, self._nep4_L_eff], dtype=tf.int32)
                 self._nep4_l_of_q = tf.constant(
                     _lay["nep4_l_of_q"], dtype=tf.int32)
                 self._nep4_n_global = tf.constant(
@@ -486,6 +509,63 @@ class TNEP(layers.Layer):
                     _lay["nep4_n_to_species"], dtype=tf.int32)
                 self._nep4_n_to_local = tf.constant(
                     _lay["nep4_n_to_local"], dtype=tf.int32)
+                # Angular-contraction weights (trainable summed-channel
+                # weights for l ≥ l_keep). Only allocated when l_keep < L;
+                # otherwise None and the fold reduces to the bilinear-only
+                # case. Init: 'mean' (1/N_sum_l per slot) matches the
+                # linear-angular convention; 'sum' (1.0) and 'glorot' (0
+                # μ-init, σ at gen 0 supplies spread) also handled.
+                #
+                # SHARED across centre types. The angular weights pick
+                # which l ≥ l_keep channels survive the summation — by
+                # the same algebraic argument as mixing (any per-type
+                # linear acting on the descriptor is absorbable into
+                # W0[t]), per-type w_l adds zero expressive capacity over
+                # shared. Sharing collapses N_sum_l·T → N_sum_l SNES
+                # dims (saves 12 dims for T=3, N_sum_l=6).
+                if self._nep4_N_sum_l > 0:
+                    if init_scheme == "mean":
+                        w_l_val = 1.0 / float(self._nep4_N_sum_l)
+                        w_l_init = np.full(
+                            (self._nep4_N_sum_l,), w_l_val, dtype=np.float32)
+                    elif init_scheme == "sum":
+                        w_l_init = np.ones(
+                            (self._nep4_N_sum_l,), dtype=np.float32)
+                    else:   # glorot
+                        rng_l = np.random.default_rng(
+                            int(getattr(cfg, "seed", 0)) ^ 0xA17EC0DE)
+                        limit_l = float(np.sqrt(
+                            6.0 / (self._nep4_N_sum_l + 1)))
+                        w_l_init = rng_l.uniform(
+                            -limit_l, limit_l,
+                            size=(self._nep4_N_sum_l,)).astype(np.float32)
+                    self.W_pre_angular_l = tf.Variable(
+                        w_l_init, trainable=False,
+                        name="W_pre_angular_nep4_lkeep", dtype=tf.float32)
+                    # Precompute two constant projectors used by the fold
+                    # to assemble W_ang[L_eff, L] (shared, no T axis):
+                    #   _nep4_W_ang_kept: [L_eff, L] identity on the kept
+                    #     rows (l_post < l_keep); zeros on the summed row.
+                    #   _nep4_w_l_scatter: [N_sum_l, L_eff, L] with a 1 at
+                    #     [j, l_keep, l_keep+j]; the einsum
+                    #     'j,jpl->pl' against W_pre_angular_l places the
+                    #     trainable weights into the summed row.
+                    L_raw = self._nep4_L
+                    L_eff = self._nep4_L_eff
+                    l_keep = self._nep4_l_keep
+                    kept_np = np.zeros((L_eff, L_raw), dtype=np.float32)
+                    for l_post in range(l_keep):
+                        kept_np[l_post, l_post] = 1.0
+                    self._nep4_W_ang_kept = tf.constant(kept_np)
+                    scat_np = np.zeros(
+                        (self._nep4_N_sum_l, L_eff, L_raw), dtype=np.float32)
+                    for j in range(self._nep4_N_sum_l):
+                        scat_np[j, l_keep, l_keep + j] = 1.0
+                    self._nep4_w_l_scatter = tf.constant(scat_np)
+                else:
+                    self.W_pre_angular_l = None
+                    self._nep4_W_ang_kept = None
+                    self._nep4_w_l_scatter = None
                 # Layout invariant locked in for the L-batched matmul fast
                 # path in `_W0_preprocess_eff_nep4`. The trivial-compression
                 # walk in DescriptorBuilderGPU emits (n, n', l) with the
@@ -797,7 +877,8 @@ class TNEP(layers.Layer):
         return tf.einsum('...qp,...tqh->...tph', U_full, W0)
 
     def _W0_preprocess_eff(self, W0: tf.Tensor,
-                            W_pre_override: tf.Tensor | None = None) -> tf.Tensor:
+                            W_pre_override: tf.Tensor | None = None,
+                            W_pre_l_override: tf.Tensor | None = None) -> tf.Tensor:
         """Fold the angular preprocessing contraction into W0.
 
         Algebra: with `desc' = preprocess(desc_raw)` where
@@ -830,7 +911,9 @@ class TNEP(layers.Layer):
         W_pre = (W_pre_override if W_pre_override is not None
                  else self.W_pre_angular)
         if self.descriptor_preprocess_contract == "nep4_radial":
-            return self._W0_preprocess_eff_nep4(W0, W_pre)
+            w_l = (W_pre_l_override if W_pre_l_override is not None
+                   else self.W_pre_angular_l)
+            return self._W0_preprocess_eff_nep4(W0, W_pre, w_l)
         # W0 storage: [(C,) T, Q_new, H]. Gather/scatter along Q_new to
         # produce [(C,) T, Q_raw, H], then weight by W_pre.
         if self._preprocess_scatter is None:
@@ -853,7 +936,8 @@ class TNEP(layers.Layer):
         return W0_at_qraw * factor
 
     def _W0_preprocess_eff_nep4(self, W0: tf.Tensor,
-                                 c: tf.Tensor) -> tf.Tensor:
+                                 c: tf.Tensor,
+                                 w_l: tf.Tensor | None = None) -> tf.Tensor:
         """NEP4 bilinear (rank-1 outer-product) fold of W0.
 
         Implements the equation
@@ -861,16 +945,26 @@ class TNEP(layers.Layer):
                                   · c[t, s(n'), n'', k(n')]
                                   · p[n, n', l]
         as a transformation of W0 from the [n'', l]-indexed storage at
-        Q_new = n_max_out · L to the [n, n', l]-indexed raw-descriptor
+        Q_new = n_max_out · L_eff to the [n, n', l]-indexed raw-descriptor
         layout at Q_raw, so the existing matmul code can continue to
         operate against the unmodified raw descriptor:
             U = W0_eff[t, q_raw] · desc_raw[q_raw]
-              ≡ W0[t, q_new(n'', l)] · g[t, n'', l]
-              ≡ W0[t, q_new(n'', l(q))] · Σ_{n,n'} c·c · p
+              ≡ W0[t, q_new(n'', l_post)] · g[t, n'', l_post]
+              ≡ W0[t, q_new(n'', l_post(q))] · Σ_{n,n'} c·c · p
+
+        When the optional angular contraction is active (N_sum_l > 0),
+        L_eff = l_keep + 1 < L and `w_l[T, N_sum_l]` supplies the
+        trainable weights of the single summed channel that aggregates
+        l ≥ l_keep. The fold then expands W0 from L_eff back to L by
+        building W_ang[T, L_eff, L] (identity on the kept rows, the
+        learned weights on the summed row) and contracting it into the
+        weight tensor in a single einsum.
 
         Args:
-          W0: [(C,) T, n_max_out · L, H]   weights at Q_new
+          W0: [(C,) T, n_max_out · L_eff, H]   weights at Q_new
           c:  [(C,) T_centre, T_neighbour, n_max_out, α]   NEP4 coeffs
+          w_l: [(C,) T_centre, N_sum_l]   angular-summed weights,
+               or None when l_keep ≥ L (no angular contraction)
 
         Returns:
           W0_eff: [(C,) T, Q_raw, H]   weights at the raw descriptor dim
@@ -911,11 +1005,39 @@ class TNEP(layers.Layer):
         W0_shape = tf.shape(W0)
         H_ = W0_shape[-1]
         leading = W0_shape[:-2]
-        # W0:    [..., T, n_max_out·L, H]
-        # W0_NLH: [..., T, n_max_out, L, H]   (l is its own axis, no gather)
+        # W0:     [..., T, n_max_out·L_eff, H]
+        # W0_NLp: [..., T, n_max_out, L_eff, H]   (l_post is its own axis)
         new_shape = tf.concat(
             [leading, self._nep4_mid_shape, tf.reshape(H_, [1])], axis=0)
         W0_NLH = tf.reshape(W0, new_shape)
+        # ── Optional angular expansion L_eff → L ─────────────────────────────
+        # When the bilinear fold is stacked with an angular contraction
+        # (N_sum_l > 0 ⇒ L_eff = l_keep + 1 < L), W0 is stored at the
+        # collapsed L_eff. To fold it against the raw descriptor we have
+        # to expand its l axis back to L using the learned summed-channel
+        # weights:
+        #   W_ang[t, l_post, l]
+        #     = δ(l_post, l)                      for l_post < l_keep,
+        #     = w_l[t, l - l_keep]                for l_post = l_keep,
+        #                                         l ≥ l_keep,
+        #     = 0                                 otherwise.
+        # Built without any per-call allocation by fusing the precomputed
+        # kept-row identity (`_nep4_W_ang_kept`) with the scattered
+        # learned weights (`_nep4_w_l_scatter`).
+        if self._nep4_N_sum_l > 0:
+            # w_l is shared across centre types — shape [N_sum_l] (single)
+            # or [C, N_sum_l] (batched). W_ang ends up [L_eff, L] or
+            # [C, L_eff, L]; the W0 expansion einsum broadcasts over t.
+            if has_C:
+                W_ang_summed = tf.einsum(
+                    'Cj,jpl->Cpl', w_l, self._nep4_w_l_scatter)
+                W_ang = self._nep4_W_ang_kept + W_ang_summed  # [C, L_eff, L]
+                W0_NLH = tf.einsum('Cjl,CtNjh->CtNlh', W_ang, W0_NLH)
+            else:
+                W_ang_summed = tf.einsum(
+                    'j,jpl->pl', w_l, self._nep4_w_l_scatter)
+                W_ang = self._nep4_W_ang_kept + W_ang_summed  # [L_eff, L]
+                W0_NLH = tf.einsum('jl,tNjh->tNlh', W_ang, W0_NLH)
         # AB:    [..., T_c, Q_raw, n_max_out]
         # AB_pl: [..., T_c, Q_pair_kept, L, n_max_out]   (q axis factored)
         ab_shape = tf.concat(
@@ -1732,7 +1854,8 @@ class TNEP(layers.Layer):
                                   W0: tf.Tensor, b0: tf.Tensor,
                                   W1: tf.Tensor, b1: tf.Tensor,
                                   U_pair: tf.Tensor | None = None,
-                                  W_pre_angular: tf.Tensor | None = None) -> tf.Tensor:
+                                  W_pre_angular: tf.Tensor | None = None,
+                                  W_pre_angular_l: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
         Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
@@ -1791,7 +1914,10 @@ class TNEP(layers.Layer):
         # with the precomputed raw W_atom. Mutually exclusive with
         # mixing/gating (so the two folds never compose in this build).
         if self.descriptor_preprocess_contract != "off":
-            W0 = self._W0_preprocess_eff(W0, W_pre_override=W_pre_angular)
+            W0 = self._W0_preprocess_eff(
+                W0,
+                W_pre_override=W_pre_angular,
+                W_pre_l_override=W_pre_angular_l)
 
         # ── Forward: input→hidden ─────────────────────────────────────────────
         # Per type: [B*A, Q] @ [Q, C*H] → [B*A, C*H] → [C, B, A, H]

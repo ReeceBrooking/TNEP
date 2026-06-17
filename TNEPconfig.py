@@ -377,7 +377,7 @@ class TNEPconfig:
     # l_aware mixing composes with all preprocess modes; other mixing
     # archs (linear, cross_pair_l) raise NotImplementedError when
     # preprocess is on.
-    descriptor_preprocess_contract: str = "angular"
+    descriptor_preprocess_contract: str = "nep4_radial"
     # NEP4 learned-basis fold output radial-channel count. Only consulted
     # when descriptor_preprocess_contract == "nep4_radial". When None
     # (default), the layout auto-picks n_max_out = Q_raw / L so that
@@ -496,7 +496,7 @@ class TNEPconfig:
 
     # --- core ----------------------------------------------------------
     # Number of samples made in each train generation
-    pop_size: int | None = 100
+    pop_size: int | None = 200
     # Number of training generations (number of updates to the model)
     num_generations: int = 60000
     # Number of structures used in each train step (None = full batch)

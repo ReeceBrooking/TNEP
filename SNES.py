@@ -59,6 +59,9 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
             and getattr(model, "descriptor_preprocess_contract", "off") != "off"
             and getattr(model, "W_pre_angular", None) is not None):
         model.W_pre_angular.assign(params[idx]); idx += 1
+    if (idx < len(params)
+            and getattr(model, "W_pre_angular_l", None) is not None):
+        model.W_pre_angular_l.assign(params[idx]); idx += 1
 
 class SNES:
     """Separable Natural Evolution Strategy optimizer for TNEP.
@@ -372,6 +375,18 @@ class SNES:
             # we'll scatter into below.
             self.n_preprocess = int(
                 self.model._preprocess_summed_count)
+            # Optional second preprocess slab: angular-summed weights for
+            # the nep4_radial+l_keep stack. SHARED across centre types
+            # → N_sum_l SNES dims, placed immediately after the main
+            # preprocess slab in μ. Zero when l_keep ≥ L (no contraction)
+            # or for any non-nep4 mode. (Per-type sharing argument: any
+            # per-t linear acting on the descriptor is absorbable into
+            # W0[t], so per-type w_l adds no expressive capacity.)
+            if (self._preprocess_mode == "nep4_radial"
+                    and int(getattr(self.model, "_nep4_N_sum_l", 0)) > 0):
+                self.n_preprocess_l = int(self.model._nep4_N_sum_l)
+            else:
+                self.n_preprocess_l = 0
             # Initial value (uniform across T and Q_raw) for the mean/sum
             # init schemes. Glorot init is set in mu_init directly.
             init_scheme = str(getattr(
@@ -407,12 +422,14 @@ class SNES:
             self._preprocess_init_scheme = init_scheme
         else:
             self.n_preprocess = 0
+            self.n_preprocess_l = 0
             self._preprocess_Q_raw = 0
             self._preprocess_init_value = 1.0
             self._preprocess_init_scheme = "mean"
             self._preprocess_init_per_q_raw = None
 
-        self.dim = self.n_anns_total + self.n_U_pair + self.n_preprocess
+        self.dim = (self.n_anns_total + self.n_U_pair
+                    + self.n_preprocess + self.n_preprocess_l)
 
         # Search distribution parameters as tf.Variables (stay on GPU).
         # Initialisation scheme is configurable:
@@ -442,6 +459,14 @@ class SNES:
         if self.n_preprocess > 0 and preprocess_scale != 1.0:
             pre_start = self.n_anns_total + self.n_U_pair
             sigma_init_vec[pre_start:pre_start + self.n_preprocess] *= preprocess_scale
+        # The angular-summed slab (nep4 l_keep) shares the preprocess σ scale —
+        # they're the same kind of parameter (learned linear weight on a
+        # raw-descriptor axis) and exploration noise should track the same
+        # decoupling that already applies to the c slab.
+        if self.n_preprocess_l > 0 and preprocess_scale != 1.0:
+            pre_l_start = (self.n_anns_total + self.n_U_pair
+                           + self.n_preprocess)
+            sigma_init_vec[pre_l_start:pre_l_start + self.n_preprocess_l] *= preprocess_scale
         self.sigma = tf.Variable(sigma_init_vec, trainable=False, name="snes_sigma")
 
         auto_pop = int(4 + (3 * np.log(self.dim)))
@@ -648,6 +673,15 @@ class SNES:
                 summed_init = rng.uniform(
                     -limit, limit, size=summed_init.size).astype(np.float32)
             mu[pre_start:pre_start + self.n_preprocess] = summed_init
+        # nep4_radial angular-summed slab: read the model's W_pre_angular_l
+        # Variable (TNEP populated it per cfg.descriptor_preprocess_init in
+        # the nep4 branch — 'mean' → 1/N_sum_l, 'sum' → 1.0, 'glorot' →
+        # uniform jitter) and copy to μ. Mirrors the main preprocess slab.
+        if self.n_preprocess_l > 0:
+            pre_l_start = (self.n_anns_total + self.n_U_pair
+                           + self.n_preprocess)
+            w_l_init = self.model.W_pre_angular_l.numpy().reshape(-1)
+            mu[pre_l_start:pre_l_start + self.n_preprocess_l] = w_l_init
         return mu
 
     def _maybe_adapt_lambda(self, gen: int, data_loss: float,
@@ -885,6 +919,13 @@ class SNES:
             else:
                 pre_labels = np.full(self.n_preprocess, T, dtype=np.int32)
             tail_labels_parts.append(pre_labels)
+        # nep4 angular-summed slab: SHARED across centre types [N_sum_l].
+        # All entries affect every type's forward pass equally, so they
+        # rank against the global fitness signal (label T) — same
+        # convention as shared U_pair.
+        if self.n_preprocess_l > 0:
+            pre_l_labels = np.full(self.n_preprocess_l, T, dtype=np.int32)
+            tail_labels_parts.append(pre_l_labels)
         if tail_labels_parts:
             tail_labels = np.concatenate(tail_labels_parts)
             return np.concatenate([ann_tov, tail_labels])
@@ -1784,6 +1825,7 @@ class SNES:
             b1p = named.get("b1_pol")
             U_pair_val = named.get("U_pair")
             W_pre_angular_val = named.get("W_pre_angular")
+            W_pre_angular_l_val = named.get("W_pre_angular_l")
             # Absorb U_pair^T into W0 (and W0_pol).
             if U_pair_val is not None:
                 W0 = self.model._W0_eff(W0, U_pair_val)
@@ -1793,10 +1835,12 @@ class SNES:
             if (getattr(self.model, "descriptor_preprocess_contract", "off")
                     != "off"):
                 W0 = self.model._W0_preprocess_eff(
-                    W0, W_pre_override=W_pre_angular_val)
+                    W0, W_pre_override=W_pre_angular_val,
+                    W_pre_l_override=W_pre_angular_l_val)
                 if W0p is not None:
                     W0p = self.model._W0_preprocess_eff(
-                        W0p, W_pre_override=W_pre_angular_val)
+                        W0p, W_pre_override=W_pre_angular_val,
+                        W_pre_l_override=W_pre_angular_l_val)
             # Stash the folded tensors for the next validate() call this gen.
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
@@ -1916,8 +1960,10 @@ class SNES:
             W0_pol, b0_pol, W1_pol, b1_pol         (target_mode == 2)
             U_pair                                 (descriptor_mixing on)
             W_pre_angular                          (preprocess_contract != "off")
+            W_pre_angular_l                        (nep4_radial + l_keep < L)
         """
-        out: dict = {"U_pair": None, "W_pre_angular": None}
+        out: dict = {"U_pair": None, "W_pre_angular": None,
+                     "W_pre_angular_l": None}
         idx = 0
         out["W0"] = params[idx]; idx += 1
         out["b0"] = params[idx]; idx += 1
@@ -1932,6 +1978,8 @@ class SNES:
             out["U_pair"] = params[idx]; idx += 1
         if self.n_preprocess > 0 and idx < len(params):
             out["W_pre_angular"] = params[idx]; idx += 1
+        if self.n_preprocess_l > 0 and idx < len(params):
+            out["W_pre_angular_l"] = params[idx]; idx += 1
         return out
 
     def reconstruct_params_tf(self, param_vectors: tf.Tensor) -> tuple:
@@ -2041,6 +2089,22 @@ class SNES:
                     full_flat = base_flat + summed_contrib
                     W_pre = tf.reshape(full_flat, base_static_shape)
             tail = tail + (W_pre,)
+
+        # Optional nep4 angular-summed slab. Simple flat reshape: μ stores
+        # [T, N_sum_l] entries directly. None when N_sum_l == 0 (no
+        # contraction) — emit an explicit None so downstream zip-like
+        # consumers can distinguish "absent" from "present but empty".
+        if self.n_preprocess_l > 0:
+            pre_l_flat = param_vectors[..., offset:offset + self.n_preprocess_l]
+            offset += self.n_preprocess_l
+            N_sum_l = int(self.model._nep4_N_sum_l)
+            # Shared across centre types — slab IS the flat [N_sum_l] vector
+            # (no T axis). Batched form retains the candidate axis only.
+            if is_batched:
+                W_pre_l = tf.reshape(pre_l_flat, [-1, N_sum_l])
+            else:
+                W_pre_l = tf.reshape(pre_l_flat, [N_sum_l])
+            tail = tail + (W_pre_l,)
 
         return tail
 
@@ -2369,6 +2433,30 @@ class SNES:
                         tf.reduce_sum(tf.square(dev), axis=1)
                         / float(self.n_preprocess))
 
+        # nep4 angular-summed slab: penalise deviation from the init w_l
+        # under the same lambdas. The slab is small (T·N_sum_l) so
+        # averaging over its own size keeps the per-parameter penalty
+        # comparable to the c slab above.
+        if self.n_preprocess_l > 0:
+            lp1 = float(getattr(self.cfg,
+                                "descriptor_preprocess_lambda_1", 0.0) or 0.0)
+            lp2 = float(getattr(self.cfg,
+                                "descriptor_preprocess_lambda_2", 0.0) or 0.0)
+            if lp1 > 0.0 or lp2 > 0.0:
+                pre_l_start = (self.n_anns_total + self.n_U_pair
+                               + self.n_preprocess)
+                pre_l_slab = param_vectors[
+                    :, pre_l_start:pre_l_start + self.n_preprocess_l]
+                ref_l = tf.reshape(self.model.W_pre_angular_l, [-1])
+                dev_l = pre_l_slab - ref_l[tf.newaxis, :]
+                if lp1 > 0.0:
+                    reg = reg + lp1 * tf.reduce_sum(
+                        tf.abs(dev_l), axis=1) / float(self.n_preprocess_l)
+                if lp2 > 0.0:
+                    reg = reg + lp2 * tf.sqrt(
+                        tf.reduce_sum(tf.square(dev_l), axis=1)
+                        / float(self.n_preprocess_l))
+
         return reg
 
     def _extract_type_params_batched(self, param_vectors: tf.Tensor, t: int) -> tf.Tensor:
@@ -2691,6 +2779,9 @@ class SNES:
         # W_pre_angular_cand: per-candidate preprocess coefficients (None
         # when descriptor_preprocess_contract='off').
         W_pre_angular_cand = named.get("W_pre_angular")
+        # W_pre_angular_l_cand: per-candidate angular-summed coefficients
+        # for the nep4_radial + l_keep stack (None when n_preprocess_l==0).
+        W_pre_angular_l_cand = named.get("W_pre_angular_l")
 
         # Loss / weighting hyperparameters from cfg + batch context. Reading
         # these dynamically (instead of hardcoding mse) restores parity with
@@ -2719,8 +2810,12 @@ class SNES:
             if (W_pre_angular_cand is not None
                     and getattr(self.model, "descriptor_preprocess_contract",
                                 "off") != "off"):
-                W0 = self.model._W0_preprocess_eff(W0, W_pre_angular_cand)
-                W0p = self.model._W0_preprocess_eff(W0p, W_pre_angular_cand)
+                W0 = self.model._W0_preprocess_eff(
+                    W0, W_pre_angular_cand,
+                    W_pre_l_override=W_pre_angular_l_cand)
+                W0p = self.model._W0_preprocess_eff(
+                    W0p, W_pre_angular_cand,
+                    W_pre_l_override=W_pre_angular_l_cand)
 
             # Combined per-component weights for the training loss:
             # pol_weights × per-component inverse weights (if active).
@@ -2773,7 +2868,8 @@ class SNES:
             preds = self.model.predict_batch_candidates(
                 desc, W_atom, Z, amask, W0, b0, W1, b1,
                 U_pair=U_pair_cand,
-                W_pre_angular=W_pre_angular_cand)  # [C, B, T_dim]
+                W_pre_angular=W_pre_angular_cand,
+                W_pre_angular_l=W_pre_angular_l_cand)  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]

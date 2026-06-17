@@ -842,7 +842,20 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
             if n_max_out <= 0:
                 raise ValueError(
                     f"descriptor_nep4_n_max_out={n_max_out} must be > 0.")
-        Q_new = n_max_out * L
+        # Optional angular contraction stacked on top of the bilinear fold:
+        # collapse l ≥ l_keep into a single learnable summed channel, mirroring
+        # the linear "angular" preprocess mode. The bilinear nep4 fold keeps
+        # the L axis intact; this step then contracts it to L_eff = l_keep + 1.
+        l_keep_cfg = getattr(cfg, "descriptor_preprocess_angular_l_keep", None)
+        if l_keep_cfg is None or int(l_keep_cfg) >= L:
+            nep4_l_keep = int(L)
+            nep4_L_eff = int(L)
+            nep4_N_sum_l = 0
+        else:
+            nep4_l_keep = max(0, int(l_keep_cfg))
+            nep4_L_eff = nep4_l_keep + 1
+            nep4_N_sum_l = L - nep4_l_keep
+        Q_new = n_max_out * nep4_L_eff
         # Rebuild the Fortran (n, n', l) emit order and record the
         # (n_global, n'_global, l) tuple for each q_raw. Mirrors the loop
         # in descriptor_block_layout (we re-walk it rather than passing
@@ -920,7 +933,7 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
             coef_init_per_q_raw=None,
             summed_q_raw_mask=summed_mask,
             L=L,
-            l_keep=L,
+            l_keep=nep4_l_keep,
             # NEP4-specific fields:
             nep4_n_max_out=int(n_max_out),
             nep4_alpha_max=int(alpha_max),
@@ -931,6 +944,10 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
             nep4_np_global=nep4_np_global,
             nep4_n_to_species=nep4_n_to_species,
             nep4_n_to_local=nep4_n_to_local,
+            # Angular contraction (stacked on top of the bilinear fold):
+            nep4_l_keep=nep4_l_keep,
+            nep4_L_eff=nep4_L_eff,
+            nep4_N_sum_l=nep4_N_sum_l,
         )
 
     raise ValueError(
@@ -1045,6 +1062,39 @@ def descriptor_post_preprocess_block_layout(
                 l: np.asarray(per_l[l], dtype=np.int32) for l in range(L_eff)}
             post_block_sizes[k] = alpha * L_eff
         dim_q_post = self_block_size + other_block_size
+
+    elif preprocess_mode == "nep4_radial":
+        # NEP4 collapses the (n, n', species_pair) structure into a flat
+        # (n'', l) axis at Q_new = n_max_out · L_eff (L_eff = l_keep + 1
+        # when the angular contraction is stacked on top; L_eff = L
+        # otherwise). There is no residual species-pair concept in Q_new,
+        # so the mixing layout uses a single logical "block" of size
+        # Q_new; l_aware mixing then rotates n'' within each angular
+        # momentum index. The reshape order is row-major [n_max_out, L_eff]
+        # (matches `_nep4_mid_shape` in TNEP), so q = n''·L_eff + l_post.
+        Q_raw_lay = int(layout["dim_q"])
+        if Q_raw_lay % L != 0:
+            raise ValueError(
+                f"nep4 post-preprocess layout: raw Q_raw={Q_raw_lay} not "
+                f"divisible by L={L}.")
+        Q_pair_kept = Q_raw_lay // L
+        n_max_out_cfg = getattr(cfg, "descriptor_nep4_n_max_out", None)
+        n_max_out = int(n_max_out_cfg) if n_max_out_cfg is not None else Q_pair_kept
+        l_keep_cfg = getattr(cfg, "descriptor_preprocess_angular_l_keep", None)
+        if l_keep_cfg is None or int(l_keep_cfg) >= L:
+            L_eff = L
+        else:
+            L_eff = max(0, int(l_keep_cfg)) + 1
+        Q_new = n_max_out * L_eff
+        post_pair_keys = ["all"]
+        post_alpha = {"all": n_max_out}
+        q_all = np.arange(Q_new, dtype=np.int32)
+        per_l_all = {l: np.arange(l, Q_new, L_eff, dtype=np.int32)
+                     for l in range(L_eff)}
+        post_pair_q_index = {"all": q_all}
+        post_pair_ln_index = {"all": per_l_all}
+        post_block_sizes = {"all": Q_new}
+        dim_q_post = Q_new
 
     else:  # "off"
         raise ValueError(
