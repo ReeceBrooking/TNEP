@@ -11,29 +11,22 @@ from TNEPconfig import TNEPconfig
 
 
 class TNEP(layers.Layer):
-    """Per-type single-hidden-layer ANN for predicting energy, dipole, or polarizability.
+    """Per-type single-hidden-layer ANN predicting energy, dipole, or polarizability.
 
-    Forward pass per atom i with type t:
-        a_i  = q_i @ W0[t] + b0[t]           # [num_neurons]
-        h_i  = tanh(a_i)                      # [num_neurons]
-        U_i  = h_i · W1[t] + b1              # scalar
+    Per atom i (type t): U_i = tanh(q_i @ W0[t] + b0[t]) · W1[t] + b1.
+        W0 [num_types, dim_q, num_neurons]  in→hidden
+        b0 [num_types, num_neurons]         hidden bias
+        W1 [num_types, num_neurons]         hidden→scalar
+        b1 ()                               global scalar bias
 
-    Weights:
-        W0 : [num_types, dim_q, num_neurons]  input -> hidden
-        b0 : [num_types, num_neurons]         hidden bias
-        W1 : [num_types, num_neurons]         hidden -> scalar
-        b1 : ()                               global scalar bias
+    Modes (cfg.target_mode):
+        0 PES     : E = -Σ_i U_i                            → [1]
+        1 Dipole  : μ = -Σ_ij |r_ij|² · (dU_i/dr_ij_vec)    → [3]
+        2 Polar.  : α[6] via dual ANN (scalar + tensor)     → [6]
 
-    Prediction modes (cfg.target_mode):
-        0 (PES)    : E = -sum_i U_i                                   -> scalar
-        1 (Dipole) : μ = -sum_i sum_j |r_ij|² * (dU_i/dr_ij_vec)     -> [3]
-        2 (Polar.) : α[6] via dual ANN (scalar + tensor)              -> [6]
-
-    For mode 2 (polarizability), a second "scalar ANN" is added:
-        W0_pol, b0_pol, W1_pol, b1_pol
-    The scalar ANN computes per-atom F_pol -> isotropic diagonal.
-    The tensor ANN (primary W0/b0/W1/b1) computes forces -> anisotropic virial.
-    Output: [xx, yy, zz, xy, yz, zx]
+    Mode 2 adds a scalar ANN (W0_pol/b0_pol/W1_pol/b1_pol) giving the isotropic
+    diagonal; the primary ANN's forces give the anisotropic virial.
+    Output order: [xx, yy, zz, xy, yz, zx].
     """
 
     def __init__(self,
@@ -42,11 +35,8 @@ class TNEP(layers.Layer):
         super().__init__(**kwargs)
         self.cfg = cfg
 
-        # Preprocessing contraction (phase 1 of 2): if enabled, run the
-        # mutual-exclusion guards then override cfg.dim_q to the
-        # contracted output dim BEFORE allocating W0 and downstream
-        # Variables that key off cfg.dim_q. Phase 2 below allocates the
-        # per-type coefficient Variable W_pre_*.
+        # Preprocess contraction phase 1/2: run guards, then override cfg.dim_q
+        # to the contracted dim BEFORE allocating W0. Phase 2 allocates W_pre_*.
         self.descriptor_preprocess_contract = str(getattr(
             cfg, "descriptor_preprocess_contract", "off"))
         if self.descriptor_preprocess_contract not in (
@@ -63,25 +53,20 @@ class TNEP(layers.Layer):
                     f"compress_mode='trivial' (got {_cm!r}); the bilinear "
                     f"fold needs the (n, n', l) decomposition that only "
                     f"trivial compression preserves.")
-            # nep4_radial collapses the (n, n', species_pair) structure
-            # into a flat (n'', l) axis, so the post-contraction block
-            # layout that descriptor_mixing assumes is undefined.
+            # nep4_radial collapses (n, n', species_pair) into a flat (n'', l)
+            # axis, so the block layout descriptor_mixing assumes is undefined.
             if bool(getattr(cfg, "descriptor_mixing", False)):
                 raise NotImplementedError(
                     "descriptor_preprocess_contract='nep4_radial' is "
                     "mutually exclusive with descriptor_mixing in this "
                     "build. Disable mixing or run nep4_radial standalone.")
         if self.descriptor_preprocess_contract != "off":
-            # Descriptor mixing composes with preprocess: blocks are per
-            # (post-pair, l_post) and naturally map to the contracted
-            # Q_new structure.
             from DescriptorBuilderGPU import (
                 descriptor_block_layout, descriptor_preprocess_layout)
             _layout_pre = descriptor_block_layout(cfg)
             self._preprocess_layout = descriptor_preprocess_layout(
                 cfg, _layout_pre, self.descriptor_preprocess_contract)
-            # Override cfg.dim_q so W0 below is allocated at the
-            # contracted output dim.
+            # Override cfg.dim_q so W0 is allocated at the contracted dim.
             if not hasattr(cfg, "dim_q_raw") or cfg.dim_q_raw is None:
                 cfg.dim_q_raw = int(cfg.dim_q)
             cfg.dim_q = int(self._preprocess_layout["dim_q_new"])
@@ -89,10 +74,8 @@ class TNEP(layers.Layer):
             self._preprocess_layout = None
 
         self.dim_q = cfg.dim_q
-        # When preprocessing is on, the per-type ANN's W0 stores weights
-        # in the CONTRACTED dim (self.dim_q = Q_new) but the forward
-        # matmul folds the contraction in and operates on RAW descriptors
-        # at Q_raw. Track Q_raw separately for forward-path use.
+        # With preprocess on, W0 stores at Q_new but the forward matmul folds
+        # the contraction in and operates on RAW descriptors at Q_raw; track it.
         if self.descriptor_preprocess_contract != "off":
             self.dim_q_forward = int(cfg.dim_q_raw)
         else:
@@ -100,11 +83,8 @@ class TNEP(layers.Layer):
         self.num_types = cfg.num_types
         self.num_neurons = cfg.num_neurons
         self._H_final = cfg.num_neurons
-        # Resolve the Keras activation callable. Any name supported by
-        # `tf.keras.activations.get` is accepted at construction; the
-        # backward derivative path (`_activation_grad`) will raise
-        # NotImplementedError at first dipole / pol prediction if the
-        # chosen activation isn't plumbed there.
+        # Any tf.keras.activations.get name is accepted here; _activation_grad
+        # raises NotImplementedError at first dipole/pol pass if not plumbed.
         self._activation_name = str(cfg.activation).lower().strip()
         self._glorot_gain = 1.0
         self.activation = tf.keras.activations.get(cfg.activation)
@@ -142,9 +122,7 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        # Validate dipole contraction power (mode 1 only). Caught here
-        # so configuration errors surface at model construction rather
-        # than at first forward pass.
+        # Validate dipole contraction power (mode 1 only) at construction time.
         if cfg.target_mode == 1:
             _N = int(getattr(cfg, "dipole_rij_power", 2))
             if _N < 0:
@@ -183,23 +161,12 @@ class TNEP(layers.Layer):
                 trainable=True,
             )
 
-        # Optimizer constructed last so it can capture references to
-        # the just-created weight tensors.
-        # Optional descriptor-mixing layer (GPUMD c_nk analog).
-        # U_pair is shared across central atom types; one mixing
-        # square block per unordered neighbour-species pair. Block
-        # sizes are pair-dependent (trivial compression mixes radial
-        # channels across species pair boundaries), so U_pair is
-        # padded to max_block_size and we track each pair's active
-        # size separately.
-        #
-        # For efficient assembly of the full Q×Q mixing matrix, we
-        # also precompute per-pair "placement" matrices P_p ∈
-        # R^{bs × Q} that map the bs active features of pair p onto
-        # their non-contiguous q-indices in the flat descriptor.
-        # Then U_full = Σ_p P_p^T · U_pair[..., p, :bs, :bs] · P_p
-        # is a clean einsum that broadcasts over any leading batch
-        # dims (single-instance and per-candidate paths both work).
+        # Optional descriptor-mixing layer (GPUMD c_nk analog). One padded
+        # square block per unordered neighbour-species pair (padded to
+        # max_block_size, active size tracked per pair). Per-pair placement
+        # matrices P_p ∈ R^{bs×Q} map active features to their non-contiguous
+        # q-indices so U_full = Σ_p P_pᵀ · U_pair[...,p,:bs,:bs] · P_p is one
+        # einsum broadcasting over any leading batch dims.
         self.descriptor_mixing = bool(getattr(cfg, "descriptor_mixing", False))
         self.descriptor_mixing_per_type = bool(
             getattr(cfg, "descriptor_mixing_per_type", False))
@@ -207,10 +174,8 @@ class TNEP(layers.Layer):
             from DescriptorBuilderGPU import (
                 descriptor_block_layout,
                 descriptor_post_preprocess_block_layout)
-            # When preprocess contraction is on, mixing operates at
-            # Q_new (the contracted W0 storage dim), so the block
-            # layout it needs is the POST-preprocess one. Otherwise
-            # use the raw SOAP-turbo block layout at Q_raw.
+            # With preprocess on, mixing operates at Q_new so it needs the
+            # post-preprocess layout; else the raw SOAP-turbo layout at Q_raw.
             if self.descriptor_preprocess_contract != "off":
                 _raw_layout = descriptor_block_layout(cfg)
                 self._mix_layout = descriptor_post_preprocess_block_layout(
@@ -221,19 +186,14 @@ class TNEP(layers.Layer):
             self._mix_num_pairs = len(self._mix_pair_keys)
             self._mix_Q = int(self._mix_layout["dim_q"])
             T = cfg.num_types
-            # Per-(pair, l) residual blocks. Within a pair, only
-            # radial channels at the same l mix; cross-l mixing is
-            # forbidden by construction. α_eff_per_pair from the
-            # descriptor layout gives the radial dimension; L =
-            # l_max + 1.
+            # Per-(pair, l) residual blocks: only radial channels at the same l
+            # mix, cross-l is forbidden. alpha_eff_per_pair = radial dim; L=l_max+1.
             self._mix_alpha_per_pair = [
                 int(self._mix_layout["alpha_eff_per_pair"][k])
                 for k in self._mix_pair_keys]
             self._mix_max_alpha = int(self._mix_layout["max_alpha_eff"])
-            # Use the layout's L_eff when present (post-preprocess
-            # layouts collapse l>l_keep into a single slot, so
-            # L_eff = l_keep + 1; the raw layout has no L_eff field
-            # and uses cfg.l_max+1).
+            # L_eff when present (post-preprocess collapses l>l_keep to one slot);
+            # else cfg.l_max+1.
             self._mix_L = int(self._mix_layout.get("L_eff",
                                                    int(cfg.l_max) + 1))
             # Per-(pair, l) placement matrices P_{p,l} ∈ R^{α_p × Q}.
@@ -248,11 +208,9 @@ class TNEP(layers.Layer):
                     per_pair.append(tf.constant(P))
                 mix_P_ln.append(per_pair)
             self._mix_P_ln = mix_P_ln
-            # Stacked projector for the batched _U_full einsum fast
-            # path: one tensor [num_pairs * L, α, Q] when α is uniform
-            # across pairs (the common case). Replaces num_pairs × L
-            # individual einsum launches with a single batched einsum.
-            # See _U_full for the contraction.
+            # Stacked projector [num_pairs*L, α, Q] for the batched _U_full fast
+            # path when α is uniform (common case): one batched einsum instead
+            # of num_pairs×L launches.
             if len(set(self._mix_alpha_per_pair)) == 1:
                 alpha = self._mix_alpha_per_pair[0]
                 PL = self._mix_num_pairs * self._mix_L
@@ -268,11 +226,9 @@ class TNEP(layers.Layer):
             else:
                 self._mix_P_ln_stack = None
                 self._mix_P_ln_uniform_alpha = None
-            # V_pair_l shape:
-            #   shared    : [num_pairs, L, max_α, max_α]
-            #   per-type  : [T, num_pairs, L, max_α, max_α]
-            # Padded to max_α so the storage has uniform stride;
-            # padded rows/cols stay zero and never affect the math.
+            # U_pair shape (padded to max_α, padding stays zero):
+            #   shared   [num_pairs, L, max_α, max_α]
+            #   per-type [T, num_pairs, L, max_α, max_α]
             if self.descriptor_mixing_per_type:
                 shape = (T, self._mix_num_pairs, self._mix_L,
                          self._mix_max_alpha, self._mix_max_alpha)
@@ -288,29 +244,24 @@ class TNEP(layers.Layer):
         else:
             self.U_pair = None
 
-        # Preprocessing contraction (phase 2 of 2): Variable allocation
-        # and mutual-exclusion guards. cfg.dim_q has already been
-        # overridden in phase 1 at the top of __init__ so W0 above is
-        # sized at Q_new.
+        # Preprocess contraction phase 2/2: W_pre_* allocation. cfg.dim_q was
+        # already overridden in phase 1 so W0 above is sized at Q_new.
         if self.descriptor_preprocess_contract != "off":
             init_scheme = str(getattr(cfg, "descriptor_preprocess_init", "mean"))
             T_pre = int(cfg.num_types)
             self.preprocess_per_type = bool(getattr(
                 cfg, "descriptor_preprocess_per_type", True))
             if self.descriptor_preprocess_contract == "nep4_radial":
-                # c tensor: rank-4 [T_centre, T_neighbour, n_max_out, α].
-                # The linear-fold tail machinery below (Q_raw-shaped W_pre,
-                # passthrough kept slots, per-q_raw init) does not apply;
-                # we allocate c directly and precompute the bilinear fold
-                # gather indices for `_W0_preprocess_eff`.
+                # c tensor rank-4 [T_centre, T_neighbour, n_max_out, α]. The
+                # linear-fold tail machinery below doesn't apply; allocate c and
+                # precompute the bilinear-fold gather indices for _W0_preprocess_eff.
                 _lay = self._preprocess_layout
                 n_max_out = int(_lay["nep4_n_max_out"])
                 alpha_max = int(_lay["nep4_alpha_max"])
                 coef_shape = tuple(_lay["coef_shape"])
                 full_coef_size = int(_lay["nep4_full_coef_size"])
-                # Init: Glorot-style with fan_in = α (one c-vector contracts
-                # over α primitives per centre/neighbour pair). Per-element
-                # σ on each c gives a roughly unit-scale bilinear product.
+                # Init: Glorot with fan_in=α (each c contracts α primitives);
+                # per-element σ gives a roughly unit-scale bilinear product.
                 init_norm = float(_lay["coef_init_norm"])
                 if init_scheme == "glorot":
                     fan_in = max(1, alpha_max)
@@ -320,8 +271,7 @@ class TNEP(layers.Layer):
                     init_np = rng.uniform(
                         -limit, limit, size=coef_shape).astype(np.float32)
                 elif init_scheme in ("mean", "sum"):
-                    # Uniform fan-in normalised init. Reasonable starting
-                    # point; SNES then searches.
+                    # Uniform fan-in normalised init; SNES searches from here.
                     init_np = np.full(coef_shape, init_norm, dtype=np.float32)
                 else:
                     raise ValueError(
@@ -330,18 +280,15 @@ class TNEP(layers.Layer):
                 self.W_pre_angular = tf.Variable(
                     init_np, trainable=False, name="W_pre_angular_nep4",
                     dtype=tf.float32)
-                # All c entries are SNES μ-slots (no passthrough). Layout
-                # mirrors the linear-fold tail so existing SNES wiring
-                # (n_preprocess, flat indices, scatter M) keeps working
-                # over the full c tensor.
+                # All c entries are SNES μ-slots (no passthrough); layout mirrors
+                # the linear-fold tail so SNES wiring keeps working over full c.
                 smask_full = np.ones(coef_shape, dtype=bool)
                 self._preprocess_summed_mask = tf.constant(smask_full, dtype=tf.bool)
                 flat_idx = np.arange(full_coef_size, dtype=np.int32)
                 self._preprocess_summed_flat_idx = tf.constant(
                     flat_idx, dtype=tf.int32)
                 self._preprocess_summed_count = int(full_coef_size)
-                # Kept-template is zero (no passthrough); SNES scatters μ
-                # values into every position each gen.
+                # Kept-template zero (no passthrough); SNES scatters μ everywhere.
                 base_template = np.zeros(coef_shape, dtype=np.float32)
                 self._preprocess_kept_template = tf.constant(
                     base_template, dtype=tf.float32)
@@ -349,16 +296,13 @@ class TNEP(layers.Layer):
                 self._preprocess_summed_scatter_M = tf.constant(
                     _M_np, dtype=tf.float32)
                 self._preprocess_kept_template_size = full_coef_size
-                # NEP4-specific precomputed gather indices for the bilinear
-                # fold (consumed by `_W0_preprocess_eff`).
+                # Precomputed gather indices for the NEP4 bilinear fold.
                 self._nep4_n_max_out = n_max_out
                 self._nep4_alpha_max = alpha_max
                 self._nep4_L = int(_lay["L"])
-                # Precompute the [n_max_out, L] mid-shape constant used
-                # in `_W0_preprocess_eff_nep4` to reshape W0 from
-                # [..., T, n_max_out·L, H] → [..., T, n_max_out, L, H].
-                # Without this the fold creates a fresh tf.constant per
-                # call inside the @tf.function-traced predict_batch path.
+                # [n_max_out, L] mid-shape constant for reshaping W0 in
+                # _W0_preprocess_eff_nep4; precomputed to avoid a fresh
+                # tf.constant per call in the traced predict_batch path.
                 self._nep4_mid_shape = tf.constant(
                     [self._nep4_n_max_out, self._nep4_L], dtype=tf.int32)
                 self._nep4_l_of_q = tf.constant(
@@ -371,23 +315,17 @@ class TNEP(layers.Layer):
                     _lay["nep4_n_to_species"], dtype=tf.int32)
                 self._nep4_n_to_local = tf.constant(
                     _lay["nep4_n_to_local"], dtype=tf.int32)
-                # Linear-fold-only attributes left at None — branch-checked
-                # in `_W0_preprocess_eff`.
+                # Linear-fold-only attrs left None; branch-checked in _W0_preprocess_eff.
                 self._preprocess_q_to_q_new = None
                 self._preprocess_scatter = None
                 self.optimizer = SNES(self)
                 return
             Q_raw_pre = int(self._preprocess_layout["coef_shape"][0])
 
-            # Pull the per-q_raw classification from the layout.
-            #   summed_mask: True where the q_raw contributes to a SUMMED
-            #                output channel (multiple contributors)
-            #                → has a learnable W_pre coefficient.
-            #                False where the q_raw goes to a KEPT
-            #                (passthrough) channel → W_pre fixed at 1.0
-            #                (identity scaling).
-            #   Shape: 1-D [Q_raw] for angular; 2-D [T, Q_raw] for
-            #   species_pair / both.
+            # Per-q_raw classification from the layout. summed_mask: True where
+            # q_raw feeds a SUMMED channel (learnable W_pre); False for KEPT
+            # passthrough (W_pre fixed 1.0). Shape 1-D [Q_raw] (angular) or
+            # 2-D [T, Q_raw] (species_pair/both).
             _summed = self._preprocess_layout.get("summed_q_raw_mask")
             if _summed is None:
                 _summed = np.zeros((Q_raw_pre,), dtype=bool)
@@ -396,12 +334,10 @@ class TNEP(layers.Layer):
                 _scalar = float(self._preprocess_layout["coef_init_norm"])
                 _per_q = np.full((Q_raw_pre,), _scalar, dtype=np.float32)
 
-            # Build the W_pre init tensor honouring kept vs summed:
-            # kept entries always start at 1.0 (passthrough); summed
-            # entries start at the per-q_raw mean / sum / glorot value.
+            # W_pre init: kept entries start at 1.0 (passthrough); summed at the
+            # per-q_raw mean/sum/glorot value.
             def _build_init_2d() -> np.ndarray:
-                """Return [T, Q_raw] init (used as the source before
-                squeezing T for per_type=False)."""
+                """Return [T, Q_raw] init (source before squeezing T for per_type=False)."""
                 if _per_q.ndim == 1:
                     init_2d = np.broadcast_to(
                         _per_q[None, :], (T_pre, Q_raw_pre)).astype(np.float32)
@@ -437,17 +373,15 @@ class TNEP(layers.Layer):
                 # W_pre shape [T, Q_raw]
                 init_np = init_2d_np.astype(np.float32).copy()
             else:
-                # Global W_pre [Q_raw]: collapse the T axis.
-                # For 1-D layouts (angular) init is identical across t;
-                # for 2-D layouts take the max (ghost entries are 0,
-                # active entries carry the per-(t, q_raw) init value).
+                # Global W_pre [Q_raw]: collapse T. 1-D layouts identical across
+                # t; 2-D take max (ghost entries 0, active carry the init value).
                 init_np = np.max(init_2d_np, axis=0).astype(np.float32).copy()
             self.W_pre_angular = tf.Variable(
                 init_np, trainable=False, name="W_pre_angular",
                 dtype=tf.float32)
 
-            # Stash summed mask for SNES (which exposes only the summed
-            # entries to the μ vector). Shape mirrors W_pre's shape.
+            # Summed mask for SNES (exposes only summed entries to μ); shape
+            # mirrors W_pre.
             if self.preprocess_per_type:
                 if _summed.ndim == 1:
                     smask_full = np.broadcast_to(
@@ -460,25 +394,19 @@ class TNEP(layers.Layer):
                 else:
                     smask_full = np.any(_summed, axis=0)
             self._preprocess_summed_mask = tf.constant(smask_full, dtype=tf.bool)
-            # Flat indices into W_pre for the summed entries — used by
-            # SNES to scatter μ values into the Variable each generation.
+            # Flat indices of summed entries; SNES scatters μ into W_pre by these.
             flat_idx = np.flatnonzero(smask_full.reshape(-1)).astype(np.int32)
             self._preprocess_summed_flat_idx = tf.constant(flat_idx, dtype=tf.int32)
             self._preprocess_summed_count = int(flat_idx.size)
-            # Base template (kept positions retain their init value, e.g.
-            # 1.0; summed positions are zeroed and SNES scatters its μ
-            # values into them each generation). Stored as a tf.constant
-            # so reconstruction in the candidate path needs only a
+            # Base template: kept positions keep init (e.g. 1.0), summed zeroed.
+            # tf.constant so candidate-path reconstruction needs only a
             # tensor_scatter_nd_update, never a Variable read.
             base_template = np.where(smask_full, 0.0, init_np).astype(np.float32)
             self._preprocess_kept_template = tf.constant(
                 base_template, dtype=tf.float32)
-            # Precompute the one-hot scatter matrix used by SNES.
-            # reconstruct_params_tf to broadcast summed entries into the
-            # full W_pre tensor.  Static shape, ~6 MB for typical CHO
-            # angular config (n_summed × base_size). Building this once
-            # at __init__ avoids re-issuing a `tf.one_hot` kernel each
-            # chunk (which fragmented the @tf.function trace).
+            # One-hot scatter matrix (n_summed × base_size) for SNES.
+            # reconstruct_params_tf. Built once here to avoid a per-chunk
+            # tf.one_hot kernel that fragmented the @tf.function trace.
             _base_flat_size = int(base_template.size)
             _M_np = np.zeros(
                 (flat_idx.size, _base_flat_size), dtype=np.float32)
@@ -488,10 +416,9 @@ class TNEP(layers.Layer):
             self._preprocess_kept_template_size = _base_flat_size
             _map_np = self._preprocess_layout["q_raw_to_q_new"]
             self._preprocess_q_to_q_new = tf.constant(_map_np, dtype=tf.int32)
-            # For per-type maps (species_pair), precompute a one-hot
-            # scatter matrix M[T, Q_raw, Q_new] so _W0_preprocess_eff can
-            # fold via einsum without per-type gather. Entries where the
-            # map is -1 (q_raw doesn't involve type t) produce zero rows.
+            # Per-type maps (species_pair): one-hot scatter M[T, Q_raw, Q_new]
+            # so _W0_preprocess_eff folds via einsum without per-type gather;
+            # map==-1 (q_raw not in type t) gives zero rows.
             if _map_np.ndim == 2:
                 T_pre_m = int(_map_np.shape[0])
                 Q_raw_m = int(_map_np.shape[1])
@@ -517,32 +444,24 @@ class TNEP(layers.Layer):
     def _U_full(self, U_pair: tf.Tensor | None = None) -> tf.Tensor:
         """Assemble the full block-diagonal mixing matrix.
 
-        l_aware architecture: (l_max+1) [α_p × α_p] sub-blocks per pair,
-        one per angular momentum. Cross-l mixing forbidden.
+        l-aware: (l_max+1) [α_p × α_p] sub-blocks per pair, cross-l forbidden.
             U_full = I_Q + Σ_p Σ_l P_{p,l}ᵀ · V_{p,l} · P_{p,l}
-
-        `tf.eye(Q)` broadcasts across leading batch dims so the same code
-        handles single / per-candidate × shared / per-type. With V
-        initialised at zero, U_full == I_Q at gen 0.
+        tf.eye(Q) broadcasts over leading batch dims (single/per-candidate ×
+        shared/per-type). V init = 0 ⇒ U_full == I_Q at gen 0.
         """
         V = self.U_pair if U_pair is None else U_pair
-        # V shape: [..., (T?), num_pairs, L, max_α, max_α].
-        # Fast path: uniform α across pairs. Flatten (num_pairs, L)
-        # → PL and run one batched einsum over the stacked projector
-        # P:[PL, α, Q], V:[..., PL, α, α].
+        # V: [..., (T?), num_pairs, L, max_α, max_α].
+        # Fast path: uniform α. Flatten (num_pairs, L)→PL, one batched einsum
+        # over stacked projector P:[PL, α, Q], V:[..., PL, α, α].
         if self._mix_P_ln_stack is not None:
             alpha = self._mix_P_ln_uniform_alpha
             PL = self._mix_num_pairs * self._mix_L
-            # Slice off the (max_α − α) padding rows/cols.
-            V_active = V[..., :alpha, :alpha]
-            # Reshape (num_pairs, L) → PL. Preserve leading batch
-            # dims (which may include candidate axis C and/or type
-            # axis T) via dynamic-shape concat.
+            V_active = V[..., :alpha, :alpha]                # drop padding rows/cols
+            # Reshape (num_pairs, L)→PL, preserving leading batch dims (C and/or T).
             new_shape = tf.concat(
                 [tf.shape(V_active)[:-4], [PL, alpha, alpha]], axis=0)
             V_flat = tf.reshape(V_active, new_shape)
-            # Output q-axes labelled i, m. Contraction:
-            # p=PL (pair, l), j=α (first proj), k=α (second proj).
+            # p=PL (pair,l), j/k=α projections, i/m=output q-axes.
             V_full = tf.einsum(
                 'pji,...pjk,pkm->...im',
                 self._mix_P_ln_stack, V_flat, self._mix_P_ln_stack)
@@ -560,24 +479,15 @@ class TNEP(layers.Layer):
 
     def _W0_eff(self, W0: tf.Tensor,
                 U_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Pre-multiply W0 by U_full^T along the Q axis. Equivalent to
-        mixing the descriptor (desc' = U_full · desc) but absorbs the
-        mixing into the weights so the rest of the forward / backprop /
-        dipole sum use raw descriptors and raw grad_values unchanged.
+        """Pre-multiply W0 by U_fullᵀ along Q — equivalent to mixing the
+        descriptor (desc' = U_full · desc) but absorbed into the weights, so the
+        forward/backprop/dipole sum use raw descriptors and grad_values unchanged.
 
-        Shapes (shared U_pair):
-            U_pair [num_pairs, bs, bs]       + W0 [T, Q, H]
-                                             → W0_eff [T, Q, H]
-            U_pair [C, num_pairs, bs, bs]    + W0 [C, T, Q, H]
-                                             → W0_eff [C, T, Q, H]
-        Shapes (per-central-type U_pair):
-            U_pair [T, num_pairs, bs, bs]    + W0 [T, Q, H]
-                                             → W0_eff [T, Q, H]
-            U_pair [C, T, num_pairs, bs, bs] + W0 [C, T, Q, H]
-                                             → W0_eff [C, T, Q, H]
+        Shapes:
+            shared   U_pair [(C,) num_pairs, bs, bs]    + W0 [(C,) T, Q, H] → W0_eff [(C,) T, Q, H]
+            per-type U_pair [(C,) T, num_pairs, bs, bs] + W0 [(C,) T, Q, H] → W0_eff [(C,) T, Q, H]
 
-        With the residual V parameterisation (V init = 0 ⇒ U_full = I),
-        W0_eff == W0 exactly at generation 0.
+        V init = 0 ⇒ U_full = I ⇒ W0_eff == W0 at gen 0.
         """
         if not self.descriptor_mixing:
             return W0
@@ -588,32 +498,16 @@ class TNEP(layers.Layer):
 
     def _W0_preprocess_eff(self, W0: tf.Tensor,
                             W_pre_override: tf.Tensor | None = None) -> tf.Tensor:
-        """Fold the angular preprocessing contraction into W0.
-
-        Algebra: with `desc' = preprocess(desc_raw)` where
-            desc'[t, q_new] = Σ_{q_raw} W_pre[t, q_raw] · 𝟙[q_to_q_new[q_raw] = q_new]
-                                       · desc_raw[q_raw],
-        the ANN forward `h = (W0)^T · desc'` (per type) is equivalent to
-            h[h_idx] = Σ_{q_raw} desc_raw[q_raw] · W_pre[t, q_raw]
-                                · W0[t, q_to_q_new[q_raw], h_idx]
-        i.e. a per-type weight matrix at the RAW dim:
-            W0_eff[t, q_raw, h_idx] = W_pre[t, q_raw]
-                                    · W0[t, q_to_q_new[q_raw], h_idx]
-
-        This lets the existing matmul code stay unchanged (operating at
-        Q_raw) while W0 storage stays at Q_new — mirroring the mixing-
-        layer fold in `_W0_eff`. Backward dq comes out at Q_raw directly,
-        so the dipole contraction with the precomputed raw W_atom is also
-        unchanged.
+        """Fold the angular preprocess contraction into W0, giving raw-dim weights:
+            W0_eff[t, q_raw, h] = W_pre[t, q_raw] · W0[t, q_to_q_new[q_raw], h]
+        Keeps the matmul at Q_raw while W0 storage stays at Q_new (mirrors
+        _W0_eff); backward dq comes out at Q_raw for the raw-W_atom dipole sum.
 
         Args:
-          W0:             [(C,) T, Q_new, H]   weights at the contracted dim
-          W_pre_override: [(C,) T, Q_raw]      per-type preprocess coefficients
-                          (with optional leading candidate axis matching W0).
-                          When None, falls back to self.W_pre_angular [T, Q_raw].
-
+          W0:             [(C,) T, Q_new, H]  weights at contracted dim
+          W_pre_override: [(C,) T, Q_raw]     per-type coeffs; None → self.W_pre_angular
         Returns:
-          W0_eff: [(C,) T, Q_raw, H]  weights at the raw dim
+          W0_eff: [(C,) T, Q_raw, H]
         """
         if self.descriptor_preprocess_contract == "off":
             return W0
@@ -630,13 +524,8 @@ class TNEP(layers.Layer):
             # 2-D map (species_pair / both): per-type scatter via einsum.
             W0_at_qraw = tf.einsum(
                 'tqp,...tph->...tqh', self._preprocess_scatter, W0)
-        # Multiply by W_pre.
-        #   per_type=True : W_pre [(C,) T, Q_raw] → factor [(C,) T, Q_raw, 1]
-        #   per_type=False: W_pre [(C,) Q_raw]    → factor [(C,) Q_raw, 1]
-        #                   needs a T-axis singleton inserted (at the index
-        #                   of Q_raw in the post-newaxis shape = rank - 2)
-        #                   so the broadcast against W0_at_qraw works for
-        #                   both with- and without- candidate dim.
+        # Multiply by W_pre. per_type=False needs a T-axis singleton inserted
+        # (at rank-2) so the broadcast works with or without a candidate dim.
         factor = W_pre[..., tf.newaxis]
         if not self.preprocess_per_type:
             factor = tf.expand_dims(factor, axis=factor.shape.rank - 2)
@@ -646,34 +535,23 @@ class TNEP(layers.Layer):
                                  c: tf.Tensor) -> tf.Tensor:
         """NEP4 bilinear (rank-1 outer-product) fold of W0.
 
-        Implements the equation
-            g[t, n'', l] = Σ_{n, n'} c[t, s(n), n'', k(n)]
-                                  · c[t, s(n'), n'', k(n')]
-                                  · p[n, n', l]
-        as a transformation of W0 from the [n'', l]-indexed storage at
-        Q_new = n_max_out · L to the [n, n', l]-indexed raw-descriptor
-        layout at Q_raw, so the existing matmul code can continue to
-        operate against the unmodified raw descriptor:
-            U = W0_eff[t, q_raw] · desc_raw[q_raw]
-              ≡ W0[t, q_new(n'', l)] · g[t, n'', l]
-              ≡ W0[t, q_new(n'', l(q))] · Σ_{n,n'} c·c · p
+        Implements g[t, n'', l] = Σ_{n,n'} c[t,s(n),n'',k(n)] · c[t,s(n'),n'',k(n')]
+        · p[n,n',l], transforming W0 from [n'',l] storage at Q_new = n_max_out·L
+        to the [n,n',l] raw layout at Q_raw so the matmul stays against raw desc.
 
         Args:
-          W0: [(C,) T, n_max_out · L, H]   weights at Q_new
+          W0: [(C,) T, n_max_out · L, H]                   weights at Q_new
           c:  [(C,) T_centre, T_neighbour, n_max_out, α]   NEP4 coeffs
-
         Returns:
-          W0_eff: [(C,) T, Q_raw, H]   weights at the raw descriptor dim
+          W0_eff: [(C,) T, Q_raw, H]
         """
         T_c = int(self.cfg.num_types)
         T_n = T_c
         n_max_out = int(self._nep4_n_max_out)
         L_ = int(self._nep4_L)
         alpha = int(self._nep4_alpha_max)
-        # Rearrange c so the (T_neighbour, α) axes become a single flat
-        # axis aligned with the precomputed `nep4_n_global` index map.
-        # c [..., T_c, T_n, n_max_out, α] → [..., T_c, T_n, α, n_max_out]
-        # then flatten T_n·α → [..., T_c, T_n·α, n_max_out].
+        # Flatten (T_neighbour, α) → one axis aligned with nep4_n_global:
+        # c [..., T_c, T_n, n_max_out, α] → [..., T_c, T_n·α, n_max_out].
         has_C = (c.shape.rank == 5)
         if has_C:
             c_perm = tf.transpose(c, perm=[0, 1, 2, 4, 3])
@@ -687,13 +565,11 @@ class TNEP(layers.Layer):
         A_a = tf.gather(c_flat, self._nep4_n_global, axis=-2)
         A_b = tf.gather(c_flat, self._nep4_np_global, axis=-2)
         AB = A_a * A_b   # [..., T_c, Q_raw, n_max_out]   (rank-1 outer product)
-        # Reshape W0 to expose (n_max_out, L). W0 [..., T, n_max_out·L, H].
+        # Reshape W0 [..., T, n_max_out·L, H] to expose (n_max_out, L),
+        # preserving leading batch axes. _nep4_mid_shape is precomputed to avoid
+        # a fresh tf.constant per call in the traced path.
         W0_shape = tf.shape(W0)
         H_ = W0_shape[-1]
-        # Build new shape preserving any leading batch (e.g. candidate) axes.
-        # The [n_max_out, L] middle slice is precomputed at __init__ as
-        # `self._nep4_mid_shape` so this concat doesn't allocate a fresh
-        # tf.constant per call in the @tf.function-traced path.
         leading = W0_shape[:-2]
         new_shape = tf.concat(
             [leading, self._nep4_mid_shape, tf.reshape(H_, [1])], axis=0)
@@ -701,10 +577,7 @@ class TNEP(layers.Layer):
         # Gather along the l axis using l_of_q:
         # W0_at_q[..., t, n'', q, h] = W0_NLH[..., t, n'', l_of_q(q), h]
         W0_at_q = tf.gather(W0_NLH, self._nep4_l_of_q, axis=-2)
-        # Combine: sum over n''.
-        # AB         [..., T_c, Q_raw, n_max_out]      (no h axis)
-        # W0_at_q    [..., T,   n_max_out, Q_raw, H]   (no h axis on n'')
-        # Want W0_eff[..., T, Q_raw, H] = Σ_{n''} AB[t, q, n''] · W0_at_q[t, n'', q, h]
+        # W0_eff[..., T, Q_raw, H] = Σ_{n''} AB[t,q,n''] · W0_at_q[t,n'',q,h].
         W0_eff = tf.einsum('...tqN,...tNqh->...tqh', AB, W0_at_q)
         return W0_eff
 
@@ -728,12 +601,10 @@ class TNEP(layers.Layer):
             target_mode 1: [3]  dipole vector
             target_mode 2: [6]  polarizability tensor
         """
-        # Absorb U_pair^T into W0 (and W0_pol below) once per call so
-        # both the forward and calc_forces use the U-folded weights.
-        # When descriptor_mixing is disabled, _W0_eff is a no-op.
+        # Absorb U_pairᵀ into W0 once so forward and calc_forces share the
+        # folded weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
-        # Expand W0 from Q_new back to Q_raw when the preprocess
-        # contraction is on (mirrors validate()/score()).
+        # Expand W0 Q_new → Q_raw when preprocess is on (mirrors score()).
         if self.descriptor_preprocess_contract != "off":
             W0_eff = self._W0_preprocess_eff(W0_eff)
 
@@ -742,9 +613,8 @@ class TNEP(layers.Layer):
         b0_t = tf.gather(self.b0, Z)   # [A, H]
         W1_t = tf.gather(self.W1, Z)   # [A, H]
 
-        # Hidden layer: h_i = activation(z_i),  z_i = q_i @ W0[t_i] + b0[t_i]
-        # Keep z (pre-activation) for the swish-side backward chain rule;
-        # tanh discards it (1 − h² suffices).
+        # Hidden layer: h = activation(z), z = q @ W0[t] + b0[t]. Keep z for the
+        # swish backward chain (tanh needs only 1 − h²).
         z = tf.einsum('nd,ndh->nh', descriptors, W0_t) + b0_t   # [A, H]
         h = self.activation(z)                                   # [A, H]
         # Mask out padded atoms
@@ -763,12 +633,9 @@ class TNEP(layers.Layer):
                                   z=z)  # [A, M, 3]
 
         if self.cfg.target_mode == 1:
-            # Dipole contraction. `cfg.dipole_rij_power` selects the
-            # weighting:
+            # Dipole. cfg.dipole_rij_power selects the per-pair weight:
             #   N >= 1 : μ = -Σ_pair |r_ij|^N · F_ij
-            #   N == 0 : μ = -Σ_i de_dq[i] · grad_values[i, i]   (self-only)
-            # The dispatcher returns the appropriate per-pair scalar
-            # weight for the chosen branch.
+            #   N == 0 : μ = -Σ_i de_dq[i] · grad_values[i, i]  (self-only)
             _, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)
             rij_n = (self._dipole_pair_weight_padded(tf.square(rij), grad_index)
@@ -818,31 +685,17 @@ class TNEP(layers.Layer):
             return pol
 
     def _activation_grad(self, h: tf.Tensor, z: tf.Tensor) -> tf.Tensor:
-        """Derivative of the activation w.r.t. its input, evaluated at z.
-
-        The dipole / polarisability backward chain rule needs `dh/dz`
-        applied as a Hadamard factor to `de/dh`. For tanh, dh/dz = 1 − h²
-        depends only on the activation output. For swish/silu, dh/dz also
-        depends on the pre-activation z, so callers MUST supply it (or
-        pass `z = None` to fall back to the tanh formula — only valid
-        when self._activation_name == 'tanh').
+        """dh/dz for the activation, applied as a Hadamard factor in the dipole/pol
+        backward chain.
+            tanh : 1 − h²                        (needs only h)
+            swish: σ(z) · (1 + z · (1 − σ(z)))   (needs z; this form avoids the
+                   z≫0 cancellation of the equivalent σ(z) + h·(1−σ(z)))
 
         Args:
-            h: activation output, shape broadcastable to z.
-            z: pre-activation (`W0·q + b0` for the first hidden layer,
-               `W0_2·h1 + b0_2` for the second). Required for swish.
-
+            h: activation output, broadcastable to z.
+            z: pre-activation (W0·q + b0). Required for swish; None only for tanh.
         Returns:
-            tensor with the same shape as h, equal to dh/dz.
-
-        Formulas:
-            tanh : dh/dz = 1 − h²                (h itself encodes z's tanh)
-            swish: dh/dz = σ(z) · (1 + z · (1 − σ(z)))
-                   equivalently σ(z) + h · (1 − σ(z)).  Both forms cost one
-                   sigmoid; the (1+z·(1−σ)) form is used because it avoids
-                   the catastrophic-cancellation case at z ≫ 0 where
-                   `1 − σ(z) ≈ 0` and `h ≈ z` would multiply to lose
-                   precision.
+            tensor shaped like h.
         """
         if self._activation_name == "tanh":
             return 1.0 - tf.square(h)
@@ -863,9 +716,7 @@ class TNEP(layers.Layer):
     def calc_forces(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
                     W0_t: tf.Tensor, neighbor_mask: tf.Tensor,
                     z: tf.Tensor | None = None) -> tf.Tensor:
-        """Compute dU_i/dR_j for every atom i and its neighbours j via chain rule.
-
-        Vectorized version — no Python loops. Uses padded gradient tensors.
+        """Compute dU_i/dR_j for every atom i and neighbour j via chain rule (padded).
 
         Args:
             h              : [N, H]              hidden activations f(z)
@@ -873,9 +724,7 @@ class TNEP(layers.Layer):
             W1_t           : [N, H]              per-atom output weights
             W0_t           : [N, dim_q, H]       per-atom input weights
             neighbor_mask  : [N, M]              1.0 for real neighbors, 0.0 for padding
-            z              : [N, H]              pre-activation (W0·q + b0).
-                                                 Required when self._activation_name
-                                                 != 'tanh'.
+            z              : [N, H]              pre-activation; required for swish.
 
         Returns:
             forces : [N, M, 3]  dU_i/dR_j per atom per neighbor
@@ -901,15 +750,14 @@ class TNEP(layers.Layer):
                             positions, Z_int, targets, boxes (lists over structures)
             val_data      : same structure, used for validation each generation
             plot_callback : optional callable(history, gen) for periodic plotting
-            resume_state  : optional dict from `model_io.load_checkpoint`,
-                            carries SNES distribution + best-val + history +
-                            RNG state. When provided, training continues from
-                            `resume_state['last_gen'] + 1`.
+            resume_state  : optional dict from `model_io.load_checkpoint`
+                            (SNES distribution + best-val + history + RNG). When
+                            given, training continues from last_gen + 1.
 
         Returns:
-            history         : dict with keys generation, train_loss, val_loss (lists)
-            final_model     : TNEP model with weights from the last generation
-            best_val_model  : TNEP model with weights from the best validation generation
+            history        : dict of generation, train_loss, val_loss (lists)
+            final_model    : model at the last generation
+            best_val_model : model at the best-validation generation
         """
         history, final_model, best_val_model = self.optimizer.fit(
             train_data, val_data, plot_callback=plot_callback,
@@ -931,25 +779,20 @@ class TNEP(layers.Layer):
                 cos_sim_all   : [S] tensor — per-structure cosine similarity (modes 1,2)
             preds : [S, T] tensor of predictions
         """
-        # Streaming chunked scoring. Bounds peak memory to one chunk's
-        # gradient slice.
+        # Streaming chunked scoring; peak memory bounded to one chunk's grads.
         from data import prefetched_chunks
         S_test = test_data["num_atoms"].shape[0]
         chunk_sz = (self.cfg.batch_chunk_size
                     if self.cfg.batch_chunk_size is not None else S_test)
-        # Pre-fold U_pair^T into W0 (and W0_pol) once per score call
-        # so every chunk forward uses the same already-absorbed
-        # weights. No-op when descriptor mixing is disabled.
+        # Pre-fold U_pairᵀ into W0 (and W0_pol) once so every chunk shares the
+        # absorbed weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
         W0_pol_eff = (self._W0_eff(self.W0_pol)
                       if (self.cfg.target_mode == 2
                           and getattr(self, "W0_pol", None) is not None)
                       else getattr(self, "W0_pol", None))
-        # Mirror the training-path second fold: when the preprocess
-        # contraction is on, W0 is stored at Q_new and must be expanded
-        # back to Q_raw before `predict_batch`'s einsum, which assumes
-        # raw-dim descriptors. See validate()/_evaluate_chunk for the
-        # canonical chain.
+        # Second fold: with preprocess on, expand W0 Q_new → Q_raw before
+        # predict_batch's raw-dim einsum (mirrors validate()/_evaluate_chunk).
         if self.descriptor_preprocess_contract != "off":
             W0_eff = self._W0_preprocess_eff(W0_eff)
             if W0_pol_eff is not None:
@@ -1044,77 +887,29 @@ class TNEP(layers.Layer):
                          suffix: str | None = None,
                          presentation: bool = False,
                          shared_axis_scale: bool = False) -> tuple[dict, tf.Tensor]:
-        """Score the model directly on an XYZ file or a directory of them.
+        """Score directly on an XYZ file or directory, via the standard pipeline
+        (collect → descriptors → assemble → pad_and_stack) then :py:meth:`score`.
 
-        Onboards the data through the standard pipeline (`collect` →
-        descriptor build → `assemble_data_dict` → `pad_and_stack`), then
-        dispatches to :py:meth:`score`. Useful for one-line evaluation
-        on a held-out test set without manually wiring the data dict.
-
-        Species handling:
-            The model's training-time `cfg.num_types`, `cfg.types`, and
-            `cfg.dim_q` are preserved across the call so per-type ANN
-            routing and the descriptor builder produce the same layout
-            the model was trained on. Atom types in the test set are
-            re-indexed into the training-time species ordering — atoms
-            of species the model has never seen raise `KeyError`.
+        Training-time cfg.num_types/types/dim_q are preserved so the descriptor
+        layout matches; test types are re-indexed into the training species
+        ordering (unseen species raise KeyError).
 
         Args:
-            path: path to a single ``.xyz`` file or to a directory.
-                When a directory is given, every ``.xyz`` file in it is
-                concatenated (sorted by filename) into a single test set.
-            allowed_species: optional override of `cfg.allowed_species`.
-                ``None`` keeps the training-time filter. Pass an explicit
-                list (e.g. ``[1, 8]`` for water) to relax filtering when
-                the test set has a strict subset of the training species.
-            max_structures: optional cap on the number of structures
-                returned by `collect`. ``None`` = no cap.
-            filter_mode: optional override of `cfg.filter_mode`
-                (``"subset"`` or ``"exact"``). ``None`` keeps the current
-                cfg value.
-            pin_to_cpu: forwarded to `pad_and_stack`. Default ``True``
-                keeps the test data on host RAM (saves GPU memory for
-                scoring; the score forward streams chunks to the device).
-            plot: when ``True``, generate the standard scoring figures
-                (parity plot per component, error-vs-magnitude scatter)
-                after scoring. Uses :py:func:`plotting.plot_correlation`
-                and :py:func:`plotting.plot_error_vs_magnitude`, which
-                honour ``cfg.plot_units`` for unit overrides.
-            save_plots: directory to write figures into. ``None`` skips
-                saving (figures are only shown if ``show_plots=True``).
-                Auto-creates the directory if it doesn't exist.
-            show_plots: ``True`` (default) shows figures via the active
-                matplotlib backend. Set to ``False`` for headless / batch
-                contexts where ``save_plots`` is enough.
-            suffix: optional string appended to the figure filenames
-                (e.g. ``"water_test"`` produces ``correlation_water_test_…``).
-            presentation: when ``True``, switches the figure style to a
-                presentation / poster-friendly preset (thick lines,
-                large fonts) — currently a no-op style switch (the flag
-                is plumbed through but the underlying parity / error
-                plots haven't adopted presentation styling yet); flagged
-                via ``cfg`` so future plot functions can pick it up.
-            shared_axis_scale: when ``True``, the per-component parity
-                panels (x, y, z for dipole or 6-component pol) all use
-                the SAME x/y range computed from the joint min/max of
-                (targets, predictions) across every component. Useful
-                when one component dominates the others and per-panel
-                autoscaling hides the asymmetry. Default ``False`` keeps
-                each panel autoscaled to its own component's range.
+            path: single ``.xyz`` or a directory (all ``.xyz`` concatenated, sorted).
+            allowed_species: override cfg.allowed_species; None keeps the filter.
+            max_structures: cap on structures; None = no cap.
+            filter_mode: override cfg.filter_mode ("subset"/"exact"); None keeps it.
+            pin_to_cpu: forwarded to pad_and_stack; True keeps test data on host RAM.
+            plot: generate parity + error-vs-magnitude figures after scoring.
+            save_plots: dir to write figures (auto-created); None skips saving.
+            show_plots: show via matplotlib backend; False for headless.
+            suffix: string appended to figure filenames.
+            presentation: poster-style flag, currently a no-op (plumbed via cfg).
+            shared_axis_scale: True → all parity panels share one x/y range from
+                the joint min/max (useful when one component dominates).
 
         Returns:
-            Same as :py:meth:`score`: ``(metrics, preds)`` where
-            ``metrics`` is the standard dict (RMSE, R², per-component R²,
-            RRMSE, cos similarity) and ``preds`` is an ``[S, T_dim]``
-            tensor of model predictions on the loaded set.
-
-        Example:
-            >>> model = load_model("models/.../best_val.h5")
-            >>> metrics, preds = model.score_from_file(
-            ...     "datasets/test_waterbulk.xyz",
-            ...     allowed_species=[1, 8],
-            ... )
-            >>> print(f"water-test RMSE = {float(metrics['rmse']):.4f}")
+            (metrics, preds) as :py:meth:`score` — preds is [S, T_dim].
         """
         import os
         import copy
@@ -1124,8 +919,7 @@ class TNEP(layers.Layer):
 
         cfg = self.cfg
 
-        # Snapshot training-time species + dim so the descriptor builder
-        # and per-type ANN routing keep the layout the model expects.
+        # Snapshot training-time species + dim so the layout stays as expected.
         TRAIN_NUM_TYPES = int(cfg.num_types)
         TRAIN_TYPES     = list(cfg.types)
         TRAIN_DIM_Q     = int(cfg.dim_q)
@@ -1172,10 +966,8 @@ class TNEP(layers.Layer):
         if max_structures is not None:
             cfg_for_load.total_N = int(max_structures)
 
-        # Pipeline: collect → build descriptors with TRAINING-TIME species →
-        # assemble → pad_and_stack. `collect` overrides num_types from the
-        # data; we restore it afterwards so the builder produces dim_q=165
-        # (or whatever the model was trained at) instead of the data-implied dim.
+        # collect overrides num_types from the data; restore below so the builder
+        # produces the trained dim_q, not the data-implied one.
         print(f"score_from_file: loading {path} ...")
         dataset, ti_loaded = collect(cfg_for_load)
         if max_structures is not None and len(dataset) > max_structures:
@@ -1218,19 +1010,14 @@ class TNEP(layers.Layer):
         try:
             metrics, preds = self.score(test_data)
             if plot:
-                # Lazy import — avoids matplotlib at module import time
-                # for non-interactive uses of TNEP.
+                # Lazy import: keeps matplotlib out of module import.
                 from plotting import plot_correlation, plot_error_vs_magnitude
                 if save_plots is not None:
                     os.makedirs(save_plots, exist_ok=True)
                 targets_np = test_data["targets"].numpy()
                 preds_np   = preds.numpy()
-                # plot_correlation expects an RRMSE entry alongside RMSE.
-                # `score()` doesn't compute it (callers normally inject
-                # one because the denominator depends on the per-atom vs
-                # total-target convention). Mirror MasterTNEP's
-                # convention: divide RMSE by the target std on the same
-                # space the score was reported in (per-atom here).
+                # plot_correlation needs an RRMSE entry score() doesn't produce;
+                # inject RMSE / target-std on the reported (per-atom) space.
                 diff = targets_np - preds_np
                 std_overall = max(float(targets_np.std()), 1e-12)
                 std_comp = np.maximum(targets_np.std(axis=0), 1e-12)
@@ -1238,13 +1025,8 @@ class TNEP(layers.Layer):
                 metrics_plot = dict(metrics)
                 metrics_plot["rrmse"] = float(metrics["rmse"]) / std_overall
                 metrics_plot["rrmse_components"] = rmse_comp / std_comp
-                # Use the model's cfg for unit handling so cfg.plot_units
-                # ("debye" / "e*bohr" / "e*angstrom") is honoured.
-                # The `presentation` flag is stashed on the cfg as
-                # `_presentation_mode` so plot functions can pick it up
-                # via getattr(cfg, "_presentation_mode", False) when
-                # they grow presentation-styled paths. For now this is
-                # a no-op switch; the kwarg exists for API stability.
+                # cfg carries plot_units; stash presentation on cfg as
+                # _presentation_mode for future plot paths (no-op today).
                 _prev_pres = getattr(self.cfg, "_presentation_mode", None)
                 self.cfg._presentation_mode = bool(presentation)
                 print(f"  plotting (save_plots={save_plots}, "
@@ -1262,8 +1044,7 @@ class TNEP(layers.Layer):
                                              show_plots=show_plots,
                                              suffix=suffix)
                 finally:
-                    # Restore previous presentation flag (or remove it
-                    # if we set it for the first time).
+                    # Restore/remove the presentation flag.
                     if _prev_pres is None:
                         try:
                             delattr(self.cfg, "_presentation_mode")
@@ -1281,20 +1062,12 @@ class TNEP(layers.Layer):
                     pass
 
     def score_summary(self, test_data: dict[str, tf.Tensor]) -> dict:
-        """Print and return a labelled comparison-ready scoring summary.
+        """Print and return a comparison-ready scoring summary.
 
-        Reports metrics in BOTH per-atom space (matches GPUMD's `loss.out`
-        `rmse_virial` convention) AND total-dipole space (matches the
-        convention used in TNEP / NEP papers like Xu et al for headline
-        RMSE / R² values). Use this to compare against published numbers
-        without space-convention confusion.
-
-        Also derives an RRMSE = √(1 − R²) for each space, which is the
-        centered definition (variance-normalised). Note: this differs from
-        the un-centered SNES training RRMSE (`best_rrmse` in history),
-        which uses `Σy²` rather than `Σ(y − ȳ)²` in the denominator —
-        the two are nearly equal when target means are small but not
-        identical.
+        Reports metrics in BOTH per-atom space (GPUMD loss.out rmse_virial) and
+        total-dipole space (NEP-paper headline RMSE/R²). RRMSE = √(1 − R²) is the
+        centered definition, differing from the un-centered SNES training RRMSE
+        (Σy² denominator) — nearly equal only when target means are small.
         """
         metrics, preds = self.score(test_data)
         m = {k: (float(v.numpy()) if hasattr(v, "numpy") else float(v))
@@ -1349,28 +1122,25 @@ class TNEP(layers.Layer):
             W0_pol..b1_pol : same shapes, for mode 2 only (None otherwise)
 
         Returns:
-            predictions : [B, T_dim]  where T_dim = 1 (PES), 3 (dipole), 6 (pol)
+            predictions : [B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
-        # predict_batch is a pure forward primitive: caller is
-        # responsible for whether W0 / W0_pol are raw or already
-        # U-absorbed (via _W0_eff). This keeps the function single-
-        # purpose and avoids double-mixing when callers (validate,
-        # predict_batch_candidates) have already folded U_pair^T in.
+        # Pure forward primitive: caller decides whether W0/W0_pol are raw or
+        # already U-absorbed, so no double-mixing here.
         W0_use = W0
         W0_pol_use = W0_pol
 
         b0_t = tf.gather(b0, Z)   # [B, A, H]
         W1_t = tf.gather(W1, Z)   # [B, A, H_final]
 
-        # Per-type loop for W0: avoids materialising [B, A, Q, H] (dominant memory cost).
-        # b0/W1 only have [B, A, H] so their gathers are fine.
+        # Per-type loop for W0 avoids materialising [B, A, Q, H] (memory-dominant);
+        # b0/W1 are only [B, A, H] so their gathers are fine.
         type_masks = [
             tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
             for t in range(self.num_types)
         ]
-        # Pre-activation z1 preserved for the swish-side backward chain.
+        # z1 preserved for the swish backward chain.
         z1 = tf.add_n([
             tf.einsum('baq,qh->bah', descriptors, W0_use[t]) * type_masks[t]
             for t in range(self.num_types)
@@ -1395,13 +1165,12 @@ class TNEP(layers.Layer):
         B = tf.shape(descriptors)[0]
 
         if self.cfg.target_mode == 1 and W_atom is not None:
-            # Precomputed-kernel path: avoids [C, P, Q] inside vectorized_map.
-            # Mathematically: dipole[b,s] = -Σ_{a,q} de_dq[b,a,q] * W_atom[b,a,s,q]
-            #   = -Σ_p rij²[p] * Σ_q de_dq[struct[p],atom[p],q] * grad_values[p,s,q]
-            # (identical to the COO forces path, proven by substituting W_atom definition)
+            # Precomputed-kernel path (avoids [C, P, Q]):
+            # dipole[b,s] = -Σ_{a,q} de_dq[b,a,q]·W_atom[b,a,s,q], identical to
+            # the COO forces path by W_atom's definition.
             return -tf.einsum('baq,basq->bs', de_dq, W_atom)  # [B, 3]
 
-        # Standard COO path (used when W_atom is not precomputed: score(), predict())
+        # Standard COO path (W_atom not precomputed: score(), predict()).
         forces_per_pair = self._calc_forces_coo(de_dq, grad_values, pair_struct, pair_atom)
 
         if self.cfg.target_mode == 1:
@@ -1409,10 +1178,8 @@ class TNEP(layers.Layer):
                                     positions, boxes, box_inv, B)
 
         elif self.cfg.target_mode == 2:
-            # Polarizability's scalar ANN gets the U-absorbed W0_pol_use
-            # so it operates in the same learned-feature space as the
-            # main ANN. Raw descriptors are passed; the algebra is
-            # equivalent to feeding desc_mixed into raw W0_pol.
+            # Scalar ANN uses the U-absorbed W0_pol_use (same feature space as
+            # the main ANN); raw descriptors ≡ feeding desc_mixed into raw W0_pol.
             return self._polarizability_coo(
                 descriptors, forces_per_pair, pair_struct, pair_atom, pair_gidx,
                 positions, boxes, box_inv, Z, atom_mask,
@@ -1455,10 +1222,7 @@ class TNEP(layers.Layer):
         Returns:
             predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
         """
-        # Q is the dim of the descriptor-axis seen by the matmul. When
-        # preprocessing is on, W0 storage lives at Q_new but the matmul
-        # operates at Q_raw after the preprocess fold (see
-        # _W0_preprocess_eff). dim_q_forward selects the right value.
+        # Q = dim seen by the matmul: Q_raw after the preprocess fold, else Q_new.
         Q = self.dim_q_forward
         H = self.num_neurons
         H_final = self._H_final
@@ -1468,32 +1232,25 @@ class TNEP(layers.Layer):
         A = tf.shape(descriptors)[1]
         C = tf.shape(W0)[0]
 
-        # Type masks [B, A, 1] — independent of C, reused for both matmul directions
+        # Type masks [B, A, 1] — C-independent, reused for both matmul directions.
         type_masks = [
             tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
             for t in range(T)
         ]
 
-        # Per-candidate descriptor mixing: absorb U_pair^T into W0 so
-        # the rest of the forward/backward uses raw descriptors and
-        # the de_dq we produce is already in raw-desc space (ready to
-        # combine with raw grad_values in the dipole sum). See _W0_eff
-        # for the algebraic identity.
+        # Per-candidate mixing: absorb U_pairᵀ into W0 so forward/backward stay
+        # in raw-desc space (de_dq combines with raw grad_values). See _W0_eff.
         if self.descriptor_mixing and U_pair is not None:
             W0 = self._W0_eff(W0, U_pair)
 
-        # Preprocessing contraction: fold the per-type per-channel
-        # coefficients into W0 along the Q_new axis, producing a W0_eff
-        # at Q_raw. The matmul code below sees Q = Q_raw uniformly and
-        # the dipole backward yields de_dq at Q_raw, ready to contract
-        # with the precomputed raw W_atom. Mutually exclusive with
-        # mixing/gating (so the two folds never compose in this build).
+        # Preprocess fold: W0 Q_new → Q_raw so the matmul below is uniform at
+        # Q_raw and de_dq comes out at Q_raw for the raw-W_atom sum. Mutually
+        # exclusive with mixing.
         if self.descriptor_preprocess_contract != "off":
             W0 = self._W0_preprocess_eff(W0, W_pre_override=W_pre_angular)
 
         # ── Forward: input→hidden ─────────────────────────────────────────────
-        # Per type: [B*A, Q] @ [Q, C*H] → [B*A, C*H] → [C, B, A, H]
-        # One GEMM per type instead of C separate GEMMs inside pfor.
+        # Per type: [B*A, Q] @ [Q, C*H] → [C, B, A, H]. One GEMM/type, not C.
         desc_flat = tf.reshape(descriptors, [B * A, Q])
         pre_h_terms = []
         for t in range(T):
@@ -1511,8 +1268,7 @@ class TNEP(layers.Layer):
         W1_t_all = tf.reshape(tf.gather(W1, Z_flat, axis=1), [C, B, A, H_final])
 
         # ── Activation (single hidden layer) ──────────────────────────────────
-        # z1 = pre_h + b0  is the pre-activation; preserve it for the
-        # swish-side backward chain rule below.
+        # z1 preserved for the swish backward chain below.
         z1 = pre_h + b0_t_all
         h1 = self.activation(z1)
         h1 = h1 * atom_mask[tf.newaxis, :, :, tf.newaxis]
@@ -1524,7 +1280,7 @@ class TNEP(layers.Layer):
             return -tf.reduce_sum(E, axis=2, keepdims=True)  # [C, B, 1]
 
         # ── Dipole: backward matmul ───────────────────────────────────────────
-        # U = h1 · W1 + b1 ⇒ ∂U/∂h1 = W1, ∂U/∂a1 = activation'(h1, z1)·W1.
+        # ∂U/∂a1 = activation'(h1, z1)·W1.
         de_da    = self._activation_grad(h1, z1) * W1_t_all   # [C, B, A, H]
         de_da_flat = tf.reshape(de_da, [C, B * A, H])         # [C, B*A, H]
 
@@ -1541,16 +1297,9 @@ class TNEP(layers.Layer):
         return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
 
     def _scalar_rij_pow(self, rij2: tf.Tensor) -> tf.Tensor:
-        """|r_ij|^N as a scalar per-pair weight (N ≥ 1 only).
-
-        Derived from the rij² primitive without a fresh sqrt for even N:
-            N = 1      → sqrt(rij²)
-            N = 2      → rij² unchanged (zero ops; default path)
-            N even ≥ 4 → tf.pow(rij², N/2)
-            N odd  ≥ 3 → tf.pow(rij², (N-1)/2) · sqrt(rij²)
-
-        N = 0 is handled by `_dipole_pair_weight_*` (different algebraic
-        branch — restricts the dipole sum to self pairs only), not here.
+        """|r_ij|^N per-pair weight from the rij² primitive (N ≥ 1; avoids sqrt
+        for even N). N=0 (self-pairs only) is handled by _dipole_pair_weight_*.
+            N=1 → √rij²;  N=2 → rij²;  even≥4 → rij²^(N/2);  odd≥3 → rij²^((N-1)/2)·√rij²
         """
         N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if N == 1:
@@ -1565,18 +1314,11 @@ class TNEP(layers.Layer):
     def _dipole_pair_weight_coo(self, rij2: tf.Tensor,
                                  pair_atom: tf.Tensor,
                                  pair_gidx: tf.Tensor) -> tf.Tensor:
-        """Per-pair weight in the dipole sum, COO-pair interface.
-
-            N == 0 : 1 where pair_atom == pair_gidx AND rij² < 1e-20
-                     (true zero-image self pair), 0 elsewhere
-                     → dipole collapses to -Σ_i de_dq[i] · grad_values[i, i].
-                     The rij² guard rejects periodic IMAGES of atom i that
-                     appear as its own neighbour with the same atom index
-                     but a nonzero displacement vector — including those
-                     would double-count the self contribution.
-            N >= 1 : |r_ij|^N — self pairs naturally contribute 0 via
-                     |r_ii|^N = 0, and periodic-image self pairs are
-                     weighted correctly by their nonzero |r|^N.
+        """Per-pair dipole weight, COO-pair interface.
+            N == 0 : 1 where pair_atom==pair_gidx AND rij²<1e-20 (true self pair),
+                     else 0. The rij² guard rejects periodic self-images (same
+                     atom index, nonzero displacement) that would double-count.
+            N >= 1 : |r_ij|^N (self pairs → 0, images weighted correctly).
         """
         N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if N == 0:
@@ -1587,19 +1329,11 @@ class TNEP(layers.Layer):
 
     def _dipole_pair_weight_padded(self, rij2: tf.Tensor,
                                     grad_index: tf.Tensor) -> tf.Tensor:
-        """Per-pair weight in the dipole sum, padded [A, M] interface.
+        """Per-pair dipole weight, padded [A, M] interface (same dispatch as COO).
+        Centre of row i is i, so self pairs are grad_index[i,m]==i AND rij²<1e-20.
 
-        Same dispatch as the COO variant. The "centre" for row i is just
-        i itself (the padded layout is [centre A, neighbour-slot M]), so
-        self pairs are wherever `grad_index[i, m] == i` AND rij² < 1e-20.
-        The rij² guard rejects periodic-image self entries (same atom
-        index, nonzero displacement) that would otherwise double-count.
-
-        Contract: the returned weight tensor is only valid AFTER the
-        caller multiplies by `neighbor_mask` to zero out padding rows
-        (padding rows can have grad_index == 0 == some real centre and
-        rij2 == 0, so they look like self pairs). The single-structure
-        predict() path applies this mask in its dipole branch.
+        Caller MUST multiply by neighbor_mask afterwards: padding rows can look
+        like self pairs (grad_index==0, rij2==0). predict()'s dipole branch does.
         """
         N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if N == 0:
@@ -1658,12 +1392,10 @@ class TNEP(layers.Layer):
                                   pair_gidx: tf.Tensor, positions: tf.Tensor,
                                   boxes: tf.Tensor, B: tf.Tensor,
                                   A: tf.Tensor) -> tf.Tensor:
-        """Aggregate rij²-weighted gradients per (structure, atom) — independent of candidates.
-
-        W_atom[b,a,s,q] = Σ_{p: struct[p]=b, atom[p]=a} rij²[p] × grad_values[p,s,q]
-
-        Dipole is then -einsum('baq,basq->bs', de_dq, W_atom) with no P dimension
-        inside vectorized_map, eliminating the [C, P, Q] intermediate.
+        """Aggregate rij²-weighted gradients per (structure, atom); candidate-independent.
+            W_atom[b,a,s,q] = Σ_{p: struct=b, atom=a} rij²[p]·grad_values[p,s,q]
+        Dipole is then -einsum('baq,basq->bs', de_dq, W_atom), no P axis inside
+        the candidate loop (eliminates the [C, P, Q] intermediate).
 
         Args:
             grad_values : [P, 3, Q]  (already scaled if descriptor scaling is active)
@@ -1680,15 +1412,10 @@ class TNEP(layers.Layer):
         """
         P = tf.shape(grad_values)[0]
         Q = tf.shape(grad_values)[2]
-        # dipole_rij_power short-circuits:
-        #   N == 0 : weight is just the self-pair indicator 1[i==j]. The
-        #            data pipeline already filtered the COO list to
-        #            self-pairs only (data.py self_pairs_only branch), so
-        #            every pair satisfies i==j and weight = 1 everywhere.
-        #            Skips the expensive _neighbor_displacements_coo +
-        #            tf.linalg.inv(boxes) entirely.
-        #   N >= 1 : standard per-pair |r|^N weight (self pairs contribute
-        #            zero via |r_ii|=0); needs displacements.
+        # N == 0 : weight = 1 everywhere — the COO list is already filtered to
+        #          self-pairs (data.py self_pairs_only), so skip displacements
+        #          + tf.linalg.inv(boxes) entirely.
+        # N >= 1 : per-pair |r|^N weight; needs displacements.
         _N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if _N == 0:
             weight = tf.ones([P], dtype=grad_values.dtype)
@@ -1756,9 +1483,7 @@ class TNEP(layers.Layer):
         Returns:
             dipole : [B, 3]
         """
-        # Dipole contraction.
-        #   N >= 1 : μ = -Σ_pair |r_ij|^N · F_ij  (scalar weight × force vector)
-        #   N == 0 : μ = -Σ_i F_ii (self-only — see _dipole_pair_weight_coo)
+        # μ: N>=1 → -Σ_pair |r_ij|^N·F_ij; N==0 → -Σ_i F_ii (self-only).
         _, rij2 = self._neighbor_displacements_coo(
             positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
         weight = self._dipole_pair_weight_coo(rij2, pair_atom, pair_gidx)  # [P]

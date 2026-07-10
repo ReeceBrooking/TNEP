@@ -6,17 +6,15 @@ import numpy as np
 class TNEPconfig:
     """Holds all hyperparameters and runtime state for a TNEP training run.
 
-    Class-level defaults are overwritten at runtime by MasterTNEP after
-    data loading (num_types, types, dim_q, indices).
+    Runtime-state fields (num_types, types, dim_q, indices) are overwritten
+    by MasterTNEP after data loading.
 
-    Sections (in natural pipeline order — what's the data → how features
-    are computed → model → loss → optimiser → memory plumbing → outputs):
-
+    Sections:
         1. Dataset & targets
         2. Descriptor (SOAP-turbo: geometry, backend, preprocessing)
         3. Network architecture
         4. Loss & regularisation
-        5. SNES optimiser (core, plateau-reset, validation)
+        5. SNES optimiser
         6. Memory & I/O staging
         7. Output & diagnostics
         8. Runtime state (auto-populated by data load)
@@ -52,56 +50,23 @@ class TNEPconfig:
     target_key: str | None = None
     # Scale dipole targets by atom count (per-atom dipole training)
     scale_targets: bool = True
-    # Native units of dipole targets in the dataset. Used (a) to derive
-    # the e·Å conversion factor when `convert_dipole_to_eangstrom=True`,
-    # and (b) as the plot-axis / stats unit label when conversion is off.
-    # "e*angstrom" = e·Å
-    # "e*bohr"     = e·a₀   (× 0.5292 → e·Å)
-    # "debye"      = Debye  (× 0.2082 → e·Å)
+    # Native units of dipole targets in the dataset: "e*angstrom" (e·Å),
+    # "e*bohr" (e·a₀, × 0.5292 → e·Å), "debye" (× 0.2082 → e·Å). Sets the
+    # e·Å conversion factor and the plot/stats unit label.
     dipole_units: str = "e*bohr"
-    # When True, dipole targets are converted to e·Å on data load and
-    # training / plots / spectra all use e·Å. When False, raw dataset
-    # values are passed through unchanged — model trains in dataset
-    # native units. Useful when you want loss / RMSE / RRMSE numbers
-    # directly comparable with reference values quoted in e·a₀ or Debye.
+    # True = convert dipole targets to e·Å on load; False = train/plot in
+    # dataset native units (for RMSE comparable with e·a₀ / Debye references).
     convert_dipole_to_eangstrom: bool = False
-    # Polarizability off-diagonal weight (target_mode=2 only): loss for
-    # components [xy, yz, zx] scaled by lambda_shear^2. GPUMD default 1.0
-    # — equal weighting; <1.0 downweights off-diagonal.
+    # Polarizability off-diagonal ([xy,yz,zx]) loss weight, scaled by
+    # lambda_shear^2 (target_mode=2 only). 1.0 = equal weighting (GPUMD default).
     lambda_shear: float = 1.0
 
-    # Power of |r_ij| applied to per-pair forces in the dipole contraction
-    # (target_mode=1 only). Two algebraic branches:
-    #
-    #   N = 0   →  μ = − Σ_i de_dq[i] · grad_values[i, i]
-    #             (Sums ONLY the self-pair (i, i) contributions.
-    #             A naive μ = -Σ F_ij over all pairs would be identically
-    #             zero by translation invariance of q_i, since
-    #             Σ_{all j incl. self} ∂q_i/∂R_j = 0. Restricting the sum
-    #             to self pairs isolates the centre's own gradient, which
-    #             equals −Σ_{j≠i} ∂q_i/∂R_j and is non-zero. The result
-    #             is rotation-covariant and a valid dipole-like quantity,
-    #             but DIFFERENT in functional form from the N ≥ 1 branches —
-    #             not a "lower-power" version of the same formula.)
-    #
-    #   N = 1   →  μ = − Σ_{pair} |r_ij|   · F_ij  (first radial moment;
-    #             Schofield-style virial-like weight)
-    #   N = 2   →  μ = − Σ_{pair} |r_ij|²  · F_ij  (Xu et al. JCTC 2024 /
-    #             GPUMD default — what the dipole pathway has used to date)
-    #   N ≥ 3   →  μ = − Σ_{pair} |r_ij|^N · F_ij  (higher moments;
-    #             mostly diagnostic / sensitivity studies)
-    #
-    # For N ≥ 1, self pairs (i, i) are present in the COO list but
-    # contribute zero automatically because |r_ii|^N = 0 — no separate
-    # handling needed. The N = 0 branch uses the COO list's self entries
-    # exclusively and skips all neighbour pairs.
-    #
-    # Default 0 enables the self-pair-only formulation. For the
-    # standard Xu et al. JCTC 2024 / GPUMD-compatible formula, set
-    # `dipole_rij_power = 2`; for the GAP-style first radial moment,
-    # set it to 1. Models saved with one N MUST be re-trained if N is
-    # changed — the contraction defines what the network's per-atom
-    # scalar is mapped to.
+    # Power N of |r_ij| in the dipole contraction (target_mode=1 only):
+    #   0 = self-pair-only, μ = −Σ_i de_dq[i]·grad_values[i,i] (distinct form)
+    #   1 = first radial moment, μ = −Σ_pair |r_ij| ·F_ij
+    #   2 = Xu et al. JCTC 2024 / GPUMD default, μ = −Σ_pair |r_ij|²·F_ij
+    #   ≥3 = higher moments (diagnostic)
+    # Models must be re-trained if N changes.
     dipole_rij_power: int = 0
 
     # ═══════════════════════════════════════════════════════════════════
@@ -125,43 +90,28 @@ class TNEPconfig:
     central_weight: float = 1.0
 
     # --- compute backend (CPU/quippy vs GPU/TF) ------------------------
-    # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU when available).
-    # The GPU path supports basis="poly3" and compress_mode="trivial" only;
-    # falls back to a clear error if other settings are requested.
+    # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU).
+    # GPU path supports basis="poly3" and compress_mode="trivial" only.
     descriptor_mode: int = 0
 
-    # Internal precision for the GPU descriptor compute. The Fortran reference
-    # uses double-precision throughout; "float64" mirrors that exactly. The
-    # opt-in "float32" path keeps roughly half the VRAM and runs faster on
-    # consumer GPUs (which are 2-32× more performant in fp32 than fp64), at
-    # the cost of slightly looser agreement with quippy. Trajectory-inference
-    # outputs are always cast to float32 at the boundary regardless of this
-    # setting, so the user-visible difference is dominated by accumulation
-    # noise in the radial recursion. Has no effect for descriptor_mode=0.
+    # GPU descriptor compute precision: "float64" (matches Fortran reference)
+    # or "float32" (~half VRAM, faster on consumer GPUs, looser agreement).
+    # No effect for descriptor_mode=0.
     descriptor_precision: str = "float64"
 
-    # Number of structures concatenated into a single SOAP graph call.
-    #   1     : per-frame (lowest VRAM, highest launch overhead)
-    #   int>1 : multi-frame batching, amortises kernel launches
-    #   None  : auto — choose the largest batch that fits the memory budget
-    # Used by both training (DescriptorBuilder.build_descriptors) and
-    # trajectory inference. process_trajectory's `descriptor_batch_frames`
-    # kwarg overrides this value for that call only.
+    # Structures per SOAP graph call: 1 = per-frame (lowest VRAM), int>1 =
+    # batched, None = auto-fit to memory budget. Used by training and
+    # trajectory inference; process_trajectory kwarg overrides per call.
     descriptor_batch_frames: int | None = 500
 
-    # Pair-tile size for the gradient compute. 0 = single-shot (lower
-    # launch overhead, higher peak VRAM). >0 = tile pairs in chunks of
-    # this size (cuts peak VRAM at the dominant [k_max,n_max,P] tensors;
-    # at fp32 also auto-enables XLA fusion in the trajectory path).
-    # Sensible value for ~600-atom systems: 8000.
+    # Pair-tile size for the gradient compute: 0 = single-shot (higher peak
+    # VRAM), >0 = tile pairs (cuts VRAM; at fp32 also enables XLA fusion).
+    # ~8000 suits ~600-atom systems.
     descriptor_pair_tile_size: int = 8000
 
-    # GPU memory budget (bytes) used by the auto-sizer when
-    # descriptor_batch_frames is None. None falls back to the builder's
-    # default (6 GiB).
+    # GPU memory budget (bytes) for the auto-sizer when
+    # descriptor_batch_frames is None. None = builder default (6 GiB).
     descriptor_memory_budget_bytes: int | None = None
-
-    # Number of parallel workers for SOAP descriptor computation.
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE
@@ -169,134 +119,55 @@ class TNEPconfig:
 
     # Hidden-layer width of the per-type ANN.
     num_neurons: int = 30
-    # Activation function for the hidden layer. Any name accepted by
-    # `tf.keras.activations.get` works for the forward pass. For
-    # dipole / polarisability training (target_mode = 1 or 2), the
-    # backward derivative is hand-coded — only `tanh` and `swish`
-    # (alias `silu`) are fully plumbed. Other activations will raise
-    # NotImplementedError at the first force / dipole prediction.
-    # Energy training (target_mode = 0) doesn't use the hand-coded
-    # backward and works with any Keras activation.
+    # Hidden-layer activation (any tf.keras.activations name for the forward
+    # pass). Dipole/polarisability training (target_mode 1/2) has a hand-coded
+    # backward — only "tanh" and "swish" (alias "silu") supported there;
+    # energy training (target_mode 0) accepts any.
     activation: str = 'swish'
 
-    # When True, insert a learnable per-species-pair linear mixing
-    # layer between the (fixed) SOAP-turbo descriptor and the ANN.
-    # `desc'[q in block_ab] = U_pair[a,b] @ desc[q in block_ab]` per
-    # unordered neighbour-species pair (a, b). Trivial compression
-    # makes the block sizes pair-dependent (20 / 35 at alpha_max=4,
-    # l_max=4, 3 species) and the q-indices non-contiguous; the
-    # implementation gathers/scatters accordingly. U_pair is shared
-    # across central atom types — the per-type ANN already
-    # differentiates downstream. Identity init so the model starts
-    # bit-identical to the no-mixing baseline. This is the closest
-    # direct analog to GPUMD/NEP's trainable radial-basis coefficients
-    # c_nk (which mix fixed Chebyshev primitives into learned radial
-    # functions per species pair).
+    # When True, insert a learnable per-species-pair linear mixing layer
+    # between the fixed SOAP-turbo descriptor and the ANN (U_pair shared
+    # across central types, identity-init). Analog of NEP's trainable
+    # radial-basis coefficients c_nk.
     descriptor_mixing: bool = True
-    # When True (and descriptor_mixing=True), U_pair becomes
-    # per-central-atom-type: shape [T, num_pairs, max_bs, max_bs]
-    # instead of [num_pairs, max_bs, max_bs]. Each central type t
-    # gets its own learned set of pair-mixing matrices, applied to
-    # atoms of that type. Strictly more expressive than the shared
-    # variant (which is the T=1 case of this) — captures central-
-    # type-specific feature selection on top of the pair-block
-    # decomposition. Cost: T× the U_pair param count. Identity-init
-    # per (t, p) so the model starts bit-identical to the mixing-
-    # disabled baseline regardless of T.
+    # When True (with descriptor_mixing), U_pair becomes per-central-type
+    # ([T, num_pairs, max_bs, max_bs]) — more expressive, T× the param count.
     descriptor_mixing_per_type: bool = False
-    # Parameterisation applied to each V_pair descriptor-mixing block.
-    # Both non-off modes are STRUCTURAL constraints (not soft penalties):
-    # SNES walks the upper-triangle of a skew-symmetric A and U is
-    # reconstructed from A by a closed-form map. U is exactly orthogonal
-    # regardless of any λ.
-    #   "off"    : V_pair is unregularised. Each block has bs² trainable
-    #              parameters; SNES sigma bounds exploration.
-    #   "cayley" : U = (I − A)(I + A)⁻¹  — rational chord. Cannot
-    #              represent rotations with a −1 eigenvalue except in
-    #              the limit |A| → ∞. bs·(bs−1)/2 free params per block.
-    #   "expm"   : U = exp(A)              — exponential geodesic.
-    #              Surjective onto SO(n); no Jacobian singularity.
-    #              bs·(bs−1)/2 free params per block. RECOMMENDED.
-    # Only consulted when descriptor_mixing=True.
+    # Parameterisation of each descriptor-mixing block (structural, not a
+    # penalty); only used when descriptor_mixing=True:
+    #   "off"    : unregularised, bs² params per block
+    #   "cayley" : U = (I−A)(I+A)⁻¹, bs·(bs−1)/2 params, no −1-eigenvalue
+    #   "expm"   : U = exp(A), surjective onto SO(n), bs·(bs−1)/2 params. RECOMMENDED.
     descriptor_mixing_regularizer: str = "expm"
 
-    # Descriptor preprocessing contraction layer. Sits BEFORE the W0
-    # layer of the per-type ANN; output becomes the new descriptor
-    # input. A learned per-(centre type, raw channel) coefficient
-    # table contracts the chosen axis of the raw SOAP descriptor
-    # down to a smaller feature vector. NEP-inspired but applied
-    # AFTER the SOAP power-spectrum squaring (vs NEP's pre-squaring
-    # projection on the density coefficients).
-    #
-    # Modes (Q_raw = raw SOAP dim, L = l_max+1):
-    #   "off"          : (default) no preprocessing; W0 sees raw Q_raw.
-    #   "angular"      : Contract over l per (pair, n_pair). l < l_keep
-    #                    are kept as passthrough channels; l ≥ l_keep
-    #                    summed into one output channel. Output dim
-    #                    Q_new = (l_keep + 1 if l_keep < L else 0) ·
-    #                    Σ_pair α_eff_per_pair. Coefficients [T, Q_raw].
-    #   "species_pair" : Per-central-type contraction into SELF (the
-    #                    (t,t) pair) vs OTHER (all (t, j ≠ t) pairs
-    #                    summed). Output dim Q_new = 2 · max_α · L.
-    #                    Coefficients [T, Q_raw], pair-masked.
-    #   "both"         : Collapse BOTH axes — combines "angular" and
-    #                    "species_pair". Smallest Q_new; biggest info
-    #                    loss; per-(block, l_group) per-type init.
-    #   "nep4_radial"  : NEP4-faithful learned-basis fold (rank-1
-    #                    outer-product weighting on (n, n')):
-    #                      g[t, n'', l] = Σ_{n,n'} c[t,s(n),n'',k(n)]
-    #                                          · c[t,s(n'),n'',k(n')]
-    #                                          · p[n, n', l]
-    #                    Mathematically equivalent to a NEP4 descriptor
-    #                    with SOAP-turbo's radial basis as primitives.
-    #                    Output dim Q_new = n_max_out · L; n_max_out
-    #                    defaults to Q_raw/L so the descriptor dim is
-    #                    PRESERVED (pure non-linear transformation).
-    #                    Coefficients shape [T_centre, T_neighbour,
-    #                    n_max_out, α] — same indexing as NEP4's
-    #                    c^{Z_i,Z_j}_{n'',k}. Requires
-    #                    compress_mode='trivial'.
-    #
-    # Descriptor mixing composes with all preprocess modes.
+    # Descriptor preprocessing contraction, before the ANN W0 layer; a learned
+    # per-(centre type, raw channel) table contracts the raw SOAP descriptor
+    # (Q_raw = raw dim, L = l_max+1). Composes with descriptor_mixing.
+    #   "off"          : no preprocessing (W0 sees raw Q_raw)
+    #   "angular"      : contract over l per (pair, n_pair); see angular_l_keep
+    #   "species_pair" : per-type contraction into SELF vs OTHER pairs, Q_new = 2·max_α·L
+    #   "both"         : collapse both axes (smallest Q_new, most info loss)
+    #   "nep4_radial"  : NEP4-faithful learned-basis fold, Q_new = n_max_out·L;
+    #                    requires compress_mode='trivial'
     descriptor_preprocess_contract: str = "off"
-    # NEP4 learned-basis fold output radial-channel count. Only consulted
-    # when descriptor_preprocess_contract == "nep4_radial". When None
-    # (default), the layout auto-picks n_max_out = Q_raw / L so that
-    # Q_new = Q_raw (descriptor dim is preserved — pure non-linear
-    # transformation). Set explicitly to reduce / expand the descriptor
-    # — small values (≈ α or 2α) match NEP4's typical "compact learned
-    # basis" setting and give the strongest inductive bias.
+    # NEP4 fold output radial-channel count (nep4_radial mode only). None =
+    # auto n_max_out = Q_raw/L so Q_new = Q_raw (dim preserved); small values
+    # (≈ α or 2α) match NEP4's compact-basis setting.
     descriptor_nep4_n_max_out: int | None = None
-    # Initialisation for preprocess coefficients:
-    #   "mean"   : (default) 1/N where N is the contracted-axis size.
-    #              For angular mode N = l_max+1, so each coefficient is
-    #              1/(l_max+1); gen-0 output ≈ mean across l per channel.
-    #              Output magnitude similar to inputs — well conditioned.
-    #   "sum"    : 1.0. Gen-0 output = sum across the contracted axis.
-    #              Output magnitude grows with N; W0 has to re-scale.
-    #   "glorot" : Glorot-uniform: U(-√(6/(fan_in+fan_out)), +√(...)).
+    # Preprocess coefficient init: "mean" (1/N, well-conditioned), "sum" (1.0),
+    # or "glorot" (Glorot-uniform).
     descriptor_preprocess_init: str = "mean"
-    # Per-tail σ scaling for preprocess coefficients (analogous to
-    # mixing_sigma_scale). Default 1.0 = same as the ANN. Reduce
-    # (e.g. 0.1) if SNES sampling noise on preprocess coefficients
-    # overwhelms the optimisation signal.
+    # Per-tail σ scaling for preprocess coefficients (1.0 = same as ANN; reduce
+    # if SNES sampling noise overwhelms the signal).
     preprocess_sigma_scale: float = 1.0
-    # Angular contraction threshold: l < angular_l_keep are kept as
-    # passthrough output channels (no learnable coefficient — the
-    # descriptor channel goes straight to its own W0 row). l ≥
-    # angular_l_keep are summed into ONE output channel per
-    # (pair, n_pair) with L − angular_l_keep learnable coefficients.
-    # Default 1 reproduces the original behaviour (l=0 kept, l>0 summed).
-    # Only consulted in modes that collapse the l axis ("angular", "both").
+    # Angular contraction threshold (angular/both modes): l < angular_l_keep
+    # kept as passthrough channels, l ≥ it summed into one output channel.
     descriptor_preprocess_angular_l_keep: int = 2
-    # When True (default), W_pre coefficients are per central-atom type
-    # (shape [T, n_summed_q_raw, N]). When False, coefficients are
-    # GLOBAL across centre types — symmetric coupling, smallest param count.
+    # True = W_pre coefficients per central-atom type; False = global across
+    # centre types (symmetric, smallest param count).
     descriptor_preprocess_per_type: bool = False
-    # L1/L2 regularisation strengths on (coefficient − init). Penalises
-    # deviation from the mean/sum/glorot init (not from zero). Set both
-    # to 0.0 to disable; defaults below give a mild soft prior toward
-    # the chosen init.
+    # L1/L2 strengths on (coefficient − init): soft prior toward the chosen
+    # init, not zero. Both 0.0 = disable.
     descriptor_preprocess_lambda_1: float = 0.0005
     descriptor_preprocess_lambda_2: float = 0.0005
 
@@ -304,40 +175,26 @@ class TNEPconfig:
     # 4. LOSS & REGULARISATION
     # ═══════════════════════════════════════════════════════════════════
 
-    # Master switch for the L1/L2 regularisation block. When False:
-    # both the per-type fitness path and the main fitness add 0
-    # regularisation regardless of lambda_1 / lambda_2 / per-type
-    # settings. lambda values are still maintained (and reported in
-    # history) so flipping back to True mid-run resumes seamlessly.
-    # Useful for ablation studies and for early "warm-up" generations
-    # where the data fit dominates.
+    # Master switch for L1/L2 regularisation. False = add 0 reg regardless
+    # of lambda settings (lambda values kept so re-enabling mid-run resumes).
     toggle_regularization: bool = True
-    # L1/L2 regularization strengths.
-    #   None  : auto = sqrt(dim * 1e-6 / num_types)
-    #   -1.0  : dynamic — adapt every `lambda_adapt_interval` gens so
-    #           the L1 (or L2) penalty stays at `lambda_target_ratio`
-    #           of the data RMSE. Starts from the auto value.
-    #   float : fixed scalar
+    # L1/L2 strengths: None = auto sqrt(dim*1e-6/num_types), -1.0 = dynamic
+    # (adapt every lambda_adapt_interval gens toward lambda_target_ratio of
+    # data RMSE), float = fixed.
     lambda_1: float | None = 0.0005
     lambda_2: float | None = 0.0005
-    # Dynamic-λ controls (only used when lambda_1 or lambda_2 == -1).
-    # `target_ratio`: target ratio of reg-penalty to data RMSE. 0.05
-    #   means "keep regularisation at ~5% of the data loss." GPUMD
-    #   NEP4 uses a similar target (~0.01–0.1 depending on data size).
-    # `damping`: multiplicative step exponent. λ_new = λ * (target/r)^d.
-    #   Smaller d → slower adaptation, less oscillation. 0.2 is gentle.
-    # `interval`: how often (in gens) to recompute and rescale λ.
-    #   Matches the existing per-100-gen reg-sampling cadence by default.
-    # `min/max`: safety clamp on adapted λ.
+    # Dynamic-λ controls (only when lambda_1 or lambda_2 == -1):
+    #   target_ratio : target reg-penalty / data-RMSE ratio
+    #   damping      : step exponent, λ_new = λ·(target/r)^d (smaller = gentler)
+    #   interval     : gens between recompute/rescale
+    #   min/max      : clamp on adapted λ
     lambda_target_ratio: float = 0.05
     lambda_damping: float = 0.2
     lambda_adapt_interval: int = 100
     lambda_min: float = 1e-8
     lambda_max: float = 1.0
-    # Per-type regularization and ranking (GPUMD NEP4 style).
-    # Each type's params are regularized separately, creating per-type fitness
-    # rankings that drive per-type natural gradient updates.
-    # Only effective for multi-element systems (auto-disabled for single-element).
+    # Per-type regularization + fitness ranking (GPUMD NEP4 style), driving
+    # per-type natural-gradient updates. Auto-disabled for single-element systems.
     per_type_regularization: bool = True
 
     # ═══════════════════════════════════════════════════════════════════
@@ -355,12 +212,9 @@ class TNEPconfig:
     eta_sigma: float | None = None
     # Initial distribution standard deviation
     init_sigma: float = 0.1
-    # Lower bound on sigma after each SNES update. Without a floor,
-    # `σ ← σ · exp(η · grad_σ)` can drift toward zero on a long run
-    # (especially with the per-type ranking schedule), collapsing the
-    # search distribution to a point and silently killing exploration.
-    # Set to None or 0 to disable. Typical adapted σ is 1e-3 to 1e-1,
-    # so 1e-6 is non-distorting.
+    # Lower bound on sigma after each SNES update, preventing σ→0 collapse of
+    # the search distribution on long runs. None or 0 = disable; 1e-6 is
+    # non-distorting (typical adapted σ is 1e-3 to 1e-1).
     sigma_floor: float | None = 1e-6
 
     # --- validation ----------------------------------------------------
@@ -378,70 +232,31 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- per-chunk compute ---------------------------------------------
-    # Number of SNES candidates to evaluate per GPU chunk (limits VRAM).
-    # Defaults:
-    #   10    : Safe baseline that fits a 12 GB consumer GPU (the dev
-    #           box) without OOM under typical molecule sizes. Shipping
-    #           default since "VRAM-safe" beats "fastest" for new users.
-    #   None  : No chunking — the whole population is evaluated in one
-    #           shot. Use on A100 40 GB and similar; auto-applied when
-    #           cfg.csc_enable=True and the GPU profile is selected.
+    # SNES candidates evaluated per GPU chunk (limits VRAM): 10 = VRAM-safe
+    # baseline for a 12 GB GPU; None = no chunking (whole population at once,
+    # for A100-class / CSC GPU profile).
     population_chunk_size: int | None = 10
-    # Number of structures to process per GPU chunk during evaluation.
-    # None = all at once. Default 2000 fits the dev box; the CPU CSC
-    # profile drops this to 500 because CPU forward passes prefer
-    # smaller chunks (per-op latency >> per-FLOP rate vs GPU).
+    # Structures per GPU chunk during evaluation. None = all at once; 2000
+    # fits the dev box (CPU CSC profile uses 500, latency-sensitive).
     batch_chunk_size: int | None = 2000
 
-    # Where the static training tensors (descriptors, grad_values,
-    # positions, pair indices, etc.) live, and which chunk-staging
-    # path the SNES eval / TNEP.score loops use:
-    #
-    #   True  : tensors stay on host CPU. Per-chunk slice → tf.gather
-    #           → implicit H2D copy each gen. Use when the full
-    #           dataset is too big for VRAM.
-    #   False : tensors live on /GPU:0 — including grad_values, which
-    #           is loaded fully onto the GPU at startup. The
-    #           chunk-staging path becomes pure on-device
-    #           gather/strided_slice — no host round-trip. Fastest
-    #           mode when the working set (grad_values + descriptors +
-    #           activations) fits in VRAM.
+    # Where static training tensors (descriptors, grad_values, positions, pair
+    # indices) live: True = host CPU, per-chunk gather with H2D copy each gen
+    # (for datasets too big for VRAM); False = /GPU:0, on-device gather
+    # (fastest when the working set fits in VRAM).
     pin_data_to_cpu: bool = False
 
     # --- HPC / Slurm mode ----------------------------------------------
-    # Master switch for CSC / Slurm-supercomputer mode (Mahti, Puhti,
-    # LUMI etc.). When True, `_apply_csc_overrides` tunes the per-chunk
-    # sizing (population_chunk_size / batch_chunk_size / pin_data_to_cpu)
-    # for the detected profile. Grad_values stays in RAM (or VRAM,
-    # depending on `pin_data_to_cpu`).
-    # Default False keeps non-HPC behaviour identical.
+    # Master switch for CSC / Slurm mode (Mahti, Puhti, LUMI). True =
+    # _apply_csc_overrides tunes per-chunk sizing for the detected profile.
+    # False keeps non-HPC behaviour identical.
     csc_enable: bool = False
 
-    # Force which CSC profile (`_apply_csc_overrides`) applies. Only
-    # consulted when `csc_enable=True`.
-    #   "auto" (default) — pick the profile from runtime hardware
-    #                      detection (`_has_gpu` in MasterTNEP).
-    #   "cpu"            — force the CPU profile even if a GPU is
-    #                      visible. Useful for benchmarking the CPU
-    #                      path on a GPU-equipped dev box.
-    #   "gpu"            — force the GPU profile. Useful when the
-    #                      detection heuristic fails (e.g. cuda
-    #                      visible but the GPU is reserved).
-    #
-    # Profile overrides applied:
-    #
-    #   GPU profile (A100 40 GB, ~32 cores):
-    #       population_chunk_size = None    (no chunking)
-    #       batch_chunk_size      = 2000
-    #       pin_data_to_cpu       = False
-    #
-    #   CPU profile (Mahti 128-core EPYC, no GPU):
-    #       population_chunk_size = 10
-    #       batch_chunk_size      = 500     (CPU latency-sensitive)
-    #       pin_data_to_cpu       = True    (no GPU to upload to)
-    #
-    # See `_apply_csc_overrides` in MasterTNEP.py for the canonical
-    # implementation — when these defaults are tuned, update both sides.
+    # Force which CSC profile applies (csc_enable=True only):
+    #   "auto" = pick from runtime hardware detection
+    #   "cpu"  = force CPU profile (pop_chunk=10, batch_chunk=500, pin=True)
+    #   "gpu"  = force GPU profile (pop_chunk=None, batch_chunk=2000, pin=False)
+    # Canonical impl in _apply_csc_overrides (MasterTNEP.py) — keep both in sync.
     csc_profile: str = "auto"
 
     # ═══════════════════════════════════════════════════════════════════
@@ -457,14 +272,10 @@ class TNEPconfig:
     # Periodic plotting interval (None = disabled; int = plot every N generations)
     plot_interval: int | None = None
 
-    # Periodic training checkpoint interval. None = no checkpointing.
-    # int = write a rolling checkpoint to `{save_path}/checkpoint.h5`
-    # every N generations, overwriting any previous checkpoint at that
-    # path. The checkpoint embeds the full cfg, current SNES distribution
-    # (mu, sigma), best-val state, full history, RNG state, and last
-    # completed gen — enough to resume identically via
-    # `train_model(checkpoint=path)`. Requires `save_path` to be set;
-    # warned and skipped otherwise.
+    # Rolling checkpoint interval. None = disabled; int = write
+    # {save_path}/checkpoint.h5 every N gens (embeds cfg, SNES distribution,
+    # best-val state, history, RNG state — resume via train_model(checkpoint=path)).
+    # Requires save_path.
     checkpoint_interval: int | None = 2000
 
     # Show extra info in progress bar (L1, L2 regularisation)

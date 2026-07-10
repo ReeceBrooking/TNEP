@@ -11,20 +11,15 @@ from ase import Atoms
 BOHR_TO_ANGSTROM = 0.529177210903
 DEBYE_TO_EANGSTROM = 0.20819434
 
-# Box used for structures without periodic boundary conditions.
-# Large enough that MIC never wraps any pairwise displacement (1000 Å >> any
-# molecular extent or NEP cutoff radius).
+# No-PBC box: 1000 Å cube, large enough that MIC never wraps any displacement.
 _NO_PBC_BOX = 1000.0 * np.eye(3, dtype=np.float32)
 
 
 def cell_to_box(atoms) -> np.ndarray:
-    """Return the cell matrix for *atoms*, or a large dummy box if unset/zero.
+    """Return the cell matrix for *atoms*, or _NO_PBC_BOX if unset/zero.
 
-    Two cases are treated as "no periodic boundary":
-      1. ASE stores an unset cell as a zero 3×3 matrix — det = 0, not invertible.
-      2. A Lattice is present in the file but all entries are zero (uniformly 0).
-    In both cases a 1000 Å cubic box is returned so MIC never alters any
-    pairwise displacement while keeping GPU code unconditional.
+    Unset (zero 3×3, det=0) or all-zero lattice → 1000 Å cube so MIC is a no-op
+    while GPU code stays unconditional.
     """
     cell = atoms.cell.array.astype(np.float32)
     if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
@@ -33,13 +28,10 @@ def cell_to_box(atoms) -> np.ndarray:
 
 
 def _dipole_conversion_factor(dipole_units: str) -> float:
-    """Return the multiplicative factor to convert dipole_units → e·Å.
+    """Multiplicative factor converting dipole_units → e·Å (1.0 if already e·Å).
 
     Args:
         dipole_units : "e*angstrom", "e*bohr", or "debye"
-
-    Returns:
-        float — conversion factor (1.0 if already in e·Å)
     """
     if dipole_units == "e*angstrom":
         return 1.0
@@ -53,12 +45,9 @@ def _dipole_conversion_factor(dipole_units: str) -> float:
 
 
 def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
-    """Load all structures from train.xyz and assign integer type indices.
+    """Load structures from cfg.data_path, discover species, filter, drop bad data.
 
-    Populates cfg.num_types and cfg.types as a side effect.
-
-    Args:
-        cfg : TNEPconfig with data_path set
+    Side effect: populates cfg.num_types and cfg.types.
 
     Returns:
         dataset           : list of ase.Atoms
@@ -89,9 +78,8 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
         dataset, dataset_types_int = filter_by_species(dataset, dataset_types_int, allowed_Z=cfg.allowed_species, mode=cfg.filter_mode)
         print("After species filter (" + cfg.filter_mode + "): " + str(len(dataset)) + " structures")
 
-    # Recompute type list and indices after species filtering. Coerce
-    # to Python int — `struct.numbers` is a numpy array, so the raw
-    # entries are np.int64 and would later fail json.dumps in model_io.
+    # Recompute type list/indices after filtering. Coerce to Python int:
+    # struct.numbers holds np.int64, which would later fail json.dumps in model_io.
     cfg.types = []
     for struct in dataset:
         for z in struct.numbers:
@@ -105,11 +93,8 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
     # Filter bad data based on config flags
     dataset, dataset_types_int = filter_bad_data(dataset, dataset_types_int, cfg)
 
-    # Per-type structure coverage: fraction of structures that contain
-    # at least one atom of each type. Useful for spotting under-represented
-    # species early — under-represented types regularise unstably and
-    # are typically the first thing to investigate when train RMSE
-    # plateaus per-type.
+    # Per-type coverage: fraction of structures containing each type. Flags
+    # under-represented species early (they regularise unstably).
     if dataset_types_int:
         from ase.data import chemical_symbols
         S = len(dataset_types_int)
@@ -122,17 +107,13 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
 
 
 def assign_type_indices(dataset: list[Atoms], types: list[int]) -> list[np.ndarray]:
-    """Map atoms to type indices using a known type list.
-
-    Unlike collect(), this does not discover types — it uses the provided
-    type list (e.g. from a trained model's cfg.types) to assign indices.
+    """Map atoms to type indices using a known type list (no discovery).
 
     Args:
         dataset : list of ase.Atoms
         types   : list of atomic numbers defining the type ordering
-
     Returns:
-        dataset_types_int : list of ndarray [N_i] — integer type index per atom
+        list of ndarray [N_i] — integer type index per atom
     """
     dataset_types_int = []
     for struct in dataset:
@@ -144,12 +125,10 @@ def assign_type_indices(dataset: list[Atoms], types: list[int]) -> list[np.ndarr
 
 
 def _extract_target(structure: Atoms, target_key: str) -> tf.Tensor:
-    """Extract target, converting 9-component polarizability to 6-component if needed.
+    """Extract target tensor; flatten 9-component polarizability to 6 if needed.
 
-    Handles datasets where values have a trailing space inside the quoted string
-    (e.g. mu="-0.734398 0.000000 -0.040971 ").  ASE's extxyz parser splits on
-    literal space and produces a spurious NaN at the end; trailing NaN elements
-    are stripped before the tensor is returned.
+    Trailing NaNs are stripped: a trailing space inside a quoted value (e.g.
+    mu="... ") makes ASE's extxyz parser emit a spurious NaN at the end.
     """
     if target_key in structure.info:
         raw = np.asarray(structure.info[target_key], dtype=np.float32)
@@ -203,11 +182,7 @@ def filter_bad_data(
     dataset_types_int: list[np.ndarray],
     cfg: TNEPconfig,
 ) -> tuple[list[Atoms], list[np.ndarray]]:
-    """Remove untrainable structures (NaN positions, NaN targets, missing targets).
-
-    Always runs. Structures with NaN positions, NaN targets, or a missing
-    target key can't be trained against and are dropped. If any are dropped,
-    a warning listing the per-category and total counts is printed.
+    """Drop untrainable structures (NaN positions/targets, missing target key).
 
     Returns:
         filtered_dataset, filtered_types_int : filtered parallel lists
@@ -238,26 +213,19 @@ def _target_key_for_mode(target_mode: int) -> str:
 
 
 def _resolve_target_key(cfg: TNEPconfig) -> str:
-    """Return the target key to use, honouring cfg.target_key if set.
-
-    If cfg.target_key is not None it is returned as-is, allowing non-standard
-    dataset labels (e.g. "mu", "alpha") to be used without changing target_mode.
-    Otherwise falls back to the mode default ("energy", "dipole", "pol").
-    """
+    """Return cfg.target_key if set (allows labels like "mu"/"alpha"), else the
+    mode default ("energy"/"dipole"/"pol")."""
     if cfg.target_key is not None:
         return cfg.target_key
     return _target_key_for_mode(cfg.target_mode)
 
 
 def component_labels(target_mode: int, num_components: int) -> list[str]:
-    """Return human-readable labels for each target component.
+    """Human-readable label per target component.
 
     Args:
         target_mode    : 0 (PES), 1 (dipole), 2 (polarizability)
-        num_components : number of output components (fallback for unknown modes)
-
-    Returns:
-        list of str labels, one per component
+        num_components : output count (fallback labels for unknown modes)
     """
     if target_mode == 0:
         return ["Energy"]
@@ -273,8 +241,8 @@ def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> Non
 
     Args:
         metrics : dict from TNEP.score() with rmse, r2, r2_components, etc.
-        cfg     : TNEPconfig (used for target_mode and component labels)
-        prefix  : str prepended to the first line (e.g. "Model test set" or "External test")
+        cfg     : TNEPconfig (target_mode, component labels)
+        prefix  : str prepended to the first line
     """
     rmse = float(metrics["rmse"])
     r2 = float(metrics["r2"])
@@ -347,7 +315,10 @@ def assemble_data_dict(
     grad_index: list[list[list[int]]],
     cfg: TNEPconfig,
 ) -> dict:
-    """Assemble a data dict from structures, type indices, and precomputed descriptors.
+    """Assemble a data dict from structures, type indices, and descriptors.
+
+    Applies dipole unit conversion (× _dipole_conversion_factor) and, when
+    cfg.scale_targets, per-atom scaling (target / N_atoms) for dipole mode.
 
     Args:
         dataset     : list of ase.Atoms
@@ -358,7 +329,8 @@ def assemble_data_dict(
         cfg         : TNEPconfig (uses target_mode)
 
     Returns:
-        dict with keys: positions, Z_int, targets, boxes, descriptors, gradients, grad_index
+        dict: positions, Z_int, targets, boxes, descriptors, gradients, grad_index
+        (+ forces/virials auto-detected in PES mode)
     """
     target_key = _resolve_target_key(cfg)
     targets = [_extract_target(s, target_key) for s in dataset]
@@ -393,17 +365,12 @@ def assemble_data_dict(
 
 
 def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Tensor]:
-    """Build type indices, descriptors, and padded data dict for evaluation.
-
-    Convenience function that chains assign_type_indices → build_descriptors →
-    assemble_data_dict → pad_and_stack.
+    """Chain assign_type_indices → build_descriptors → assemble_data_dict →
+    pad_and_stack into a padded data dict ready for score()/predict_batch().
 
     Args:
-        dataset : list of ase.Atoms — structures to evaluate
-        cfg     : TNEPconfig from training (carries types, descriptor params, target_mode)
-
-    Returns:
-        padded data dict ready for model.score() or model.predict_batch()
+        dataset : list of ase.Atoms to evaluate
+        cfg     : TNEPconfig from training (types, descriptor params, target_mode)
     """
     types_int = assign_type_indices(dataset, cfg.types)
     builder = make_descriptor_builder(cfg)
@@ -418,10 +385,10 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
 
 
 def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> tuple[dict, dict, dict]:
-    """Split dataset into train / test / validation and build SOAP descriptors.
+    """Split into train/test/val (cfg.indices, cfg.test_ratio) and build descriptors.
 
-    Uses cfg.indices (shuffled) and cfg.test_ratio to partition. Builds
-    descriptors and gradients via DescriptorBuilder for each split.
+    Test descriptors are deferred (see test_pending below); an external
+    cfg.test_data_path replaces the internal test split with a train+val split.
 
     Args:
         dataset           : list of ase.Atoms
@@ -445,7 +412,7 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     builder = make_descriptor_builder(cfg)
 
     if cfg.test_data_path is not None:
-        # External test set: split data_path into train + val only
+        # External test set: split data_path into train + val only.
         n_val = int(cfg.test_ratio * n_structures)
         val_idx = indices[:n_val]
         train_idx = indices[n_val:]
@@ -485,15 +452,10 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         val_types_int = [dataset_types_int[i] for i in val_idx]
         train_types_int = [dataset_types_int[i] for i in train_idx]
 
-    # Build train + val descriptors. Test descriptors are NOT built here —
-    # they're constructed lazily at scoring time by `materialize_test_data`
-    # (avoids paying that cost before training, in case the user aborts).
-    # When `dipole_rij_power == 0` the dipole forward consumes only
-    # self-pair gradients ∂q_i/∂r_i. Build in batches and immediately
-    # drop the neighbour-gradient rows that the forward will never
-    # read — bounds peak memory to one batch's worth of the
-    # ~90%-of-COO neighbour-gradient tensor (see
-    # `descriptor_self_batch_size` doc).
+    # Build train + val descriptors; test is deferred to materialize_test_data.
+    # dipole_rij_power==0 → dipole forward reads only self-pair gradients
+    # ∂q_i/∂r_i, so build self-only in batches and drop the ~90%-of-COO
+    # neighbour rows the forward never reads (bounds peak memory to one batch).
     _self_only_batch = (int(cfg.descriptor_self_batch_size)
                         if getattr(cfg, "descriptor_self_batch_size", None)
                         is not None else None)
@@ -518,9 +480,8 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
 
     train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
     val_data   = assemble_data_dict(val_dataset,   val_types_int,   val_descriptors,   val_gradients,   val_grad_index,   cfg)
-    # Test set: deferred. Stash the raw atoms + per-atom type indices so
-    # `materialize_test_data` can build descriptors at scoring time. The
-    # rest of train_model treats this dict as opaque until then.
+    # Deferred test set: stash raw atoms + type indices for
+    # materialize_test_data to build descriptors at scoring time.
     test_pending = {
         "_pending_test": True,
         "dataset": test_dataset,
@@ -541,24 +502,20 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
 def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
                           num_types: int | None = None,
                           pin_to_cpu: bool | None = None) -> dict:
-    """Build test descriptors on demand and return a ready-to-score data dict.
+    """Build test descriptors on demand; return a ready-to-score data dict.
 
-    Idempotent: if `test_pending` has already been materialised, the cached
-    dict is returned unchanged. The cached dict is stashed in
-    `test_pending["_built"]` so callers can hold onto the same `test_pending`
-    handle across the training loop and scoring without rebuilding.
+    Idempotent: the built dict is cached under test_pending["_built"] and
+    returned unchanged on repeat calls.
 
     Args:
-        test_pending : dict from `split()`'s third return value with
-                       `_pending_test=True` plus raw `dataset` and
-                       `types_int` keys.
-        cfg          : TNEPconfig (descriptor backend, target_mode, ...)
-        num_types    : passed to `pad_and_stack`. Defaults to cfg.num_types.
-        pin_to_cpu   : passed to `pad_and_stack`. Defaults to
-                       cfg.pin_data_to_cpu.
+        test_pending : split()'s third return value (_pending_test=True plus
+                       raw dataset/types_int keys).
+        cfg          : TNEPconfig
+        num_types    : for pad_and_stack; defaults to cfg.num_types.
+        pin_to_cpu   : for pad_and_stack; defaults to cfg.pin_data_to_cpu.
 
     Returns:
-        Padded, stacked test_data dict (same shape as train_data / val_data).
+        Padded, stacked test_data dict (same shape as train_data/val_data).
     """
     if not test_pending.get("_pending_test", False):
         return test_pending  # already materialised or never deferred
@@ -587,9 +544,8 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     test_data = pad_and_stack(
         test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
         self_pairs_only=_self_only)
-    # Pre-stage per-chunk pair indices to GPU. Test eval doesn't go
-    # through `_evaluate_chunk` (TNEP.score uses model.predict_batch),
-    # so XLA padding isn't needed for test data.
+    # Pre-stage per-chunk pair indices to GPU (test eval uses predict_batch,
+    # not _evaluate_chunk, so no XLA padding needed).
     S_test = int(test_data["num_atoms"].shape[0])
     chunk = cfg.batch_chunk_size if cfg.batch_chunk_size is not None else S_test
     test_ranges = [(s, min(s + chunk, S_test)) for s in range(0, S_test, chunk)]
@@ -604,15 +560,12 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
 def pad_and_stack(data: dict, num_types: int | None = None,
                   pin_to_cpu: bool = True,
                   self_pairs_only: bool = False) -> dict[str, tf.Tensor]:
-    """Convert variable-length list-of-tensors data into COO + padded tensors.
+    """Convert variable-length list data into COO gradients + padded tensors.
 
-    Gradient data is stored in COO (Coordinate) sparse format to avoid the
-    O(S * A_max * M_max * 3 * Q) dense allocation. Only real atom-neighbor
-    pairs are stored, giving memory proportional to actual neighbor count
-    rather than the padded maximum.
-
-    Descriptors, positions, and other per-atom fields remain structure-padded
-    as [S, A_max, ...] since their size is dominated by A_max, not M_max.
+    Gradients use COO (only real atom-neighbor pairs) to avoid the dense
+    O(S·A_max·M_max·3·Q) allocation. Per-atom fields (descriptors, positions)
+    stay structure-padded [S, A_max, ...]. self_pairs_only keeps only the
+    zero-image self entry per centre (dipole_rij_power=0 path).
 
     Args:
         data : dict from split() with keys:
@@ -653,15 +606,9 @@ def pad_and_stack(data: dict, num_types: int | None = None,
 
     # Count pairs per structure to build CSR struct_ptr and size COO arrays.
     if self_pairs_only:
-        # Self-only: count how many centres have at least one row in
-        # data["grad_index"][s][i] equal to i (the centre's own index).
-        # Quippy/soap_turbo emits the zero-image self entry FIRST per
-        # centre. We keep ONLY that first row; periodic self-images
-        # (same atom index, nonzero displacement vector) are
-        # intentionally dropped — including them would double-count the
-        # self contribution under dipole_rij_power=0.
-        # Defensive: an atom with no neighbours and no self entry
-        # contributes zero pairs.
+        # Count centres with a self entry (grad_index[s][i] == i). Keep only
+        # the first (zero-image) match; periodic self-images would double-count
+        # the self contribution under dipole_rij_power=0.
         pair_counts = [
             int(sum(1 for i in range(atom_counts[s])
                     if bool(np.any(np.asarray(data["grad_index"][s][i]) == i))))
@@ -729,16 +676,9 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             gv_full = data["gradients"][s][i]
             gidx_full = np.asarray(data["grad_index"][s][i])
             if self_pairs_only:
-                # Keep only the FIRST row where the neighbour index ==
-                # centre index. soap_turbo/quippy emit the zero-image
-                # self entry first per centre; any subsequent matches
-                # are periodic IMAGES of atom i (same atom index,
-                # nonzero displacement vector) and would double-count
-                # the self contribution under dipole_rij_power=0, so
-                # we intentionally drop them. Drops the neighbour
-                # pairs entirely — grad_values_np shrinks from
-                # O(N·M) per structure to O(N), and N=0 dipole
-                # becomes a clean Σ_i de_dq[i] · grad_values[i, i].
+                # Keep only the first zero-image self row (gidx == i); drop
+                # periodic self-images and all neighbour pairs. grad_values
+                # shrinks O(N·M)→O(N) and dipole becomes Σ_i de_dq[i]·grad[i,i].
                 mask = (gidx_full == i)
                 if not bool(np.any(mask)):
                     continue
@@ -761,10 +701,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
                 pair_gidx_np[pair_offset:k_end]   = gidx_full
                 pair_offset += n_nbrs
 
-    # Convert each numpy array to a TF tensor then immediately delete the numpy
-    # copy so peak RAM stays at ~1x dataset size rather than ~2x.
-    # When pin_to_cpu, always pin to CPU. Otherwise pin to GPU when one
-    # exists; CPU-only nodes fall back to the implicit CPU placement.
+    # Convert to TF then delete the numpy copy so peak RAM stays ~1x, not ~2x.
+    # pin_to_cpu → CPU; else GPU if present (CPU-only falls back implicitly).
     _dev_ctx = (tf.device('/CPU:0') if pin_to_cpu
                 else _gpu_device_ctx())
     with _dev_ctx:
@@ -793,23 +731,17 @@ def pad_and_stack(data: dict, num_types: int | None = None,
 def pack_chunk_from_flat(frame_results: list, dim_q: int,
                           max_atoms: int | None = None) -> dict:
     """Pack per-frame TF tensors from build_descriptors_flat(return_tf=True)
-    into a chunk-level dict with COO gradients and padded descriptors.
+    into a chunk dict (COO gradients + padded descriptors) for _evaluate_chunk.
 
     Each frame_results[s] = (soap_t [N, Q], grad_t [P, 3, Q], pa_t [P], pg_t [P]),
-    all TF tensors living on the descriptor builder's compute device. This packer
-    concatenates them on-device with per-frame structure indices and pads
-    descriptors to `max_atoms` so the resulting dict slots into the chunk
-    evaluation path used by SNES._evaluate_chunk.
+    concatenated on-device with per-frame structure indices.
 
     Args:
         frame_results : list of per-frame (soap, grad, pa, pg) TF tensors.
         dim_q         : descriptor dimension (Q).
-        max_atoms     : explicit padding length for the A axis. None = pad
-                        to the chunk's own max(atom_counts). When the chunk
-                        is being evaluated against tensors padded to a
-                        wider A_max (e.g. the dataset-wide pad used by
-                        positions/Z_int), pass that value to keep all
-                        per-structure fields shape-consistent.
+        max_atoms     : A-axis pad length. None = chunk's own max(atom_counts);
+                        pass a wider dataset-wide A_max to stay shape-consistent
+                        with positions/Z_int.
 
     Returns a dict with descriptor-shaped fields only:
         descriptors  [B, A_max, Q]   float32
@@ -865,11 +797,10 @@ def pack_chunk_from_flat(frame_results: list, dim_q: int,
 
 
 def _is_contiguous_range(arr: np.ndarray) -> bool:
-    """True iff `arr` is a strictly monotonic +1 sequence (i.e. a true slice).
+    """True iff `arr` is a strictly +1 monotonic sequence (a true slice).
 
-    Stronger than checking `arr[-1] - arr[0] + 1 == arr.size`, which falsely
-    accepts any permutation whose first/last elements happen to bracket a
-    contiguous range. A real contiguous slice has every diff == 1.
+    Every diff must be 1 — stronger than arr[-1]-arr[0]+1 == arr.size, which
+    would falsely accept permutations bracketing a contiguous range.
     """
     if arr.size == 0:
         return False
@@ -896,8 +827,8 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
         targets      [B_chunk, T]
         types_contained [B_chunk, T]   (only present when caller supplied it)
 
-    The chunk's gradient pair slice is produced by tf.gather over the
-    in-memory grad_values tensor.
+    Gradient pairs are gathered from the in-memory grad_values via struct_ptr;
+    pair_struct is remapped to chunk-local indices.
     """
     if isinstance(indices, tf.Tensor):
         idx_tf = tf.cast(indices, tf.int32)
@@ -913,11 +844,9 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
             chunk[k] = tf.gather(data[k], idx_tf)
 
     chunk["descriptors"] = tf.gather(data["descriptors"], idx_tf)
-    # COO pair gather: pairs for structure idx_tf[i] live in the slice
-    # struct_ptr[idx_tf[i]] : struct_ptr[idx_tf[i]+1] of the flat
-    # gradient/pair arrays. Build the flat pair-index list via
-    # tf.ragged.range and gather. pair_struct is remapped to chunk-local
-    # indices [0..B_chunk) via value_rowids().
+    # COO pair gather: pairs for structure idx_tf[i] live in
+    # struct_ptr[idx_tf[i]:idx_tf[i]+1]. Flatten via tf.ragged.range;
+    # pair_struct → chunk-local [0..B_chunk) via value_rowids().
     ptr = data["struct_ptr"]
     pair_starts = tf.gather(ptr, idx_tf)
     pair_ends   = tf.gather(ptr, idx_tf + 1)
@@ -937,15 +866,12 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
 # ============================================================================
 
 def prestage_chunk_indices(data: dict, ranges: list) -> None:
-    """Pre-build GPU tensors for the per-chunk pair indices
-    (pair_atom, pair_gidx, pair_struct) for each (s, e) in `ranges`.
+    """Pre-build GPU tensors for per-chunk pair indices (pair_atom, pair_gidx,
+    pair_struct) for each (s, e) in `ranges`.
 
-    For deterministic full-batch chunks, these arrays are constant across
-    generations — staging them once at startup eliminates ~3-5 ms/chunk of
-    per-gen `tf.constant` + DMA work. Stored on the data dict under
-    `_pair_idx_gpu_cache` and consumed by `_stage_finalize_tf` when present.
-
-    Memory cost: ~3 × P_chunk × 4 bytes per chunk; tiny.
+    Full-batch chunks are constant across generations, so staging once at
+    startup saves ~3-5 ms/chunk of per-gen tf.constant + DMA. Stored under
+    data["_pair_idx_gpu_cache"], consumed by the staging paths.
     """
     cache: dict = data.setdefault("_pair_idx_gpu_cache", {})
     pa_full = data["pair_atom"]
@@ -970,12 +896,9 @@ def prestage_chunk_indices(data: dict, ranges: list) -> None:
 
 
 class ChunkIndexCache:
-    """Caches the deterministic-per-chunk artefacts that
-    slice_and_complete_chunk would otherwise rebuild every call:
-    the flat pair-index array (`flat_pair_idx`) and the chunk-local
-    `pair_struct` mapping. Keyed by (id(data), s_start, s_end). Cheap
-    to build, useful for full-batch where the same chunks repeat every
-    generation; harmless on cache miss for finite batches.
+    """Caches per-chunk flat_pair_idx and chunk-local pair_struct, keyed by
+    (id(data), s_start, s_end). Avoids rebuilding them every generation for
+    repeating full-batch chunks; harmless on miss for finite batches.
     """
     def __init__(self):
         self._cache: dict = {}
@@ -991,9 +914,8 @@ class ChunkIndexCache:
             pair_ranges = tf.ragged.range(pair_starts, pair_ends)
             flat_pair_idx_tf = tf.cast(pair_ranges.flat_values, tf.int32)
             pair_struct_tf   = tf.cast(pair_ranges.value_rowids(), tf.int32)
-            # Materialise the int32 indices to numpy so the staging paths
-            # can fancy-index the passthrough pair arrays without an extra
-            # device sync per call. Small (< 100 K ints typically).
+            # Numpy copy lets staging fancy-index passthrough pair arrays
+            # without a per-call device sync (small, < ~100 K ints).
             flat_pair_idx_np = flat_pair_idx_tf.numpy()
             item = {
                 "flat_pair_idx_tf": flat_pair_idx_tf,
@@ -1019,20 +941,15 @@ def get_chunk_index_cache() -> ChunkIndexCache:
 
 
 def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
-    """Numpy-only first phase of chunk staging (no TF ops).
-
-    Packages the chunk's per-structure slices as small ndarrays and
-    passes the in-RAM gradient/pair tensors through untouched.
-    `_stage_finalize_tf` then turns this dict into TF tensors. Both
-    phases run serially on the main thread; the split just keeps the
-    plain-numpy slicing separate from the TF-constant conversion.
+    """Numpy-only first phase of chunk staging: slice per-structure fields to
+    ndarrays and pass the in-RAM gradient/pair tensors through untouched.
+    _stage_finalize_tf converts the result to TF tensors.
     """
     precomputed = get_chunk_index_cache().get(data, s_start, s_end)
     idx_np = np.arange(int(s_start), int(s_end), dtype=np.int32)
     flat_pair_idx_np = precomputed["flat_pair_idx_np"]
 
     # Slice every CPU-resident structure-padded field into numpy.
-    # tf.gather equivalents will run in the main thread.
     out: dict = {"_idx_np": idx_np, "_precomputed": precomputed}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
@@ -1046,8 +963,7 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     desc_np = desc.numpy() if hasattr(desc, "numpy") else np.asarray(desc)
     out["_np_descriptors"] = desc_np[idx_np]
 
-    # In-RAM: hand back the original tensors / arrays untouched.
-    # Main thread will tf.gather them.
+    # In-RAM: hand back the original grad/pair tensors untouched (finalize gathers).
     out["_passthrough_grad_values"] = data["grad_values"]
     out["_passthrough_pair_atom"]   = data["pair_atom"]
     out["_passthrough_pair_gidx"]   = data["pair_gidx"]
@@ -1057,20 +973,15 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
 def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
                         s_start: int | None = None,
                         s_end: int | None = None) -> dict:
-    """Main-thread half of staging: convert the worker's numpy output to
-    TF tensors. Cheap (just tf.constant calls), runs in the foreground.
-
-    When `data["_pair_idx_gpu_cache"]` has a pre-staged entry for the
-    chunk's (s_start, s_end) range, the deterministic pair-index tensors
-    (pair_atom, pair_gidx, pair_struct) are reused from the cache instead
-    of being rebuilt each call."""
+    """Second phase of staging: convert _stage_disk_only's numpy output to TF
+    tensors (tf.constant). Reuses pre-staged pair-index tensors from
+    data["_pair_idx_gpu_cache"] for (s_start, s_end) when present."""
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
                   "forces", "virials")
-    # pin_to_cpu=True ⇒ raw data is in host RAM; staging uploads each
-    # chunk to GPU when one is present (no-op on CPU-only). False ⇒
-    # raw data already lives on-device; no device context needed.
+    # pin_to_cpu=True ⇒ host RAM, upload each chunk to GPU if present.
+    # False ⇒ already on-device, no device context needed.
     ctx = _gpu_device_ctx() if pin_to_cpu else _NullCtx()
     pair_idx_cache = data.get("_pair_idx_gpu_cache")
     pair_idx_entry = None
@@ -1088,11 +999,8 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
             chunk["pair_struct"] = (tf.identity(raw["_precomputed"]["pair_struct_tf"])
                                      if pin_to_cpu else
                                      raw["_precomputed"]["pair_struct_tf"])
-        # In-RAM passthrough. When the chunk's pair indices form a
-        # contiguous range (the common case for sequential full-batch
-        # chunking), use tf.strided_slice — pure GPU slice, no D2D gather
-        # of the full chunk. Otherwise (random sub-sampling) fall back to
-        # tf.gather.
+        # Contiguous pair indices (sequential full-batch) → strided slice
+        # (pure GPU, no D2D gather); random sub-sampling → tf.gather.
         flat_pair_idx_np = raw["_precomputed"]["flat_pair_idx_np"]
         is_contig = _is_contiguous_range(flat_pair_idx_np)
         if is_contig:
@@ -1120,13 +1028,9 @@ class _NullCtx:
 
 
 def _gpu_device_ctx():
-    """Return `tf.device('/GPU:0')` when a GPU is visible, else a no-op
-    context. Used by chunk-staging code paths that historically used a
-    bare `with tf.device('/GPU:0'):` block. On a CPU-only run (Mahti CPU
-    partition) that bare device pin would otherwise raise — TF defaults
-    to hard placement, so requesting `/GPU:0` with no GPU registered
-    fails immediately. This helper lets the same code path execute
-    unchanged on either node type."""
+    """Return tf.device('/GPU:0') when a GPU is visible, else a no-op context.
+    Lets staging code run unchanged on CPU-only nodes, where a bare
+    '/GPU:0' pin would raise under TF's hard placement."""
     try:
         if tf.config.list_physical_devices('GPU'):
             return tf.device('/GPU:0')
@@ -1141,12 +1045,9 @@ _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
 
 
 def move_data_to_gpu(data: dict) -> None:
-    """Move every static (non-staging-helper) field in `data` onto
-    `/GPU:0`. Used after the GPU-resident grad cache is built so the
-    chunk-staging path doesn't have to round-trip through host
-    numpy. Tensors already on the GPU are left alone (tf.identity
-    inside `with tf.device('/GPU:0')` is a no-op for resident
-    tensors). Underscore-prefixed keys (helper objects) are skipped.
+    """Move every static (non-helper) field in `data` onto /GPU:0 so staging
+    avoids host round-trips. Resident tensors are left alone (identity-on-GPU
+    is a no-op); underscore-prefixed helper keys are skipped.
     """
     keys = list(_RESIDENT_SMALL_KEYS) + [
         "descriptors", "pair_atom", "pair_gidx", "pair_struct",
@@ -1167,12 +1068,9 @@ def move_data_to_gpu(data: dict) -> None:
 def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
     """Pure-GPU chunk staging for `_gv_resident_gpu` data dicts.
 
-    All inputs are GPU tensors. Per-chunk work is tf.gather on a
-    handful of small [B]-axis fields, a tf.strided_slice on
-    grad_values, optional tf.pad — all on-device. No worker thread,
-    no numpy, no host↔device traffic. Replaces the
-    `_stage_disk_only` + `_stage_finalize_tf` two-phase path
-    entirely for the GPU-resident case.
+    All inputs are GPU tensors; per-chunk work is on-device tf.gather over
+    small [B]-axis fields plus a strided slice on grad_values. No numpy or
+    host↔device traffic. Replaces the two-phase disk_only/finalize path.
     """
     chunk: dict = {}
     s_lo = int(s_start)
@@ -1228,17 +1126,11 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
 def prefetched_chunks(data: dict, ranges: list, pin_to_cpu: bool):
     """Yield (s_start, s_end, chunk) tuples for each (s, e) in `ranges`.
 
-    Chunks are staged serially on the main thread; the name is kept for
-    historical reasons (an earlier prefetch thread was removed). Two
-    modes, picked by the data dict's state:
-
-    1. **GPU-resident** (`_gv_resident_gpu=True`): chunks are built
-       purely on-device via `_stage_chunk_resident`. No host↔GPU
-       traffic. Fastest mode — used when the grad cache fits in VRAM.
-
-    2. **In-RAM serial**: chunks are staged via `_stage_disk_only`
-       (numpy passthrough) + `_stage_finalize_tf` (TF conversion),
-       both on the main thread.
+    Two modes by data-dict state:
+    1. GPU-resident (_gv_resident_gpu=True): on-device via
+       _stage_chunk_resident (no host↔GPU traffic; used when the grad
+       cache fits in VRAM).
+    2. In-RAM: _stage_disk_only (numpy) + _stage_finalize_tf (TF convert).
     """
     if not ranges:
         return
@@ -1248,8 +1140,7 @@ def prefetched_chunks(data: dict, ranges: list, pin_to_cpu: bool):
             yield int(s), int(e), _stage_chunk_resident(data, int(s), int(e))
         return
 
-    # Pre-warm the chunk-index cache from the main thread so the
-    # staging path never triggers a TF op on cache miss.
+    # Pre-warm the chunk-index cache so staging never hits a TF op on miss.
     idx_cache = get_chunk_index_cache()
     for _s, _e in ranges:
         idx_cache.get(data, _s, _e)

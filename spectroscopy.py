@@ -22,33 +22,21 @@ if TYPE_CHECKING:
 
 
 def compute_dipole_acf(dipoles: np.ndarray) -> np.ndarray:
-    """Compute the dipole autocorrelation function via the Wiener-Khinchin theorem.
+    """Dipole ACF ⟨μ(0)·μ(τ)⟩ via Wiener-Khinchin (FFT, O(N log N)). Xu et al. 2024, Eq. 9.
 
-    Uses FFT for O(N log N) efficiency instead of direct O(N²) summation.
-    Sums (not averages) over x, y, z components — i.e. computes the dot-
-    product ACF ⟨μ(0)·μ(τ)⟩ exactly as in Xu et al., J. Chem. Theory
-    Comput. 2024, 20, 3273-3284, Eq. 9.
-
-    Estimator: **biased**. Each lag is normalised by the full trajectory
-    length T (not by (T-τ)). This matches GPUMD and Xu's reference
-    implementation. The biased form lets the ACF decay smoothly toward
-    zero at large τ — the unbiased 1/(T-τ) form would amplify the noisy
-    tail (few overlapping pairs at high lag) and leak that noise into
-    the spectrum.
+    Sums (not averages) over x,y,z. Biased estimator: each lag divided by
+    full length T (not T-τ), matching GPUMD/Xu — decays smoothly to zero at
+    large τ instead of amplifying the noisy tail.
 
     Args:
-        dipoles : [T, 3] ndarray — dipole moment trajectory (one per MD frame)
+        dipoles : [T, 3] ndarray — dipole trajectory (one per MD frame)
 
     Returns:
-        acf : [T] ndarray — dipole autocorrelation function (e²·Å² units
-              if dipoles are in e·Å). NOT normalised to acf[0] = 1.
+        acf : [T] ndarray — dipole ACF (e²·Å² if dipoles in e·Å). NOT normalised to acf[0]=1.
     """
     T = dipoles.shape[0]
-    # Zero-pad to ≥ 2T-1 for linear (non-circular) correlation. Round up
-    # to a fast FFT length so NumPy/scipy can hit their O(N log N) paths
-    # cleanly instead of a slow prime-factor decomposition. `next_fast_len`
-    # lives in scipy.fft on modern releases; fall back to plain 2*T when
-    # scipy isn't available.
+    # Zero-pad to ≥ 2T-1 for linear (non-circular) correlation, rounded up to
+    # a fast FFT length. next_fast_len lives in scipy.fft; fall back to 2*T.
     try:
         from scipy.fft import next_fast_len as _nfl
         n_fft = int(_nfl(2 * T - 1))
@@ -62,8 +50,7 @@ def compute_dipole_acf(dipoles: np.ndarray) -> np.ndarray:
         power = np.real(fd * np.conj(fd))
         full_acf = np.fft.irfft(power, n=n_fft)[:T]
         acf += full_acf
-    # Biased estimator: divide by T (constant), not (T-τ). Sums (not
-    # averages) over the three spatial components per Xu Eq. 9.
+    # Biased estimator: divide by constant T, not (T-τ).
     acf /= float(T)
     return acf
 
@@ -76,57 +63,41 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
                          quantum_correction: str = "harmonic",
                          power_dc_cutoff_cm: float = 100.0,
                          ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute IR absorption spectrum from a dipole moment trajectory.
+    """IR absorption spectrum from a dipole trajectory. GPUMD / Xu et al. 2024.
 
-    Follows GPUMD / Xu et al., J. Chem. Theory Comput. 2024, 20, 3273–3284:
-        1. Subtract mean dipole to remove DC component
-        2. Compute dipole autocorrelation function C(τ) = <μ(0)·μ(τ)>
-        3. Truncate ACF to first acf_ratio of the trajectory (default 10%)
-        4. Apply Hann window and Kronecker doubling factor
-        5. Cosine transform to obtain line shape M(ω) (guaranteed non-negative)
-        6. IR absorption: σ(ω) ∝ ω · (1 − e^(−ℏω/kT)) · M(ω)
-           — the "harmonic" quantum correction. Reduces to ω² · M(ω) only
-           in the classical limit ℏω ≪ kT (i.e. ν̃ ≪ 210 cm⁻¹ at 300 K).
-           At ν̃ ≈ 3000 cm⁻¹ at 300 K, the classical ω² form overweights
-           by a factor of ℏω/kT ≈ 14, masking lower-frequency modes —
-           hence the OH/CH stretch always dominates an ω²-weighted plot.
-        7. Smooth with a moving average of width smooth_k
+    Pipeline: subtract mean dipole → ACF C(τ)=<μ(0)·μ(τ)> → truncate to first
+    acf_ratio → Hann window + Kronecker doubling → cosine transform to line
+    shape M(ω) ≥ 0 → weight → smooth.
+
+    IR weighting (harmonic): σ(ω) ∝ ω·(1 − e^(−ℏω/kT))·M(ω). Reduces to
+    classical ω²·M(ω) only for ℏω ≪ kT (ν̃ ≪ 210 cm⁻¹ at 300 K); beyond that
+    the ω² form overweights high-freq modes (~14× at 3000 cm⁻¹), masking
+    lower modes.
 
     Args:
         dipoles            : [T, 3] ndarray — dipole trajectory (e·Å, one per frame)
-        dt_fs              : float — timestep between frames in femtoseconds
-        window             : str or None — window function ('hann', 'blackman', or None)
-        max_freq_cm        : float — maximum frequency to return in cm⁻¹
-        acf_ratio          : float — fraction of trajectory to use as max ACF lag (default 0.1)
-        smooth_k           : int — smoothing strength. Higher = smoother
-                              spectrum (broader peaks, less noise). For the
-                              default smooth_kind="gaussian" this is the
-                              FWHM of the Gaussian kernel **in frequency bins**;
-                              for smooth_kind="box" it is the moving-average
-                              window width in bins. 0 = disable.
-                              Typical FWHM: 5-30 cm⁻¹ for clean spectra at
-                              dt_fs=0.25 fs (bin width ≈ 0.4-2 cm⁻¹), so
-                              smooth_k=10-50 covers most cases.
-        smooth_kind        : str — "gaussian" (default; no spectral ringing,
-                              recommended) or "box" (moving average; matches
-                              GPUMD notebook but has sinc-like sidelobes
-                              around sharp peaks).
-        temperature        : float — simulation temperature in K (only used when
-                              quantum_correction != "classical"). Default 300 K.
-        quantum_correction : str — IR absorption weighting:
-                              "harmonic"  : ω · (1 − e^(−ℏω/kT)) · M(ω)  — GPUMD default
-                              "classical" : ω² · M(ω)                    — Xu Eq. 1 original
-                              "quadratic" : alias for "classical" (ω²·M(ω))
-                              "linear"    : ω · M(ω)                     — high-freq limit
-                              "none"      : M(ω) (power spectrum only)
-        power_dc_cutoff_cm : float — frequencies below this are excluded
-                              from the power-spectrum peak-normaliser.
-                              The raw M(ω) has a huge DC peak that would
-                              otherwise crush all vibrational features to
-                              ~1 % of full scale. Set 0 to keep the DC
-                              bin in the normaliser (matches the IR
-                              intensity normaliser, which is naturally
-                              ω-suppressed at DC). Default 100 cm⁻¹.
+        dt_fs              : float — timestep between frames in fs
+        window             : str or None — 'hann', 'blackman', or None
+        max_freq_cm        : float — max frequency returned, cm⁻¹
+        acf_ratio          : float — fraction of trajectory used as max ACF lag (default 0.1)
+        smooth_k           : int — smoothing strength (higher = smoother). For
+                              smooth_kind="gaussian" it is the kernel FWHM in
+                              frequency bins; for "box" the moving-average width
+                              in bins. 0 = disable.
+        smooth_kind        : str — "gaussian" (default; no ringing) or "box"
+                              (moving average; matches GPUMD but has sidelobes).
+        temperature        : float — simulation T in K (used when quantum_correction
+                              != "classical"). Default 300 K.
+        quantum_correction : str — IR weighting:
+                              "harmonic"  : ω·(1 − e^(−ℏω/kT))·M(ω)  — GPUMD default
+                              "classical" : ω²·M(ω)                  — Xu Eq. 1
+                              "quadratic" : alias for "classical"
+                              "linear"    : ω·M(ω)                   — high-freq limit
+                              "none"      : M(ω)
+        power_dc_cutoff_cm : float — exclude bins below this from the
+                              power-spectrum peak-normaliser (raw M(ω) has a
+                              huge DC peak that would crush vibrational features
+                              to ~1%). 0 keeps the DC bin. Default 100 cm⁻¹.
     Returns:
         freq_cm   : [N] ndarray — frequencies in cm⁻¹
         intensity : [N] ndarray — IR absorption intensity (arb. units)
@@ -138,8 +109,6 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     acf_full = compute_dipole_acf(dipoles)
 
     # Truncate ACF — only the first acf_ratio fraction has good statistics.
-    # Use multiplicative form so non-reciprocal ratios (e.g. 0.3) and small
-    # ratios (e.g. 0.05) work correctly. Guard against acf_ratio<=0.
     if acf_ratio <= 0.0:
         raise ValueError(f"acf_ratio must be > 0, got {acf_ratio}")
     Nmax = max(1, int(len(acf_full) * acf_ratio))
@@ -159,20 +128,15 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
 
     acf_prepared = acf * w * kronecker
 
-    # Cosine transform: M(k) = Σ_t acf(t) · cos(2πkt / (2Nmax-1)) is the real
-    # part of the rfft of acf_prepared zero-padded to length 2Nmax-1.
-    # O(N log N) in C vs O(N²) in Python.
+    # Cosine transform: M(k) = Σ_t acf(t)·cos(2πkt/(2Nmax-1)) = real part of
+    # rfft of acf_prepared zero-padded to length 2Nmax-1.
     M_omega = np.fft.rfft(acf_prepared, n=2 * Nmax - 1).real
 
-    # Frequency axis: convert from DCT index to cm⁻¹
-    # k-th bin corresponds to frequency k / ((2*Nmax-1) * dt_fs) in 1/fs
+    # Frequency axis: DCT bin k → k/((2Nmax-1)·dt_fs) in 1/fs → cm⁻¹.
     c_cm_per_fs = 2.99792458e-5  # speed of light in cm/fs
     freq_cm = np.arange(Nmax) / ((2 * Nmax - 1) * dt_fs * c_cm_per_fs)
 
-    # IR absorption weighting. The "harmonic" form ω·(1-e^(-ℏω/kT))·M(ω)
-    # is what GPUMD uses; the classical ω²·M(ω) form is only valid for
-    # ν̃ ≪ kT/ℏ (~210 cm⁻¹ at 300 K) and dramatically overweights high-
-    # frequency modes when applied beyond that regime.
+    # IR absorption weighting (see docstring for the harmonic vs classical forms).
     qc = str(quantum_correction).lower()
     hbar_c_eV_cm = 1.23984e-4              # ℏc in eV·cm  (so ℏω [eV] = ℏc · ν̃ [cm⁻¹])
     kT_eV = 8.617333e-5 * float(temperature)
@@ -184,8 +148,7 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
         prefactor = np.ones_like(freq_cm)
     elif qc == "harmonic":
         x = hbar_c_eV_cm * freq_cm / max(kT_eV, 1e-30)   # ℏω/kT  (dimensionless)
-        # (1 - e^{-x}) for x→0 is x (gives classical ω² limit); for large
-        # x saturates to 1 (gives ω scaling, the high-freq quantum limit).
+        # (1-e^{-x}) → x as x→0 (classical ω² limit), → 1 for large x (ω limit).
         prefactor = freq_cm * (1.0 - np.exp(-x))
     else:
         raise ValueError(
@@ -200,12 +163,9 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     intensity = intensity[mask]
     power = power[mask]
 
-    # Smooth. Higher `smooth_k` → smoother spectrum.
-    #   smooth_kind="gaussian" (default): no spectral ringing. Treated as
-    #     FWHM in bins; σ = smooth_k / 2.355. Preserves freq_cm length.
-    #   smooth_kind="box": moving average of width smooth_k bins. Matches
-    #     GPUMD-notebook behaviour but produces sinc-like sidelobes around
-    #     sharp peaks. Uses mode='valid' which shortens freq_cm.
+    # Smooth. "gaussian": FWHM in bins (σ = smooth_k/2.355), preserves freq_cm
+    # length. "box": moving average of width smooth_k bins; mode='valid'
+    # shortens freq_cm.
     if smooth_k > 1 and len(intensity) > smooth_k:
         sk = str(smooth_kind).lower()
         if sk == "gaussian":
@@ -219,7 +179,6 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
                                               mode="nearest")
                 power     = gaussian_filter1d(power,     sigma=sigma_bins,
                                               mode="nearest")
-                # freq_cm unchanged — Gaussian filter preserves alignment.
             else:
                 sk = "box"                                   # fall back below
         if sk == "box":
@@ -239,14 +198,9 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
     if peak > 0:
         intensity /= peak
 
-    # For the raw power spectrum M(ω), the global max sits at ω ≈ 0
-    # (since the ACF C(τ) is largest at τ=0 and the cosine transform of
-    # a one-sided decaying function peaks at ω=0). Dividing by that DC
-    # peak collapses every vibrational feature to <1 % of full scale —
-    # the spectrum looks "empty" on a linear plot. Exclude bins below
-    # `power_dc_cutoff_cm` from the normaliser so vibrational peaks are
-    # visible. Set to 0 to disable (keeps the original DC-dominated
-    # behaviour for users who want raw M(ω) magnitudes).
+    # Raw M(ω) peaks at ω≈0, so normalising by that DC peak would collapse
+    # vibrational features to <1%. Exclude bins below power_dc_cutoff_cm from
+    # the normaliser (0 to disable).
     if power_dc_cutoff_cm > 0:
         mask_vib = freq_cm >= float(power_dc_cutoff_cm)
     else:
@@ -260,14 +214,9 @@ def compute_ir_spectrum(dipoles: np.ndarray, dt_fs: float = 1.0, window: str | N
 
 def _ir_plot_basename(trajectory_path: str | None,
                        model_label: str | None) -> str:
-    """Build a descriptive plot stem from trajectory + model names.
-
-    e.g. trajectory_path = "datasets/ethanol_nve.traj"
-         model_label    = "n50_q165_pop100_CHO"
-         → "ethanol_nve_n50_q165_pop100_CHO"
-
-    Any None or empty parts are skipped. Falls back to "ir_spectrum" if
-    both are None.
+    """Build a plot stem from trajectory + model names, e.g.
+    ("ethanol_nve.traj", "n50_q165_CHO") → "ethanol_nve_n50_q165_CHO".
+    Skips None/empty parts; falls back to "ir_spectrum".
     """
     parts = []
     if trajectory_path:
@@ -281,14 +230,10 @@ def _plot_one_ir_panel(ax_lo, ax_hi, freq_cm: np.ndarray, y: np.ndarray,
                         split_at_cm: float | None,
                         ylabel: str, title: str,
                         invert_y: bool = False) -> None:
-    """Plot one IR trace into either a single axis (`ax_hi`, `ax_lo=None`)
-    or a broken-axis pair (low/high regions normalised independently).
-
-    When `split_at_cm` is None: plot full range into `ax_hi` only.
-    When `split_at_cm` is a float: plot ν̃ ≤ split into `ax_lo` and
-    ν̃ > split into `ax_hi`. Each side is renormalised to peak = 1 within
-    its window so that high-freq structure isn't crushed by low-freq peaks.
-    Diagonal break marks are drawn between the two halves.
+    """Plot one IR trace into a single axis (split_at_cm=None → ax_hi only)
+    or a broken-axis pair (ν̃ ≤ split → ax_lo, ν̃ > split → ax_hi). Each side
+    is renormalised to peak=1 within its window so high-freq structure isn't
+    crushed by low-freq peaks; diagonal break marks join the halves.
     """
     if split_at_cm is None:
         ax_hi.plot(freq_cm, y, color='black', linewidth=0.8)
@@ -301,9 +246,7 @@ def _plot_one_ir_panel(ax_lo, ax_hi, freq_cm: np.ndarray, y: np.ndarray,
         ax_hi.grid(alpha=0.3)
         return
 
-    # Split-region rendering. Two adjacent axes (ax_lo for the lower
-    # wavenumber band, ax_hi for the higher) each with independent
-    # peak-normalisation; visual "broken-axis" cue between them.
+    # Split-region rendering: two adjacent axes, each independently peak-normalised.
     mask_lo = freq_cm <= split_at_cm
     mask_hi = freq_cm >  split_at_cm
     if not mask_lo.any() or not mask_hi.any():
@@ -315,9 +258,8 @@ def _plot_one_ir_panel(ax_lo, ax_hi, freq_cm: np.ndarray, y: np.ndarray,
     f_hi, y_hi = freq_cm[mask_hi], y[mask_hi]
 
     if invert_y:
-        # `y` is transmittance built from the GLOBAL-peak absorbance. To
-        # renormalise per region, recover the absorbance, peak-normalise
-        # it within each region, then re-apply the chosen T(A) mapping.
+        # y is transmittance from global-peak absorbance. To renormalise per
+        # region: recover absorbance, peak-normalise per region, re-apply T(A).
         a_lo = _transmittance_to_absorbance(y_lo)
         a_hi = _transmittance_to_absorbance(y_hi)
         peak_lo = float(np.max(a_lo)) if a_lo.size else 0.0
@@ -336,8 +278,7 @@ def _plot_one_ir_panel(ax_lo, ax_hi, freq_cm: np.ndarray, y: np.ndarray,
         if peak_hi > 0:
             y_hi = y_hi / peak_hi
 
-    # IR convention: high wavenumber on the left. So ax_hi is on the
-    # LEFT of the pair, ax_lo on the RIGHT.
+    # IR convention: high wavenumber on the left → ax_hi left, ax_lo right.
     ax_hi.plot(f_hi, y_hi, color='black', linewidth=0.8)
     ax_lo.plot(f_lo, y_lo, color='black', linewidth=0.8)
     ax_hi.set_xlim(f_hi.max(), f_hi.min())     # invert
@@ -357,10 +298,9 @@ def _plot_one_ir_panel(ax_lo, ax_hi, freq_cm: np.ndarray, y: np.ndarray,
     kwargs.update(transform=ax_lo.transAxes)
     ax_lo.plot((-d, +d), (-d, +d), **kwargs)
     ax_lo.plot((-d, +d), (1 - d, 1 + d), **kwargs)
-    # Shared x-label spans both, centred on the pair.
+    # x-label added at figure level below (shared across the pair).
     ax_hi.set_xlabel("")
     ax_lo.set_xlabel("")
-    # Use the figure-level annotation for the combined x-label below.
 
 
 def _emit_single_ir_figure(freq_cm: np.ndarray, y: np.ndarray,
@@ -369,25 +309,19 @@ def _emit_single_ir_figure(freq_cm: np.ndarray, y: np.ndarray,
                             stem: str, cfg: TNEPconfig,
                             save_plots: str | None, show_plots: bool,
                             invert_y: bool) -> None:
-    """Emit ONE labelled figure (absorbance OR transmittance), saved
-    separately so the two are not crammed into one image.
-    """
+    """Emit ONE labelled figure (absorbance OR transmittance), saved separately."""
     from plotting import _save_fig
     if split_at_cm is None:
         fig, ax = plt.subplots(figsize=(14, 6))
         _plot_one_ir_panel(None, ax, freq_cm, y, None,
                            ylabel=ylabel, title=title)
     else:
-        # Broken-axis pair: [hi | lo] for a single quantity.
-        # Width ratios are set in PROPORTION to the wavenumber range each
-        # side covers, so the cm⁻¹-per-pixel scale is identical on both
-        # halves (i.e. a 50 cm⁻¹ feature has the same on-screen width
-        # regardless of which side of the break it sits on).
+        # Broken-axis pair [hi | lo]. Width ratios proportional to each side's
+        # wavenumber range, so cm⁻¹-per-pixel is identical on both halves.
         f_max = float(freq_cm.max())
         f_min = float(freq_cm.min())
         f_split = float(split_at_cm)
-        # Clamp so we never get zero/negative widths from a split outside
-        # the data range; fall back to 1:1 in that pathological case.
+        # Clamp against zero/negative widths from a split outside the data range.
         hi_extent = max(f_max - f_split, 1.0)
         lo_extent = max(f_split - f_min, 1.0)
         fig, axes = plt.subplots(
@@ -414,21 +348,17 @@ def _emit_single_ir_figure(freq_cm: np.ndarray, y: np.ndarray,
         plt.close(fig)
 
 
-# Module-level state set by `plot_ir_spectrum` and consumed by
+# Module-level T(A) convention set by `plot_ir_spectrum`, consumed by
 # `_plot_one_ir_panel` for per-region transmittance reconstruction.
-# Keeps the panel-helper signature stable while letting the outer
-# plotter dictate the T(A) convention.
 _TRANSMITTANCE_MODE: str = "beer_lambert"
 _TRANSMITTANCE_SCALE: float = 1.0
 
 
 def _absorbance_to_transmittance(A: np.ndarray) -> np.ndarray:
-    """A → T using the currently-configured convention.
+    """A → T under the configured convention.
 
-    "beer_lambert" : T = 10^(−scale·A)   — proper Beer-Lambert form;
-                     T=10^(−1) ≈ 0.1 at A=1 with default scale=1.
-    "linear"       : T = 1 − A           — visual mirror of absorbance,
-                     used by most computational-IR pipelines for display.
+    "beer_lambert" : T = 10^(−scale·A)  (T≈0.1 at A=1, scale=1)
+    "linear"       : T = 1 − A          (visual mirror, common in comp-IR)
     """
     A = np.asarray(A)
     if _TRANSMITTANCE_MODE == "beer_lambert":
@@ -439,9 +369,8 @@ def _absorbance_to_transmittance(A: np.ndarray) -> np.ndarray:
 
 
 def _transmittance_to_absorbance(T: np.ndarray) -> np.ndarray:
-    """T → A, inverse of `_absorbance_to_transmittance` under the
-    currently-configured convention. Clipped to keep log/inverse stable
-    against FFT round-off producing T slightly above 1 or below 0."""
+    """T → A, inverse of `_absorbance_to_transmittance`. Clipped to keep
+    log/inverse stable against FFT round-off (T slightly outside [0,1])."""
     T = np.clip(np.asarray(T), 1e-30, 1.0)
     if _TRANSMITTANCE_MODE == "beer_lambert":
         return -np.log10(T) / max(_TRANSMITTANCE_SCALE, 1e-30)
@@ -458,45 +387,30 @@ def plot_ir_spectrum(freq_cm: np.ndarray, intensity: np.ndarray, cfg: TNEPconfig
                      split_at_cm: float | None = None,
                      transmittance_mode: str = "beer_lambert",
                      transmittance_scale: float = 1.0) -> None:
-    """Plot IR spectrum as TWO separate, labelled figures.
-
-    Emits the absorbance and transmittance plots as **independent files**
-    so neither is cramped. Filename suffixes distinguish them:
-        <stem>_absorbance.png
-        <stem>_transmittance.png
-    (or `_absorbance_split500.png` etc. when `split_at_cm` is set).
-
-    Y-axes both ascend normally:
-        - Absorbance     : peaks point UP from a flat 0 baseline.
-        - Transmittance  : peaks dip DOWN from a flat 1 baseline.
+    """Plot IR spectrum as two separate labelled figures (absorbance and
+    transmittance), saved as independent files <stem>_absorbance.png /
+    <stem>_transmittance.png (or _split500 etc. when split_at_cm is set).
+    Absorbance peaks point up from 0; transmittance peaks dip down from 1.
 
     Args:
         freq_cm             : [N] ndarray — frequencies in cm⁻¹
         intensity           : [N] ndarray — normalised IR intensity (peak=1)
-        cfg                 : TNEPconfig — used for save-directory resolution
+        cfg                 : TNEPconfig — save-directory resolution
         save_plots          : str or None — directory to save into
-        show_plots          : bool — True to display interactively
+        show_plots          : bool — display interactively
         title               : str — figure title prefix
         trajectory_path     : str or None — appears in filename
         model_label         : str or None — appears in filename
-        split_at_cm         : float or None — broken-axis split (per-region
-                              peak-normalisation). Default None = full range.
+        split_at_cm         : float or None — broken-axis split with per-region
+                              peak-normalisation. None = full range.
         transmittance_mode  : str — A → T conversion:
-                              "beer_lambert" (default): T = 10^(−scale·A).
-                                  Physically meaningful Beer-Lambert form.
-                                  Peak A=1 maps to T=0.1 with default scale.
-                              "linear" : T = 1 − A. Visual mirror only;
-                                  not Beer-Lambert correct but used in
-                                  many computational-IR pipelines.
-        transmittance_scale : float — multiplier on A for Beer-Lambert
-                              mode (effective path-length·concentration
-                              product). Higher → deeper transmittance
-                              dips. Default 1.0 gives ~10 % minimum
-                              transmission at the strongest peak.
+                              "beer_lambert" (default): T = 10^(−scale·A)
+                              "linear" : T = 1 − A (visual mirror only)
+        transmittance_scale : float — multiplier on A for Beer-Lambert mode;
+                              higher → deeper dips. Default 1.0 gives ~10%
+                              minimum transmission at the strongest peak.
     """
-    # Stash the chosen mode on module state so the per-region renormaliser
-    # in `_plot_one_ir_panel` (used by the split-axis layout) can apply
-    # the same A↔T mapping when recomputing transmittance per region.
+    # Stash the chosen mode on module state for the per-region renormaliser.
     global _TRANSMITTANCE_MODE, _TRANSMITTANCE_SCALE
     _TRANSMITTANCE_MODE = str(transmittance_mode).lower()
     _TRANSMITTANCE_SCALE = float(transmittance_scale)
@@ -570,51 +484,31 @@ def ir_spectrum_from_file(
     transmittance_scale: float = 1.0,
     **ir_kwargs,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load a saved dipole trajectory and plot its IR + power spectra.
-
-    Convenience wrapper around `np.load`/`np.loadtxt` + `compute_ir_spectrum`.
-    Accepts either the binary `.npy` or the text `.txt` file written by
-    `process_trajectory`. Emits the absorbance + transmittance plots as
-    separate, labelled files, plus the companion power-spectrum plot.
+    """Load a saved dipole trajectory (.npy or .txt, shape [T,3]) and plot its
+    IR + power spectra. Wraps np.load/np.loadtxt + compute_ir_spectrum; emits
+    absorbance + transmittance as separate files plus the power-spectrum plot.
 
     Args:
-        dipole_path        : path to the dipole file (.npy or .txt). Shape [T, 3].
-        dt_fs              : timestep between frames in femtoseconds.
-        save_dir           : directory to save plots into. None = don't save.
-        show               : True to display interactively.
-        title              : optional plot title (defaults to the file basename).
-        model_label        : optional model identifier baked into the saved
-                             filename (e.g. "n50_q165_CHO"). None = none.
-        plot_power         : also produce the companion power-spectrum plot.
-        split_at_cm        : if set, the absorbance + transmittance plots
-                             are rendered as broken-axis pairs split at
-                             this wavenumber (e.g. 500.0). Each side is
-                             independently peak-normalised. None = full
-                             range.
-        cfg                : optional TNEPconfig used by the plotters for unit
-                             labels. A minimal default is created if None.
-
+        dipole_path        : dipole file (.npy or .txt), shape [T, 3].
+        dt_fs              : timestep between frames in fs.
+        save_dir           : directory to save plots into (None = don't save).
+        show               : display interactively.
+        title              : plot title (defaults to file basename).
+        model_label        : model id baked into the filename (e.g. "n50_q165_CHO").
+        plot_power         : also produce the power-spectrum plot.
+        split_at_cm        : if set, render broken-axis pairs split at this
+                             wavenumber, each side peak-normalised. None = full range.
+        cfg                : TNEPconfig for unit labels (minimal default if None).
         window             : ACF window — 'hann' (default), 'blackman', or None.
-        max_freq_cm        : maximum wavenumber kept on the spectrum (cm⁻¹).
-        acf_ratio          : fraction of the trajectory used as max ACF lag.
-        smooth_k           : smoothing strength. Higher = smoother spectrum.
-                             For Gaussian smoothing this is the FWHM in
-                             frequency bins; for box it is the moving-average
-                             window. 0 disables.
-        smooth_kind        : "gaussian" (default; no ringing) or "box".
-        temperature        : simulation T in K. Used by the harmonic quantum
-                             correction.
-        quantum_correction : IR weighting:
-                              "harmonic"  : ω·(1 − e^(−ℏω/kT))·M(ω) (GPUMD)
-                              "classical" : ω²·M(ω) (Xu Eq. 1 original)
-                              "quadratic" : alias for "classical"
-                              "linear"    : ω·M(ω)
-                              "none"      : M(ω)
-        power_dc_cutoff_cm : exclude bins below this from the power-spectrum
-                             peak-normaliser (and from the visible plot
-                             range). Set 0 to disable.
-        **ir_kwargs        : any additional kwargs forwarded to
-                             `compute_ir_spectrum` (future-proofing).
+        max_freq_cm        : max wavenumber kept (cm⁻¹).
+        acf_ratio          : fraction of trajectory used as max ACF lag.
+        smooth_k           : smoothing strength (Gaussian FWHM / box width in bins).
+        smooth_kind        : "gaussian" (default) or "box".
+        temperature        : simulation T in K (harmonic correction).
+        quantum_correction : IR weighting — see compute_ir_spectrum.
+        power_dc_cutoff_cm : exclude bins below this from the power normaliser
+                             and visible range. 0 disables.
+        **ir_kwargs        : extra kwargs forwarded to compute_ir_spectrum.
 
     Returns:
         (freq_cm, intensity, power) — 1-D arrays.
@@ -636,8 +530,7 @@ def ir_spectrum_from_file(
         **ir_kwargs,
     )
 
-    # The plotters consult cfg only for unit labels; a fresh TNEPconfig
-    # with the default e·Å unit is fine when one isn't supplied.
+    # Plotters consult cfg only for unit labels; a fresh default is fine.
     if cfg is None:
         cfg = TNEPconfig()
 
@@ -651,8 +544,7 @@ def ir_spectrum_from_file(
         transmittance_scale=transmittance_scale,
     )
     if plot_power:
-        # Same DC cutoff for the visible plot range as the normaliser,
-        # so the two stay consistent.
+        # Same DC cutoff for visible range and normaliser, for consistency.
         plot_power_spectrum(
             freq_cm, power, cfg,
             save_plots=save_dir, show_plots=show,
@@ -672,20 +564,18 @@ def plot_power_spectrum(freq_cm: np.ndarray, power: np.ndarray, cfg: TNEPconfig,
                         model_label: str | None = None) -> None:
     """Plot the dipole power spectrum M(ω) (no ω weighting).
 
-    M(ω) has a strong DC peak (ω≈0) that dwarfs all vibrational features;
-    this plot crops the visible range to ν̃ ≥ `low_cm_cutoff` cm⁻¹ (default
-    100) and defaults to a log y-axis so the 2-4 orders of magnitude of
-    dynamic range across vibrational modes are visible.
+    M(ω) has a strong DC peak (ω≈0) dwarfing vibrational features, so the
+    visible range is cropped to ν̃ ≥ low_cm_cutoff and the y-axis defaults to
+    log (vibrational modes span 2-4 orders of magnitude).
 
     Args:
         freq_cm         : [N] ndarray — frequencies in cm⁻¹
         power           : [N] ndarray — normalised power spectrum M(ω)
-        cfg             : TNEPconfig — used for save-directory resolution
+        cfg             : TNEPconfig — save-directory resolution
         save_plots      : str or None — directory to save into (None = don't save)
-        show_plots      : bool — True to display interactively
+        show_plots      : bool — display interactively
         title           : str — plot title
-        low_cm_cutoff   : float — drop frequencies below this from the plot
-                          (default 100 cm⁻¹). 0 = keep full range.
+        low_cm_cutoff   : float — drop frequencies below this (default 100; 0 = full range)
         use_log         : bool — log y-axis (default True)
         trajectory_path : str or None — used in the saved filename
         model_label     : str or None — used in the saved filename
@@ -720,9 +610,9 @@ def plot_power_spectrum(freq_cm: np.ndarray, power: np.ndarray, cfg: TNEPconfig,
 
 
 # --------------------------------------------------------------------------
-# Phase 3: fused pack + predict @tf.function. Cached per model instance so
-# the graph is traced exactly once. Input signature uses [None] dims so a
-# changing batch size / atom count / pair count does not retrigger tracing.
+# Fused pack + predict @tf.function, cached per model instance (traced once).
+# [None] dims in the input signature keep batch/atom/pair size changes from
+# retriggering tracing.
 # --------------------------------------------------------------------------
 _FUSED_PREDICT_CACHE: dict = {}
 
@@ -730,10 +620,8 @@ _FUSED_PREDICT_CACHE: dict = {}
 def _get_fused_predict(model: 'TNEP'):
     """Return (and cache) a per-model fused pack+predict @tf.function.
 
-    The graph captures the model weights via closure, so SNES candidate
-    evaluation (which swaps weights) must not use this path — it's
-    trajectory-inference-only. Per-model caching keyed by id(model) is
-    sufficient for that contract.
+    Captures model weights via closure, so this is trajectory-inference-only:
+    SNES candidate evaluation (which swaps weights) must not use it. Cached by id(model).
     """
     key = id(model)
     cached = _FUSED_PREDICT_CACHE.get(key)
@@ -756,23 +644,17 @@ def _get_fused_predict(model: 'TNEP'):
         tf.TensorSpec(shape=[None],            dtype=tf.int32),    # num_atoms
     ]
 
-    # Keras Variables aren't accepted as direct @tf.function args via the
-    # TraceTypeBuilder, so we materialise them into tf.constant tensors at
-    # trace time and capture via closure. Trajectory inference is fixed-
-    # weights, so this is safe; SNES population evaluation must not use
-    # this path (it needs per-call weight swapping).
+    # Keras Variables can't be direct @tf.function args, so materialise them
+    # into tf.constant tensors at trace time and capture via closure (safe
+    # since trajectory inference is fixed-weight).
     def _to_tensor(v):
         if v is None:
             return None
         # Keras 3 Variables expose .value (a Tensor); fall back to convert.
         return tf.convert_to_tensor(v.value if hasattr(v, "value") else v)
 
-    # Pre-absorb U_pairᵀ into W0 (and W0_pol) when descriptor mixing is
-    # active. `predict_batch` is a pure forward primitive that trusts
-    # the caller to do this; the SNES paths handle it explicitly, but
-    # the trajectory-inference fused graph previously passed raw W0,
-    # silently dropping the learned mixing. Mirrors the score() pattern
-    # in TNEP.py.
+    # Pre-absorb U_pairᵀ into W0 (and W0_pol) when descriptor mixing is active;
+    # predict_batch trusts the caller to do this. Mirrors score() in TNEP.py.
     if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
         W0_eff_var = model._W0_eff(model.W0)
         W0p_eff_var = (model._W0_eff(model.W0_pol)
@@ -791,21 +673,16 @@ def _get_fused_predict(model: 'TNEP'):
     W1p_t = _to_tensor(getattr(model, "W1_pol", None))
     b1p_t = _to_tensor(getattr(model, "b1_pol", None))
 
-    # NOTE: not jit_compile=True. The descriptor-side XLA path (locked
-    # compute fns built with jit_compile=True for trajectory) handles the
-    # heavy SOAP work. predict_batch internally has shape-dependent stacks
-    # in _calc_forces_coo that XLA can't lower (varying P per call), so
-    # we keep this graph as a regular @tf.function trace. Per-op launch
-    # overhead at this stage is dwarfed by the fused descriptor compute.
+    # Not jit_compile: predict_batch has shape-dependent stacks in
+    # _calc_forces_coo (varying P per call) that XLA can't lower, and the
+    # heavy SOAP work is already handled by the descriptor-side XLA path.
     @tf.function(input_signature=sig, reduce_retracing=False)
     def fused(soap_concat, grad_concat, pa_concat, pg_concat,
               atom_counts, pair_counts,
               positions, Z, boxes, atom_mask, num_atoms):
         S = tf.shape(num_atoms)[0]
-        # Pad descriptors via scatter_nd. RaggedTensor.to_tensor is the
-        # natural choice but the underlying RaggedTensorToTensor op has no
-        # XLA kernel, so we build the dense [S, A_max, Q] layout directly
-        # from per-row struct/intra indices.
+        # Pad descriptors via scatter_nd to dense [S, A_max, Q] (RaggedTensor
+        # .to_tensor has no XLA kernel), using per-row struct/intra indices.
         A_max = tf.shape(atom_mask)[1]
         struct_idx_long = tf.repeat(tf.range(S, dtype=tf.int64), atom_counts)
         cum = tf.concat([[tf.constant(0, dtype=tf.int64)],
@@ -826,11 +703,8 @@ def _get_fused_predict(model: 'TNEP'):
             W0_t, b0_t, W1_t, b1_t,
             W0p_t, b0p_t, W1p_t, b1p_t,
         )
-        # NOTE: predict_batch returns the TOTAL dipole, not per-atom — even
-        # when cfg.scale_targets is True. Training stores per-atom *targets*,
-        # and TNEP.score() divides raw_preds by N to compare on the same
-        # scale. So preds here is already the total system
-        # dipole; do NOT multiply by num_atoms.
+        # predict_batch returns the TOTAL dipole (not per-atom) regardless of
+        # cfg.scale_targets, so do NOT multiply by num_atoms.
         return preds
 
     _FUSED_PREDICT_CACHE[key] = fused
@@ -845,16 +719,10 @@ def _build_fused_inputs(
     pin_to_cpu: bool = True,
 ) -> tuple:
     """Concatenate per-frame TF tensors and build host-side padded fields.
-
-    The concats are eager TF ops over a Python list of GPU tensors (one
-    kernel each), and the host-built fields (positions, Z, boxes,
-    atom_mask, num_atoms) get a single CPU→device push per outer batch.
     Returned tuple matches the input_signature of `_get_fused_predict`.
 
-    Destructive: clears `frame_results` after each field's concat is built,
-    so the per-frame device tensors are released as soon as their data is
-    folded into the chunk-level concats. This halves the peak VRAM during
-    the pack step (peak ~= one concatenation, not concat + originals).
+    Destructive: clears `frame_results` once its data is folded into the
+    concats, halving peak VRAM during the pack step.
     """
     S = len(frames)
     atom_counts = [int(r[0].shape[0]) for r in frame_results]
@@ -875,8 +743,7 @@ def _build_fused_inputs(
         grad_concat = tf.zeros((0, 3, dim_q), dtype=tf.float32)
         pa_concat   = tf.zeros((0,), dtype=tf.int32)
         pg_concat   = tf.zeros((0,), dtype=tf.int32)
-    # All per-frame data is now in the concat tensors; release the
-    # caller's list so the per-frame slices get garbage-collected.
+    # All per-frame data is now in the concats; release the caller's list.
     frame_results.clear()
 
     atom_counts_t = tf.constant(atom_counts, dtype=tf.int64)
@@ -913,17 +780,17 @@ def _pack_traj_batch_from_flat(
     dim_q: int,
     pin_to_cpu: bool = True,
 ) -> dict:
-    """Pack flat per-frame COO arrays into a stacked batch for predict_batch.
+    """Pack flat per-frame COO arrays (all numpy) into a stacked batch for
+    predict_batch: concatenate pair-level arrays and build a struct-index
+    from per-frame counts (no per-atom loop).
 
     Each frame_results[s] = (descriptors[N,Q], grad_values[P_s,3,Q],
-    pair_atom[P_s], pair_gidx[P_s]), all numpy. We concatenate the pair-level
-    arrays in one shot and build a struct-index from the per-frame counts —
-    no per-atom Python loop, no .numpy() round-trips.
+    pair_atom[P_s], pair_gidx[P_s]).
 
     Returns:
         dict with descriptors [B,A,Q], grad_values [P,3,Q], pair_atom/gidx/struct [P],
         positions [B,A,3], Z_int [B,A], boxes [B,3,3], atom_mask [B,A], num_atoms [B]
-        — same layout as data.pad_and_stack() so predict_batch consumes it unchanged.
+        — same layout as data.pad_and_stack().
     """
     S = len(frames)
     atom_counts = [r[0].shape[0] for r in frame_results]
@@ -982,31 +849,26 @@ def predict_trajectory_batch(
     descriptor_precision: str | None = None,
     descriptor_pair_tile_size: int | None = None,
 ) -> np.ndarray:
-    """Run dipole/polarizability prediction on one batch of trajectory frames.
-
-    Build → pack → predict → return. Caller drives the outer batch loop and
-    releases batch_frames after the call. predict_batch internally branches on
-    cfg.target_mode, so passing the polarizability weights for a mode-1 model
-    is harmless (they're never read).
+    """Run dipole/polarizability prediction on one batch of trajectory frames
+    (build → pack → predict → return). Caller drives the outer batch loop.
+    predict_batch branches on cfg.target_mode, so passing polarizability
+    weights for a mode-1 model is harmless (never read).
 
     Args:
         model        : trained TNEP model (target_mode = 1 or 2)
-        builder      : reusable DescriptorBuilder (constructed once per trajectory)
+        builder      : reusable DescriptorBuilder (one per trajectory)
         batch_frames : list of ase.Atoms in this batch
         batch_types  : list of [N_i] int arrays — type indices per frame
-        pin_to_cpu   : place batch tensors on CPU (transferred to GPU implicitly).
-                       Required for trajectories too large to fit in VRAM.
-        descriptor_batch_frames : number of frames per descriptor builder graph
-                       call (TF GPU mode only). 1 = per-frame; int >= 2 = batched;
-                       None = auto-size to descriptor_memory_budget_bytes.
-        descriptor_memory_budget_bytes : GPU memory budget (bytes) used by the
-                       auto-sizer when descriptor_batch_frames is None. None
-                       falls back to the builder's default (6 GiB). Quippy mode
-                       and explicit-int batch sizes ignore this field.
-        descriptor_precision : "float64" (default, mirrors quippy/Fortran),
-                       "float32" (~2× throughput, ~½ VRAM, looser quippy
-                       agreement). None falls back to the builder's
-                       cfg.descriptor_precision. Quippy mode ignores this.
+        pin_to_cpu   : place batch tensors on CPU (needed for trajectories too
+                       large to fit in VRAM).
+        descriptor_batch_frames : frames per descriptor builder graph call (TF
+                       GPU only). 1 = per-frame; ≥2 = batched; None = auto-size.
+        descriptor_memory_budget_bytes : GPU budget for the auto-sizer when
+                       descriptor_batch_frames is None (default 6 GiB). Ignored
+                       by quippy and explicit-int batch sizes.
+        descriptor_precision : "float64" (default, mirrors quippy) or "float32"
+                       (~2× throughput, ~½ VRAM, looser agreement). None →
+                       builder default. Ignored by quippy.
 
     Returns:
         [B, 3] for dipole models, [B, 6] for polarizability models.
@@ -1021,31 +883,20 @@ def predict_trajectory_batch(
         prefers_tf = False
 
     if prefers_tf:
-        # GPU descriptor builder → fused pack+predict graph (Phase 3).
-        # The fused @tf.function pads descriptors, builds pair_struct, runs
-        # predict_batch, and applies the dipole scale factor — all in one
-        # graph trace, so XLA can fuse across the boundaries that used to be
-        # eager-mode op launches.
-        # Switch the builder's compute precision before this batch if a
-        # trajectory-time override was passed; build_descriptors_flat
-        # rebuilds the locked compute fns lazily when precision changes.
+        # GPU descriptor builder → fused pack+predict graph.
+        # Switch compute precision before this batch if overridden;
+        # build_descriptors_flat rebuilds the locked compute fns lazily.
         if descriptor_precision is not None:
             builder.set_precision(descriptor_precision)
         if descriptor_pair_tile_size is not None:
             builder.set_pair_tile_size(int(descriptor_pair_tile_size))
-        # XLA-JIT is reserved for the (fp32 + pair-tiling) path only.
-        #   - fp64 + XLA suffers from severe register pressure (fp64 takes
-        #     2× the register space of fp32), causing big spill kernels and
-        #     a net slowdown that more than negates the fusion benefit. We
-        #     observed ~10× slowdowns on water_bulk fp64 under XLA. Best
-        #     to keep fp64 always non-XLA.
-        #   - Without pair-tiling the per-call shape varies and XLA
-        #     recompiles each batch (~5-7 s ptxas per compile, with
-        #     register-spill warnings).
-        # With pair-tiling enabled and fp32 selected, pairs are padded to a
-        # multiple of pair_tile_size and each tile body has a fixed shape;
-        # XLA compiles each (n_atoms_chunk, n_tiles) bucket once and runs
-        # at full fused-kernel speed afterward.
+        # XLA-JIT only for the (fp32 + pair-tiling) path:
+        #   - fp64 + XLA suffers severe register pressure and spill kernels
+        #     (~10× slowdown observed on water_bulk); keep fp64 non-XLA.
+        #   - Without pair-tiling the per-call shape varies and XLA recompiles
+        #     each batch (~5-7 s ptxas per compile).
+        # With fp32 + pair-tiling, pairs are padded to a multiple of
+        # pair_tile_size (fixed tile shape); XLA compiles each bucket once.
         ptile = int(getattr(builder, "_pair_tile_size", 0))
         builder_is_fp32 = (
             getattr(builder, "_real_dtype", None) is not None
@@ -1067,9 +918,8 @@ def predict_trajectory_batch(
         del frame_results
         fused_predict = _get_fused_predict(model)
         preds = fused_predict(*fused_inputs)
-        # The graph captured / copied its inputs already; drop the chunk-level
-        # concat tensors before the .numpy() sync so the next iteration has
-        # the full VRAM budget available for the SOAP build.
+        # Graph already captured its inputs; drop the concat tensors before the
+        # .numpy() sync so the next SOAP build has the full VRAM budget.
         del fused_inputs
         out = preds.numpy()
         del preds
@@ -1085,10 +935,8 @@ def predict_trajectory_batch(
                                            cfg.dim_q, pin_to_cpu=pin_to_cpu)
         del frame_results
 
-        # Apply mixing absorption in the same order as the fused path so
-        # the two backends produce identical predictions. This is a
-        # pre-existing training-time operation whose absence at inference
-        # would silently corrupt trajectory dipoles.
+        # Apply mixing absorption in the same order as the fused path so both
+        # backends produce identical predictions.
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             W0_pred = model._W0_eff(model.W0)
             W0p_pred = (model._W0_eff(model.W0_pol)
@@ -1110,11 +958,8 @@ def predict_trajectory_batch(
             getattr(model, 'W1_pol', None),
             getattr(model, 'b1_pol', None),
         )
-        # NOTE: predict_batch returns the TOTAL dipole regardless of
-        # cfg.scale_targets. Training stores per-atom *targets*, and
-        # TNEP.score() divides raw_preds by N to compare on the same scale.
-        # So preds is already the total system dipole;
-        # no per-atom→total rescaling is needed here.
+        # predict_batch returns the TOTAL dipole regardless of
+        # cfg.scale_targets; no per-atom→total rescaling needed.
         out = preds.numpy()
         del batch, preds
     return out
@@ -1141,20 +986,11 @@ def _scalar_acf_fft(signal: np.ndarray) -> np.ndarray:
 
 
 def compute_raman_acfs(polarizabilities: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Compute isotropic and anisotropic polarizability autocorrelation functions.
+    """Isotropic and anisotropic polarizability ACFs. Xu et al. 2024, Eq. 12.
 
-    Decomposes the polarizability tensor into isotropic (γ) and anisotropic (β)
-    parts, then computes their respective ACFs.
-
-    Ref: Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284, Eq. 12
-
-    Decomposition:
-        γ(t) = (α_xx + α_yy + α_zz) / 3     (isotropic scalar)
-        β_ij = α_ij - γ·δ_ij                  (traceless anisotropic tensor)
-
-    ACFs:
+    Decompose α into isotropic γ = Tr(α)/3 and traceless β_ij = α_ij − γ·δ_ij, then:
         C_iso(τ)   = <γ(0)·γ(τ)>
-        C_aniso(τ) = <β_ij(0)·β_ij(τ)>       (full tensor contraction)
+        C_aniso(τ) = <β_ij(0)·β_ij(τ)>   (full tensor contraction)
 
     Args:
         polarizabilities : [T, 6] ndarray — [xx, yy, zz, xy, yz, zx] per frame
@@ -1198,25 +1034,19 @@ def compute_raman_acfs(polarizabilities: np.ndarray) -> tuple[np.ndarray, np.nda
 
 def compute_raman_spectrum(polarizabilities: np.ndarray, dt_fs: float = 1.0, window: str | None = 'hann',
                            max_freq_cm: float = 4000.0, temperature: float = 300.0) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute Raman spectrum from a polarizability trajectory.
+    """Raman spectrum from a polarizability trajectory. Xu et al. 2024.
 
-    Follows Xu et al., J. Chem. Theory Comput., 2024, 20, 3273–3284:
-        1. Decompose α(t) into isotropic γ(t) and anisotropic β(t)  (Eq. 12)
-        2. Compute ACFs: C_iso(τ), C_aniso(τ)
-        3. Fourier transform to get line shapes
-        4. Assemble parallel/perpendicular spectra  (Eq. 10-11)
-        5. Apply Bose-Einstein correction: (n(ω) + 1) / ω
-
-    Polarised (VV) and depolarised (VH) Raman intensities:
-        I_VV(ω) ∝ [45·L_iso(ω) + 4·L_aniso(ω)] · (n(ω)+1)/ω
-        I_VH(ω) ∝ 3·L_aniso(ω) · (n(ω)+1)/ω
+    Pipeline: decompose α → ACFs C_iso/C_aniso → FFT to line shapes L_iso/L_aniso
+    → assemble VV/VH → Bose-Einstein correction (n(ω)+1)/ω. Intensities (Eq. 10-11):
+        I_VV(ω) ∝ [45·L_iso + 4·L_aniso] · (n(ω)+1)/ω    (polarised)
+        I_VH(ω) ∝ 3·L_aniso · (n(ω)+1)/ω                 (depolarised)
 
     Args:
         polarizabilities : [T, 6] ndarray — [xx, yy, zz, xy, yz, zx] per frame
-        dt_fs            : float — timestep between frames in femtoseconds
-        window           : str or None — window function ('hann', 'blackman', None)
-        max_freq_cm      : float — maximum frequency in cm⁻¹
-        temperature      : float — temperature in Kelvin for Bose-Einstein factor
+        dt_fs            : float — timestep between frames in fs
+        window           : str or None — 'hann', 'blackman', or None
+        max_freq_cm      : float — max frequency in cm⁻¹
+        temperature      : float — T in K for the Bose-Einstein factor
 
     Returns:
         freq_cm  : [N] ndarray — frequencies in cm⁻¹
@@ -1245,10 +1075,8 @@ def compute_raman_spectrum(polarizabilities: np.ndarray, dt_fs: float = 1.0, win
     c_cm_per_fs = 2.99792458e-5  # speed of light in cm/fs
     freq_cm = freq_per_fs / c_cm_per_fs
 
-    # Bose-Einstein correction: (n(ω) + 1) / ω
-    # n(ω) = 1 / (exp(ℏω/kT) - 1)
-    # ℏω in eV: ℏ·c·ν̃ where ν̃ in cm⁻¹
-    # ℏc = 1.23984e-4 eV·cm, kT at 300K = 0.02585 eV
+    # Bose-Einstein correction: (n(ω)+1)/ω with n(ω)=1/(exp(ℏω/kT)-1),
+    # ℏω [eV] = ℏc·ν̃ [cm⁻¹].
     hbar_c_eV_cm = 1.23984e-4  # eV·cm
     kT = 8.617333e-5 * temperature  # eV (k_B in eV/K)
 

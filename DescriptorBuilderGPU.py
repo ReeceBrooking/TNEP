@@ -1,21 +1,10 @@
-"""TF-based SOAP-turbo descriptor builder (in development).
+"""NumPy reference SOAP-turbo descriptor builder (correctness oracle).
 
-This module is being ported phase by phase from the Fortran soap_turbo
-reference (see /home/reece/TNEP/soapturbof90/) and validated against
-quippy at every stage. The plan lives in conversation history; the
-current phase is recorded below.
-
-Phase 0 (this commit)
----------------------
-Reference fixtures: small test structures are run through quippy with a
-fixed SOAP configuration; the outputs (descriptors, gradients, neighbour
-indices) are saved as .npz files under tests/fixtures/. These files are
-the ground truth that every subsequent phase compares against.
-
-Phases 1–9 will add: basis matrices, radial expansion, angular expansion,
-cnk scatter-sum, power spectrum, derivatives, Cartesian conversion, and
-self-derivative. The class DescriptorBuilderGPU is currently a stub that
-raises NotImplementedError on construction.
+Ports the Fortran soap_turbo reference (/home/reece/TNEP/soapturbof90/)
+and validates against quippy in 10 phases: basis matrices, radial/angular
+expansion, cnk scatter-sum, power spectrum, derivatives, Cartesian
+conversion, self-derivative, and the DescriptorBuilderGPU class wrapper.
+Phase 0 saves quippy reference fixtures under tests/fixtures/.
 """
 
 from __future__ import annotations
@@ -28,10 +17,8 @@ from quippy.descriptors import Descriptor
 from scipy.special import erf
 
 
-# --- SOAP configuration used for all reference fixtures ------------------
-# Mirrors the TNEPconfig defaults so fixtures are representative of the
-# real workload. Keep this tuple stable — every phase tests against the
-# fixtures generated with these parameters.
+# SOAP config for all reference fixtures. Mirrors TNEPconfig defaults; keep
+# stable — every phase tests against fixtures generated with these params.
 REFERENCE_SOAP_PARAMS = dict(
     l_max=4,
     alpha_max=4,
@@ -53,10 +40,8 @@ REFERENCE_SOAP_PARAMS = dict(
 def _build_soap_string(species_Z: list[int], **soap_params) -> str:
     """Construct the soap_turbo descriptor string for one centre type.
 
-    Mirrors the building logic in DescriptorBuilder.__init__. The single
-    central species is encoded by the central_index argument added by the
-    caller; this helper emits the rest of the string (per-species arrays
-    of length n_species).
+    Emits the per-species arrays (length n_species); the caller appends
+    central_index. Mirrors DescriptorBuilder.__init__.
     """
     n = len(species_Z)
     s = (
@@ -79,17 +64,9 @@ def _build_soap_string(species_Z: list[int], **soap_params) -> str:
 
 
 def _make_test_structures() -> dict[str, Atoms]:
-    """Small ASE Atoms objects covering edge cases worth validating.
-
-    Cases:
-      water_monomer    : 3-atom non-periodic, single H–O–H environment
-      water_dimer      : 6-atom non-periodic with two distinct centres
-      h2_close         : two H atoms at 0.74 Å (bond length) — tight pair
-      h2_far           : two H atoms near rcut_hard — soft-cutoff edge
-      single_h         : one H atom in a vacuum — only self-interaction
-      si_bulk          : 8-atom periodic Si — exercises PBC + cross-cell pairs
-      si_dimer         : two Si in a small periodic box — image neighbours
-    """
+    """Small ASE Atoms edge cases: water_monomer, water_dimer, h2_close,
+    h2_far (soft-cutoff edge), single_h (self only), si_bulk (PBC),
+    si_dimer (image neighbours)."""
     structures: dict[str, Atoms] = {}
 
     # Water monomer
@@ -151,22 +128,10 @@ def _run_quippy(atoms: Atoms, species_Z: list[int],
                 soap_params: dict) -> dict[str, np.ndarray]:
     """Call quippy with one Descriptor per central species.
 
-    Returns:
-        dict with:
-          n_atoms        : int
-          n_species      : int
-          species_Z      : [n_species] int — atomic numbers in canonical order
-          numbers        : [n_atoms] int — atomic numbers per atom
-          positions      : [n_atoms, 3] float
-          cell           : [3, 3] float
-          pbc            : [3] bool
-          descriptors    : [n_atoms, dim_q] float — per-atom SOAP, padded with zeros
-                           for atoms whose species has empty central_index output
-          grad_values    : [P, 3, dim_q] float — per-pair Cartesian gradients
-          pair_atom      : [P] int — centre atom index (0-based)
-          pair_gidx      : [P] int — neighbour atom index (0-based)
-        Notes: dim_q is the *compressed* SOAP dimension, identical across species
-        for compress_mode='trivial' with equal alpha_max per species.
+    Returns a dict of reference arrays: descriptors [n_atoms, dim_q],
+    grad_values [P, 3, dim_q], pair_atom/pair_gidx [P] (0-based), plus
+    structure metadata (numbers, positions, cell, pbc, species_Z).
+    dim_q is the compressed SOAP dim (uniform across species for trivial).
     """
     n_atoms = len(atoms)
     soap_strings = [
@@ -231,17 +196,15 @@ def _run_quippy(atoms: Atoms, species_Z: list[int],
 def build_reference_fixtures(out_dir: str = "tests/fixtures") -> None:
     """Generate quippy reference data for every test structure.
 
-    Each structure is saved as <out_dir>/<name>.npz containing the dict
-    returned by _run_quippy plus the SOAP parameter set as a JSON string.
-    Subsequent phases load these and assert_allclose against them.
+    Saves <out_dir>/<name>.npz with the _run_quippy dict plus SOAP params
+    as JSON. Subsequent phases assert_allclose against these.
     """
     import json
 
     os.makedirs(out_dir, exist_ok=True)
     structures = _make_test_structures()
 
-    # Pick species set per structure: the union of element types present.
-    # Sorted by Z so quippy's central_index ordering is deterministic.
+    # Species set per structure = element types present, sorted by Z.
     print(f"Generating quippy reference fixtures in {out_dir}/")
     print(f"  SOAP params: {REFERENCE_SOAP_PARAMS}")
     print()
@@ -257,8 +220,7 @@ def build_reference_fixtures(out_dir: str = "tests/fixtures") -> None:
             **ref,
         )
 
-        # Sanity stats — flag anything obviously broken before later phases
-        # waste cycles trying to match it.
+        # Sanity stats — flag obvious breakage early.
         desc = ref["descriptors"]
         grads = ref["grad_values"]
         has_nan = np.isnan(desc).any() or np.isnan(grads).any()
@@ -275,10 +237,7 @@ def build_reference_fixtures(out_dir: str = "tests/fixtures") -> None:
 
 
 def load_fixture(name: str, fixtures_dir: str = "tests/fixtures") -> dict:
-    """Load a fixture .npz back into a dict of numpy arrays.
-
-    Returns a plain dict; the soap_params field is decoded from JSON.
-    """
+    """Load a fixture .npz into a dict; soap_params decoded from JSON."""
     import json
     data = np.load(os.path.join(fixtures_dir, f"{name}.npz"), allow_pickle=False)
     out = {k: data[k] for k in data.files if k != "soap_params"}
@@ -294,11 +253,7 @@ def assert_allclose_soap(
     rtol: float = 1e-5,
     label: str = "soap",
 ) -> None:
-    """Compare SOAP descriptors with informative diagnostics on failure.
-
-    Reports max absolute diff, max relative diff, and the index of the
-    worst element so debugging is one numpy access away.
-    """
+    """Compare SOAP descriptors; report max abs/rel diff and worst index."""
     if predicted.shape != expected.shape:
         raise AssertionError(
             f"{label} shape mismatch: predicted {predicted.shape} vs expected {expected.shape}")
@@ -318,29 +273,16 @@ def assert_allclose_soap(
 
 # =========================================================================
 # Phase 1 — Basis matrices, compression mask, multiplicity array
-# =========================================================================
-#
-# These are all one-time CPU compute (NumPy). The outputs feed the per-pair
-# vectorised TF kernels in later phases.
-#
-# References to the Fortran source:
-#   build_overlap_matrix_poly3      <- soap_turbo_radial.f90:770-776
-#   build_orthonormalization_poly3  <- soap_turbo_radial.f90:780-816
-#   make_compress_mask_trivial      <- soap_turbo_compress.f90:73-106
-#   build_multiplicity_array        <- soap_turbo.f90:496-535
+# Fortran refs: soap_turbo_radial.f90:770-816, soap_turbo_compress.f90:73-106,
+# soap_turbo.f90:496-535.
 # =========================================================================
 
 
 def build_overlap_matrix_poly3(alpha_max: int) -> np.ndarray:
     """Analytic overlap matrix S of the unnormalised poly3 radial basis.
 
-    From soap_turbo_radial.f90:770-776 (1-indexed):
-        S[i, i] = 1
-        S[i, j] = sqrt((5 + 2i)(5 + 2j)) / (5 + i + j)   for j != i
-
-    Returns S of shape [alpha_max, alpha_max], symmetric and positive-definite
-    for alpha_max <= ~10 (numerical instability sets in beyond that — the
-    Fortran refuses to go past alpha_max=10).
+    S[i,i]=1; S[i,j]=sqrt((5+2i)(5+2j))/(5+i+j) for j!=i (1-indexed).
+    Returns [alpha_max, alpha_max], SPD for alpha_max<=~10.
     """
     a = np.arange(1, alpha_max + 1, dtype=np.float64)            # 1-indexed
     i_idx, j_idx = np.meshgrid(a, a, indexing="ij")              # both [α, α]
@@ -349,15 +291,10 @@ def build_overlap_matrix_poly3(alpha_max: int) -> np.ndarray:
 
 
 def build_orthonormalization_matrix_poly3(alpha_max: int) -> np.ndarray:
-    """Compute W = S^(-1/2) for the poly3 basis.
+    """W = S^(-1/2) for the poly3 basis, via SVD: U·diag(1/sqrt(svd))·Vt.
 
-    Fortran (soap_turbo_radial.f90:780-816) does this in two steps:
-        1. Build S^(1/2) via SVD: U·diag(svd)·VT -> U·diag(sqrt(svd))·VT
-        2. Invert S^(1/2) via Cholesky (dpotrf + dpotri)
-
-    For symmetric positive-definite S this is equivalent to the direct
-    construction W = U·diag(1/sqrt(svd))·VT. We use the direct form here
-    — it's identical numerically and avoids the matrix inversion step.
+    Numerically identical to the Fortran's SVD-then-Cholesky two-step
+    (soap_turbo_radial.f90:780-816) for SPD S.
     """
     S = build_overlap_matrix_poly3(alpha_max)
     U, svd, Vt = np.linalg.svd(S)                                 # S = U·diag(svd)·Vt
@@ -367,11 +304,10 @@ def build_orthonormalization_matrix_poly3(alpha_max: int) -> np.ndarray:
 
 
 def build_block_W(alpha_max_per_species: list[int]) -> np.ndarray:
-    """Block-diagonal W of shape [n_max, n_max] across species.
+    """Block-diagonal W [n_max, n_max]: one poly3 basis per species.
 
-    Each species gets its own poly3 basis; off-diagonal blocks are zero
-    because radial functions of one species are *defined* to be orthogonal
-    to functions of other species (soap_turbo.f90:227-258).
+    Off-diagonal blocks are zero (cross-species radial functions are
+    orthogonal by definition; soap_turbo.f90:227-258).
     """
     n_max = sum(alpha_max_per_species)
     W = np.zeros((n_max, n_max), dtype=np.float64)
@@ -383,15 +319,11 @@ def build_block_W(alpha_max_per_species: list[int]) -> np.ndarray:
 
 
 def compute_dim_q(cfg) -> int:
-    """Compute the SOAP descriptor dimension `n_compressed` from cfg alone.
+    """SOAP descriptor dimension n_compressed from cfg alone (closed-form).
 
-    Closed-form: depends only on (alpha_max, l_max, num_types, compress_mode);
-    no GPU/TF compute and no neighbour-list build required. Lets callers
-    resolve cfg.dim_q before instantiating any descriptor builder.
-
-    Supports compress_mode in {"trivial", "linear"} (the GPU path's two
-    modes); other values are routed to make_compress_mask_trivial as a
-    sensible default.
+    Depends only on (alpha_max, l_max, num_types, compress_mode); no
+    neighbour-list build. compress_mode 'linear' is special-cased; others
+    route to make_compress_mask_trivial.
     """
     alpha_max = int(cfg.alpha_max)
     l_max = int(cfg.l_max)
@@ -406,30 +338,17 @@ def compute_dim_q(cfg) -> int:
 
 
 def descriptor_block_layout(cfg) -> dict:
-    """Return per-species-pair index groupings of the SOAP-turbo descriptor.
+    """Group the flat dim_q axis by unordered species pair (s_a, s_b).
 
-    Each kept (n, n', l) channel maps back to an unordered species pair
-    (s_a, s_b), where s_a is the species owning the global radial index
-    `n` and s_b is the species owning `n'`. This decomposes the flat
-    `dim_q` axis into `num_pairs = T·(T+1)/2` blocks that share the
-    same underlying physical meaning (the n-body contribution from
-    that neighbour-species pair).
+    Each kept (n, n', l) channel maps to the pair owning (n, n'),
+    decomposing dim_q into T·(T+1)/2 blocks. Kept channels for a pair are
+    NOT contiguous (they interleave along the Fortran (n, n', l) order), so
+    callers gather by q index. compress_mode='trivial' only; raises on
+    'linear' (not separable by species pair).
 
-    The kept channels for a single (s_a, s_b) pair are *not*
-    contiguous in the flat descriptor — they interleave with other
-    pairs along the Fortran (n, n', l) loop order — so callers should
-    use `gather(q_indices)` rather than `slice(start, end)`.
-
-    Supports compress_mode='trivial' only; raises on 'linear' since
-    that compression's index mapping doesn't decompose cleanly by
-    species pair.
-
-    Returns dict with:
-        pair_keys     : list of (s_a, s_b) tuples, s_a <= s_b
-        pair_q_index  : dict {(s_a, s_b): np.int32 array of q indices}
-        block_sizes   : dict {(s_a, s_b): int}
-        max_block_size: int — largest block, useful for padding U_pair
-        dim_q         : int — total kept channels (= sum of block sizes)
+    Returns dict: pair_keys, pair_q_index, pair_ln_index, l_index,
+    block_sizes, max_block_size, alpha_eff_per_pair, max_alpha_eff,
+    N_per_l, dim_q.
     """
     compress_mode = getattr(cfg, "compress_mode", "trivial")
     if compress_mode != "trivial":
@@ -442,8 +361,7 @@ def descriptor_block_layout(cfg) -> dict:
     n_species = int(cfg.num_types)
     alpha_per_species = [alpha_max] * n_species
 
-    # 1-based species ownership of each global radial index. Species s
-    # owns global radial indices [start_s, start_s + alpha_per_species[s]).
+    # 1-based species ownership of each global radial index.
     n_to_species = np.empty(sum(alpha_per_species) + 1, dtype=np.int32)
     n_to_species[0] = -1   # unused (n is 1-based in Fortran)
     cursor = 1
@@ -457,18 +375,8 @@ def descriptor_block_layout(cfg) -> dict:
         pivots.add(max(pivots) + alpha_per_species[s])
 
     pair_q_index: dict[tuple[int, int], list[int]] = {}
-    # Per-pair, per-l decomposition. Channels emitted by the Fortran
-    # loop have `l` innermost (verified against soap_turbo_compress.f90):
-    #
-    #   do n = 1, n_max
-    #     do m = n, n_max
-    #       do l = 0, l_max
-    #         if (n in pivots) or (m in pivots): emit
-    #
-    # So within a single pair's channel list, the position modulo
-    # (l_max+1) gives the angular momentum index. We accumulate the
-    # `(pair, l) -> [q indices]` mapping explicitly here so callers
-    # (e.g. l-channel-aware mixing) don't have to redo the slicing.
+    # Fortran emit order is (n, n', l) with l innermost, emitting when n or
+    # n' is a pivot. pair_ln_index maps (pair, l) -> [q indices].
     pair_ln_index: dict[tuple[int, int], dict[int, list[int]]] = {}
 
     q_counter = 0
@@ -495,13 +403,10 @@ def descriptor_block_layout(cfg) -> dict:
             l: np.asarray(v, dtype=np.int32)
             for l, v in pair_ln_index[k].items()
         }
-    # Per-pair α_eff = number of radial channels at any single l.
-    # Must be uniform across l for a fixed pair (each kept (n, m)
-    # pivot contributes one channel per l).
+    # Per-pair α_eff = radial channels per l (uniform across l for a pair).
     alpha_eff_per_pair: dict[tuple[int, int], int] = {}
     for k in pair_keys:
         counts_by_l = {l: len(v) for l, v in pair_ln_index_np[k].items()}
-        # Sanity check: must have exactly l_max+1 entries, all equal.
         assert set(counts_by_l.keys()) == set(range(l_max + 1)), (
             f"pair {k}: l-index keys {sorted(counts_by_l)} != "
             f"range(0, {l_max + 1})")
@@ -509,16 +414,8 @@ def descriptor_block_layout(cfg) -> dict:
         assert len(unique_counts) == 1, (
             f"pair {k}: alpha_eff varies across l: {counts_by_l}")
         alpha_eff_per_pair[k] = int(next(iter(unique_counts)))
-    # Per-l union over all pairs: all q-indices at angular momentum l,
-    # concatenated in deterministic pair order. Used by the
-    # `cross_pair_l` mixing arch, which allows mixing radial channels
-    # across species pairs at the same angular momentum (but never
-    # across different angular momenta).
-    #
-    # N_l (number of channels per l, summed across pairs) is uniform
-    # across l, because the Fortran loop emits exactly l_max+1
-    # channels per kept (n, m) pair regardless of l. We assert
-    # uniformity below.
+    # Per-l union over all pairs (deterministic pair order). Used by
+    # cross_pair_l mixing. N_l is uniform across l (asserted below).
     l_index_np: dict[int, np.ndarray] = {}
     for l in range(l_max + 1):
         union: list[int] = []
@@ -526,7 +423,6 @@ def descriptor_block_layout(cfg) -> dict:
             union.extend(int(q) for q in pair_ln_index_np[k][l])
         l_index_np[l] = np.asarray(union, dtype=np.int32)
     N_l_per = {l: l_index_np[l].size for l in range(l_max + 1)}
-    # Sanity check: N_l should be uniform across l.
     if len(set(N_l_per.values())) > 1:
         raise AssertionError(
             f"N_l varies across l: {N_l_per}. cross_pair_l mixing "
@@ -548,29 +444,14 @@ def descriptor_block_layout(cfg) -> dict:
 
 
 def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
-    """Return precomputed index mappings for the preprocessing contraction.
+    """Precomputed index mappings for the preprocessing contraction.
 
-    For each q_raw ∈ [0, Q_raw), `q_raw_to_q_new[q_raw]` gives the output
-    channel that q_raw contributes to. The forward op is then a per-type
-    scatter-sum:
-        desc'[t, q_new] = Σ_{q_raw : map[q_raw] = q_new}
-                              W_pre[t, q_raw] * desc[q_raw]
+    Forward op is a per-type scatter-sum:
+        desc'[t, q_new] = Σ_{q_raw: map[q_raw]=q_new} W_pre[t, q_raw]·desc[q_raw]
 
-    Modes:
-      "off"     : no preprocessing; dim_q_new = layout["dim_q"], map = None.
-      "angular" : contract over l per (pair, n_pair). Output indexed by
-                  (pair, n_pair); within a pair, n_pair runs 0..α_eff_pair−1.
-                  L raw channels per output, one per angular momentum.
-
-    Other modes raise NotImplementedError in this first pass.
-
-    Returns dict with at least:
-        dim_q_new      : int
-        q_raw_to_q_new : np.int32 [Q_raw] (or None if mode="off")
-        coef_shape     : (Q_raw,) the natural shape of the per-type
-                         coefficient tensor (W_pre[t, q_raw]).
-        coef_init_norm : float, the 1/N value for "mean" init
-        L              : int, the contracted-axis size (= l_max+1 for angular)
+    Modes: "off", "angular" (contract over l per (pair, n_pair)),
+    "species_pair", "both", "nep4_radial". Returns dict with dim_q_new,
+    q_raw_to_q_new [Q_raw] (None if "off"), coef_shape, coef_init_norm, L.
     """
     pair_keys = layout["pair_keys"]
     pair_ln_index = layout["pair_ln_index"]
@@ -578,10 +459,8 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
     Q_raw = int(layout["dim_q"])
     L = int(cfg.l_max) + 1
 
-    # l_keep: low-l channels kept as passthrough (no learnable coefficient).
-    # l < l_keep → each gets its own output channel; l ≥ l_keep are summed
-    # into one output channel per (pair, n_pair) block. Default 1 keeps l=0
-    # alone, sums l>0. Only consulted by "angular" and "both".
+    # l_keep: l < l_keep pass through (own output channel); l >= l_keep are
+    # summed into one channel per (pair, n_pair). Default 1. "angular"/"both".
     l_keep = int(getattr(cfg, "descriptor_preprocess_angular_l_keep", 1))
     if l_keep < 0 or l_keep > L:
         raise ValueError(
@@ -600,14 +479,8 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         )
 
     if mode == "angular":
-        # Per (pair, n_pair) block:
-        #   - l ∈ [0, l_keep)   → each becomes its own passthrough output
-        #                          channel (single contributor, no learnable
-        #                          coefficient — W_pre value is fixed at 1.0).
-        #   - l ∈ [l_keep, L)   → summed into one output channel with
-        #                          L − l_keep learnable coefficients
-        #                          (init 1/(L − l_keep) so the gen-0 sum ≈ 1).
-        # Output dim Q_new = (l_keep + (1 if l_keep < L)) · Σ_pair α_eff_pair.
+        # Per (pair, n_pair): l<l_keep passthrough (W_pre=1); l>=l_keep summed
+        # into one channel with L-l_keep learnable coefs (init 1/(L-l_keep)).
         n_summed_block = 1 if l_keep < L else 0
         n_summed_l = L - l_keep
         init_summed_val = (1.0 / float(n_summed_l)) if n_summed_l > 0 else 0.0
@@ -618,14 +491,13 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         for pair in pair_keys:
             alpha = alpha_eff_per_pair[pair]
             for n_pair in range(alpha):
-                # l < l_keep → each gets its own passthrough channel.
+                # l < l_keep → own passthrough channel.
                 for l in range(l_keep):
                     q_raw = int(pair_ln_index[pair][l][n_pair])
                     q_raw_to_q_new[q_raw] = out_cursor
                     init_per_q_raw[q_raw] = 1.0          # passthrough init
-                    # summed_mask[q_raw] stays False     # not learnable
                     out_cursor += 1
-                # l ≥ l_keep → all summed into one output channel.
+                # l ≥ l_keep → summed into one channel.
                 if n_summed_block > 0:
                     for l in range(l_keep, L):
                         q_raw = int(pair_ln_index[pair][l][n_pair])
@@ -648,18 +520,9 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         )
 
     if mode == "species_pair":
-        # No padding: each block sized to its NATURAL α_eff.
-        # For each central type t:
-        #   SELF block  : the (t,t) pair contributes α[(t,t)] kept channels
-        #                 per l (single contributor — passthrough, no W_pre).
-        #   OTHER block : pairs (t, j ≠ t) contribute max(α_cross) summed
-        #                 channels per l (T-1 contributors per slot).
-        # Per centre dim_q_new = (α_self + max_α_cross) · L.
-        # For uniform α across pairs (typical), this is uniform across t.
-        # When α varies per pair (e.g. mixed alpha_per_species), the
-        # natural dims may differ per t — we use the max across t to keep
-        # W0 uniformly shaped; the smaller-α centres have empty trailing
-        # slots in their other-block.
+        # Per centre t: SELF block = (t,t) pair (passthrough); OTHER block =
+        # pairs (t,j≠t) summed (T-1 contributors). Per-centre dim_q_new =
+        # (α_self + max_α_cross)·L. Max across t keeps W0 uniformly shaped.
         T = int(cfg.num_types)
         # Per-centre α_self and max-cross-α
         alpha_self_per_t = [0] * T
@@ -675,9 +538,7 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         alpha_self = max(alpha_self_per_t)
         alpha_other = max(alpha_other_max_per_t)
         Q_new = (alpha_self + alpha_other) * L
-        # q_new layout per centre (uniform):
-        #   [0, alpha_self · L)                : SELF block (n_pair, l) major
-        #   [alpha_self · L, Q_new)            : OTHER block (n_pair, l) major
+        # q_new layout: [0, alpha_self·L) SELF, then OTHER; (n_pair, l) major.
         q_raw_to_q_new = np.full((T, Q_raw), -1, dtype=np.int32)
         init_per_t_q_raw = np.zeros((T, Q_raw), dtype=np.float32)
         summed_mask = np.zeros((T, Q_raw), dtype=bool)
@@ -718,19 +579,9 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         )
 
     if mode == "both":
-        # Combines species_pair (no padding) with angular l_keep collapse.
-        # Per centre t, per pair p ∈ {(t,t), (t, j ≠ t)}, per radial n_pair:
-        #   l ∈ [0, l_keep)   → each gets its own output channel.
-        #   l ∈ [l_keep, L)   → summed into ONE output channel.
-        # Classification:
-        #   SELF + kept_l   : single contributor (the (t,t) entry at l).
-        #                      PASSTHROUGH (no W_pre).
-        #   SELF + sum_l    : L − l_keep contributors (one per l in
-        #                      [l_keep, L) of (t,t)). SUMMED.
-        #   OTHER + kept_l  : T − 1 contributors (one per cross-pair).
-        #                      SUMMED.
-        #   OTHER + sum_l   : (T − 1)·(L − l_keep) contributors. SUMMED.
-        # Per-centre Q_new = (α_self + α_other) · (l_keep + (1 if l_keep<L)).
+        # species_pair × angular l_keep collapse. Per (centre, pair, n_pair):
+        # l<l_keep own channel, l>=l_keep summed. SELF+kept = passthrough;
+        # SELF+sum, OTHER+kept, OTHER+sum are summed with varying fan-in.
         T = int(cfg.num_types)
         alpha_self_per_t = [0] * T
         alpha_other_max_per_t = [0] * T
@@ -748,11 +599,8 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         n_summed_l = L - l_keep
         out_per_pair = l_keep + n_summed_block
         Q_new = (alpha_self + alpha_other) * out_per_pair
-        # q_new per centre layout (uniform):
-        #   SELF block  [0,            alpha_self · out_per_pair)
-        #   OTHER block [self_end,     Q_new)
-        # Within each block, the per (n_pair, l_or_sum) ordering is
-        # (n_pair, [l<l_keep] then [sum]) — l major within n_pair.
+        # q_new layout: SELF block [0, alpha_self·out_per_pair), then OTHER;
+        # (n_pair, [l<l_keep] then [sum]) ordering, l major within n_pair.
         self_end = alpha_self * out_per_pair
         init_self_kept   = 1.0
         init_self_sum    = 1.0 / float(max(1, n_summed_l))
@@ -808,22 +656,11 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         )
 
     if mode == "nep4_radial":
-        # NEP4-faithful learned-basis fold. Replaces the linear preprocess
-        # W_pre with the rank-1 outer-product bilinear weighting
-        #   g[t, n'', l] = Σ_{n,n'} c[t, s(n), n'', k(n)]
-        #                          · c[t, s(n'), n'', k(n')]
-        #                          · p[n, n', l]
-        # See the derivation block-comment at descriptor_preprocess_layout
-        # nep4 mode; same indexing as NEP4's c^{Z_i,Z_j}_{n'',k}.
-        #
-        # Layout fields specific to nep4_radial (consumed by TNEP's
-        # `_W0_preprocess_eff` and SNES tail wiring):
-        #   nep4_n_max_out : int     — output radial-channel count
-        #   nep4_l_of_q    : [Q_raw] — l index for each raw channel
-        #   nep4_n_global  : [Q_raw] — global n index for each raw channel
-        #   nep4_np_global : [Q_raw] — global n' index for each raw channel
-        #   nep4_n_to_species : [n_max_global] — species of each global n
-        #   nep4_n_to_local   : [n_max_global] — within-species index of each n
+        # NEP4 learned-basis fold: rank-1 bilinear weighting
+        #   g[t, n'', l] = Σ_{n,n'} c[t,s(n),n'',k(n)]·c[t,s(n'),n'',k(n')]·p[n,n',l]
+        # (same indexing as NEP4's c^{Z_i,Z_j}_{n'',k}). Adds nep4_* layout
+        # fields (n_max_out, l_of_q, n_global, np_global, n_to_species,
+        # n_to_local) consumed by TNEP's _W0_preprocess_eff / SNES tail.
         alpha_max = int(cfg.alpha_max)
         T = int(cfg.num_types)
         n_max_global = T * alpha_max
@@ -835,7 +672,7 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         Q_pair_kept = Q_raw // L
         n_max_out_cfg = getattr(cfg, "descriptor_nep4_n_max_out", None)
         if n_max_out_cfg is None:
-            # Preserve total dim: Q_new = Q_raw → n_max_out = Q_pair_kept.
+            # Preserve total dim: Q_new = Q_raw.
             n_max_out = Q_pair_kept
         else:
             n_max_out = int(n_max_out_cfg)
@@ -843,10 +680,8 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
                 raise ValueError(
                     f"descriptor_nep4_n_max_out={n_max_out} must be > 0.")
         Q_new = n_max_out * L
-        # Rebuild the Fortran (n, n', l) emit order and record the
-        # (n_global, n'_global, l) tuple for each q_raw. Mirrors the loop
-        # in descriptor_block_layout (we re-walk it rather than passing
-        # the data through `layout` to keep that signature stable).
+        # Re-walk the Fortran (n, n', l) emit order, recording
+        # (n_global, n'_global, l) per q_raw (keeps layout signature stable).
         alpha_per_species = [alpha_max] * T
         pivots: set[int] = {1}
         for s in range(T - 1):
@@ -862,8 +697,8 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         nep4_l_of_q = np.zeros(Q_raw, dtype=np.int32)
         nep4_n_global = np.zeros(Q_raw, dtype=np.int32)
         nep4_np_global = np.zeros(Q_raw, dtype=np.int32)
-        # global-n indexing (0-based) for the c tensor's flat species×α axis:
-        #   n_global(n_fortran) = (species(n_fortran)) * α_max + (n_fortran - species_start - 1)
+        # global-n (0-based) for c tensor's flat species×α axis:
+        #   n_global = species·α_max + within-species-index
         nep4_n_to_species = np.zeros(n_max_global, dtype=np.int32)
         nep4_n_to_local = np.zeros(n_max_global, dtype=np.int32)
         for s in range(T):
@@ -891,17 +726,12 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         assert q_counter == Q_raw, (
             f"nep4_radial layout walk emitted {q_counter} entries, "
             f"expected Q_raw={Q_raw}.")
-        # All c entries are LEARNABLE (no kept-passthrough slots). The
-        # summed_q_raw_mask placeholder used by the linear-fold tail
-        # machinery is sized over the full c tensor shape so SNES treats
-        # every entry as a μ slot.
+        # All c entries learnable; summed_mask sized over the full c tensor
+        # so SNES treats every entry as a μ slot.
         coef_shape = (T, T, n_max_out, alpha_max)
         full_coef_size = int(np.prod(coef_shape))
         summed_mask = np.ones(coef_shape, dtype=bool)
-        # Initialisation: Glorot-style fan-in (= α_max for each c sum;
-        # see fold algebra). Scalar applied uniformly; the per-q_raw
-        # init slot is not used (the c tensor lives in n''/k-space, not
-        # q_raw-space).
+        # Glorot fan-in = α_max (per c sum). c lives in n''/k-space, not q_raw.
         fan_in = max(1, alpha_max)
         init_norm = float(np.sqrt(1.0 / fan_in))
         return dict(
@@ -933,34 +763,16 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
 
 def descriptor_post_preprocess_block_layout(
         cfg, layout: dict, preprocess_mode: str) -> dict:
-    """Block layout of the Q_new output of the preprocess contraction.
+    """Block layout of the Q_new preprocess output (post-contraction).
 
-    Mirrors `descriptor_block_layout` (pair_keys, pair_q_index,
-    pair_ln_index, alpha_eff_per_pair, dim_q) but with q-indices in
-    Q_new (post-contraction) space and an `L_eff` field giving the
-    effective l-axis size that l_aware mixing should use.
+    Mirrors descriptor_block_layout but q-indices are in Q_new space, plus
+    an L_eff field (effective l-axis size for l_aware mixing). Used by
+    descriptor_mixing when it composes with preprocess.
 
-    Used by `descriptor_mixing` when it composes with preprocess: the
-    mixing rotation operates at Q_new (the W0 storage dim when
-    preprocess is on), so it needs Q_new-indexed block boundaries.
-
-    Layout per preprocess mode:
-
-      "angular" l_keep = x:
-        pair_keys      = same as the SOAP-turbo layout
-        L_eff          = l_keep + (1 if l_keep < L else 0)
-        alpha_eff_pair = unchanged
-        within each (pair, n_pair): x kept l-channels + 1 summed channel
-
-      "species_pair":
-        pair_keys      = ["self", "other"]  (logical, shared across centres)
-        L_eff          = L  (l axis preserved)
-        alpha_eff      = {"self": max_t α[(t,t)], "other": max α_cross}
-
-      "both" l_keep = x:
-        pair_keys      = ["self", "other"]
-        L_eff          = l_keep + (1 if l_keep < L else 0)
-        alpha_eff      = {"self": max_t α[(t,t)], "other": max α_cross}
+    Per mode: "angular" keeps pair_keys, L_eff = l_keep + (l_keep<L);
+    "species_pair"/"both" use pair_keys ["self","other"], alpha_eff =
+    {self: max_t α[(t,t)], other: max α_cross}, L_eff = L (species_pair) or
+    l_keep + (l_keep<L) (both).
     """
     pair_keys_raw = layout["pair_keys"]
     pair_ln_index = layout["pair_ln_index"]
@@ -1071,27 +883,15 @@ def make_compress_mask_trivial(
     alpha_max_per_species: list[int],
     l_max: int,
 ) -> dict:
-    """Build the sparse projection P for compress_mode='trivial'.
+    """Sparse projection P for compress_mode='trivial'.
 
-    Fortran reference: soap_turbo_compress.f90:73-106.
+    Fortran ref: soap_turbo_compress.f90:73-106. Keeps only (n, n', l)
+    channels where n or n' is a species' first global radial index ("pivot":
+    n=1, and n=1+alpha_max, ... for extra species), in Fortran (n, n', l) order.
 
-    Trivial compression keeps only (n, n', l) channels in which n or n' is
-    the first global radial index of *some* species (i.e. a "pivot"). For
-    a single species this means n=1; for two species with alpha_max=4 each
-    it means n in {1, 5}.
-
-    The output index `compressed_idx` enumerates kept channels in the
-    Fortran's (n, n', l) order. The source index `uncompressed_idx`
-    enumerates the same triples without filtering — used by the power
-    spectrum to know which uncompressed channel each kept output draws from.
-
-    Returns:
-        compressed_idx   : [P_nonzero] int — output index (0-based)
-        uncompressed_idx : [P_nonzero] int — source index (0-based)
-        coeffs           : [P_nonzero] float — all 1.0 for trivial mode
-        skip_mask        : [n_uncompressed] bool — True where channel is dropped
-        n_compressed     : int — output dim_q (= len(compressed_idx))
-        n_uncompressed   : int — n_max·(n_max+1)/2 · (l_max+1)
+    Returns: compressed_idx [P_nonzero] (output), uncompressed_idx [P_nonzero]
+    (source), coeffs [P_nonzero] (all 1.0), skip_mask [n_uncompressed] (True=
+    dropped), n_compressed (= dim_q), n_uncompressed (= n_max·(n_max+1)/2·(l_max+1)).
     """
     n_species = len(alpha_max_per_species)
     n_max = sum(alpha_max_per_species)
@@ -1136,25 +936,13 @@ def build_multiplicity_array(
 ) -> np.ndarray:
     """Per-(n, n', l, m) multiplicities for the power-spectrum sum.
 
-    Fortran reference: soap_turbo.f90:496-535.
+    Fortran ref: soap_turbo.f90:496-535.
+        mult = 1; ·= sqrt(2) if n != n'; ·= 2 if m > 0
+    Iteration order matches make_compress_mask_trivial (m=0..l innermost);
+    skipped channels contribute no m entries.
 
-        mult(n, n', m) = 1
-        mult *= sqrt(2)  if n != n'
-        mult *= 2        if m > 0
-
-    Iteration order matches the Fortran exactly: outer loops over (n, n', l)
-    in the same order as make_compress_mask_trivial; inner loop over m=0..l.
-    Skipped (n, n', l) channels do not contribute any m entries.
-
-    Args:
-        n_max     : sum of per-species alpha_max
-        l_max     : max angular momentum
-        skip_mask : bool array of shape [n_uncompressed] = n_max·(n_max+1)/2·(l_max+1).
-                    None means no compression (all channels kept).
-
-    Returns:
-        multiplicity_array of shape [n_active], where
-            n_active = sum_{kept (n, n', l)} (l + 1)
+    Args: n_max, l_max; skip_mask [n_uncompressed] (None = keep all).
+    Returns: multiplicity_array [n_active], n_active = Σ_{kept (n,n',l)}(l+1).
     """
     n_unc = n_max * (n_max + 1) // 2 * (l_max + 1)
     if skip_mask is None:
@@ -1179,15 +967,8 @@ def build_multiplicity_array(
 # --- Phase 1 validators --------------------------------------------------
 
 def _validate_orthonormality(alpha_max: int, atol: float = 1e-6) -> None:
-    """W must satisfy W·S·W = I (W = S^(-1/2) symmetric).
-
-    Equivalent to the orthonormality of the resulting basis:
-        <g_n | g_m> = (W·S·W)[n, m] = δ_{n, m}
-
-    The condition number of S grows rapidly with alpha_max; the Fortran
-    refuses alpha_max > 10 for this reason. With float64 SVD we get ~1e-12
-    residual at alpha_max=4 (production setting), ~1e-8 at alpha_max=7.
-    """
+    """W·S·W = I (basis orthonormality). cond(S) grows with alpha_max;
+    Fortran caps at 10. float64 SVD: ~1e-12 residual at alpha_max=4."""
     S = build_overlap_matrix_poly3(alpha_max)
     W = build_orthonormalization_matrix_poly3(alpha_max)
     WSW = W @ S @ W
@@ -1277,13 +1058,8 @@ def _validate_multiplicity_count_matches_fixtures(
             l_max=l_max,
             skip_mask=mask["skip_mask"],
         )
-        # Expected length: sum over kept (n, n', l) of (l+1)
-        # For l_max=4, l in 0..4 contributes (l+1) values, so per kept (n, n'):
-        # the sum of m-counts is 1+2+3+4+5 = 15 (since l=0..4 gives all 5 channels kept).
-        # Number of kept (n, n', l) = n_compressed.
-        # If all 5 l-values are kept per (n, n') pair: n_compressed = n_pairs * 5.
+        # Expected length = n_pairs_kept · Σ_{l=0..l_max}(l+1).
         n_pairs_kept = mask["n_compressed"] // (l_max + 1)
-        # Each kept pair contributes 1+2+3+4+5 = 15 m-values for l_max=4
         expected_length = n_pairs_kept * sum(range(1, l_max + 2))
         if mult.shape[0] != expected_length:
             raise AssertionError(
@@ -1342,38 +1118,19 @@ def run_phase1_validation() -> None:
 
 
 # =========================================================================
-# Phase 2 — Radial expansion coefficients (poly3 basis, forward only)
-# =========================================================================
+# Phase 2 — Radial expansion coefficients (poly3, forward only)
+# Fortran ref: soap_turbo_radial.f90:69-380 (get_radial_expansion_..._poly3).
 #
-# Fortran reference: soap_turbo_radial.f90 lines 69-380
-#   - get_radial_expansion_coefficients_poly3
-#
-# Algorithm (per pair):
-#   1. Normalise rj, rcut_soft, atom_sigma by rcut_hard
-#   2. Build amplitude factor (cubic Hermite envelope * radial_enhancement)
-#   3. Recurse on I_α (α=-1..alpha_max+2) — primary integral over [0, rcut_soft]
-#   4. If pair near soft cutoff: second recursion over [rcut_soft, rcut_hard]
-#      with smoothing-filter Gaussian
-#   5. Apply orthonormalisation: W @ (temp1 + pref_f * temp2)
-#   6. Multiply by amplitude and global rcut_hard^(1/2) scaling
-#
-# This phase is NumPy. Phase 6 will lift the per-pair-vectorised loops to TF.
-# Numpy keeps the code easy to step through with a debugger and matches the
-# Fortran's "scalar state per pair" model directly.
-#
-# Restriction: only basis="poly3" supported; assumes uniform per-species
-# hyperparameters (alpha_max, rcut_hard, rcut_soft, atom_sigma_r,
-# atom_sigma_r_scaling, amplitude_scaling, central_weight, nf, radial_enhancement).
-# Per-species hyperparameters can be added later.
+# Per pair: normalise by rcut_hard; amplitude (Hermite envelope ·
+# radial_enhancement); first-integral recursion I_α over [0, rcut_soft];
+# second recursion over [rcut_soft, rcut_hard] with smoothing filter if near
+# cutoff; orthonormalise W·(temp1 + pref_f·temp2); scale by amplitude·sqrt(rcut).
+# poly3 only; uniform per-species hyperparameters.
 # =========================================================================
 
 
 def _N_a(alpha: int, rcut_hard: float = 1.0) -> float:
-    """Polynomial normalisation N_a (soap_turbo_radial.f90:38-52).
-
-    N_a(rcut, α) = sqrt(rcut / (2α + 5))
-    Used both inside the recursion and to relate raw integrals to basis-coeffs.
-    """
+    """Polynomial normalisation N_a = sqrt(rcut/(2α+5)) (soap_turbo_radial.f90:38-52)."""
     return float(np.sqrt(rcut_hard / (2.0 * alpha + 5.0)))
 
 
@@ -1385,10 +1142,8 @@ def _radial_first_integral(
 ) -> np.ndarray:
     """First-integral recursion over [0, rcut_soft]. Returns [alpha_max, P].
 
-    Mirrors soap_turbo_radial.f90:563-593. The α-index convention follows
-    the Fortran exactly: at iteration n=1..alpha_max we store I_np2 into
-    output index n-1 (Python 0-indexed). The state advances by one α per
-    iteration; the recursion is sequential in α but parallel in pairs.
+    Mirrors soap_turbo_radial.f90:563-593. Iteration n=1..alpha_max stores
+    I_np2 into output index n-1; sequential in α, parallel in pairs.
     """
     P = rjs.shape[0]
     sq2 = np.sqrt(2.0)
@@ -1440,9 +1195,8 @@ def _radial_second_integral(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Soft-cutoff filter contribution. Returns (temp2 [alpha_max, P], pref_f [P]).
 
-    Mirrors Fortran:611-645. For pairs satisfying (rcut_soft - rj) >= 4σ
-    we still compute (the result is small) and rely on pref_f being tiny;
-    the gating is enforced via near_cutoff_mask in the caller.
+    Mirrors Fortran:611-645. Computed for all pairs; caller gates via
+    near_cutoff_mask (far pairs have tiny pref_f anyway).
     """
     P = rjs.shape[0]
     sq2 = np.sqrt(2.0)
@@ -1494,14 +1248,9 @@ def _radial_amplitude(
     amplitude_scaling: float,
     radial_enhancement: int,
 ) -> np.ndarray:
-    """Per-pair amplitude factor. Fortran:189-231.
-
-    Encodes:
-      - cubic Hermite envelope (1 + 2rj³ - 3rj²)^amplitude_scaling
-      - the 1/atom_sigma_scaled factor
-      - central_weight for j == 1 pairs
-      - radial_enhancement {0, 1, 2} multipliers
-    """
+    """Per-pair amplitude (Fortran:189-231): Hermite envelope
+    (1+2rj³-3rj²)^amplitude_scaling / atom_sigma_scaled, ·central_weight for
+    central pairs, ·radial_enhancement {0,1,2} multiplier."""
     s2 = atom_sigma_scaled ** 2
     if amplitude_scaling == 0.0:
         amp = 1.0 / atom_sigma_scaled
@@ -1540,19 +1289,11 @@ def radial_expansion_coeff_poly3_numpy(
     W_single: np.ndarray,             # [alpha_max, alpha_max] for one species
     global_scaling: float = 1.0,
 ) -> np.ndarray:                      # [n_max, P]
-    """Compute radial expansion coefficients in the orthonormal basis.
+    """Radial expansion coefficients in the orthonormal basis.
 
-    Returns radial_exp_coeff [n_max, P] where n_max = n_species * alpha_max.
-    Row r belongs to species (r // alpha_max); only pairs whose neighbour
-    species matches that block contribute non-zero values.
-
-    All hyperparameters are uniform across species — multi-species support
-    in the Fortran allows different rcut/sigma per species, which is not
-    yet implemented here.
-
-    Pairs with rj >= rcut_hard contribute zero (caller is responsible for
-    masking these in the upstream pair list, but we also mask here for
-    safety).
+    Returns [n_max, P], n_max = n_species·alpha_max. Row r belongs to species
+    r//alpha_max; only neighbour-species-matching pairs contribute. Uniform
+    per-species hyperparameters. Pairs with rj >= rcut_hard contribute zero.
     """
     P = rjs.shape[0]
     n_max = n_species * alpha_max
@@ -1594,9 +1335,8 @@ def radial_expansion_coeff_poly3_numpy(
     # Mask out inactive pairs
     raw = raw * pair_active[None, :].astype(np.float64)
 
-    # Distribute to species blocks: for pair p with neighbour-species s,
-    # rows [s*alpha_max : (s+1)*alpha_max] receive raw[:, p].
-    # Other rows stay zero.
+    # Distribute to species blocks: pair p (neighbour-species s) fills rows
+    # [s*alpha_max : (s+1)*alpha_max]; other rows stay zero.
     radial = np.zeros((n_max, P), dtype=np.float64)
     for s in range(n_species):
         species_pair_mask = (pair_neighbour_species == s).astype(np.float64)  # [P]
@@ -1669,14 +1409,8 @@ def _validate_radial_first_integral_against_quadrature() -> None:
 
 
 def _validate_radial_second_integral_against_quadrature() -> None:
-    """The second-integral recursion's temp2 must satisfy a quadrature identity.
-
-    The Fortran second integral with prefactor pref_f represents:
-       pref_f * ∫_{rcut_soft}^{1} (1-r)^(α+2) * G(r - rj_f, σ_f) dr / N_a(α)
-    multiplied by the convolution prefactor. For total contribution we need
-    pref_f * temp2 to match a direct integral of polynomial * Gaussian
-    (the smoothing-filter version). Test by integrating directly.
-    """
+    """Second-integral recursion sanity: pref_f·temp2 finite, smooth, and
+    pref_f ∈ [0, 1]. (Direct filter quadrature not re-derived here.)"""
     rcut_hard = 6.0
     rcut_soft = 5.5
     atom_sigma_r = 0.5
@@ -1694,11 +1428,7 @@ def _validate_radial_second_integral_against_quadrature() -> None:
     atom_sigma_scaled = atom_sigma_n * np.ones_like(test_rj_n)
     temp2, pref_f = _radial_second_integral(test_rj_n, alpha_max, rcut_soft_n, atom_sigma_scaled, nf)
 
-    # Reference: pref_f * temp2 should equal the smoothed integral
-    # ∫_{rcut_soft}^{1} (1-r)^(α+2) G(r-rj, σ) * f(r) dr / N_a(α)
-    # where f is the Gaussian filter that spans the buffer zone. Direct
-    # quadrature isn't trivial without re-deriving the filter — instead,
-    # check that the result is finite, smooth, and zero at rj = rcut_soft.
+    # No direct filter quadrature; just check finiteness and pref_f range.
     if not np.all(np.isfinite(temp2)):
         raise AssertionError("second-integral recursion produced non-finite values")
     if not np.all(np.isfinite(pref_f)):
@@ -1748,9 +1478,7 @@ def _validate_radial_smooth_in_rj() -> None:
     )                                                                 # [4, 50]
     if not np.all(np.isfinite(radial)):
         raise AssertionError("non-finite radial coefficients")
-    # Jump test: max change between adjacent rj samples should be small relative
-    # to the typical magnitude. We use 10x the typical step magnitude as the
-    # outlier threshold.
+    # Jump test: adjacent-rj change > 10× the typical step flags a discontinuity.
     diffs = np.abs(np.diff(radial, axis=1))                           # [4, 49]
     typical = np.median(diffs, axis=1, keepdims=True)
     outliers = (diffs > 10 * (typical + 1e-12)).any(axis=0)
@@ -1839,19 +1567,11 @@ def run_phase2_validation() -> None:
 
 # =========================================================================
 # Phase 3 — Angular expansion coefficients (poly3 forward only)
-# =========================================================================
+# Fortran refs (soap_turbo_angular.f90): Plm 36-85, ilexp 256-315, eimphi
+# 200-224, assembly 368-458; preflm soap_turbo_functions.f90:202-228.
 #
-# Fortran reference:
-#   _get_plm_array         <- soap_turbo_angular.f90:36-85  (Plm via l-recursion)
-#   _get_ilexp             <- soap_turbo_angular.f90:256-315 (i_l(x²)·exp(-x²))
-#   _get_eimphi_factor     <- soap_turbo_angular.f90:200-224 (Chebyshev e^{-imφ})
-#   _get_preflm            <- soap_turbo_functions.f90:202-228 (Y_lm normalisation)
-#   angular_expansion_coeff <- soap_turbo_angular.f90:368-458 (assembly per pair)
-#
-# Flat indexing: k = l*(l+1)/2 + m  (0-based; Fortran is 1-based via k = 1+...)
-# k_max = (l_max+1)(l_max+2)/2.
-# Vectorised over pairs throughout — every per-pair scalar in the Fortran
-# becomes a [P]-shape NumPy array.
+# Flat index k = l(l+1)/2 + m (0-based); k_max = (l_max+1)(l_max+2)/2.
+# Vectorised over pairs: each Fortran per-pair scalar is a [P] array.
 # =========================================================================
 
 
@@ -2091,10 +1811,8 @@ def _validate_ilexp_finite_and_continuous() -> None:
     max_diff = diffs.max()
     print(f"   ilexp finite over x∈[1e-4, 31.6], 7 l-values; max adjacent diff = {max_diff:.3e}  PASS")
 
-    # Cross-check vs scipy.special.spherical_in. The Fortran's recursion is
-    # numerically noisy at small x for high l (cancellation in flm2 - (2l-1)/x²·flm1)
-    # but the source comment says "noise stays below 1e-7" — we match that bound.
-    # See soap_turbo_angular.f90:262 for the convention.
+    # Cross-check vs scipy.special.spherical_in; recursion is noisy at small
+    # x/high l but stays below 1e-7 (soap_turbo_angular.f90:262).
     import scipy.special as sps
     test_x = np.array([0.5, 1.0, 2.0, 3.0])
     out_mid = _get_ilexp(test_x, l_max=6)
@@ -2168,9 +1886,7 @@ def _validate_angular_finite_and_symmetric() -> None:
         if n_pairs == 0:
             continue
 
-        # Build (rj, theta, phi) per pair — relative to centre under PBC if periodic.
-        # For non-periodic structures (cell large), use direct displacements.
-        # For periodic, apply minimum-image convention.
+        # Build (rj, theta, phi) per pair; minimum-image if periodic.
         is_periodic = np.any(f["pbc"])
         rjs = np.zeros(n_pairs)
         thetas = np.zeros(n_pairs)
@@ -2258,15 +1974,9 @@ def run_phase3_validation() -> None:
 
 
 # =========================================================================
-# Phase 4 — cnk scatter-sum
-# =========================================================================
-#
-# Fortran reference: soap_turbo.f90:418-449
-#
+# Phase 4 — cnk scatter-sum (Fortran ref: soap_turbo.f90:418-449)
 # cnk[k, n, i] = 4π · Σ_{p ∈ neigh(i)} radial_exp[n, p] · angular_exp[k, p]
-#
-# This is a per-pair outer product followed by a segment-sum over centres.
-# np.add.at gives the (un-buffered) scatter-add we need.
+# Per-pair outer product then segment-sum over centres via np.add.at.
 # =========================================================================
 
 
@@ -2344,10 +2054,8 @@ def _compute_cnk_for_fixture(name: str) -> tuple[np.ndarray, dict]:
     rjs, thetas, phis = _build_pair_geometry_from_fixture(f)
     pair_atom = np.asarray(f["pair_atom"], dtype=np.int32)
     pair_gidx = np.asarray(f["pair_gidx"], dtype=np.int32)
-    # Strict self-pair: same atom AND zero displacement. In a periodic system,
-    # the same atom can also appear as a neighbour at non-zero image offset
-    # (rj > 0); those are regular neighbours, not the centre's "own pair".
-    # The Fortran's j==1 convention places the rj=0 self-pair first per centre.
+    # Strict self-pair (Fortran j==1): same atom AND rj=0. Image self-pairs
+    # (rj > 0) are regular neighbours.
     pair_is_central = (pair_atom == pair_gidx) & (rjs < 1e-10)
 
     # Neighbour species: map atomic number → index 0..n_species-1
@@ -2409,12 +2117,8 @@ def _validate_cnk_shape() -> None:
 
 
 def _validate_cnk_m0_is_real() -> None:
-    """For m=0 channels, cnk should be purely real (within fp noise).
-
-    Reason: at m=0 the angular coefficient `prefm[0] = 1` is real, so the
-    full angular expansion factor at m=0 is real (preflm * Plm * prefl[l]).
-    Multiplied by real radial_exp gives a real cnk.
-    """
+    """m=0 channels of cnk are purely real: prefm[0]=1 makes the angular
+    factor real, and radial_exp is real."""
     for name in ["water_monomer", "water_dimer", "h2_close"]:
         cnk, f = _compute_cnk_for_fixture(name)
         l_max = f["soap_params"]["l_max"]
@@ -2428,18 +2132,8 @@ def _validate_cnk_m0_is_real() -> None:
 
 
 def _validate_cnk_equivalence_under_symmetry() -> None:
-    """Equivalent atoms must give the same |cnk|.
-
-    Tested on non-periodic fixtures only:
-      - water_monomer: H atoms 1, 2 are mirror-related → equal |cnk|
-      - h2_close: atoms 0, 1 are identical → equal |cnk|
-
-    Periodic fixtures (si_bulk, si_dimer) require proper neighbour-list
-    image enumeration which is deferred to Phase 6 — quippy's pair list
-    contains multiple cell-image entries per (i, j) pair, which our MIC
-    reconstruction collapses to the minimum image. Phase 5's end-to-end
-    fixture comparison is the correctness gate for the full pipeline.
-    """
+    """Equivalent atoms give the same |cnk| (water_monomer H 1,2; h2_close
+    0,1). Non-periodic only; periodic image enumeration deferred to Phase 6."""
     cases = [
         ("water_monomer", [1, 2]),
         ("h2_close", [0, 1]),
@@ -2475,18 +2169,11 @@ def run_phase4_validation() -> None:
 
 # =========================================================================
 # Phase 5 — Power spectrum + end-to-end forward gate
-# =========================================================================
-#
-# Fortran reference: soap_turbo.f90:539-697
-#
-# Per atom i, the SOAP power spectrum is built by:
-#   this_soap[(n, n', l)] = Σ_m mult(n, n', m) · Re(cnk[k(l,m), n, i] · conj(cnk[k(l,m), n', i]))
-# over (n, n') in the upper triangle and l = 0..l_max, then sparse projection
-# via the compress mask, then L2-normalise per atom.
-#
-# This phase ends with the **end-to-end forward gate**: bit-exact comparison
-# of compute_soap_forward_numpy output against the Phase-0 quippy fixtures
-# for all non-periodic structures.
+# Fortran ref: soap_turbo.f90:539-697. Per atom i:
+#   this_soap[(n,n',l)] = Σ_m mult(n,n',m)·Re(cnk[k(l,m),n,i]·conj(cnk[k(l,m),n',i]))
+# over upper-triangle (n,n') and l=0..l_max, then compress + L2-normalise.
+# Ends with the forward gate: compute_soap_forward_numpy vs quippy fixtures
+# (non-periodic).
 # =========================================================================
 
 
@@ -2510,9 +2197,8 @@ def power_spectrum_numpy(
     n_unc = n_max * (n_max + 1) // 2 * (l_max + 1)
     this_soap = np.zeros((n_unc, n_sites), dtype=np.float64)
 
-    # Loop in Fortran order: outer n, then n', then l, then m.
-    # counter tracks position in skip_mask; counter2 tracks position in
-    # multiplicity_array (which only has entries for kept channels).
+    # Fortran order (n, n', l, m). counter → skip_mask; counter2 →
+    # multiplicity_array (kept channels only).
     counter = 0
     counter2 = 0
     for n in range(n_max):
@@ -2554,12 +2240,10 @@ def compute_soap_forward_numpy(
     *,
     nf: float = 4.0,              # smoothing-filter exponent (GPUMD default)
 ) -> np.ndarray:                  # [n_atoms, n_compressed] float64
-    """End-to-end forward SOAP-turbo for one structure.
+    """End-to-end forward SOAP-turbo for one structure (quippy pair list in).
 
-    Pair geometry is reconstructed from `(positions, cell, pbc)` via MIC.
-    Non-periodic structures are exact; for periodic structures with multiple
-    images per (i, j) within rcut, this collapses them — Phase 6 will replace
-    this with a proper image-enumerating neighbour-list builder.
+    Pair geometry reconstructed via MIC; exact for non-periodic. Periodic
+    multi-image pairs are collapsed (Phase 6 fixes this).
     """
     n_atoms = positions.shape[0]
     n_species = len(species_Z)
@@ -2649,14 +2333,8 @@ def compute_soap_forward_numpy(
 # --- Phase 5 validators --------------------------------------------------
 
 def _validate_soap_against_fixtures(atol: float = 1e-6, rtol: float = 1e-5) -> None:
-    """End-to-end forward gate.
-
-    Compare compute_soap_forward_numpy to quippy's saved descriptors for every
-    non-periodic fixture. Periodic fixtures (si_bulk, si_dimer) are skipped
-    until Phase 6 provides an image-enumerating neighbour-list builder; the
-    Phase 0 fixture validation already showed quippy's pair list contains
-    multiple cell images per (i, j) which our MIC reconstruction collapses.
-    """
+    """End-to-end forward gate: compute_soap_forward_numpy vs quippy
+    descriptors for non-periodic fixtures (periodic deferred to Phase 6)."""
     non_periodic = ["water_monomer", "water_dimer", "h2_close", "h2_far", "single_h"]
     max_err_overall = 0.0
     for name in non_periodic:
@@ -2693,23 +2371,11 @@ def run_phase5_validation() -> None:
 
 
 # =========================================================================
-# Phase 6 — Periodic neighbour-list builder + class skeleton
-# =========================================================================
-#
-# To make the Phase-5 forward gate pass for periodic fixtures we need a
-# pair-list builder that enumerates cell images. Quippy's pair list contains
-# multiple entries per (i, j) when several periodic images of j fall within
-# rcut of i — the MIC reconstruction in compute_soap_forward_numpy collapses
-# those to a single image, dropping signal.
-#
-# This phase adds:
-#   build_neighbour_list_numpy   - image-enumerating NL with rjs, θ, φ
-#   compute_soap_from_positions  - end-to-end forward without quippy pair list
-#   DescriptorBuilderGPU class skeleton (NumPy backend; TF lift deferred to Phase 10)
-#
-# The neighbour list searches a bounding box of cell images sized by
-# rcut * ||b_i|| where b_i are reciprocal-lattice vectors. For non-periodic
-# directions the search is restricted to image (0).
+# Phase 6 — Periodic neighbour-list builder
+# Image-enumerating pair list so the Phase-5 gate passes for periodic
+# fixtures (MIC collapses multi-image pairs). Adds build_neighbour_list_numpy
+# and compute_soap_from_positions_numpy (no quippy pair list). Image search
+# spans a box sized rcut·||b_i|| (reciprocal vectors); image 0 only if aperiodic.
 # =========================================================================
 
 
@@ -2721,21 +2387,11 @@ def build_neighbour_list_numpy(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Image-aware neighbour list (fully vectorised).
 
-    Returns (pair_atom, pair_gidx, rjs, thetas, phis), all shape [P]:
-        pair_atom : centre atom index (0-based)
-        pair_gidx : neighbour atom index (0-based)
-        rjs       : displacement length under image
-        thetas, phis : spherical angles of the displacement
-
-    Conventions:
-      - Self-pair for each centre (i, i, image=000) is emitted first, with rj=0.
-      - All real (i, j, image) triples with rj < rcut are emitted, including
-        multiple images of the same atom when applicable.
-
-    Implementation: builds the [N, N, N_img, 3] displacement tensor in one
-    broadcast, filters by rcut, then sorts by centre index. Replaces the prior
-    Python triple-nested loop, which dominated total per-frame time on small
-    structures.
+    Returns (pair_atom, pair_gidx, rjs, thetas, phis), all [P]. Each centre's
+    (i, i, image=000) self-pair (rj=0) is emitted first, then all
+    (i, j, image) with rj < rcut (including multiple images of one atom).
+    Builds the [N, N, N_img, 3] displacement tensor, filters by rcut, sorts
+    by centre.
     """
     n_atoms = positions.shape[0]
     is_periodic = bool(np.any(pbc))
@@ -2751,13 +2407,9 @@ def build_neighbour_list_numpy(
         else:
             b_norms = np.linalg.norm(cell_inv, axis=1)
             n_imgs = np.where(pbc, np.ceil(rcut * b_norms).astype(np.int32), 0)
-            # Wrap atom positions into the primary cell. Required when atoms
-            # sit far outside [0, L): the image-search range n_imgs only
-            # spans rcut worth of images around each atom's nominal position,
-            # so an unwrapped atom at p ≈ -3L would miss its real-image
-            # neighbours that the wrapped version finds. Quippy wraps
-            # internally; matching that here keeps both backends translation-
-            # invariant on the same input.
+            # Wrap into the primary cell: the image search only spans rcut
+            # around each atom, so unwrapped atoms would miss real neighbours.
+            # Matches quippy's internal wrap (translation invariance).
             frac = positions @ cell_inv
             frac -= np.floor(frac)
             positions = frac @ cell
@@ -2808,15 +2460,11 @@ def build_neighbour_list_numpy(
                           np.arctan2(disp_neigh[:, 1], disp_neigh[:, 0]),
                           0.0)
 
-    # Per-centre neighbour counts → insert self-pair at the start of each block.
-    # We build the final flat arrays of length n_atoms + len(i_neigh) directly.
+    # Insert each centre's self-pair at the start of its block; build the
+    # flat length-(n_atoms + len(i_neigh)) arrays by scatter assignment.
     n_per_centre = np.bincount(i_neigh, minlength=n_atoms).astype(np.int32)
     block_offsets = np.concatenate(([0], np.cumsum(n_per_centre + 1)))   # [n_atoms+1]
-    # Indices into the combined output for each block
     centre_self_pos = block_offsets[:-1]                                  # [n_atoms]
-    # neighbour-pair positions: each centre's neighbours go right after its self-pair
-    # We can compute per-pair output index from cumulative counts and intra-block index.
-    # Simpler: scatter assignment.
     P = int(block_offsets[-1])
     pair_atom = np.empty(P, dtype=np.int32)
     pair_gidx = np.empty(P, dtype=np.int32)
@@ -2831,10 +2479,8 @@ def build_neighbour_list_numpy(
     thetas[centre_self_pos] = 0.0
     phis[centre_self_pos] = 0.0
 
-    # Neighbour-pair output indices: for the k-th neighbour of centre i,
-    # destination index = block_offsets[i] + 1 + intra_index_within_block.
-    # i_neigh is already sorted by centre, so intra-block index is just a running
-    # counter that resets per centre. Use cumulative diff trick:
+    # Neighbour output index = block_offsets[i] + 1 + intra-block index
+    # (i_neigh sorted by centre, so intra-block is a per-centre running counter).
     intra_idx = np.arange(len(i_neigh), dtype=np.int32) - np.cumsum(n_per_centre)[i_neigh] + n_per_centre[i_neigh]
     neigh_pos = block_offsets[i_neigh] + 1 + intra_idx
     pair_atom[neigh_pos] = i_neigh
@@ -2855,11 +2501,8 @@ def compute_soap_from_positions_numpy(
     *,
     nf: float = 4.0,
 ) -> np.ndarray:
-    """End-to-end forward SOAP using our own neighbour-list builder.
-
-    No quippy required at runtime — pair geometry comes from
-    build_neighbour_list_numpy. Otherwise identical to compute_soap_forward_numpy.
-    """
+    """End-to-end forward SOAP via build_neighbour_list_numpy (no quippy).
+    Otherwise identical to compute_soap_forward_numpy."""
     n_atoms = positions.shape[0]
     n_species = len(species_Z)
     alpha_max = int(soap_params["alpha_max"])
@@ -2869,16 +2512,11 @@ def compute_soap_from_positions_numpy(
     pair_atom, pair_gidx, rjs, thetas, phis = build_neighbour_list_numpy(
         positions, cell, pbc, rcut_hard
     )
-    # Strict self-pair: same atom AND zero displacement. In a periodic system,
-    # the same atom can also appear as a neighbour at non-zero image offset
-    # (rj > 0); those are regular neighbours, not the centre's "own pair".
-    # The Fortran's j==1 convention places the rj=0 self-pair first per centre.
+    # Strict self-pair (Fortran j==1): same atom AND rj=0. Image self-pairs
+    # (rj > 0) are regular neighbours.
     pair_is_central = (pair_atom == pair_gidx) & (rjs < 1e-10)
     pair_active = rjs < rcut_hard
 
-    # Self-pairs need the (i, j) atom-index match too — but our NL marks them
-    # as the i==j case explicitly. The radial code's `is_central` check uses
-    # the `pair_is_central` boolean.
     z_to_idx = {int(z): idx for idx, z in enumerate(species_Z)}
     pair_neighbour_species = np.array(
         [z_to_idx[int(numbers[int(j)])] for j in pair_gidx], dtype=np.int32
@@ -2992,18 +2630,9 @@ def run_phase6_validation() -> None:
 
 # =========================================================================
 # Phase 7 — Radial derivatives (NumPy)
-# =========================================================================
-#
-# Fortran reference:
-#   first-integral derivative   <- soap_turbo_radial.f90:265-275, 594-604
-#   second-integral derivative  <- soap_turbo_radial.f90:315-336, 645-666
-#   amplitude_der               <- soap_turbo_radial.f90:196-231 (interleaved with amplitude)
-#   final assembly              <- soap_turbo_radial.f90:339-343, 360
-#
-# The derivative recursion needs temp1 / temp2 evaluated up to alpha_max+2
-# instead of alpha_max — provided by calling _radial_first_integral with the
-# extended limit. With rcut_hard=1 normalised internally, the chain-rule
-# coefficients reduce to ratios of N_a values.
+# Fortran refs (soap_turbo_radial.f90): first-int der 265-275/594-604,
+# second-int der 315-336/645-666, amplitude_der 196-231, assembly 339-360.
+# Needs temp1/temp2 up to alpha_max+2; chain-rule coeffs reduce to N_a ratios.
 # =========================================================================
 
 
@@ -3074,8 +2703,7 @@ def _radial_first_integral_der(
     """
     s2 = atom_sigma_scaled ** 2
     out = np.zeros((alpha_max, P := rjs.shape[0]), dtype=np.float64)
-    # Fortran's loop variable n maps to Python β-1 for the temp1 indices.
-    # n=1 (Fortran) → temp1[0], temp1[1], temp1[2]; etc.
+    # Fortran loop var n → Python β-1 for temp1 indices.
     rj_minus = rjs - 1.0                                              # (rj - rcut_hard)
     sigma_term = atom_sigma_scaling * rj_minus / atom_sigma_scaled
     for n_f in range(1, alpha_max + 1):
@@ -3200,11 +2828,8 @@ def radial_expansion_coeff_poly3_with_der_numpy(
     transformed = W_single @ combined
     raw = amplitude[None, :] * transformed * global_scaling * np.sqrt(rcut_hard)
 
-    # Derivative path
-    # Fortran exp_coeff_der_temp = (first-integral-chain-rule) + (second-integral-chain-rule
-    #                              with pref_f factor and der_pref_f*temp2 baked in by
-    #                              _radial_second_integral_der). Then the final assembly
-    # multiplies by amplitude and adds amplitude_der*(temp1 + pref_f*temp2).
+    # Derivative path: amplitude·(temp1_der + temp2_der) +
+    # amplitude_der·(temp1 + pref_f·temp2). temp2_der bakes in der_pref_f·temp2.
     temp1_der = _radial_first_integral_der(
         rj_n, temp1_ext, alpha_max, atom_sigma_scaled, atom_sigma_r_scaling
     )
@@ -3238,21 +2863,15 @@ def radial_expansion_coeff_poly3_with_der_numpy(
 # --- Phase 7 validators --------------------------------------------------
 
 def _validate_radial_der_via_finite_difference(eps: float = 1e-6) -> None:
-    """Finite-difference check of d(radial)/d(rj) for several rj values.
-
-    Pick a single pair at various rj values, compute radial via Phase 2's
-    forward function at rj±eps, take (R(+) - R(-))/(2eps), compare to the
-    analytical derivative. Tolerance grows with float64 noise: 1e-5 abs.
-    """
+    """FD check of d(radial)/d(rj): (R(rj+eps)-R(rj-eps))/2eps vs analytic."""
     rcut_hard = 6.0
     rcut_soft = 5.5
     atom_sigma_r = 0.5
     alpha_max = 4
     W = build_orthonormalization_matrix_poly3(alpha_max)
 
-    # Avoid rj values straddling the near-cutoff boundary (rj = rcut_soft - 4*σ ≈ 3.5).
-    # The Fortran's strict inequality creates a tiny pref_f discontinuity there,
-    # which pollutes finite-difference samples but is not a code bug.
+    # Avoid the near-cutoff boundary (rj ≈ rcut_soft - 4σ): the strict
+    # inequality there makes a tiny pref_f jump that pollutes FD (not a bug).
     test_rj = np.array([0.5, 1.5, 2.5, 3.0, 4.5, 5.0, 5.4, 5.7, 5.9])
     max_err = 0.0
     for rj in test_rj:
@@ -3323,19 +2942,11 @@ def run_phase7_validation() -> None:
 
 # =========================================================================
 # Phase 8 — Angular + cnk derivatives (NumPy)
-# =========================================================================
+# Fortran refs: plm_der soap_turbo_angular.f90:106-169, ilexp_der 329-356,
+# angular_with_der 225-244/440-447, cnk_with_der soap_turbo.f90:781-822.
 #
-# Fortran reference:
-#   _get_plm_array_der  <- soap_turbo_angular.f90:106-169
-#   _get_ilexp_der      <- soap_turbo_angular.f90:329-356
-#   angular_with_der    <- soap_turbo_angular.f90:225-244, 440-447
-#   aggregate_cnk_with_der <- soap_turbo.f90:781-822
-#
-# Conventions (matching the Fortran):
-#   exp_coeff_rad_der   = d(angular_exp_coeff)/d(rj)
-#   exp_coeff_pol_der   = -d(angular_exp_coeff)/d(theta)   (sign absorbed)
-#   exp_coeff_azi_der   = d(angular_exp_coeff)/d(phi) / sin(theta)
-# Plm derivatives use modified forms that absorb the sin(θ) singularity at the poles.
+# Conventions: rad_der = d/d(rj); pol_der = -d/d(theta); azi_der =
+# d/d(phi)/sin(theta). Plm derivatives absorb the sin(θ) pole singularity.
 # =========================================================================
 
 
@@ -3535,11 +3146,7 @@ def _validate_plm_der_against_fd(eps: float = 1e-6) -> None:
 
 
 def _validate_plm_div_sin_direct() -> None:
-    """plm_div_sin(l, m) should equal -m·P_lm/sin(θ) directly when sin(θ) is bounded.
-
-    Test at non-pole θ values; the recursion is identity-derived but we check it
-    matches the direct formula.
-    """
+    """plm_div_sin(l, m) = -m·P_lm/sin(θ), checked at non-pole θ."""
     test_theta = np.array([0.3, 0.7, 1.2, 1.7, 2.4, 2.8])
     l_max = 5
     max_err = 0.0
@@ -3730,22 +3337,14 @@ def run_phase8_validation() -> None:
 
 
 # =========================================================================
-# Phase 9 — Power-spectrum derivatives + Cartesian conversion + self-derivative
-# =========================================================================
+# Phase 9 — Power-spectrum derivatives + Cartesian + self-derivative
+# Fortran ref: soap_turbo.f90:583-697, 778-822.
 #
-# Fortran reference: soap_turbo.f90:583-697 plus the cnk derivative loop in
-# get_derivatives (lines 778-822).
-#
-# Pipeline per pair p:
-#   1. Build (n, n', l)-flat derivatives this_soap_*_der via product rule
-#      on cnk[k, n, i] · conj(cnk[k, n', i]), with n_max(n_max+1)/2 · (l_max+1)
-#      channels, summed over m=0..l with multiplicity.
-#   2. Sparse projection onto compressed channels via the trivial-mode P matrix.
-#   3. L2 normalisation derivative:
-#        soap_*_der → soap_*_der/||soap|| − soap·dot(soap, soap_*_der)/||soap||³
-#   4. Spherical → Cartesian via the standard Jacobian.
-#   5. Self-derivative aggregation: for the central pair (j == i) of each centre,
-#      grad = -Σ_{j ≠ i} grad_pair (translational invariance).
+# Per pair p: (1) product-rule (n,n',l)-flat derivatives from cnk·conj(cnk);
+# (2) sparse compression; (3) L2-norm derivative
+#   soap_*_der/||soap|| − soap·dot(soap, soap_*_der)/||soap||³;
+# (4) spherical→Cartesian Jacobian; (5) self-derivative: central-pair grad =
+# −Σ_{j≠i} grad_pair (translational invariance).
 # =========================================================================
 
 
@@ -3937,10 +3536,8 @@ def compute_soap_with_grad_from_positions_numpy(
     pair_atom, pair_gidx, rjs, thetas, phis = build_neighbour_list_numpy(
         positions, cell, pbc, rcut_hard
     )
-    # Strict self-pair: same atom AND zero displacement. In a periodic system,
-    # the same atom can also appear as a neighbour at non-zero image offset
-    # (rj > 0); those are regular neighbours, not the centre's "own pair".
-    # The Fortran's j==1 convention places the rj=0 self-pair first per centre.
+    # Strict self-pair (Fortran j==1): same atom AND rj=0. Image self-pairs
+    # (rj > 0) are regular neighbours.
     pair_is_central = (pair_atom == pair_gidx) & (rjs < 1e-10)
     pair_active = rjs < rcut_hard
 
@@ -4052,13 +3649,8 @@ def _validate_grad_via_finite_difference_water_monomer(eps: float = 1e-5) -> Non
 def _validate_grad_against_quippy_fixture_non_periodic(
     atol: float = 1e-5, rtol: float = 1e-4
 ) -> None:
-    """Compare Cartesian gradients to quippy fixture grad_values.
-
-    For non-periodic structures, our pair list and quippy's contain identical
-    (pair_atom, pair_gidx) sets but in possibly different order. We match
-    pairs by (pair_atom, pair_gidx) — the Phase 0 fixture validation already
-    showed these are unique for non-periodic systems.
-    """
+    """Compare Cartesian gradients to quippy grad_values, matching pairs by
+    (pair_atom, pair_gidx) (unique for non-periodic structures)."""
     for name in ["water_monomer", "water_dimer", "h2_close", "single_h"]:
         f = load_fixture(name)
         positions = np.asarray(f["positions"], dtype=np.float64)
@@ -4109,18 +3701,10 @@ def run_phase9_validation() -> None:
 class DescriptorBuilderGPU:
     """SOAP-turbo descriptor builder, drop-in for DescriptorBuilder (quippy).
 
-    Same `build_descriptors_flat(dataset)` API: returns a list of
-    (descriptors, grad_values, pair_atom, pair_gidx) tuples — one per frame —
-    matching the quippy-backed builder used by the trajectory pipeline.
-
-    Currently NumPy under the hood. The "GPU" suffix marks the eventual TF lift;
-    the algorithm and validation gates are already in place. A subsequent phase
-    would replace the per-frame NumPy calls with a batched TF graph.
-
-    Limitations (Phase 10):
-        - basis must be "poly3"  (poly3gauss / poly3operator deferred)
-        - compress_mode must be "trivial"  (Darby modes deferred)
-        - Per-species hyperparameters (alpha_max, rcut, σ, etc.) must be uniform.
+    Same build_descriptors_flat(dataset) API: a list of (descriptors,
+    grad_values, pair_atom, pair_gidx) tuples, one per frame. NumPy backend
+    ("GPU" marks the eventual TF lift). Requires basis='poly3',
+    compress_mode='trivial', and uniform per-species hyperparameters.
     """
 
     def __init__(self, cfg) -> None:
@@ -4229,12 +3813,9 @@ def _validate_class_against_quippy() -> None:
         f = load_fixture(name)
         quippy_soap = np.asarray(f["descriptors"], dtype=np.float32)
 
-        # The GPU builder uses the FULL union species ordering, but the quippy
-        # fixture was generated with that structure's species subset. Compare
-        # only the channels that overlap.
-        # For "single_h" (only H) the fixture has dim_q=20; our union (H,O) is 75.
-        # Skip these fixtures or compare descriptors invariantly via norms.
-        # Simpler: only compare frames where structure species == union species.
+        # Builder uses the union species ordering; the fixture uses the
+        # structure's subset (different dim_q). Compare descriptors only when
+        # structure species == union; else just check unit norms.
         struct_Z = sorted(set(int(z) for z in f["numbers"]))
         if struct_Z == all_Z:
             err = float(np.abs(soap - quippy_soap).max())

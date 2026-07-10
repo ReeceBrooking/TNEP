@@ -8,19 +8,14 @@ _has_gpu = (_cuda_visible not in ('', '-1')) or os.path.exists('/dev/nvidiactl')
 
 
 def _allocated_cpu_count() -> int:
-    """CPU cores this process may actually use.
+    """CPU cores this process may use.
 
-    On a CSC / Slurm allocation (i.e. when cfg.csc_enable is meant to be set —
-    CSC runs are always under Slurm) use ALL allocated cores so the CPU forward
-    pass saturates the node. The count is taken, in order, from
-    SLURM_CPUS_PER_TASK, then SLURM_CPUS_ON_NODE, then the cpuset affinity mask
-    Slurm pins the job to — never the ``//2`` heuristic, which silently halves
-    the node when ``--cpus-per-task`` was not passed. Off Slurm (local dev) fall
-    back to ``os.cpu_count() // 2`` to avoid hogging a shared workstation.
+    Under Slurm, use ALL allocated cores so the CPU forward pass saturates the
+    node: SLURM_CPUS_PER_TASK, then SLURM_CPUS_ON_NODE, then the cpuset affinity
+    mask — never the ``//2`` heuristic (which would halve the node when
+    ``--cpus-per-task`` was omitted). Off Slurm, use ``cpu_count() // 2`` to
+    avoid hogging a shared workstation.
     """
-    # An explicit Slurm CPU allocation always wins (regardless of whether
-    # SLURM_JOB_ID happens to be exported), so `--cpus-per-task` drives the
-    # thread count exactly.
     for _var in ('SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE'):
         _val = os.environ.get(_var)
         if _val:
@@ -29,26 +24,22 @@ def _allocated_cpu_count() -> int:
                 return max(int(_val.split('(')[0]), 1)
             except ValueError:
                 pass
-    # In a Slurm allocation without an explicit CPU count, use the cpuset
-    # affinity mask Slurm pins the job to (never the //2 heuristic).
+    # Slurm allocation without an explicit CPU count: use the affinity mask.
     if os.environ.get('SLURM_JOB_ID') or os.environ.get('SLURM_JOBID'):
         try:
             return max(len(os.sched_getaffinity(0)), 1)
         except AttributeError:                           # non-Linux
             pass
-    # Local dev (no Slurm): halve to avoid hogging a shared workstation.
     return max((os.cpu_count() or 2) // 2, 1)
 
 
 _cpu_threads = _allocated_cpu_count()
 
-# Threading budget. On a GPU run the heavy work happens on-device — the
-# main process's TF/OpenMP threads only handle data prep + small CPU
-# fallbacks, where >4 threads costs more in scheduler overhead than it
-# saves. On a CPU-only run (Mahti CPU partition: 128 EPYC cores) the
-# matmul-heavy forward pass executes on CPU and needs the full SLURM
-# allocation. NUMEXPR / OPENBLAS pinned so NumPy paths in data.py
-# don't quietly oversubscribe on Mahti's shared CPU node.
+# Threading budget. GPU run: >4 main-process threads cost more scheduler
+# overhead than they save (heavy work is on-device). CPU-only run: the
+# matmul-heavy forward pass needs the full Slurm allocation. NUMEXPR /
+# OPENBLAS pinned so NumPy paths in data.py don't oversubscribe.
+# NOTE: these env vars MUST be set before TensorFlow is imported below.
 _main_threads = 4 if _has_gpu else _cpu_threads
 os.environ['OMP_NUM_THREADS'] = str(_main_threads)
 os.environ['MKL_NUM_THREADS'] = str(_main_threads)
@@ -61,10 +52,9 @@ if _has_gpu:
 
 import tensorflow as tf
 
-# Memory growth: stops TF from grabbing the whole GPU at startup, so
-# shared queue nodes (Mahti gpusmall/gpumedium) can coexist with other
-# tenants. No-op on CPU-only runs. Wrapped in try because the call
-# fails if TF has already initialised the device.
+# Memory growth: stops TF grabbing the whole GPU at startup so shared queue
+# nodes can coexist with other tenants. No-op on CPU. try guards the case
+# where TF has already initialised the device.
 for _gpu in tf.config.list_physical_devices('GPU'):
     try:
         tf.config.experimental.set_memory_growth(_gpu, True)
@@ -90,29 +80,17 @@ from ase.io import read, iread, write
 
 
 def _apply_csc_overrides(cfg: TNEPconfig) -> None:
-    """When `cfg.csc_enable=True`, retune the cfg to the actual Mahti
-    hardware the job is running on. Two profiles:
+    """When `cfg.csc_enable=True`, retune chunk sizing to the Mahti hardware.
 
-    GPU partition (A100 40 GB, ~32 cores per GPU):
-        - drop population/batch chunking down to the natural minimum since
-          the A100 trivially fits the entire population on-device
-
-    CPU partition (128 EPYC cores, no GPU):
-        - pin data to host explicitly (`pin_data_to_cpu=True`) so the
-          chunk-staging branch doesn't try to upload to a phantom GPU
-        - keep chunk sizes modest because forward passes execute on CPU,
-          where larger chunks just inflate per-op latency without the
-          GPU's batching amortisation
-
-    All overrides are no-ops outside csc_enable mode (local development
-    config is untouched).
+    GPU profile: A100 fits the whole population on-device, so drop chunking to
+    the minimum. CPU profile: pin data to host (no GPU to upload to) and keep
+    chunk sizes modest since larger chunks just inflate per-op CPU latency.
+    No-op outside csc_enable mode.
     """
     if not getattr(cfg, "csc_enable", False):
         return
 
-    # Pick profile: explicit cfg.csc_profile override, else hardware
-    # auto-detection. "auto" picks GPU when /dev/nvidiactl exists or
-    # CUDA_VISIBLE_DEVICES is set (computed at module import time).
+    # Profile: explicit cfg.csc_profile, else "auto" hardware detection.
     requested = str(getattr(cfg, "csc_profile", "auto")).lower()
     if requested not in ("auto", "cpu", "gpu"):
         raise ValueError(
@@ -127,9 +105,7 @@ def _apply_csc_overrides(cfg: TNEPconfig) -> None:
 
     overrides: dict[str, object] = {}
     if use_gpu_profile:
-        # Mahti GPU partition tuning. These match the user's empirical
-        # finding (population_chunk_size=None, batch_chunk_size=2000)
-        # captured in the project_mahti_speedup memory.
+        # GPU tuning per project_mahti_speedup memory (empirical).
         overrides.update({
             "population_chunk_size": None,
             "batch_chunk_size": 2000,
@@ -137,11 +113,8 @@ def _apply_csc_overrides(cfg: TNEPconfig) -> None:
         })
         profile = "GPU"
     else:
-        # CPU partition: no device-side batching benefit, and the chunk-
-        # staging code path assumes a GPU. Force the data to live in
-        # host RAM (pin_data_to_cpu=True) so the forward path doesn't
-        # try to copy to a non-existent device. Smaller batch_chunk_size
-        # keeps per-op latency reasonable on the CPU executor.
+        # CPU partition: pin data to host (no GPU to copy to); smaller
+        # batch_chunk_size keeps per-op CPU latency reasonable.
         overrides.update({
             "population_chunk_size": 10,
             "batch_chunk_size": 500,
@@ -149,8 +122,6 @@ def _apply_csc_overrides(cfg: TNEPconfig) -> None:
         })
         profile = "CPU"
 
-    # Annotate the profile string when forced via cfg.csc_profile so the
-    # log line distinguishes auto-detected vs explicit overrides.
     if requested != "auto":
         profile = f"{profile} (forced via cfg.csc_profile={requested!r})"
     changed = []
@@ -169,36 +140,18 @@ def train_model(cfg: TNEPconfig | None = None,
     """Run full TNEP training pipeline: load, split, train, test, plot, save.
 
     Args:
-        cfg          : TNEPconfig or None (uses defaults). Ignored when
-                       `checkpoint` is set — the checkpoint embeds the
-                       full cfg used for the original run, including the
-                       train/val split (cfg.indices) and architecture
-                       fields. Continuing with a different cfg would
-                       break determinism or shape-match.
-        checkpoint   : optional path to a `checkpoint.h5` written by a
-                       previous run via `cfg.checkpoint_interval`. When
-                       provided, the cfg is loaded from the file and
-                       training resumes from `last_gen + 1`. Default
-                       None starts a fresh run.
-        extract_model: when True, skip the SNES training loop entirely
-                       and treat the checkpoint as if it were the final
-                       generation — build final_model and best_val_model
-                       directly from the checkpoint's μ and best_μ,
-                       then run scoring / saving / plotting exactly as
-                       a completed training run would. Requires
-                       `checkpoint` to be set (raises otherwise).
-                       Default False.
-        cfg_overrides: optional dict of cfg field → value to apply
-                       after `load_checkpoint`, BEFORE the model is
-                       built. Use this to repair old checkpoints whose
-                       saved JSON is missing fields (e.g. legacy
-                       checkpoints saved before the
-                       `_serialize_config` fix, where class-default
-                       fields like `num_neurons` and
-                       `descriptor_mixing_per_type` were not persisted).
-                       Without overrides, the current class defaults
-                       are used — which may not match the checkpoint's
-                       architecture, producing a μ-shape mismatch.
+        cfg          : TNEPconfig or None (defaults). Ignored when
+                       `checkpoint` is set (the checkpoint embeds its own cfg).
+        checkpoint   : optional path to a `checkpoint.h5`. When provided, cfg is
+                       loaded from it and training resumes from `last_gen + 1`.
+        extract_model: when True, skip the SNES loop and build final_model /
+                       best_val_model directly from the checkpoint's μ / best_μ,
+                       then score/save/plot as a completed run. Requires
+                       `checkpoint`.
+        cfg_overrides: optional dict of cfg field → value applied after
+                       load_checkpoint, before the model is built. Repairs old
+                       checkpoints whose saved JSON is missing architecture
+                       fields (else class defaults leak in → μ-shape mismatch).
 
     Returns:
         model  : trained TNEP model (access config via model.cfg)
@@ -217,12 +170,8 @@ def train_model(cfg: TNEPconfig | None = None,
         cfg, resume_state = load_checkpoint(checkpoint)
         if cfg_overrides:
             print(f"  applying cfg_overrides: {cfg_overrides}")
-            # Validate keys against the TNEPconfig annotations. A
-            # typo would otherwise create a brand-new instance
-            # attribute via setattr() and the user's intended
-            # override would silently never apply — visible only at
-            # the eventual dim-mismatch crash. Hard fail with a list
-            # of the known fields to make the typo obvious.
+            # Validate keys: a typo would otherwise create a new attribute
+            # via setattr and silently never apply. Hard fail on unknowns.
             valid_keys = set(getattr(TNEPconfig, "__annotations__", {}).keys())
             unknown = [k for k in cfg_overrides if k not in valid_keys]
             if unknown:
@@ -251,8 +200,7 @@ def train_model(cfg: TNEPconfig | None = None,
     elif cfg is None:
         cfg = TNEPconfig()
 
-    # CSC / Slurm-supercomputer mode: retune chunk sizing for the
-    # detected Mahti profile before any downstream code runs.
+    # CSC / Slurm mode: retune chunk sizing before downstream code runs.
     _apply_csc_overrides(cfg)
 
     return _train_model_inner(cfg, resume_state=resume_state,
@@ -263,32 +211,22 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
                    suffix_per_atom: str, suffix_total: str,
                    save_dir: str | None = None,
                    show: bool | None = None) -> None:
-    """Emit the standard correlation / cos-sim / error-vs-magnitude
-    plots for one (data, predictions, metrics) triple. Always emits
-    the per-atom variant; emits the total variant (per-atom × num_atoms)
-    only when target-scaling produced `total_*` keys in the metrics
-    dict (i.e. dipole/polarizability with cfg.scale_targets=True).
-    Cosine similarity is omitted from the total plots because it's
-    scale-invariant and already shown at per-atom scale.
+    """Emit correlation / cos-sim / error-vs-magnitude plots for one
+    (data, predictions, metrics) triple.
 
-    `save_dir` and `show` override cfg.save_plots / cfg.show_plots
-    when non-None — used by the periodic-plot callback (per-gen
-    subfolder) and by test_model (custom destination per call).
+    Always emits the per-atom variant; emits the total variant (per-atom ×
+    num_atoms) only when metrics contain `total_*` keys (scale_targets=True).
+    Cos-sim is omitted from total plots (scale-invariant). `save_dir` / `show`
+    override cfg.save_plots / cfg.show_plots when non-None.
     """
     targets = data["targets"].numpy()
     preds_np = preds.numpy()
     save = save_dir if save_dir is not None else cfg.save_plots
     show = show if show is not None else cfg.show_plots
 
-    # RRMSE is computed once from total-scale targets / total-scale RMSE
-    # and shown identically on both per-atom and total plots — RRMSE is
-    # a model-vs-dataset property that shouldn't depend on which scale
-    # the correlation panel happens to be drawn in.
-    #
-    # Definition: RRMSE = RMSE / std(ref). Algebraically equivalent to
-    # sqrt(1 - R²) and consistent with the SNES per-candidate form
-    # (SNES.py:2046). Per-component uses per-component std; overall
-    # uses std of the flattened target array.
+    # RRMSE = RMSE / std(ref) (≡ sqrt(1 - R²)), computed once from total-scale
+    # values and shown identically on per-atom and total plots. Per-component
+    # uses per-component std; overall uses the flattened target std.
     has_total = "total_rmse" in metrics
     if has_total:
         scale = data["num_atoms"].numpy().astype(np.float32)[:, np.newaxis]
@@ -323,9 +261,8 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
         "r2_components": metrics["total_r2_components"],
         **rrmse_payload,
     }
-    # Carry forward cos-sim annotations for plot_correlation; the
-    # standalone plot_cosine_similarity is intentionally omitted at
-    # total scale because cosine similarity is scale-invariant.
+    # Carry cos-sim annotations into plot_correlation; standalone cos-sim
+    # plot omitted at total scale (scale-invariant).
     if "cos_sim_all" in metrics:
         total_metrics["cos_sim_mean"] = metrics["cos_sim_mean"]
         total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
@@ -334,32 +271,26 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
 
 
 def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> None:
-    """Pre-stage per-chunk pair indices, then pick the chunk-staging
-    mode for each data dict based on `cfg.pin_data_to_cpu`:
+    """Pre-stage per-chunk pair indices and pick the staging mode per
+    `cfg.pin_data_to_cpu`.
 
-      pin_data_to_cpu=False : everything lives on /GPU:0. Move every
-        static field to GPU. The SNES eval / score loops then use the
-        pure-GPU `_stage_chunk_resident` fast path.
-
-      pin_data_to_cpu=True  : tensors stay on host. The passthrough
-        branch in `_stage_finalize_tf` slices each chunk on demand.
+    pin=False: move static fields to GPU; eval/score use the resident fast
+    path. pin=True: tensors stay on host and each chunk is sliced on demand.
     """
     from data import prestage_chunk_indices, move_data_to_gpu
 
     chunk = cfg.batch_chunk_size
     pin = bool(getattr(cfg, "pin_data_to_cpu", True))
 
-    # Pre-stage pair indices for every chunk range. Tiny tensors,
-    # GPU-resident, reused every generation.
+    # Pre-stage pair indices per chunk range. Tiny GPU-resident tensors.
     for d in (train_data, val_data):
         S = int(d["num_atoms"].shape[0])
         c = chunk if chunk is not None else S
         ranges = [(s, min(s + c, S)) for s in range(0, S, c)]
         prestage_chunk_indices(d, ranges)
 
-    # GPU-resident path. Moves all static fields on-device, then sets
-    # the `_gv_resident_gpu` flag that triggers `_stage_chunk_resident`
-    # in `prefetched_chunks`.
+    # GPU-resident path: move static fields on-device and set the flag that
+    # triggers `_stage_chunk_resident` in `prefetched_chunks`.
     if not pin:
         for d in (train_data, val_data):
             d["_gv_resident_gpu"] = True
@@ -367,12 +298,9 @@ def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> No
 
 
 def _print_param_breakdown(model) -> None:
-    """Print a per-layer breakdown of the SNES parameter budget.
-
-    Pulls the cached per-component counts from `model.optimizer` and
-    prints a table of (component → count → % of total). Polarisability
-    mirrors the primary ANN when target_mode == 2 (n_anns_total =
-    2 · n_primary).
+    """Print a per-layer breakdown (component → count → % of total) of the
+    SNES parameter budget. Polarisability mirrors the primary ANN when
+    target_mode == 2.
     """
     opt = model.optimizer
     cfg = model.cfg
@@ -416,20 +344,12 @@ def _print_param_breakdown(model) -> None:
 def _train_model_inner(cfg: TNEPconfig,
                         resume_state: dict | None = None,
                         extract_model: bool = False) -> TNEP:
-    """Body of train_model, factored out from the public entry point.
+    """Body of train_model.
 
-    On resume (`resume_state` provided), the train/val split is taken
-    from the checkpoint's `cfg.indices` rather than re-shuffled, and
-    the run directory setup is skipped so outputs land in the existing
-    model dir.
-
-    When `extract_model=True` (only valid with `resume_state`), the
-    SNES training loop is skipped entirely. `final_model` and
-    `best_val_model` are reconstructed from the checkpoint's μ and
-    best_μ, and the existing history (loaded from the checkpoint) is
-    passed through to the post-fit scoring / saving / plotting path
-    unchanged. The function then returns as if training had just
-    finished naturally.
+    On resume, the train/val split comes from the checkpoint's cfg.indices
+    (not re-shuffled) and run-directory setup is skipped. When
+    extract_model=True (resume only), the SNES loop is skipped and
+    final_model / best_val_model are rebuilt from the checkpoint's μ / best_μ.
     """
     # Load dataset, filter by species, then filter bad data
     dataset, dataset_types_int = collect(cfg)
@@ -440,12 +360,8 @@ def _train_model_inner(cfg: TNEPconfig,
     elif cfg.target_mode == 2:
         print_polarizability_statistics(dataset, target_key=_resolve_target_key(cfg))
 
-    # Resolve cfg.seed=None to a concrete, serialisable seed BEFORE any RNG
-    # is constructed (whether this is a fresh run or a resume from an old
-    # checkpoint that didn't persist its seed). Without this the actual
-    # entropy consumed by np.random.default_rng(None) / TF's
-    # non-deterministic generator is lost — and a resumed run from a
-    # pre-fix checkpoint would carry the unreproducibility forward.
+    # Resolve cfg.seed=None to a concrete, serialisable seed BEFORE any RNG is
+    # constructed, else the consumed entropy is lost and can't be reproduced.
     if cfg.seed is None:
         cfg.seed = int(
             np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
@@ -453,36 +369,23 @@ def _train_model_inner(cfg: TNEPconfig,
               f"reproducible seed: {cfg.seed}")
 
     if resume_state is not None and isinstance(getattr(cfg, "indices", None), np.ndarray):
-        # Indices already restored from checkpoint — would re-shuffle to
-        # the same values anyway (deterministic via cfg.seed for runs
-        # that persisted the resolved seed), but skipping makes the
-        # resume self-explanatory and avoids any surprise if the
-        # dataset was extended between runs.
+        # Reuse the checkpoint's split rather than re-shuffling.
         print(f"  resume: using checkpoint train/val split "
               f"({len(cfg.indices)} indices)")
     else:
         cfg.randomise(dataset)
 
-    # Split into train/val (built now) and a deferred test placeholder. The
-    # test descriptors are built on first scoring (materialize_test_data),
-    # not before training — saves time when the user aborts mid-run and
-    # avoids a large test-set descriptor build delaying generation 0.
+    # Split into train/val (built now) and a deferred test placeholder; test
+    # descriptors are built lazily on first scoring (materialize_test_data).
     train_data, test_pending, val_data = split(dataset, dataset_types_int, cfg)
 
-    # Resolve dim_q from cfg before any consumer (pad_and_stack) needs it.
-    # Cross-checked against built descriptor shape further down.
+    # Resolve dim_q before any consumer needs it; cross-checked below.
     from DescriptorBuilderGPU import compute_dim_q
     cfg.dim_q = compute_dim_q(cfg)
 
-    # Convert to padded dense tensors for GPU-batched evaluation. test_data
-    # is intentionally NOT padded here; it gets padded by materialize_test_data
-    # the first time it's actually consumed.
-    # When dipole_rij_power=0 (target_mode=1), only self-pair gradients
-    # contribute to the dipole sum — neighbour pairs would be multiplied
-    # by zero. Tell pad_and_stack to drop them at data-build time so
-    # grad_values shrinks from O(N·M) to O(N) per structure. Actual
-    # savings depend on the average neighbour count — the train_P /
-    # val_P counts logged below report the true post-filter pair count.
+    # Pad to dense tensors for GPU-batched eval (test_data padded lazily).
+    # When dipole_rij_power=0 (target_mode=1) only self-pairs contribute to
+    # the dipole sum, so drop neighbour pairs (grad_values O(N·M) → O(N)).
     _self_only = (cfg.target_mode == 1
                   and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
     train_data = pad_and_stack(
@@ -499,15 +402,13 @@ def _train_model_inner(cfg: TNEPconfig,
 
     _setup_grad_staging(cfg, train_data, val_data)
 
-    # Lazy-build helper. First call performs descriptor build + pad_and_stack;
-    # subsequent calls return the cached dict (idempotent on test_pending).
+    # Lazy test-data build; cached after the first call.
     def get_test_data():
         return materialize_test_data(test_pending, cfg,
                                      num_types=cfg.num_types,
                                      pin_to_cpu=cfg.pin_data_to_cpu)
 
-    # Cross-check: built descriptor shape must match cfg.dim_q resolved
-    # above. Catches cfg / builder drift before the SNES loop starts.
+    # Cross-check built descriptor shape vs cfg.dim_q (catches cfg/builder drift).
     built_dim_q = int(train_data["descriptors"][0].shape[-1])
     if built_dim_q != cfg.dim_q:
         raise RuntimeError(
@@ -515,10 +416,8 @@ def _train_model_inner(cfg: TNEPconfig,
             f"shape {built_dim_q}; cfg / builder mismatch.")
     print("Dimension of q: " + str(cfg.dim_q))
 
-    # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/
-    # On resume, save_path is already an existing run dir from the
-    # checkpoint — skip directory creation so outputs continue to land
-    # there and the original timestamped name is preserved.
+    # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
+    # On resume, reuse the checkpoint's existing run dir.
     if cfg.save_path is not None and resume_state is None:
         setup_run_directory(cfg)
     elif resume_state is not None and cfg.save_path is not None:
@@ -528,9 +427,8 @@ def _train_model_inner(cfg: TNEPconfig,
         print(f"  resume: writing outputs to existing run dir {run_dir}")
 
     model = TNEP(cfg)
-    # When preprocess contraction is on, cfg.dim_q has been overridden to
-    # the contracted Q_new (raw dim lives at cfg.dim_q_raw). Report the
-    # compression ratio so the effect of mode / l_keep / per_type is visible.
+    # With preprocess contraction on, cfg.dim_q is the contracted Q_new
+    # (raw at cfg.dim_q_raw); report the compression ratio.
     if getattr(cfg, "descriptor_preprocess_contract", "off") != "off":
         q_raw  = int(getattr(cfg, "dim_q_raw", cfg.dim_q))
         q_new  = int(cfg.dim_q)
@@ -545,10 +443,9 @@ def _train_model_inner(cfg: TNEPconfig,
     _print_param_breakdown(model)
 
     def periodic_plot_callback(history, gen):
-        """Called during training at plot_interval to show progress."""
+        """Called at plot_interval during training to show progress."""
         print(f"\n--- Periodic plots at generation {gen} ---")
-        # First periodic plot triggers the deferred test descriptor build;
-        # subsequent calls return the cached padded dict instantly.
+        # First call triggers the deferred test descriptor build.
         test_data = get_test_data()
         m, preds = model.score(test_data)
         print(f"  Test RMSE: {float(m['rmse']):.4f}  R²: {float(m['r2']):.4f}")
@@ -564,16 +461,12 @@ def _train_model_inner(cfg: TNEPconfig,
         _plot_eval_set(cfg, test_data, preds, m,
                        "per_atom", "total", save_dir=gen_save)
 
-    # Train — unless extract_model=True, in which case rebuild
-    # `final_model` and `best_val_model` straight from the
-    # checkpoint's μ / best_μ and reuse its history dict. The
-    # post-fit scoring + plotting code below runs unchanged.
+    # Train — unless extract_model=True, in which case rebuild final_model
+    # and best_val_model from the checkpoint's μ / best_μ and reuse its history.
     if extract_model:
         from SNES import _set_model_params
         if resume_state is None:
-            # Outer train_model already enforced this, but guard the
-            # internal contract too so a future caller of
-            # _train_model_inner can't trip the same wire silently.
+            # Guard the internal contract (outer train_model also enforces this).
             raise ValueError(
                 "_train_model_inner: extract_model=True requires "
                 "resume_state (μ / best_μ must come from a checkpoint).")
@@ -583,11 +476,8 @@ def _train_model_inner(cfg: TNEPconfig,
         snes = model.optimizer
         ckpt_dim = int(np.asarray(resume_state["mu"]).size)
         if ckpt_dim != int(snes.dim):
-            # Diagnose the most common cause: the saved cfg JSON is
-            # missing fields (legacy serializer bug or new fields
-            # introduced since save), so the model rebuilt from cfg
-            # has a different architecture than what produced the
-            # stored μ. Tell the user exactly what to do.
+            # μ dim mismatch: the checkpoint's cfg disagrees with the cfg used
+            # at save time on an architecture field (usually missing JSON fields).
             raise ValueError(
                 f"Checkpoint μ has dim {ckpt_dim} but the current model "
                 f"builds dim={snes.dim}. The cfg loaded from the "
@@ -617,13 +507,10 @@ def _train_model_inner(cfg: TNEPconfig,
         best_val_model = TNEP(cfg)
         _set_model_params(best_val_model, *best_val_params)
 
-        # Mirror SNES.fit's final restoration: keep the in-place
-        # `model` (and its optimizer) aligned with the best-val state
-        # so any downstream caller that re-uses `model` directly sees
-        # the best run-end configuration, matching post-fit behaviour.
+        # Mirror SNES.fit's final restoration: align in-place `model` and its
+        # optimizer with best-val so downstream reuse sees best run-end state.
         snes.mu.assign(best_mu)
-        # best_sigma may be absent/None in older resume snapshots; skip the
-        # assign rather than KeyError'ing on None.
+        # best_sigma may be absent in older snapshots; skip rather than error.
         if resume_state.get("best_sigma") is not None:
             snes.sigma.assign(tf.constant(
                 resume_state["best_sigma"], dtype=tf.float32))
@@ -636,19 +523,15 @@ def _train_model_inner(cfg: TNEPconfig,
             plot_callback=periodic_plot_callback if cfg.plot_interval else None,
             resume_state=resume_state)
 
-    # Build the test descriptors now (if not already built by a periodic
-    # plot during training), then score final + best-val on it.
+    # Build test descriptors (if not already built) and score both models.
     test_data = get_test_data()
 
-    # Score final-generation model
     final_metrics, final_preds = final_model.score(test_data)
     print_score_summary(final_metrics, cfg, prefix="Final-gen test set")
 
-    # Score best-val model
     metrics, test_preds = best_val_model.score(test_data)
     print_score_summary(metrics, cfg, prefix="Best-val test set")
 
-    # Save models and history
     if cfg.save_path is not None:
         save_model(best_val_model, cfg, cfg.save_path, label="best_val")
         save_model(final_model, cfg, cfg.save_path, label="final_gen")
@@ -659,10 +542,8 @@ def _train_model_inner(cfg: TNEPconfig,
     if timing:
         phases = ["sample_batch", "evaluate", "rank_update", "validate", "overhead"]
         grand = sum(sum(timing[p]) for p in phases)
-        # History is sampled once per val_interval, so n_recorded is the
-        # number of val ticks — not the total generation count. The
-        # per-tick averages are still representative of typical per-gen
-        # cost since each recorded tick is itself a single gen's timing.
+        # Sampled once per val_interval, so n_recorded is the val-tick count,
+        # not the generation count (each tick is one gen's timing).
         n_recorded = len(timing["evaluate"])
         print(f"\n=== Timing Breakdown ({grand:.2f}s sampled across "
               f"{n_recorded} val ticks, val_interval={cfg.val_interval}) ===")
@@ -679,9 +560,7 @@ def _train_model_inner(cfg: TNEPconfig,
     plot_loss_breakdown(history, cfg, cfg.save_plots, cfg.show_plots)
     plot_timing(history, cfg, cfg.save_plots, cfg.show_plots)
 
-    # Per-model × per-dataset correlation / error / cos-sim plots. Each
-    # combination produces a per-atom plot plus a "total" plot (per-atom
-    # values × num_atoms) when scale_targets is active.
+    # Per-model × per-dataset correlation / error / cos-sim plots.
     val_metrics, val_preds = best_val_model.score(val_data)
     _plot_eval_set(cfg, test_data, test_preds,  metrics,       "best_val_per_atom",     "best_val_total")
     _plot_eval_set(cfg, val_data,  val_preds,   val_metrics,   "best_val_val_per_atom", "best_val_val_total")
@@ -730,16 +609,8 @@ def test_model(
 
 def _count_xyz_frames(path: str) -> int:
     """Count frames in a trajectory file. Format-aware:
-
-    - XYZ / extXYZ : walk only the atom-count headers (no parsing).
-        Each frame is: <N> line, comment line, then N atom lines.
-        Read N, skip N+1 lines per frame.
-    - ASE binary .traj : use ase.io.trajectory.Trajectory which
-        supports len() directly without loading frames.
-    - Anything else : fall back to ase.io.iread (slower; streams the
-        file but discards each frame after counting).
-
-    Function name kept for back-compat.
+    XYZ/extXYZ walk atom-count headers (no parsing); .traj uses len(); anything
+    else falls back to ase.io.iread (slower).
     """
     ext = os.path.splitext(path)[1].lower()
 
@@ -765,9 +636,7 @@ def _count_xyz_frames(path: str) -> int:
                 n_frames += 1
         return n_frames
 
-    # Unknown extension — fall back to ASE's iterator. Streams the file
-    # without keeping frames; slower than the xyz/traj fast paths but
-    # works for any format ASE understands (e.g. .lammpstrj, .pdb).
+    # Unknown extension — fall back to ASE's streaming iterator.
     from ase.io import iread
     return sum(1 for _ in iread(path, index=":"))
 
@@ -794,52 +663,35 @@ def process_trajectory(
 ) -> dict:
     """Predict properties along an MD trajectory and compute spectra.
 
-    For dipole models (mode 1): predicts dipole trajectory and computes IR spectrum.
-    For polarizability models (mode 2): predicts polarizability trajectory and
-    computes Raman spectrum.
-
-    Frames are processed in batches: descriptors are built, inferred, and discarded
-    per batch so peak memory is O(batch_size) not O(all_frames).
+    Mode 1 (dipole): dipole trajectory → IR spectrum. Mode 2 (polarizability):
+    polarizability trajectory → Raman spectrum. Frames are processed in batches
+    so peak memory is O(batch_size), not O(all_frames).
 
     Args:
-        model           : trained TNEP model (config accessed via model.cfg)
-        trajectory_path : str — path to .xyz trajectory file
-        dt_fs           : float — MD timestep in femtoseconds
-        save_plots      : str or None — directory to save plot into (default "plots")
-        show_plots      : bool — True to display plot interactively (default False)
-        batch_size      : int or None — frames per inference batch; None processes
-                          the whole trajectory as one batch.
-        pin_to_cpu      : bool — place batch tensors on CPU instead of GPU.
-                          Required when a single batch's COO tensors exceed VRAM
-                          (large systems × large batch_size). Default True.
-        descriptor_mode : int or None — overrides cfg.descriptor_mode for this
-                          run only. 0 = quippy (CPU), 1 = native TF/GPU.
-                          None = use the value baked into model.cfg.
-        descriptor_batch_frames : int or None — frames per descriptor-builder
-                          TF graph call (mode 1 only). 1 = per-frame (default,
-                          lowest memory). int >= 2 = multi-frame batching for
-                          throughput. None = auto-size to
-                          descriptor_memory_budget_bytes (default 6 GiB).
-                          Quippy mode ignores this field.
-        descriptor_memory_budget_bytes : int or None — GPU memory budget
-                          (bytes) used by the auto-sizer when
-                          descriptor_batch_frames is None. None falls back to
-                          the builder's default (6 GiB). Quippy mode and
-                          explicit-int batch sizes ignore this field.
-        descriptor_precision : str or None — internal compute precision for
-                          the GPU descriptor kernels (mode 1 only):
-                          "float64" (default, mirrors Fortran reference),
-                          "float32" (~2× throughput, ~½ VRAM, slight loss of
-                          agreement vs quippy). None falls back to
-                          cfg.descriptor_precision. Outputs are always cast
-                          to float32 at the trajectory boundary regardless.
+        model           : trained TNEP model (config via model.cfg)
+        trajectory_path : path to .xyz trajectory file
+        dt_fs           : MD timestep in femtoseconds
+        save_plots      : directory to save plots into (default "plots")
+        show_plots      : display plots interactively (default False)
+        batch_size      : frames per inference batch; None = whole trajectory.
+        pin_to_cpu      : place batch tensors on CPU. Required when a batch's
+                          COO tensors exceed VRAM. Default True.
+        descriptor_mode : override cfg.descriptor_mode (0 = quippy CPU,
+                          1 = native TF/GPU). None uses model.cfg.
+        descriptor_batch_frames : frames per descriptor TF graph call (mode 1).
+                          1 = per-frame (lowest memory); >=2 batches for
+                          throughput; None auto-sizes to the memory budget.
+        descriptor_memory_budget_bytes : GPU budget for the auto-sizer when
+                          descriptor_batch_frames is None (default 6 GiB).
+        descriptor_precision : GPU kernel precision (mode 1): "float64"
+                          (default, mirrors Fortran) or "float32" (~2×
+                          throughput, ~½ VRAM). None uses cfg. Outputs are
+                          always cast to float32 at the trajectory boundary.
 
     Returns:
-        For mode 1 (dipole):
-            dict with keys: dipoles, freq_cm, intensity, power, acf
-        For mode 2 (polarizability):
-            dict with keys: polarizabilities, freq_cm, I_VV, I_VH, I_total,
-                            acf_iso, acf_aniso
+        Mode 1: dict(dipoles, freq_cm, intensity, power, acf)
+        Mode 2: dict(polarizabilities, freq_cm, I_VV, I_VH, I_total,
+                     acf_iso, acf_aniso)
     """
     cfg = model.cfg
 
@@ -851,35 +703,25 @@ def process_trajectory(
         os.makedirs(save_plots, exist_ok=True)
     stem = os.path.splitext(os.path.basename(trajectory_path))[0]
 
-    # Fast frame count (line-skip, no parsing) so the progress bar can show a total.
+    # Fast frame count so the progress bar can show a total.
     n_total = _count_xyz_frames(trajectory_path)
     print(f"Loaded {n_total} frames from {trajectory_path}")
     total_batches = (((n_total + batch_size - 1) // batch_size)
                      if batch_size else 1)
 
-    # One descriptor builder reused across all batches — quippy descriptors are
-    # expensive to construct, so we build once. The backend is selected by
-    # cfg.descriptor_mode (0 = quippy, 1 = native TF/GPU); the per-call
-    # `descriptor_mode` argument above overrides for this trajectory only.
+    # One descriptor builder reused across all batches (quippy is expensive to
+    # construct). Backend selected by descriptor_mode / cfg.descriptor_mode.
     builder = make_descriptor_builder(cfg, mode=descriptor_mode)
-    # Trajectory-time precision override: used by mode-1 builder only. Quippy
-    # backend simply ignores the kwarg via its existing build_descriptors_flat
-    # signature (memory_budget_bytes / precision are no-ops there).
+    # Precision override used by mode-1 builder only (quippy ignores it).
     _resolved_precision = (descriptor_precision
                            if descriptor_precision is not None
                            else getattr(cfg, "descriptor_precision", "float64"))
     print(f"Descriptor backend: {type(builder).__name__}  "
           f"(precision: {_resolved_precision})")
 
-    # Stream frames in fixed-size batches: build → pack → predict → append → drop.
-    # Only batch_size ASE Atoms exist in memory at any moment.
-    #
-    # Phase 6: a 2-deep prefetch ring buffer on a background thread overlaps
-    # ase.io.iread parsing with GPU compute. The producer also pre-runs
-    # assign_type_indices on the host so the consumer thread (which holds the
-    # GPU) doesn't pay that cost. _PREFETCH_DEPTH=2 keeps memory bounded to
-    # ~3 × batch_size ASE Atoms (current GPU batch + queued + producer's
-    # half-built batch).
+    # Stream frames in fixed-size batches (build → predict → drop). A 2-deep
+    # prefetch queue on a background thread overlaps iread parsing (+ host-side
+    # assign_type_indices) with GPU compute; memory stays ~3 × batch_size.
     import queue, threading
 
     _PREFETCH_DEPTH = 2
@@ -934,10 +776,8 @@ def process_trajectory(
     results = np.concatenate(result_batches, axis=0)
     del result_batches
 
-    # Resolve where to write trajectory outputs. dipoles / polarizabilities
-    # are always saved (binary .npy + human-readable .txt) so a long-running
-    # MD inference is never lost just because plotting was disabled. Default
-    # location: save_plots dir if set, else next to the trajectory file.
+    # Outputs always saved (.npy + .txt) so long MD inference isn't lost when
+    # plotting is off. Default location: save_plots, else next to the trajectory.
     if save_plots:
         out_dir = save_plots
     else:
@@ -956,9 +796,7 @@ def process_trajectory(
             dipoles, dt_fs=dt_fs,
             smooth_k=ir_smooth, smooth_kind=ir_smooth_kind,
             power_dc_cutoff_cm=ir_power_dc_cutoff_cm)
-        # Build a descriptive plot label: <trajectory_stem>_<model_stem>
-        # so multiple runs against different models or different
-        # trajectories don't overwrite each other.
+        # Plot label <trajectory>_<model> so runs don't overwrite each other.
         model_label = os.path.splitext(os.path.basename(
             getattr(cfg, "save_path", "") or "model"))[0]
         plot_ir_spectrum(freq_cm, intensity, cfg, save_plots, show_plots,
@@ -1054,13 +892,8 @@ def dump_dipole_predictions(model_path: str,
                              out_path: str = "datasets/dipole_test.out") -> None:
     """Score `model_path` on `test_xyz` and write per-atom dipoles to disk.
 
-    Output columns: pred_xyz | ref_xyz | N_atoms (whitespace-separated).
-    Targets and predictions are in per-atom space when cfg.scale_targets=True
-    (the default for dipole models).
-
-    Structures whose species are not a subset of the model's `cfg.types`
-    are silently dropped (with a summary line) — otherwise the model
-    would crash on the first unknown Z in `assign_type_indices`.
+    Output columns: pred_xyz | ref_xyz | N_atoms. Structures with species
+    outside the model's cfg.types are dropped (with a summary line).
     """
     model = load_model(model_path)
     cfg = model.cfg

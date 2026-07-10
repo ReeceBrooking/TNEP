@@ -8,49 +8,28 @@ from TNEPconfig import TNEPconfig
 from TNEP import TNEP
 
 
-# Backward-compat: when a saved model predates a config field, the live
-# TNEPconfig class default may have been changed since that model was
-# trained. Loading would then silently change the model's behaviour —
-# e.g. dipole_rij_power's class default is 0 (self-pair-only) but every
-# pre-2026-05-28 model was trained with the |r|^2·F (N=2) construction,
-# so loading one with the class default would evaluate it with the
-# wrong dipole formula.
-#
-# Policy: for every field listed here, if the saved config dict has no
-# value for it, override the class default with the value it implicitly
-# had before the field existed. Add new entries whenever a config flag
-# is introduced whose class default may diverge from its pre-existence
-# behaviour. (Fields whose class default already matches the legacy
-# behaviour are still listed for safety, so a future default-flip does
-# not silently regress old loads.)
-#
-# Note: the `_cr_*` cluster of CR-FM-NES checkpoint keys is intentionally
-# GUARDED OUT of this policy. They are not
-# config fields — they live in the `snes` h5 group as datasets/attrs.
-# Their absence from a saved file simply means the loaded model was not
-# trained with that feature (rank-1 / CR-FM-NES), so no override is
-# needed; the save / resume blocks key off the existence of the dataset
-# itself.
+# Backward-compat: if a saved model predates a config field, the live
+# TNEPconfig class default may have drifted since it was trained, silently
+# changing behaviour on load. For each field here, when the saved config
+# lacks it, restore the value it implicitly had before the field existed.
+# Fields whose default already matches are kept listed so a future
+# default-flip can't silently regress old loads.
+# (The `_cr_*` CR-FM-NES keys are deliberately NOT here — they're `snes`
+# group datasets, not config fields; their absence just means the model
+# wasn't trained with that feature.)
 _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
-    # Dipole construction. Pre-existence: only the N=2 path existed
-    # (Xu et al. JCTC 2024). Today's class default is 0 (experimental
-    # self-pair-only).
+    # Pre-existence: only the N=2 dipole path existed (Xu et al. JCTC 2024);
+    # class default is now 0.
     "dipole_rij_power": 2,
-    # --- Architecture-affecting fields (the silent-mismatch danger zone). ---
-    # Descriptor mixing layer (V_pair). Class default is True, but a
-    # pre-mixing model has NO U_pair in its weights file. If we let the
-    # True default through, TNEP builds a mixing layer with RANDOM weights
-    # and the model silently mis-predicts. Pre-existence value: no mixing.
+    # Architecture-affecting fields (silent-mismatch danger zone): a
+    # pre-mixing model has no U_pair, so letting the True default through
+    # would build a mixing layer with random weights and mis-predict.
     "descriptor_mixing": False,
     "descriptor_mixing_per_type": False,
     "descriptor_mixing_regularizer": "off",
-    # The original NEP/Xu et al. construction uses radial_enhancement=0
-    # (no extra (r+σ√(2/π))^N factor). Today's class default is 1.
-    # Old models lacking the field were trained without enhancement.
+    # Pre-existence: no radial enhancement (class default now 1).
     "radial_enhancement": 0,
-    # Descriptor preprocess contraction (per_type W_pre, l-channel
-    # collapse, species_pair / both modes). Pre-existence: no contraction
-    # — W0 lives at raw Q.
+    # Pre-existence: no preprocess contraction — W0 lives at raw Q.
     "descriptor_preprocess_contract": "off",
     "descriptor_preprocess_angular_l_keep": 1,
     "descriptor_preprocess_per_type": True,
@@ -58,19 +37,15 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "descriptor_preprocess_lambda_1": 0.0,
     "descriptor_preprocess_lambda_2": 0.0,
     "preprocess_sigma_scale": 1.0,
-    # NEP4-faithful rank-1 outer-product fold (descriptor_preprocess_contract
-    # == "nep4_radial"). Pre-existence: not present. Default None preserves
-    # Q_raw automatically — only consulted in the nep4_radial mode.
+    # Pre-existence: not present; None preserves Q_raw (nep4_radial mode only).
     "descriptor_nep4_n_max_out": None,
 }
 
 
 def _apply_legacy_field_defaults(cfg: TNEPconfig,
                                  saved_keys) -> None:
-    """For every field in `_LEGACY_FIELD_DEFAULTS` not present in the
-    saved config, set it to its pre-existence value on `cfg`. `saved_keys`
-    is the iterable of keys the loader actually restored (e.g.
-    `config_dict.keys()`), so genuine saved values are never overwritten.
+    """Set every `_LEGACY_FIELD_DEFAULTS` field absent from `saved_keys`
+    to its pre-existence value on `cfg`; genuine saved values are untouched.
     """
     saved = set(saved_keys)
     for field, legacy in _LEGACY_FIELD_DEFAULTS.items():
@@ -79,20 +54,10 @@ def _apply_legacy_field_defaults(cfg: TNEPconfig,
 
 
 def setup_run_directory(cfg: TNEPconfig) -> str:
-    """Create a run directory under models/ and configure cfg paths.
+    """Create a timestamped run directory under models/ (with plots/ and a
+    human-readable config.txt) and set cfg.save_path/save_plots in place.
 
-    Directory structure:
-        models/
-            n{neurons}_q{dim_q}_pop{pop_size}_{YYYYMMDD_HHMMSS}/
-                plots/
-                config.txt
-                (model .h5 saved here after training)
-
-    Requires cfg.dim_q to be set (call after descriptor building).
-    Updates cfg.save_path and cfg.save_plots in place.
-
-    Returns:
-        run_dir : str — path to the created run directory
+    Requires cfg.dim_q (call after descriptor building). Returns the run dir path.
     """
     from datetime import datetime
 
@@ -146,20 +111,12 @@ def _generate_model_filename(cfg: TNEPconfig) -> str:
 def _serialize_config(cfg: TNEPconfig) -> dict:
     """Convert TNEPconfig to a JSON-serialisable dict.
 
-    Walks `TNEPconfig.__annotations__` rather than `vars(cfg)` so that
-    fields whose value matches the class-level default are *also*
-    captured. Using `vars(cfg)` alone would miss any cfg field that
-    was never explicitly written to the instance — which is the common
-    case for fields that just use their default. Without this, a
-    checkpoint saved when the class default for e.g. `num_neurons`
-    was 30 would silently restore as whatever the current class
-    default is (e.g. 50), giving an architectural mismatch with the
-    saved μ.
+    Walks `__annotations__` (not just `vars(cfg)`) so fields left at their
+    class default are captured too — otherwise a restore would pick up the
+    current class default and mismatch the saved architecture/μ.
     """
-    # Annotated fields from TNEPconfig (class scope) + any extras the
-    # caller has stashed on the instance (runtime fields like
-    # `type_map`, `indices`, `dim_q`, etc., which are populated at
-    # data-load time and have no class-level default).
+    # Annotated class fields + any runtime extras stashed on the instance
+    # (type_map, indices, dim_q, ... — set at data-load time, no class default).
     field_names = set(getattr(type(cfg), "__annotations__", {}).keys())
     field_names.update(k for k in vars(cfg).keys() if not k.startswith("_"))
 
@@ -191,33 +148,16 @@ def _serialize_config(cfg: TNEPconfig) -> dict:
 
 def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
                label: str | None = None) -> None:
-    """Save trained TNEP model weights and config to an HDF5 (.h5) file.
+    """Save trained TNEP weights + config to an HDF5 (.h5) file.
 
-    File layout:
-        /                       — top-level attributes: target_mode, num_types,
-                                  num_neurons, dim_q, elements (quick inspection)
-        /weights/               — W0, b0, W1, b1 (+ pol variants for mode 2)
-        /descriptor/            — z_to_type_index
-        /config                 — full TNEPconfig serialised as JSON string
+    Layout: top-level attrs (target_mode, num_types, num_neurons, dim_q,
+    elements); /weights (W0,b0,W1,b1, + pol variants for mode 2); /descriptor
+    (z_to_type_index); /config (TNEPconfig as JSON string).
 
-    Load with:
-        import h5py
-        with h5py.File('model.h5', 'r') as f:
-            W0 = f['weights/W0'][:]
-            cfg_dict = json.loads(f['config'][()])
-
-    Note on Cayley parameterisation: when `cfg.descriptor_mixing_regularizer
-    == "cayley"`, the saved `/weights/U_pair` dataset holds the DENSE
-    reconstructed V (= U_cayley − I), NOT the upper-triangle skew-
-    symmetric A that SNES was searching over. Loading the model for
-    inference reuses the dense V directly — no Cayley re-derivation
-    occurs. Consequence: a Cayley-trained model file is essentially
-    an unregularised l_aware model at inference time, and
-    further fine-tuning under Cayley is NOT possible from this file
-    alone (the upper-triangle A is unrecoverable from the dense V
-    without inverting the Cayley map). To continue Cayley training,
-    resume from the `.h5_checkpoint` instead, where the SNES μ vector
-    (which holds A) is persisted.
+    Cayley note: under descriptor_mixing_regularizer=="cayley" the saved
+    U_pair holds the dense reconstructed V, not the skew-symmetric A SNES
+    searched — fine for inference, but Cayley fine-tuning must resume from the
+    .h5_checkpoint (which persists A in μ), since A is unrecoverable from V.
 
     Args:
         model : trained TNEP model
@@ -244,10 +184,6 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         f.attrs["num_types"] = cfg.num_types
         f.attrs["num_neurons"] = cfg.num_neurons
         f.attrs["dim_q"] = cfg.dim_q
-        # Store as a native int array attribute — h5py handles this
-        # directly (visible via `h5ls -v model.h5`), avoiding the JSON
-        # round-trip that the full `config` dataset below needs for
-        # heterogeneous dict serialisation.
         f.attrs["elements"] = np.asarray(cfg.types, dtype=np.int32)
 
         # Weights
@@ -261,21 +197,15 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             wg.create_dataset("b0_pol", data=model.b0_pol.numpy())
             wg.create_dataset("W1_pol", data=model.W1_pol.numpy())
             wg.create_dataset("b1_pol", data=model.b1_pol.numpy())
-        # Optional descriptor-mixing layer. Stored only when the model
-        # was trained with cfg.descriptor_mixing=True. The dataset
-        # named "U_pair" holds the residual V = U - I (the internal
-        # parameterisation); loaders fall back to V=0 (so U_full=I,
-        # a no-op mixing) when absent. The l_aware layout has shape
-        #   [num_pairs, L, max_α, max_α] (or +T leading for per-type).
-        # NOTE: checkpoints from before the V-residual switch stored
-        # identity-init U_pair; reloading those will be interpreted
-        # as V=I → U_full=2I and produce wrong predictions.
+        # Optional descriptor-mixing layer, stored only when trained with
+        # cfg.descriptor_mixing=True. Dataset "U_pair" holds the residual
+        # V = U - I; loaders fall back to V=0 (U_full=I, no-op) when absent.
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             wg.create_dataset("U_pair", data=model.U_pair.numpy())
 
-        # Optional preprocess contraction tail. Stored only when the
-        # model was trained with cfg.descriptor_preprocess_contract != "off".
-        # Loaders fall back to None (W_pre kept at init values) when absent.
+        # Optional preprocess contraction tail, stored only when trained with
+        # cfg.descriptor_preprocess_contract != "off". Loaders fall back to
+        # None (W_pre kept at init values) when absent.
         if (getattr(model, "descriptor_preprocess_contract", "off") != "off"
                 and getattr(model, "W_pre_angular", None) is not None):
             wg.create_dataset(
@@ -296,16 +226,10 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
 def save_history(history: dict, cfg: TNEPconfig) -> None:
     """Write training history to history.csv in the run directory.
 
-    Always-on columns:
-        generation, train_loss, val_loss, L1, L2,
-        best_rmse, worst_rmse, sigma_min, sigma_max, sigma_mean, sigma_median.
-
-    Optional columns (written when present in history):
-        best_rrmse, avg_rrmse, L_orth.
-
-    Columns shorter than `len(history["generation"])` are padded with
-    NaN so all rows have a value for every column (this happens after
-    a resume that loads an older checkpoint missing the new keys).
+    Always-on cols: generation, train_loss, val_loss, L1, L2, best_rmse,
+    worst_rmse, sigma_{min,max,mean,median}. Optional (if present):
+    best_rrmse, avg_rrmse, L_orth. Short columns are NaN-padded so every
+    row has a value (a resume from an older checkpoint may lack new keys).
     """
     run_dir = os.path.dirname(cfg.save_path) if cfg.save_path else "."
     path = os.path.join(run_dir, "history.csv")
@@ -347,16 +271,12 @@ def save_history(history: dict, cfg: TNEPconfig) -> None:
 
 def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
                     history: dict, last_gen: int) -> None:
-    """Write a rolling training checkpoint at `path`. Atomically
-    overwrites any existing checkpoint at the same path so a
-    half-written file can never confuse the loader.
+    """Write a rolling training checkpoint (config, descriptor map, SNES
+    state, and history) at `path`, replacing any existing file atomically.
 
-    `state` keys:
-        mu, sigma                 : tf.Variable / np.ndarray — current SNES distribution
-        best_mu, best_sigma       : tf.Tensor / np.ndarray — best-val params seen
-        best_val_loss             : float
-        gens_without_improvement  : int
-        tf_rng_state              : tf.Tensor / np.ndarray (optional) — Generator state
+    `state` keys: mu, sigma (current SNES distribution); best_mu, best_sigma
+    (best-val params); best_val_loss (float); gens_without_improvement (int);
+    tf_rng_state (optional Generator state).
     """
     config_dict = _serialize_config(cfg)
     z_to_type_index = np.array(
@@ -375,7 +295,6 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
         f.attrs["elements"] = np.asarray(cfg.types, dtype=np.int32)
         f.attrs["last_gen"] = int(last_gen)
         f.attrs["num_generations"] = int(cfg.num_generations)
-        # Full cfg + descriptor type map for sturdy reload
         f.create_dataset("config", data=json.dumps(config_dict))
         f.create_dataset("descriptor/z_to_type_index", data=z_to_type_index)
         # SNES state
@@ -383,9 +302,8 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
         sg.create_dataset("mu",         data=_np(state["mu"]))
         sg.create_dataset("sigma",      data=_np(state["sigma"]))
         sg.create_dataset("best_mu",    data=_np(state["best_mu"]))
-        # best_sigma is omitted by fit() when cov_mode="crfmnes" (the active
-        # scale lives in _cr_sig; there is no best_cr_sig snapshot).
-        # Vanilla SNES always includes it.
+        # best_sigma omitted under cov_mode="crfmnes" (scale lives in _cr_sig,
+        # no snapshot); vanilla SNES always includes it.
         if state.get("best_sigma") is not None:
             sg.create_dataset("best_sigma", data=_np(state["best_sigma"]))
         sg.attrs["best_val_loss"] = float(state["best_val_loss"])
@@ -413,16 +331,10 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
 
 
 def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
-    """Load a training checkpoint. Returns `(cfg, resume_state)` where
-    `cfg` is the fully-restored config (architecture + indices + run
-    params) and `resume_state` carries the SNES + history fields needed
-    to continue training from `last_gen + 1`.
-
-    The cfg returned is identical to the one that was running when the
-    checkpoint was written — the architecture-defining fields (dim_q,
-    num_types, types, type_map, etc.) and the train/val split (via
-    cfg.indices) come straight from the file. Any cfg passed by the
-    caller of `train_model` is ignored when `checkpoint=` is set.
+    """Load a training checkpoint. Returns `(cfg, resume_state)`: `cfg` is
+    the fully-restored config (architecture, indices, run params) exactly as
+    when written, and `resume_state` carries the SNES + history fields to
+    continue from `last_gen + 1`. Any caller-passed cfg is ignored.
     """
     cfg = TNEPconfig()
     with h5py.File(path, "r") as f:
@@ -433,12 +345,10 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
                 continue
             setattr(cfg, k, v)
         _apply_legacy_field_defaults(cfg, config_dict.keys())
-        # Restore types as Python ints (json may have int64 → int already
-        # via _serialize_config, but enforce here for old checkpoints).
+        # Enforce Python int types (belt-and-braces for old checkpoints).
         if hasattr(cfg, "types"):
             cfg.types = [int(z) for z in cfg.types]
-        # Indices come back as a list from json — coerce to ndarray so
-        # downstream code that indexes with cfg.indices keeps working.
+        # indices come back from json as a list — coerce to ndarray.
         if isinstance(getattr(cfg, "indices", None), list):
             cfg.indices = np.asarray(cfg.indices, dtype=np.int64)
         cfg.type_map = {int(row[0]): int(row[1])
@@ -450,8 +360,8 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
             "mu":         sg["mu"][:],
             "sigma":      sg["sigma"][:],
             "best_mu":    sg["best_mu"][:],
-            # best_sigma absent under cov_mode="crfmnes" (snapshot skipped on
-            # save); fit()'s resume block falls back to tf.identity(self.sigma).
+            # best_sigma absent under cov_mode="crfmnes"; resume falls back to
+            # tf.identity(self.sigma).
             "best_sigma": sg["best_sigma"][:] if "best_sigma" in sg else None,
             "best_val_loss":            float(sg.attrs["best_val_loss"]),
             "gens_without_improvement": int(sg.attrs["gens_without_improvement"]),
@@ -472,11 +382,9 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
                                       for tk in hg["timing"]}
             else:
                 history[k] = list(hg[k][:])
-    # Back-pad metric keys added since the checkpoint was written
-    # (best_rrmse, avg_rrmse, L_orth) with NaN to match the length of
-    # the generation column. Without this, downstream consumers that
-    # `zip(history["generation"], history["best_rrmse"])` silently
-    # truncate to the shorter list.
+    # NaN-back-pad metric keys added since the checkpoint was written
+    # (best_rrmse, avg_rrmse, L_orth) to the generation length, else
+    # downstream zip() against generation silently truncates.
     n_rows = len(history.get("generation", []))
     for k in ("best_rrmse", "avg_rrmse", "L_orth"):
         if k not in history:
@@ -500,19 +408,15 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
         model.b0_pol.assign(b0_pol)
         model.W1_pol.assign(W1_pol)
         model.b1_pol.assign(b1_pol)
-    # Optional V_pair restore (h5 dataset still named "U_pair" but
-    # holds V = U - I internally). When absent in the checkpoint
-    # (e.g. pre-mixing models, or mixing-disabled runs), the model
-    # keeps whatever V_pair its TNEP.__init__ produced (zero init)
-    # so U_full = I, reproducing the no-mixing path.
+    # Optional V_pair restore (h5 dataset "U_pair" holds V = U - I). When
+    # absent (pre-mixing or mixing-disabled runs), keep TNEP.__init__'s
+    # zero-init V (U_full = I, no-mixing path).
     if (U_pair is not None
             and getattr(model, "descriptor_mixing", False)
             and model.U_pair is not None):
         if tuple(U_pair.shape) != tuple(model.U_pair.shape):
-            # Hard fail rather than silently falling back to V=0
-            # (no mixing): a long restart that silently dropped the
-            # learned U_pair would look like training from scratch
-            # without warning anyone.
+            # Hard fail rather than silently dropping learned U_pair (which
+            # would masquerade as training from scratch).
             raise ValueError(
                 f"saved U_pair shape {tuple(U_pair.shape)} != "
                 f"model.U_pair shape {tuple(model.U_pair.shape)}. "
@@ -521,8 +425,8 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                 f"Re-train from scratch, or rebuild the cfg to match "
                 f"the saved model.")
         model.U_pair.assign(U_pair)
-    # Optional preprocess W_pre_angular restore. Pre-preprocess
-    # checkpoints don't have this dataset → keep the init-time values.
+    # Optional W_pre_angular restore. Absent in pre-preprocess checkpoints
+    # → keep init-time values.
     if (W_pre_angular is not None
             and getattr(model, "descriptor_preprocess_contract", "off") != "off"
             and getattr(model, "W_pre_angular", None) is not None):
@@ -551,8 +455,8 @@ def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
 def _load_model_h5(path: str) -> TNEP:
     cfg = TNEPconfig()
 
-    # Read everything into memory before constructing TNEP (which initialises
-    # quippy descriptors) so the file handle is closed as early as possible.
+    # Read everything before constructing TNEP (which initialises quippy
+    # descriptors) so the file handle closes early.
     with h5py.File(path, "r") as f:
         config_dict = json.loads(f["config"][()])
 
@@ -574,15 +478,11 @@ def _load_model_h5(path: str) -> TNEP:
 
     for k, v in config_dict.items():
         if k == "descriptor_mean":
-            # Legacy field — silently ignore on load (descriptor scaling
-            # has been removed from the runtime).
+            # Legacy field — descriptor scaling was removed; ignore.
             continue
         if k == "type_map":
-            # JSON stringifies dict keys, so the round-tripped value
-            # has str keys ("6": 0) instead of int. The authoritative
-            # int-keyed type_map was already built from the
-            # `descriptor/z_to_type_index` dataset above — don't
-            # overwrite it.
+            # JSON gives str keys; the authoritative int-keyed type_map was
+            # already built from descriptor/z_to_type_index above.
             continue
         setattr(cfg, k, v)
     _apply_legacy_field_defaults(cfg, config_dict.keys())
@@ -620,16 +520,14 @@ def _load_model_npz(path: str) -> TNEP:
             rc = float(data["rc"])
             cfg.rcut_hard = rc
             cfg.rcut_soft = rc - 0.5
-        # No config_json on these very old files → no field was saved,
-        # so EVERY legacy default applies.
+        # No config_json → no field saved, so every legacy default applies.
         _apply_legacy_field_defaults(cfg, [])
 
     cfg.type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}
 
-    # Cross-check descriptor_mixing vs saved weights so an npz that says
-    # "mixing on" but lacks the U_pair weights (or vice versa) fails loud
-    # rather than building a mixing layer with random/Glorot weights and
-    # silently mis-predicting.
+    # Cross-check descriptor_mixing vs saved weights: mismatch (mixing on
+    # but no U_pair, or vice versa) fails loud instead of silently
+    # mis-predicting with random weights.
     has_U_pair = "U_pair" in data.files
     if bool(getattr(cfg, "descriptor_mixing", False)) and not has_U_pair:
         raise ValueError(

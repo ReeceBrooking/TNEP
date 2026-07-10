@@ -5,12 +5,8 @@ import re
 
 import numpy as np
 
-# Headless-safe backend selection. On HPC compute nodes there's no
-# DISPLAY, and matplotlib's default tk/qt backends will fail at import
-# time when no GUI is available. Selecting Agg up front keeps the
-# pipeline working in batch jobs while still letting interactive use
-# (where DISPLAY is set or MPLBACKEND is user-specified) get the
-# default backend.
+# Select Agg when headless (no DISPLAY/MPLBACKEND) so batch jobs don't
+# fail at import; interactive use keeps the default backend.
 if not os.environ.get("MPLBACKEND") and not os.environ.get("DISPLAY"):
     import matplotlib
     matplotlib.use("Agg")
@@ -24,16 +20,9 @@ from data import component_labels
 def unit_label(cfg: TNEPconfig) -> str:
     """Return the unit string for the current target mode.
 
-    Dipole label follows the chosen training space:
-      - `cfg.convert_dipole_to_eangstrom=True` (default) → "e·Å"
-      - `False` → the dataset's native unit derived from
-        `cfg.dipole_units` ("e·Å", "e·a₀", or "Debye").
-
-    Args:
-        cfg : TNEPconfig
-
-    Returns:
-        str — "eV" (PES), dipole unit (mode 1), or "Å³" (polarisability).
+    Returns "eV" (PES), the dipole unit (mode 1), or "Å³" (polarisability).
+    Dipole is "e·Å" when convert_dipole_to_eangstrom is set, else the
+    dataset-native unit from cfg.dipole_units.
     """
     if cfg.target_mode == 0:
         return "eV"
@@ -52,16 +41,10 @@ def unit_label(cfg: TNEPconfig) -> str:
 
 
 def _make_plot_filename(cfg: TNEPconfig, plot_name: str) -> str:
-    """Generate an automatic filename for a plot based on config and plot name.
+    """Build an automatic plot filename from config and plot name.
 
-    Format: {plot_name}_mode{target_mode}_pop{pop_size}_n{num_neurons}_l{l_max}.png
-
-    Args:
-        cfg       : TNEPconfig
-        plot_name : str — short identifier for the plot type
-
-    Returns:
-        filename : str — e.g. "snes_fitness_mode1_pop80_n30_l4.png"
+    Format: {plot_name}_{mode}_pop{pop_size}_n{num_neurons}_l{l_max}.png
+    e.g. "snes_fitness_dipole_pop80_n30_l4.png".
     """
     mode_names = {0: "pes", 1: "dipole", 2: "polar"}
     mode = mode_names.get(cfg.target_mode, f"mode{cfg.target_mode}")
@@ -70,14 +53,7 @@ def _make_plot_filename(cfg: TNEPconfig, plot_name: str) -> str:
 
 
 def _save_fig(fig: plt.Figure, cfg: TNEPconfig, plot_name: str, save_dir: str | None) -> None:
-    """Save a figure to save_dir if set.
-
-    Args:
-        fig       : matplotlib Figure
-        cfg       : TNEPconfig — used for filename generation
-        plot_name : str — short identifier for the plot type
-        save_dir  : str or None — directory to save into (None = don't save)
-    """
+    """Save a figure to save_dir (no-op if save_dir is None)."""
     if save_dir is None:
         return
     os.makedirs(save_dir, exist_ok=True)
@@ -89,15 +65,7 @@ def _save_fig(fig: plt.Figure, cfg: TNEPconfig, plot_name: str, save_dir: str | 
 
 def _finish_fig(fig: plt.Figure, cfg: TNEPconfig, plot_name: str,
                 save_plots: str | None, show_plots: bool) -> None:
-    """Save, show, and/or close a figure.
-
-    Args:
-        fig        : matplotlib Figure
-        cfg        : TNEPconfig — used for filename generation
-        plot_name  : str — short identifier for the plot type
-        save_plots : str or None — directory to save into (None = don't save)
-        show_plots : bool — True to display interactively
-    """
+    """Save (if save_plots set), then show or close the figure."""
     _save_fig(fig, cfg, plot_name, save_plots)
     if show_plots:
         plt.show()
@@ -170,10 +138,9 @@ def plot_sigma_history(history: dict, cfg: TNEPconfig,
 def plot_loss_breakdown(history: dict, cfg: TNEPconfig,
                         save_plots: str | None = None,
                         show_plots: bool = True) -> None:
-    """Plot total loss with L1, L2 regularization and mean train RMSE on log-x scale.
+    """Plot total loss, train/val RMSE and L1/L2 terms vs generation (log-log).
 
-    Bails silently when L1/L2 history columns are missing (non-regularised
-    runs, older checkpoints, GAP history dicts).
+    Bails silently when L1/L2 history columns are missing.
     """
     if "L1" not in history or "L2" not in history:
         return
@@ -211,9 +178,8 @@ def plot_timing(history: dict, cfg: TNEPconfig,
     if not timing or not timing.get("evaluate"):
         return
 
-    # Use actual generation indices so the x-axis is correct under any
-    # val_interval. Falls back to record index only if generation
-    # wasn't recorded (older history dicts).
+    # Use actual generation indices (correct under any val_interval);
+    # fall back to record index for older history dicts.
     n = len(timing["evaluate"])
     gens_recorded = history.get("generation", [])
     g = (np.asarray(gens_recorded[:n])
@@ -284,28 +250,25 @@ def _build_suptitle(cfg: TNEPconfig, suffix: str | None,
 def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict,
                      cfg: TNEPconfig, save_plots: str | None = None,
                      show_plots: bool = True, suffix: str | None = None) -> None:
-    """Plot target vs prediction correlation with per-component R².
+    """Plot target vs prediction correlation, one panel per component.
 
-    For scalar targets (PES), plots a single correlation panel.
-    For vector targets (dipole [3] or polarizability [6]), plots one correlation
-    panel per component.
+    Scalar targets (PES) get a single panel; vector targets (dipole [3],
+    polarizability [6]) get one panel each.
 
     Args:
-        targets     : [S, T] numpy array of target values
-        predictions : [S, T] numpy array of predicted values
+        targets     : [S, T] target values
+        predictions : [S, T] predicted values
         metrics     : dict from TNEP.score() with r2, rmse, r2_components
-        cfg         : TNEPconfig — used to determine target mode and labels
-        save_plots  : str or None — directory to save into
-        show_plots  : bool — True to display interactively
+        cfg         : TNEPconfig
+        save_plots  : directory to save into (None = don't save)
+        show_plots  : True to display interactively
     """
     T = targets.shape[1]
     rmse = float(metrics["rmse"])
     r2 = float(metrics["r2"])
     r2_comp = metrics["r2_components"].numpy()
-    # RRMSE is provided pre-computed by the caller (always derived
-    # from total-scale RMSE / total-scale mean-|target|) so the same
-    # value appears on both per-atom and total panels — RRMSE is a
-    # model-vs-dataset property, not a scale-dependent quantity.
+    # RRMSE is pre-computed by the caller and scale-independent, so the
+    # same value appears on per-atom and total panels.
     rrmse = float(metrics["rrmse"])
     rrmse_comp = np.asarray(metrics["rrmse_components"])
 
@@ -352,14 +315,14 @@ def plot_cosine_similarity(metrics: dict, cfg: TNEPconfig,
                            save_plots: str | None = None,
                            show_plots: bool = True,
                            suffix: str | None = None) -> None:
-    """Plot cosine similarity histogram for vector targets.
+    """Plot cosine-similarity histogram for vector targets.
 
     Args:
         metrics    : dict from TNEP.score() with cos_sim_all, cos_sim_mean
         cfg        : TNEPconfig
-        save_plots : str or None — directory to save into
-        show_plots : bool — True to display interactively
-        suffix     : str or None — appended to filename
+        save_plots : directory to save into (None = don't save)
+        show_plots : True to display interactively
+        suffix     : appended to filename
     """
     if "cos_sim_all" not in metrics:
         return
@@ -385,19 +348,18 @@ def plot_cosine_similarity(metrics: dict, cfg: TNEPconfig,
 def plot_error_vs_magnitude(targets: np.ndarray, predictions: np.ndarray,
                             cfg: TNEPconfig, save_plots: str | None = None,
                             show_plots: bool = True, suffix: str | None = None) -> None:
-    """Plot per-structure absolute error vs target magnitude.
+    """Plot per-structure absolute error vs target magnitude with a linear fit.
 
-    For vector targets (dipole/polarizability), uses the norm of the full vector.
-    Helps diagnose whether errors are proportional to target scale (capacity-limited)
-    or constant (accuracy floor from descriptors/data).
+    Vector targets use the vector norm. Diagnoses whether errors scale with
+    target magnitude (capacity-limited) or are roughly constant (accuracy floor).
 
     Args:
-        targets     : [S, T] numpy array of target values
-        predictions : [S, T] numpy array of predicted values
+        targets     : [S, T] target values
+        predictions : [S, T] predicted values
         cfg         : TNEPconfig
-        save_plots  : str or None — directory to save into
-        show_plots  : bool — True to display interactively
-        suffix      : str or None — appended to filename
+        save_plots  : directory to save into (None = don't save)
+        show_plots  : True to display interactively
+        suffix      : appended to filename
     """
     T = targets.shape[1]
 
