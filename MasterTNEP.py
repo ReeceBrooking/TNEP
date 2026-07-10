@@ -6,11 +6,40 @@ import shutil
 import signal
 import tempfile
 
-_slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
-_cpu_threads = int(_slurm_cpus) if _slurm_cpus else max(os.cpu_count() // 2, 1)
-
 _cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
 _has_gpu = (_cuda_visible not in ('', '-1')) or os.path.exists('/dev/nvidiactl')
+
+
+def _allocated_cpu_count() -> int:
+    """CPU cores this process may actually use.
+
+    On a CSC / Slurm allocation (i.e. when cfg.csc_enable is meant to be set —
+    CSC runs are always under Slurm) use ALL allocated cores so the CPU forward
+    pass saturates the node. The count is taken, in order, from
+    SLURM_CPUS_PER_TASK, then SLURM_CPUS_ON_NODE, then the cpuset affinity mask
+    Slurm pins the job to — never the ``//2`` heuristic, which silently halves
+    the node when ``--cpus-per-task`` was not passed. Off Slurm (local dev) fall
+    back to ``os.cpu_count() // 2`` to avoid hogging a shared workstation.
+    """
+    on_slurm = bool(os.environ.get('SLURM_JOB_ID')
+                    or os.environ.get('SLURM_JOBID'))
+    if on_slurm:
+        for _var in ('SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE'):
+            _val = os.environ.get(_var)
+            if _val:
+                try:
+                    # SLURM_CPUS_ON_NODE is a plain int, but guard "128(x2)".
+                    return max(int(_val.split('(')[0]), 1)
+                except ValueError:
+                    pass
+        try:
+            return max(len(os.sched_getaffinity(0)), 1)  # respects the cpuset
+        except AttributeError:                           # non-Linux
+            pass
+    return max((os.cpu_count() or 2) // 2, 1)
+
+
+_cpu_threads = _allocated_cpu_count()
 
 # Threading budget. On a GPU run the heavy work happens on-device — the
 # main process's TF/OpenMP threads only handle data prep + small CPU
