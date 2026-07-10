@@ -72,17 +72,9 @@ class TNEP(layers.Layer):
                     "mutually exclusive with descriptor_mixing in this "
                     "build. Disable mixing or run nep4_radial standalone.")
         if self.descriptor_preprocess_contract != "off":
-            # Mixing composes with preprocess only in the l_aware
-            # architecture (where blocks are per (post-pair, l_post) and
-            # naturally map to the contracted Q_new structure). Other
-            # architectures still raise.
-            if bool(getattr(cfg, "descriptor_mixing", False)):
-                _arch = str(getattr(cfg, "descriptor_mixing_arch", "linear")).lower()
-                if _arch != "l_aware":
-                    raise NotImplementedError(
-                        f"descriptor_mixing_arch={_arch!r} does not compose "
-                        f"with descriptor_preprocess_contract in this build. "
-                        f"Set arch to 'l_aware' or disable preprocess.")
+            # Descriptor mixing composes with preprocess: blocks are per
+            # (post-pair, l_post) and naturally map to the contracted
+            # Q_new structure.
             from DescriptorBuilderGPU import (
                 descriptor_block_layout, descriptor_preprocess_layout)
             _layout_pre = descriptor_block_layout(cfg)
@@ -211,12 +203,6 @@ class TNEP(layers.Layer):
         self.descriptor_mixing = bool(getattr(cfg, "descriptor_mixing", False))
         self.descriptor_mixing_per_type = bool(
             getattr(cfg, "descriptor_mixing_per_type", False))
-        self.descriptor_mixing_arch = str(
-            getattr(cfg, "descriptor_mixing_arch", "linear")).lower()
-        if self.descriptor_mixing_arch not in ("linear", "l_aware", "cross_pair_l"):
-            raise ValueError(
-                f"descriptor_mixing_arch={self.descriptor_mixing_arch!r} not in "
-                "('linear', 'l_aware', 'cross_pair_l')")
         if self.descriptor_mixing:
             from DescriptorBuilderGPU import (
                 descriptor_block_layout,
@@ -233,181 +219,80 @@ class TNEP(layers.Layer):
                 self._mix_layout = descriptor_block_layout(cfg)
             self._mix_pair_keys = self._mix_layout["pair_keys"]
             self._mix_num_pairs = len(self._mix_pair_keys)
-            self._mix_max_block_size = int(self._mix_layout["max_block_size"])
-            self._mix_block_sizes = [
-                self._mix_layout["block_sizes"][k] for k in self._mix_pair_keys]
             self._mix_Q = int(self._mix_layout["dim_q"])
             T = cfg.num_types
-            # Build per-pair placement matrices P[p] ∈ R^{bs_p × Q}. Used
-            # by the "linear" arch; the "l_aware" arch builds finer
-            # per-(pair, l) placement matrices below in addition.
-            mix_P = []
-            for p_idx, k in enumerate(self._mix_pair_keys):
-                qidx = self._mix_layout["pair_q_index"][k]   # np.int32 [bs]
-                bs = qidx.size
-                P = np.zeros((bs, self._mix_Q), dtype=np.float32)
-                P[np.arange(bs), qidx] = 1.0
-                mix_P.append(tf.constant(P))
-            self._mix_P = mix_P
-            # Stacked projector [num_pairs, bs, Q] for the linear-arch
-            # fast path. Available only when all pairs share the same bs
-            # (the common case for fixed alpha_max / l_max). Replaces
-            # num_pairs separate einsums with one batched einsum.
-            if len(set(self._mix_block_sizes)) == 1:
-                bs0 = self._mix_block_sizes[0]
-                P_lin_stack = np.zeros(
-                    (self._mix_num_pairs, bs0, self._mix_Q),
-                    dtype=np.float32)
+            # Per-(pair, l) residual blocks. Within a pair, only
+            # radial channels at the same l mix; cross-l mixing is
+            # forbidden by construction. α_eff_per_pair from the
+            # descriptor layout gives the radial dimension; L =
+            # l_max + 1.
+            self._mix_alpha_per_pair = [
+                int(self._mix_layout["alpha_eff_per_pair"][k])
+                for k in self._mix_pair_keys]
+            self._mix_max_alpha = int(self._mix_layout["max_alpha_eff"])
+            # Use the layout's L_eff when present (post-preprocess
+            # layouts collapse l>l_keep into a single slot, so
+            # L_eff = l_keep + 1; the raw layout has no L_eff field
+            # and uses cfg.l_max+1).
+            self._mix_L = int(self._mix_layout.get("L_eff",
+                                                   int(cfg.l_max) + 1))
+            # Per-(pair, l) placement matrices P_{p,l} ∈ R^{α_p × Q}.
+            mix_P_ln: list[list[tf.Tensor]] = []
+            for k in self._mix_pair_keys:
+                per_pair: list[tf.Tensor] = []
+                for l in range(self._mix_L):
+                    qidx = self._mix_layout["pair_ln_index"][k][l]
+                    a = qidx.size
+                    P = np.zeros((a, self._mix_Q), dtype=np.float32)
+                    P[np.arange(a), qidx] = 1.0
+                    per_pair.append(tf.constant(P))
+                mix_P_ln.append(per_pair)
+            self._mix_P_ln = mix_P_ln
+            # Stacked projector for the batched _U_full einsum fast
+            # path: one tensor [num_pairs * L, α, Q] when α is uniform
+            # across pairs (the common case). Replaces num_pairs × L
+            # individual einsum launches with a single batched einsum.
+            # See _U_full for the contraction.
+            if len(set(self._mix_alpha_per_pair)) == 1:
+                alpha = self._mix_alpha_per_pair[0]
+                PL = self._mix_num_pairs * self._mix_L
+                P_stack = np.zeros((PL, alpha, self._mix_Q),
+                                   dtype=np.float32)
                 for p_idx, k in enumerate(self._mix_pair_keys):
-                    qidx = self._mix_layout["pair_q_index"][k]
-                    P_lin_stack[p_idx, np.arange(bs0), qidx] = 1.0
-                self._mix_P_stack = tf.constant(P_lin_stack)
-                self._mix_P_uniform_bs = bs0
-            else:
-                self._mix_P_stack = None
-                self._mix_P_uniform_bs = None
-
-            if self.descriptor_mixing_arch == "linear":
-                # U_pair stores the RESIDUAL V = U - I (deviation from
-                # identity). The effective per-pair mixing matrix is
-                # U_block = I_bs + V_block, so V starts at zero and the
-                # model begins bit-identical to a mixing-disabled baseline.
-                # Shape:
-                #   shared    : [num_pairs, max_bs, max_bs]
-                #   per-type  : [T, num_pairs, max_bs, max_bs]
-                if self.descriptor_mixing_per_type:
-                    shape = (T, self._mix_num_pairs,
-                             self._mix_max_block_size, self._mix_max_block_size)
-                else:
-                    shape = (self._mix_num_pairs,
-                             self._mix_max_block_size, self._mix_max_block_size)
-                # Build N stacked mixing layers. Layer 0 keeps the legacy
-                # name "U_pair" so save/load round-trips for N=1.
-                self.U_pair = self.add_weight(
-                    name="U_pair",
-                    shape=shape,
-                    initializer="zeros",
-                    trainable=True,
-                )
-            elif self.descriptor_mixing_arch == "l_aware":
-                # Per-(pair, l) residual blocks. Within a pair, only
-                # radial channels at the same l mix; cross-l mixing is
-                # forbidden by construction. α_eff_per_pair from the
-                # descriptor layout gives the radial dimension; L =
-                # l_max + 1.
-                self._mix_alpha_per_pair = [
-                    int(self._mix_layout["alpha_eff_per_pair"][k])
-                    for k in self._mix_pair_keys]
-                self._mix_max_alpha = int(self._mix_layout["max_alpha_eff"])
-                # Use the layout's L_eff when present (post-preprocess
-                # layouts collapse l>l_keep into a single slot, so
-                # L_eff = l_keep + 1; the raw layout has no L_eff field
-                # and uses cfg.l_max+1).
-                self._mix_L = int(self._mix_layout.get("L_eff",
-                                                       int(cfg.l_max) + 1))
-                # Per-(pair, l) placement matrices P_{p,l} ∈ R^{α_p × Q}.
-                mix_P_ln: list[list[tf.Tensor]] = []
-                for k in self._mix_pair_keys:
-                    per_pair: list[tf.Tensor] = []
                     for l in range(self._mix_L):
                         qidx = self._mix_layout["pair_ln_index"][k][l]
-                        a = qidx.size
-                        P = np.zeros((a, self._mix_Q), dtype=np.float32)
-                        P[np.arange(a), qidx] = 1.0
-                        per_pair.append(tf.constant(P))
-                    mix_P_ln.append(per_pair)
-                self._mix_P_ln = mix_P_ln
-                # Stacked projector for the batched _U_full einsum fast
-                # path: one tensor [num_pairs * L, α, Q] when α is uniform
-                # across pairs (the common case). Replaces num_pairs × L
-                # individual einsum launches with a single batched einsum.
-                # See _U_full for the contraction.
-                if len(set(self._mix_alpha_per_pair)) == 1:
-                    alpha = self._mix_alpha_per_pair[0]
-                    PL = self._mix_num_pairs * self._mix_L
-                    P_stack = np.zeros((PL, alpha, self._mix_Q),
-                                       dtype=np.float32)
-                    for p_idx, k in enumerate(self._mix_pair_keys):
-                        for l in range(self._mix_L):
-                            qidx = self._mix_layout["pair_ln_index"][k][l]
-                            row = p_idx * self._mix_L + l
-                            P_stack[row, np.arange(alpha), qidx] = 1.0
-                    self._mix_P_ln_stack = tf.constant(P_stack)
-                    self._mix_P_ln_uniform_alpha = alpha
-                else:
-                    self._mix_P_ln_stack = None
-                    self._mix_P_ln_uniform_alpha = None
-                # V_pair_l shape:
-                #   shared    : [num_pairs, L, max_α, max_α]
-                #   per-type  : [T, num_pairs, L, max_α, max_α]
-                # Padded to max_α so the storage has uniform stride;
-                # padded rows/cols stay zero and never affect the math.
-                if self.descriptor_mixing_per_type:
-                    shape = (T, self._mix_num_pairs, self._mix_L,
-                             self._mix_max_alpha, self._mix_max_alpha)
-                else:
-                    shape = (self._mix_num_pairs, self._mix_L,
-                             self._mix_max_alpha, self._mix_max_alpha)
-                self.U_pair = self.add_weight(
-                    name="U_pair",
-                    shape=shape,
-                    initializer="zeros",
-                    trainable=True,
-                )
-            else:  # cross_pair_l
-                # One [N_l × N_l] residual matrix per angular momentum,
-                # where N_l = Σ_p α_eff_p. Mixes radial channels at the
-                # same l across all species pairs; cross-l mixing is
-                # forbidden by construction. Strictly more expressive
-                # than l_aware (l_aware ⊂ cross_pair_l: block-diagonal
-                # cross_pair_l recovers l_aware).
-                self._mix_L = int(cfg.l_max) + 1
-                self._mix_N_per_l = int(self._mix_layout["N_per_l"])
-                # Per-l placement matrices P_l ∈ R^{N_l × Q}.
-                mix_P_l: list[tf.Tensor] = []
-                for l in range(self._mix_L):
-                    qidx = self._mix_layout["l_index"][l]   # [N_l]
-                    P = np.zeros((self._mix_N_per_l, self._mix_Q),
-                                 dtype=np.float32)
-                    P[np.arange(self._mix_N_per_l), qidx] = 1.0
-                    mix_P_l.append(tf.constant(P))
-                self._mix_P_l = mix_P_l
-                # Stacked projector [L, N_l, Q] — N_l is uniform across
-                # l by descriptor_block_layout's invariant, so the stack
-                # is always available for the batched _U_full fast path.
-                P_stack = np.stack([P.numpy() for P in mix_P_l], axis=0)
-                self._mix_P_l_stack = tf.constant(P_stack)
-                # V shape:
-                #   shared    : [L, N_l, N_l]
-                #   per-type  : [T, L, N_l, N_l]
-                # No padding needed — N_l is uniform across l.
-                if self.descriptor_mixing_per_type:
-                    shape = (T, self._mix_L,
-                             self._mix_N_per_l, self._mix_N_per_l)
-                else:
-                    shape = (self._mix_L,
-                             self._mix_N_per_l, self._mix_N_per_l)
-                self.U_pair = self.add_weight(
-                    name="U_pair",
-                    shape=shape,
-                    initializer="zeros",
-                    trainable=True,
-                )
+                        row = p_idx * self._mix_L + l
+                        P_stack[row, np.arange(alpha), qidx] = 1.0
+                self._mix_P_ln_stack = tf.constant(P_stack)
+                self._mix_P_ln_uniform_alpha = alpha
+            else:
+                self._mix_P_ln_stack = None
+                self._mix_P_ln_uniform_alpha = None
+            # V_pair_l shape:
+            #   shared    : [num_pairs, L, max_α, max_α]
+            #   per-type  : [T, num_pairs, L, max_α, max_α]
+            # Padded to max_α so the storage has uniform stride;
+            # padded rows/cols stay zero and never affect the math.
+            if self.descriptor_mixing_per_type:
+                shape = (T, self._mix_num_pairs, self._mix_L,
+                         self._mix_max_alpha, self._mix_max_alpha)
+            else:
+                shape = (self._mix_num_pairs, self._mix_L,
+                         self._mix_max_alpha, self._mix_max_alpha)
+            self.U_pair = self.add_weight(
+                name="U_pair",
+                shape=shape,
+                initializer="zeros",
+                trainable=True,
+            )
         else:
             self.U_pair = None
-            self._mix_P = []
-            self._mix_block_sizes = []
 
         # Preprocessing contraction (phase 2 of 2): Variable allocation
         # and mutual-exclusion guards. cfg.dim_q has already been
         # overridden in phase 1 at the top of __init__ so W0 above is
         # sized at Q_new.
         if self.descriptor_preprocess_contract != "off":
-            if self.descriptor_mixing and self.descriptor_mixing_arch != "l_aware":
-                raise NotImplementedError(
-                    f"descriptor_mixing_arch={self.descriptor_mixing_arch!r} "
-                    f"does not compose with descriptor_preprocess_contract in "
-                    f"this build. Set arch to 'l_aware' or disable preprocess.")
             init_scheme = str(getattr(cfg, "descriptor_preprocess_init", "mean"))
             T_pre = int(cfg.num_types)
             self.preprocess_per_type = bool(getattr(
@@ -632,112 +517,46 @@ class TNEP(layers.Layer):
     def _U_full(self, U_pair: tf.Tensor | None = None) -> tf.Tensor:
         """Assemble the full block-diagonal mixing matrix.
 
-        Dispatches on `descriptor_mixing_arch`:
-          - "linear" : one [bs_p × bs_p] block per pair, mixing all
-                       (n, l) channels of that pair.
-                  U_full = I_Q + Σ_p P_pᵀ · V_p · P_p
-          - "l_aware": (l_max+1) [α_p × α_p] sub-blocks per pair, one
-                       per angular momentum. Cross-l mixing forbidden.
-                  U_full = I_Q + Σ_p Σ_l P_{p,l}ᵀ · V_{p,l} · P_{p,l}
+        l_aware architecture: (l_max+1) [α_p × α_p] sub-blocks per pair,
+        one per angular momentum. Cross-l mixing forbidden.
+            U_full = I_Q + Σ_p Σ_l P_{p,l}ᵀ · V_{p,l} · P_{p,l}
 
-        In both cases `tf.eye(Q)` broadcasts across leading batch dims
-        so the same code handles single / per-candidate × shared /
-        per-type. With V initialised at zero, U_full == I_Q at gen 0.
+        `tf.eye(Q)` broadcasts across leading batch dims so the same code
+        handles single / per-candidate × shared / per-type. With V
+        initialised at zero, U_full == I_Q at gen 0.
         """
         V = self.U_pair if U_pair is None else U_pair
-        if self.descriptor_mixing_arch == "linear":
-            # Fast path: uniform bs across pairs. One batched einsum over
-            # P:[num_pairs, bs, Q], V:[..., num_pairs, bs, bs].
-            if self._mix_P_stack is not None:
-                bs = self._mix_P_uniform_bs
-                # Slice V to the active bs×bs (padding stays zero anyway,
-                # but the explicit slice avoids touching it).
-                V_active = V[..., :bs, :bs]
-                # Output q-axes labelled i, m. Contraction axes:
-                # p=pair, j=bs (first projector), k=bs (second projector).
-                V_full = tf.einsum(
-                    'pji,...pjk,pkm->...im',
-                    self._mix_P_stack, V_active, self._mix_P_stack)
-                return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-            # Fallback: non-uniform bs.
-            parts = []
-            for p_idx, (P, bs) in enumerate(zip(self._mix_P, self._mix_block_sizes)):
-                V_block = V[..., p_idx, :bs, :bs]                            # [..., bs, bs]
-                placed = tf.einsum('ji,...jk,kl->...il', P, V_block, P)      # [..., Q, Q]
+        # V shape: [..., (T?), num_pairs, L, max_α, max_α].
+        # Fast path: uniform α across pairs. Flatten (num_pairs, L)
+        # → PL and run one batched einsum over the stacked projector
+        # P:[PL, α, Q], V:[..., PL, α, α].
+        if self._mix_P_ln_stack is not None:
+            alpha = self._mix_P_ln_uniform_alpha
+            PL = self._mix_num_pairs * self._mix_L
+            # Slice off the (max_α − α) padding rows/cols.
+            V_active = V[..., :alpha, :alpha]
+            # Reshape (num_pairs, L) → PL. Preserve leading batch
+            # dims (which may include candidate axis C and/or type
+            # axis T) via dynamic-shape concat.
+            new_shape = tf.concat(
+                [tf.shape(V_active)[:-4], [PL, alpha, alpha]], axis=0)
+            V_flat = tf.reshape(V_active, new_shape)
+            # Output q-axes labelled i, m. Contraction:
+            # p=PL (pair, l), j=α (first proj), k=α (second proj).
+            V_full = tf.einsum(
+                'pji,...pjk,pkm->...im',
+                self._mix_P_ln_stack, V_flat, self._mix_P_ln_stack)
+            return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
+        # Fallback: non-uniform α.
+        parts = []
+        for p_idx, alpha_p in enumerate(self._mix_alpha_per_pair):
+            for l in range(self._mix_L):
+                V_block = V[..., p_idx, l, :alpha_p, :alpha_p]            # [..., α_p, α_p]
+                P_pl = self._mix_P_ln[p_idx][l]                            # [α_p, Q]
+                placed = tf.einsum('ji,...jk,kl->...il', P_pl, V_block, P_pl)
                 parts.append(placed)
-            V_full = tf.add_n(parts)
-            return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-        if self.descriptor_mixing_arch == "l_aware":
-            # V shape: [..., (T?), num_pairs, L, max_α, max_α].
-            # Fast path: uniform α across pairs. Flatten (num_pairs, L)
-            # → PL and run one batched einsum over the stacked projector
-            # P:[PL, α, Q], V:[..., PL, α, α].
-            if self._mix_P_ln_stack is not None:
-                alpha = self._mix_P_ln_uniform_alpha
-                PL = self._mix_num_pairs * self._mix_L
-                # Slice off the (max_α − α) padding rows/cols.
-                V_active = V[..., :alpha, :alpha]
-                # Reshape (num_pairs, L) → PL. Preserve leading batch
-                # dims (which may include candidate axis C and/or type
-                # axis T) via dynamic-shape concat.
-                new_shape = tf.concat(
-                    [tf.shape(V_active)[:-4], [PL, alpha, alpha]], axis=0)
-                V_flat = tf.reshape(V_active, new_shape)
-                # Output q-axes labelled i, m. Contraction:
-                # p=PL (pair, l), j=α (first proj), k=α (second proj).
-                V_full = tf.einsum(
-                    'pji,...pjk,pkm->...im',
-                    self._mix_P_ln_stack, V_flat, self._mix_P_ln_stack)
-                return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-            # Fallback: non-uniform α.
-            parts = []
-            for p_idx, alpha_p in enumerate(self._mix_alpha_per_pair):
-                for l in range(self._mix_L):
-                    V_block = V[..., p_idx, l, :alpha_p, :alpha_p]            # [..., α_p, α_p]
-                    P_pl = self._mix_P_ln[p_idx][l]                            # [α_p, Q]
-                    placed = tf.einsum('ji,...jk,kl->...il', P_pl, V_block, P_pl)
-                    parts.append(placed)
-            V_full = tf.add_n(parts)
-            return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-        # cross_pair_l: V shape is [..., (T?), L, N_l, N_l]. N_l is
-        # uniform across l, so the stacked projector is always available
-        # — one batched einsum, no Python loop.
-        # Contraction: a=L, j=N_l (first proj), k=N_l (second proj);
-        # output q-axes labelled i, m.
-        V_full = tf.einsum(
-            'aji,...ajk,akm->...im',
-            self._mix_P_l_stack, V, self._mix_P_l_stack)
+        V_full = tf.add_n(parts)
         return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-
-    def _compose_V_blocks(self, V_list: list) -> tf.Tensor:
-        """Compose N stacked-mixing V tensors into ONE equivalent V.
-
-        All three linear arches (linear / l_aware / cross_pair_l) have
-        block-disjoint sub-block support — each (pair[, l]) sub-block
-        lives in disjoint Q-coordinates, so P_p P_{p'}^T = δ_{pp'} I.
-        Composing N layers therefore reduces to a per-sub-block product:
-
-            U_total = I_Q + Σ_p P_p^T [(I + V_{N-1,p}) … (I + V_{0,p}) − I] P_p
-
-        i.e. compose `(I_bs + V_k)` in the SMALL sub-block space (the
-        trailing two dims of each V), then return an equivalent
-        single-layer V that `_U_full` can fold into W0 in one shot.
-
-        Layer ordering matches `_U_full_composed`: layer 0 is applied
-        FIRST to the descriptor (q' = U_total q = U_{N-1} … U_0 q), so the
-        sub-block matmul order is `(I + V_{N-1}) … (I + V_0)`.
-
-        Padding (max_bs > bs for non-uniform arches) stays correct: the
-        padded slots of V are zero, so (I + V) in those slots is the
-        identity, products of identities remain identity, and (· − I)
-        zeros them out again.
-        """
-        bs = V_list[0].shape[-1]
-        I_block = tf.eye(bs, dtype=V_list[0].dtype)
-        U_running = I_block + V_list[0]
-        for k in range(1, len(V_list)):
-            U_running = tf.matmul(I_block + V_list[k], U_running)
-        return U_running - I_block
 
     def _W0_eff(self, W0: tf.Tensor,
                 U_pair: tf.Tensor | None = None) -> tf.Tensor:
@@ -931,38 +750,12 @@ class TNEP(layers.Layer):
         # Mask out padded atoms
         h = h * atom_mask[:, tf.newaxis]                   # [A, H]
 
-        # Target-centering inverse: add the training-set mean back so
-        # `predict` returns predictions in original (un-centered) units.
-        # The shift depends only on the data-pipeline convention:
-        #   - target_mode==1 AND scale_targets : mean is per-atom space,
-        #                                        shift by mean * num_atoms
-        #   - otherwise (mode 0 energy, mode 2 polarisability, or
-        #     mode 1 without scale_targets)   : mean is total space,
-        #                                        shift by mean
-        # This matches assemble_data_dict's gating (data.py:375), which
-        # only divides by num_atoms when target_mode==1 AND scale_targets.
-        _do_uncenter = (bool(getattr(self.cfg, "target_centering", False))
-                        and getattr(self.cfg, "_target_mean", None) is not None)
-        if _do_uncenter:
-            _mean_arr = np.asarray(self.cfg._target_mean, dtype=np.float32)
-            _shift_per_atom = (self.cfg.target_mode == 1
-                               and bool(getattr(self.cfg, "scale_targets", False)))
-
         if self.cfg.target_mode == 0:
             # PES: E = -sum_i (h_i . W1[t_i] + b1)
             E_per_atom = tf.reduce_sum(h * W1_t, axis=1) + self.b1  # [A]
             E_per_atom = E_per_atom * atom_mask                       # zero padding
-            # H-center skip: exclude H atoms from the energy sum. Their
-            # descriptor is zero (no builder was called for them) so the
-            # bias-driven U_H would otherwise contaminate the total.
-            if bool(getattr(self.cfg, "skip_h_centers", False)):
-                E_per_atom = E_per_atom * tf.cast(Z != 1, tf.float32)
             E = tf.reduce_sum(E_per_atom)
             out = tf.expand_dims(-E, axis=0)  # [1]
-            if _do_uncenter:
-                # Energy is always total-space (data pipeline never
-                # divides E targets by num_atoms), so shift by `mean`.
-                out = out + tf.constant(_mean_arr)
             return out
 
         # Modes 1 and 2 need forces
@@ -982,12 +775,6 @@ class TNEP(layers.Layer):
                      * neighbor_mask)                                     # [A, M]
             dipole_contribs = rij_n[:, :, tf.newaxis] * forces            # [A, M, 3]
             dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])         # [3]
-            if _do_uncenter:
-                if _shift_per_atom:
-                    num_atoms = tf.reduce_sum(atom_mask)
-                    dipole = dipole + tf.constant(_mean_arr) * num_atoms
-                else:
-                    dipole = dipole + tf.constant(_mean_arr)
             return dipole
 
         elif self.cfg.target_mode == 2:
@@ -1008,10 +795,6 @@ class TNEP(layers.Layer):
             h_pol = h_pol * atom_mask[:, tf.newaxis]
             F_pol = tf.reduce_sum(h_pol * W1p_t, axis=1) + self.b1_pol  # [A]
             F_pol = F_pol * atom_mask
-            # H-center skip: zero F_pol for H atoms (their descriptor is
-            # zero so F_pol would otherwise be bias-driven garbage).
-            if bool(getattr(self.cfg, "skip_h_centers", False)):
-                F_pol = F_pol * tf.cast(Z != 1, tf.float32)
             scalar_sum = tf.reduce_sum(F_pol)
 
             # --- Tensor ANN (anisotropic virial) ---
@@ -1032,10 +815,6 @@ class TNEP(layers.Layer):
             # Add scalar ANN to diagonal
             pol = pol + tf.stack([scalar_sum, scalar_sum, scalar_sum,
                                   0.0, 0.0, 0.0])
-            if _do_uncenter:
-                # Polarisability targets are total-space (no scale_targets
-                # path for mode=2), so the mean is total-space too.
-                pol = pol + tf.constant(_mean_arr)
             return pol
 
     def _activation_grad(self, h: tf.Tensor, z: tf.Tensor) -> tf.Tensor:
@@ -1153,9 +932,7 @@ class TNEP(layers.Layer):
             preds : [S, T] tensor of predictions
         """
         # Streaming chunked scoring. Bounds peak memory to one chunk's
-        # gradient slice — and is the only sensible mode when grad_values
-        # is disk-backed. With cfg.chunk_prefetch the disk-pipe of chunk N+1
-        # overlaps the model forward of chunk N.
+        # gradient slice.
         from data import prefetched_chunks
         S_test = test_data["num_atoms"].shape[0]
         chunk_sz = (self.cfg.batch_chunk_size
@@ -1171,8 +948,8 @@ class TNEP(layers.Layer):
         # Mirror the training-path second fold: when the preprocess
         # contraction is on, W0 is stored at Q_new and must be expanded
         # back to Q_raw before `predict_batch`'s einsum, which assumes
-        # raw-dim descriptors. See validate()/_evaluate_chunk at lines
-        # 1862-1869 for the canonical chain.
+        # raw-dim descriptors. See validate()/_evaluate_chunk for the
+        # canonical chain.
         if self.descriptor_preprocess_contract != "off":
             W0_eff = self._W0_preprocess_eff(W0_eff)
             if W0_pol_eff is not None:
@@ -1181,9 +958,7 @@ class TNEP(layers.Layer):
         pred_parts: list = []
         for _, _, chunk in prefetched_chunks(
                 test_data, ranges,
-                pin_to_cpu=self.cfg.pin_data_to_cpu,
-                enabled=getattr(self.cfg, "chunk_prefetch", True),
-                depth=getattr(self.cfg, "prefetch_depth", 1)):
+                pin_to_cpu=self.cfg.pin_data_to_cpu):
             pred_parts.append(self.predict_batch(
                 chunk["descriptors"], chunk["grad_values"],
                 chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
@@ -1208,20 +983,6 @@ class TNEP(layers.Layer):
         else:
             preds = raw_preds
 
-        # Target centering inverse: add the frozen training-set mean
-        # back to BOTH preds and targets so all downstream metrics and
-        # the returned `preds` are in original (un-centered) units. RMSE
-        # and R² are invariant under this shift (both terms get the same
-        # offset), but cos_sim and the absolute prediction values are
-        # not — they MUST be restored to original units to be meaningful.
-        if (bool(getattr(self.cfg, "target_centering", False))
-                and getattr(self.cfg, "_target_mean", None) is not None):
-            mean_tf = tf.constant(
-                np.asarray(self.cfg._target_mean,
-                           dtype=np.float32).reshape(1, -1))
-            preds = preds + mean_tf
-            targets = targets + mean_tf
-
         diff = preds - targets
         mse = tf.reduce_mean(tf.square(diff))
         rmse = tf.sqrt(tf.maximum(mse, 0.0))
@@ -1243,20 +1004,10 @@ class TNEP(layers.Layer):
             "r2_components": r2_components,
         }
 
-        # Total (un-scaled) metrics when target scaling is active. Both
-        # totals must be in ORIGINAL (un-centered) units: `targets` here
-        # is per-atom-original (mean added back above), so
-        # `targets * num_atoms` is the total-original. The raw network
-        # output `raw_preds` is in centered per-atom * num_atoms space —
-        # add back the corresponding offset (mean * num_atoms) per
-        # structure so total_diff compares two original-unit quantities.
+        # Total (un-scaled) metrics when target scaling is active.
         if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
             total_targets = targets * num_atoms_col
-            if (bool(getattr(self.cfg, "target_centering", False))
-                    and getattr(self.cfg, "_target_mean", None) is not None):
-                total_preds = raw_preds + mean_tf * num_atoms_col
-            else:
-                total_preds = raw_preds
+            total_preds = raw_preds
             total_diff = total_preds - total_targets
             total_rmse = tf.sqrt(tf.reduce_mean(tf.square(total_diff)))
             total_ss_res = tf.reduce_sum(tf.square(total_diff))
@@ -1423,7 +1174,7 @@ class TNEP(layers.Layer):
 
         # Pipeline: collect → build descriptors with TRAINING-TIME species →
         # assemble → pad_and_stack. `collect` overrides num_types from the
-        # data; we restore it afterwards so the builder produces dim_q-=165
+        # data; we restore it afterwards so the builder produces dim_q=165
         # (or whatever the model was trained at) instead of the data-implied dim.
         print(f"score_from_file: loading {path} ...")
         dataset, ti_loaded = collect(cfg_for_load)
@@ -1630,9 +1381,6 @@ class TNEP(layers.Layer):
         if self.cfg.target_mode == 0:
             E = tf.reduce_sum(h1 * W1_t, axis=2) + b1  # [B, A]
             E = E * atom_mask
-            # H-center skip (see comment in predict): exclude H atoms.
-            if bool(getattr(self.cfg, "skip_h_centers", False)):
-                E = E * tf.cast(Z != 1, tf.float32)
             E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
             return -E
 
@@ -1851,7 +1599,7 @@ class TNEP(layers.Layer):
         caller multiplies by `neighbor_mask` to zero out padding rows
         (padding rows can have grad_index == 0 == some real centre and
         rij2 == 0, so they look like self pairs). The single-structure
-        predict() path applies this mask at ~line 521.
+        predict() path applies this mask in its dipole branch.
         """
         N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if N == 0:
@@ -2063,11 +1811,6 @@ class TNEP(layers.Layer):
         h_pol = h_pol * atom_mask[:, :, tf.newaxis]
         F_pol = tf.reduce_sum(h_pol * W1p_t, axis=2) + b1_pol  # [B, A]
         F_pol = F_pol * atom_mask
-        # H-center skip: zero F_pol for H atoms (descriptor is zero,
-        # so F_pol would be bias-driven). The tensor (virial) part
-        # below is automatically H-free because no pairs have center=H.
-        if bool(getattr(self.cfg, "skip_h_centers", False)):
-            F_pol = F_pol * tf.cast(Z != 1, tf.float32)
         scalar_sum = tf.reduce_sum(F_pol, axis=1)               # [B]
 
         # Tensor part: per-pair outer product, then segment-sum per structure

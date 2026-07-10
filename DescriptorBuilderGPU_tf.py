@@ -25,12 +25,10 @@ from __future__ import annotations
 
 import numpy as np
 import tensorflow as tf
-from ase import Atoms
 from tqdm import tqdm
 
 # Reuse CPU-only helpers and NumPy reference from the main module
 from DescriptorBuilderGPU import (
-    REFERENCE_SOAP_PARAMS,
     build_orthonormalization_matrix_poly3,
     build_neighbour_list_numpy,
     build_multiplicity_array,
@@ -39,7 +37,6 @@ from DescriptorBuilderGPU import (
     _N_a,
     load_fixture,
     compute_soap_with_grad_from_positions_numpy,
-    _make_test_structures,
 )
 
 
@@ -60,12 +57,6 @@ def _matching_complex(real_dtype: tf.DType) -> tf.DType:
     return tf.complex128
 
 
-def _matching_real(complex_dtype: tf.DType) -> tf.DType:
-    if complex_dtype == tf.complex64:
-        return tf.float32
-    return tf.float64
-
-
 # =========================================================================
 # Radial expansion (TF)
 # =========================================================================
@@ -81,7 +72,6 @@ def _radial_first_integral_tf(
     dtype = rjs.dtype
     sq2 = tf.constant(np.sqrt(2.0), dtype=dtype)
     s2 = atom_sigma_scaled ** 2
-    P = tf.shape(rjs)[0]
 
     I_n = tf.zeros_like(rjs)
     N_n = tf.constant(1.0, dtype=dtype)
@@ -365,8 +355,6 @@ def radial_expansion_coeff_poly3_with_der_tf(
     raw_der = raw_der * pair_active_f[None, :]
 
     # Distribute to species blocks
-    n_max = n_species * alpha_max
-    P = tf.shape(rjs)[0]
     radial_blocks = []
     radial_der_blocks = []
     for s in range(n_species):
@@ -386,7 +374,6 @@ def radial_expansion_coeff_poly3_with_der_tf(
 def _get_plm_array_tf(x: tf.Tensor, l_max: int) -> tf.Tensor:
     """Plm via l-recursion. x: [P] float64. Returns [k_max, P]."""
     k_max = (l_max + 1) * (l_max + 2) // 2
-    P = tf.shape(x)[0]
     sqrt_1mx2 = tf.math.sqrt(tf.maximum(1.0 - x * x, tf.zeros_like(x)))
 
     plm_dict = {}                                                  # k → [P] tensor
@@ -460,7 +447,6 @@ def _get_ilexp_tf(x: tf.Tensor, l_max: int) -> tf.Tensor:
 
 def _get_eimphi_factor_tf(phi: tf.Tensor, m_max: int) -> tf.Tensor:
     """exp(-i·m·φ) for m=0..m_max via Chebyshev. phi: [P] float64. Returns [m_max+1, P] complex128."""
-    P = tf.shape(phi)[0]
     cos_phi = tf.math.cos(phi)
     sin_phi = tf.math.sin(phi)
     cosphi2 = 2.0 * cos_phi
@@ -535,7 +521,6 @@ def _get_ilexp_der_tf(
 ) -> tf.Tensor:
     """d(ilexp)/d(rj). Returns [l_max+1, P]."""
     dtype = rj.dtype
-    P = tf.shape(rj)[0]
     coeff1 = 2.0 * rj / atom_sigma ** 2
     coeff2 = 1.0 - atom_sigma_scaling * rj / atom_sigma
     tiny = 1e-300 if dtype == tf.float64 else 1e-30
@@ -700,41 +685,6 @@ def _build_kept_triples(skip_mask: np.ndarray, n_max: int, l_max: int) -> list[t
                     counter2 += l + 1
                 counter += 1
     return out
-
-
-def _build_kept_index_arrays(kept_triples: list, l_max: int):
-    """Pre-pad kept-triple indices into rectangular [n_kept, l_max+1] tensors.
-
-    The original power-spectrum loop iterates n_kept (=645 for 6-species
-    cfg) (n,n′,l) triples and produces one row each. Each iteration spawns
-    O(10) small ops, so XLA / the runtime see ~6500 ops of identical
-    structure. By pre-padding the variable l+1 multiplicity range to a
-    fixed l_max+1 and masking the excess, the whole reduction collapses to
-    a single gather + einsum, which fuses into one kernel.
-
-    Returns (kept_n, kept_np, kept_k_idx, kept_mult_idx, kept_mask) where
-      kept_n        : [n_kept]              int32  — n
-      kept_np       : [n_kept]              int32  — n′
-      kept_k_idx    : [n_kept, l_max+1]     int32  — k = l(l+1)/2 + m, padded
-      kept_mult_idx : [n_kept, l_max+1]     int32  — index into multiplicity_array
-      kept_mask     : [n_kept, l_max+1]     bool   — True where m ≤ l for this triple
-    """
-    n_kept = len(kept_triples)
-    M = l_max + 1
-    kept_n = np.empty(n_kept, dtype=np.int32)
-    kept_np = np.empty(n_kept, dtype=np.int32)
-    kept_k_idx = np.zeros((n_kept, M), dtype=np.int32)
-    kept_mult_idx = np.zeros((n_kept, M), dtype=np.int32)
-    kept_mask = np.zeros((n_kept, M), dtype=bool)
-    for t, (n, nprime, l, c2_start, c2_count) in enumerate(kept_triples):
-        kept_n[t] = n
-        kept_np[t] = nprime
-        k0 = l * (l + 1) // 2
-        for m in range(l + 1):  # c2_count = l + 1
-            kept_k_idx[t, m] = k0 + m
-            kept_mult_idx[t, m] = c2_start + m
-            kept_mask[t, m] = True
-    return kept_n, kept_np, kept_k_idx, kept_mult_idx, kept_mask
 
 
 def power_spectrum_with_grad_tf(
@@ -1329,87 +1279,6 @@ def _build_cfg_cache(species_Z: list[int], soap_params: dict) -> dict:
         preflm_np=_get_preflm(l_max),
         kept_triples=_build_kept_triples(mask_info["skip_mask"], n_max, l_max),
     )
-
-
-def compute_soap_from_positions_tf(
-    positions: np.ndarray,
-    cell: np.ndarray,
-    pbc: np.ndarray,
-    numbers: np.ndarray,
-    species_Z: list[int],
-    soap_params: dict,
-    *,
-    nf: float = 4.0,
-    cache: dict | None = None,
-) -> tuple[tf.Tensor, np.ndarray, np.ndarray]:
-    """Forward-only end-to-end SOAP on GPU.
-
-    Returns (soap [n_atoms, n_compressed] float32, pair_atom, pair_gidx).
-
-    Pass `cache=_build_cfg_cache(species_Z, soap_params)` to skip the
-    per-call recompute of W, mask_info, multiplicity_array, etc. The class
-    `DescriptorBuilderGPUTF` does this automatically.
-    """
-    n_atoms = positions.shape[0]
-    alpha_max = int(soap_params["alpha_max"])
-    l_max = int(soap_params["l_max"])
-    rcut_hard = float(soap_params["rcut_hard"])
-
-    if cache is None:
-        cache = _build_cfg_cache(species_Z, soap_params)
-    n_species = cache["n_species"]
-    n_max = cache["n_max"]
-    z_to_idx = cache["z_to_idx"]
-    W_np = cache["W_np"]
-    mask_info = cache["mask_info"]
-    multiplicity_np = cache["multiplicity_np"]
-    preflm_np = cache["preflm_np"]
-    kept_triples = cache["kept_triples"]
-
-    pair_atom_np, pair_gidx_np, rjs_np, thetas_np, phis_np = build_neighbour_list_numpy(
-        positions, cell, pbc, rcut_hard
-    )
-    pair_is_central_np = (pair_atom_np == pair_gidx_np) & (rjs_np < 1e-10)
-    pair_active_np = rjs_np < rcut_hard
-    pair_neighbour_species_np = np.asarray(
-        [z_to_idx[int(numbers[int(j)])] for j in pair_gidx_np], dtype=np.int32
-    )
-
-    device = "/GPU:0" if tf.config.list_physical_devices("GPU") else "/CPU:0"
-    with tf.device(device):
-        rjs = tf.constant(rjs_np, dtype=tf.float64)
-        thetas = tf.constant(thetas_np, dtype=tf.float64)
-        phis = tf.constant(phis_np, dtype=tf.float64)
-        pair_atom = tf.constant(pair_atom_np, dtype=tf.int32)
-        pair_neighbour_species = tf.constant(pair_neighbour_species_np, dtype=tf.int32)
-        pair_is_central = tf.constant(pair_is_central_np)
-        pair_active = tf.constant(pair_active_np)
-        W_single = tf.constant(W_np, dtype=tf.float64)
-        multiplicity_array = tf.constant(multiplicity_np, dtype=tf.float64)
-        compressed_idx = tf.constant(mask_info["compressed_idx"], dtype=tf.int32)
-        coeffs = tf.constant(mask_info["coeffs"], dtype=tf.float64)
-        preflm = tf.constant(preflm_np, dtype=tf.float64)
-
-        soap_norm = _compute_soap_inner_tf(
-            rjs, thetas, phis, pair_atom, pair_neighbour_species,
-            pair_is_central, pair_active,
-            W_single, multiplicity_array, compressed_idx, coeffs, preflm,
-            kept_triples=kept_triples,
-            n_atoms=n_atoms, n_species=n_species, alpha_max=alpha_max, l_max=l_max,
-            rcut_hard=rcut_hard, rcut_soft=float(soap_params["rcut_soft"]),
-            atom_sigma_r=float(soap_params["atom_sigma_r"]),
-            atom_sigma_r_scaling=float(soap_params["atom_sigma_r_scaling"]),
-            atom_sigma_t=float(soap_params["atom_sigma_t"]),
-            atom_sigma_t_scaling=float(soap_params["atom_sigma_t_scaling"]),
-            amplitude_scaling=float(soap_params["amplitude_scaling"]),
-            central_weight=float(soap_params["central_weight"]),
-            radial_enhancement=int(soap_params["radial_enhancement"]),
-            nf=nf,
-            do_central=(float(soap_params["central_weight"]) != 0.0),
-            n_compressed=int(mask_info["n_compressed"]), n_max=n_max,
-        )
-        soap_norm = tf.cast(soap_norm, tf.float32)
-    return soap_norm, pair_atom_np, pair_gidx_np
 
 
 def compute_soap_with_grad_from_positions_tf(
@@ -2284,19 +2153,6 @@ class DescriptorBuilderGPUTF:
             pair_neigh = np.asarray(
                 [z_to_idx[int(numbers[int(j)])] for j in pg], dtype=np.int32
             )
-            # Optional H-center skip: drop pairs whose CENTER atom is H.
-            # H atoms remain in the neighbour list (pair_gidx still
-            # carries them), so non-H centers still see H in their
-            # species-pair blocks. The descriptor row for any H atom
-            # will be zero in the output (no contributing pairs).
-            if bool(getattr(self.cfg, "skip_h_centers", False)):
-                keep = numbers[pa] != 1
-                if not keep.all():
-                    pa = pa[keep]; pg = pg[keep]
-                    rjs = rjs[keep]; thetas = thetas[keep]; phis = phis[keep]
-                    pair_is_central = pair_is_central[keep]
-                    pair_active = pair_active[keep]
-                    pair_neigh = pair_neigh[keep]
             all_rjs.append(rjs)
             all_thetas.append(thetas)
             all_phis.append(phis)
@@ -2539,94 +2395,6 @@ class DescriptorBuilderGPUTF:
         # in host RAM concurrently.
         del flat
         return dataset_descriptors, dataset_gradients, dataset_grad_index
-
-    def build_descriptors_streaming_to_disk(
-        self,
-        dataset: list,
-        gv_path: str,
-        chunk_size: int | None = None,
-        calc_gradients: bool = True,
-        progress_desc: str = "Building descriptors (streaming to disk)",
-    ) -> dict:
-        """Build SOAP descriptors+gradients with gradients streamed directly
-        to a binary file on disk.
-
-        Peak host RAM during the build is bounded by `chunk_size` structures'
-        worth of gradient (typically a few hundred MB for organics at
-        chunk_size=100), instead of the dataset-wide ~10 GB COO that the
-        normal `build_descriptors` path materialises before disk caching.
-
-        Args:
-            dataset        : list of ase.Atoms.
-            gv_path        : path to a binary file the gradient bytes are
-                             appended into. Truncated on entry.
-            chunk_size     : number of structures per build call. None falls
-                             back to cfg.descriptor_batch_frames (default 100).
-            calc_gradients : if False, the gradient slice is empty.
-            progress_desc  : tqdm label.
-
-        Returns dict with the data needed by `pad_and_stack` to assemble the
-        rest of the COO COO+padded outputs without ever holding all the
-        gradients in RAM:
-            descriptors            : list[np.ndarray [N_i, Q] float32]
-            pair_atom_per_struct   : list[np.ndarray [P_i] int32]
-            pair_gidx_per_struct   : list[np.ndarray [P_i] int32]
-            pair_count_per_struct  : list[int]
-            gv_path                : str
-            gv_shape               : (P_total, 3, Q)
-            gv_dtype               : np.dtype
-        """
-        self._ensure_cache()
-        if chunk_size is None:
-            chunk_size = getattr(self.cfg, "descriptor_batch_frames", 100) or 100
-        with_grad_fn, fwd_only_fn = self._get_compute_fns(jit_compile=False)
-
-        Q = int(self._cache["mask_info"]["n_compressed"])
-        descriptors: list = []
-        pair_atom_per_struct: list = []
-        pair_gidx_per_struct: list = []
-        pair_count_per_struct: list = []
-        P_total = 0
-
-        chunk_starts = list(range(0, len(dataset), int(chunk_size)))
-        iterator = chunk_starts
-        if len(chunk_starts) >= 2:
-            iterator = tqdm(chunk_starts, desc=progress_desc, unit="chunk",
-                            total=len(chunk_starts))
-
-        # Truncate / open output file. Append per-chunk via tofile().
-        with open(gv_path, "wb") as f:
-            for cstart in iterator:
-                chunk = dataset[cstart:cstart + int(chunk_size)]
-                # NumPy-output flat path: per-frame (soap, grad, pa, pg)
-                # numpy arrays — exactly the format we want to stream.
-                flat = self._build_flat_chunk(
-                    chunk, calc_gradients=calc_gradients, return_tf=False,
-                    with_grad_fn=with_grad_fn, fwd_only_fn=fwd_only_fn,
-                )
-                for soap, grad, pa, pg in flat:
-                    descriptors.append(np.asarray(soap, dtype=np.float32))
-                    pa32 = np.asarray(pa, dtype=np.int32)
-                    pg32 = np.asarray(pg, dtype=np.int32)
-                    pair_atom_per_struct.append(pa32)
-                    pair_gidx_per_struct.append(pg32)
-                    P_i = int(grad.shape[0]) if grad.size else 0
-                    pair_count_per_struct.append(P_i)
-                    if P_i:
-                        np.ascontiguousarray(grad, dtype=np.float32).tofile(f)
-                        P_total += P_i
-                # Drop the chunk's working tensors before the next build.
-                del flat
-
-        return dict(
-            descriptors=descriptors,
-            pair_atom_per_struct=pair_atom_per_struct,
-            pair_gidx_per_struct=pair_gidx_per_struct,
-            pair_count_per_struct=pair_count_per_struct,
-            gv_path=gv_path,
-            gv_shape=(P_total, 3, Q),
-            gv_dtype=np.dtype(np.float32),
-        )
 
 
 # =========================================================================

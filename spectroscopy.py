@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
-from data import cell_to_box, pack_chunk_from_flat
+from data import cell_to_box
 
 if TYPE_CHECKING:
     from ase import Atoms
@@ -791,16 +791,6 @@ def _get_fused_predict(model: 'TNEP'):
     W1p_t = _to_tensor(getattr(model, "W1_pol", None))
     b1p_t = _to_tensor(getattr(model, "b1_pol", None))
 
-    # Per-channel descriptor scaler (cfg._q_scaler). Captured into the
-    # fused graph as a constant tensor; multiplies BOTH soap_concat and
-    # grad_concat at the top of fused() so descriptors and gradients
-    # see the same training-time normalisation. None when scaling is
-    # off (descriptor_scaling="none").
-    q_scaler_const = (tf.constant(cfg._q_scaler, dtype=tf.float32)
-                      if (str(getattr(cfg, "descriptor_scaling", "none")) != "none"
-                          and getattr(cfg, "_q_scaler", None) is not None)
-                      else None)
-
     # NOTE: not jit_compile=True. The descriptor-side XLA path (locked
     # compute fns built with jit_compile=True for trajectory) handles the
     # heavy SOAP work. predict_batch internally has shape-dependent stacks
@@ -811,14 +801,6 @@ def _get_fused_predict(model: 'TNEP'):
     def fused(soap_concat, grad_concat, pa_concat, pg_concat,
               atom_counts, pair_counts,
               positions, Z, boxes, atom_mask, num_atoms):
-        # Apply per-channel descriptor scaling (cfg._q_scaler) at the
-        # same point in the chain as training (pad_and_stack does it
-        # before packing). Both `soap_concat` [N, Q] and `grad_concat`
-        # [P, 3, Q] get the same `s[Q]` along their last axis — see
-        # data._apply_q_scaler_np for the equivalent training-time op.
-        if q_scaler_const is not None:
-            soap_concat = soap_concat * q_scaler_const[tf.newaxis, :]
-            grad_concat = grad_concat * q_scaler_const[tf.newaxis, tf.newaxis, :]
         S = tf.shape(num_atoms)[0]
         # Pad descriptors via scatter_nd. RaggedTensor.to_tensor is the
         # natural choice but the underlying RaggedTensorToTensor op has no
@@ -847,7 +829,7 @@ def _get_fused_predict(model: 'TNEP'):
         # NOTE: predict_batch returns the TOTAL dipole, not per-atom — even
         # when cfg.scale_targets is True. Training stores per-atom *targets*,
         # and TNEP.score() divides raw_preds by N to compare on the same
-        # scale (TNEP.py:285-288). So preds here is already the total system
+        # scale. So preds here is already the total system
         # dipole; do NOT multiply by num_atoms.
         return preds
 
@@ -922,63 +904,6 @@ def _build_fused_inputs(
     return (soap_concat, grad_concat, pa_concat, pg_concat,
             atom_counts_t, pair_counts_t,
             positions, Z, boxes, atom_mask, num_atoms)
-
-
-def _pack_traj_batch_from_tf(
-    frame_results: list,
-    frames: list,
-    types_int_batch: list[np.ndarray],
-    dim_q: int,
-    pin_to_cpu: bool = True,
-) -> dict:
-    """TF-tensor variant of pack: avoids the NumPy round-trip on descriptors/grads.
-
-    Each frame_results[s] = (soap_t [N,Q], grad_t [P,3,Q], pa_t [P], pg_t [P]),
-    all TF tensors living on the descriptor-builder's compute device. This pack
-    concatenates them on-device with global atom-index offsets and returns the
-    same dict shape as `_pack_traj_batch_from_flat`. Auxiliary structure-padded
-    fields (positions, Z, boxes, atom_mask) still come from the ASE objects on
-    the host — they're built once per outer batch and respect pin_to_cpu.
-
-    Returns:
-        dict with descriptors [B,A,Q], grad_values [P,3,Q], pair_atom/gidx/struct [P],
-        positions [B,A,3], Z_int [B,A], boxes [B,3,3], atom_mask [B,A], num_atoms [B].
-    """
-    S = len(frames)
-    # Cache atom_counts before pack_chunk_from_flat clears frame_results.
-    atom_counts = [int(r[0].shape[0]) for r in frame_results]
-    max_atoms = max(atom_counts) if atom_counts else 0
-
-    # Descriptor-shaped fields (descriptors, grad_values, pair_*) — shared
-    # with the OTF training path via pack_chunk_from_flat.
-    chunk = pack_chunk_from_flat(frame_results, dim_q)
-
-    # Structure-padded host-built fields (positions, Z, boxes, atom_mask).
-    pos_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
-    z_np = np.zeros((S, max_atoms), dtype=np.int32)
-    box_np = np.zeros((S, 3, 3), dtype=np.float32)
-    atom_mask_np = np.zeros((S, max_atoms), dtype=np.float32)
-    num_atoms_np = np.array(atom_counts, dtype=np.int32)
-    for s in range(S):
-        N_s = atom_counts[s]
-        pos_np[s, :N_s] = frames[s].positions.astype(np.float32)
-        z_np[s, :N_s] = types_int_batch[s]
-        box_np[s] = cell_to_box(frames[s])
-        atom_mask_np[s, :N_s] = 1.0
-
-    with tf.device('/CPU:0' if pin_to_cpu else '/GPU:0'):
-        positions_t = tf.constant(pos_np);     del pos_np
-        z_t         = tf.constant(z_np);       del z_np
-        box_t       = tf.constant(box_np);     del box_np
-        atom_mask_t = tf.constant(atom_mask_np); del atom_mask_np
-        num_atoms_t = tf.constant(num_atoms_np); del num_atoms_np
-
-    chunk["positions"] = positions_t
-    chunk["Z_int"]     = z_t
-    chunk["boxes"]     = box_t
-    chunk["atom_mask"] = atom_mask_t
-    chunk["num_atoms"] = num_atoms_t
-    return chunk
 
 
 def _pack_traj_batch_from_flat(
@@ -1148,7 +1073,6 @@ def predict_trajectory_batch(
         del fused_inputs
         out = preds.numpy()
         del preds
-        out = _restore_target_mean(out, batch_frames, cfg)
     else:
         # Legacy NumPy pack + eager predict_batch path (quippy and any
         # custom builder that doesn't return TF tensors).
@@ -1161,16 +1085,10 @@ def predict_trajectory_batch(
                                            cfg.dim_q, pin_to_cpu=pin_to_cpu)
         del frame_results
 
-        # Apply per-channel scaling and mixing absorption in the same
-        # order as the fused path so the two backends produce identical
-        # predictions. Both transformations are pre-existing training-
-        # time operations whose absence at inference would silently
-        # corrupt trajectory dipoles.
-        if (str(getattr(cfg, "descriptor_scaling", "none")) != "none"
-                and getattr(cfg, "_q_scaler", None) is not None):
-            s = tf.constant(cfg._q_scaler, dtype=tf.float32)
-            batch["descriptors"] = batch["descriptors"] * s[tf.newaxis, tf.newaxis, :]
-            batch["grad_values"] = batch["grad_values"] * s[tf.newaxis, tf.newaxis, :]
+        # Apply mixing absorption in the same order as the fused path so
+        # the two backends produce identical predictions. This is a
+        # pre-existing training-time operation whose absence at inference
+        # would silently corrupt trajectory dipoles.
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             W0_pred = model._W0_eff(model.W0)
             W0p_pred = (model._W0_eff(model.W0_pol)
@@ -1194,44 +1112,12 @@ def predict_trajectory_batch(
         )
         # NOTE: predict_batch returns the TOTAL dipole regardless of
         # cfg.scale_targets. Training stores per-atom *targets*, and
-        # TNEP.score() divides raw_preds by N to compare on the same scale
-        # (TNEP.py:285-288). So preds is already the total system dipole;
+        # TNEP.score() divides raw_preds by N to compare on the same scale.
+        # So preds is already the total system dipole;
         # no per-atom→total rescaling is needed here.
         out = preds.numpy()
         del batch, preds
-        out = _restore_target_mean(out, batch_frames, cfg)
     return out
-
-
-def _restore_target_mean(out: np.ndarray, batch_frames: list,
-                         cfg) -> np.ndarray:
-    """Add the frozen training-set target mean back to trajectory
-    predictions so the returned array is in original (un-centered) units.
-
-    Mirrors the inverse done in TNEP.score / TNEP.predict. The shift
-    depends on whether the data pipeline scaled targets per-atom:
-      - target_mode=1, scale_targets=True : `out += mean * num_atoms_i`
-        per frame (the training shift was per-atom; raw_pred is total).
-      - target_mode=1, scale_targets=False: `out += mean`
-      - target_mode=2 (polarisability)    : `out += mean` (mode=2 has
-        no scale_targets path in assemble_data_dict, so the mean is
-        always in total-space).
-    Mode 0 (energy) does not enter this path — predict_trajectory_batch
-    is restricted to modes 1/2. No-op when target_centering is off.
-    """
-    if not (bool(getattr(cfg, "target_centering", False))
-            and getattr(cfg, "_target_mean", None) is not None):
-        return out
-    mean = np.asarray(cfg._target_mean, dtype=np.float32).reshape(1, -1)
-    # Mirror assemble_data_dict's gating exactly: per-atom rescaling
-    # applies ONLY when target_mode==1 AND cfg.scale_targets is True.
-    # Default for missing attr is False (matches data.py:375 semantics).
-    if cfg.target_mode == 1 and bool(getattr(cfg, "scale_targets", False)):
-        # Per-frame num_atoms scaling. batch_frames length equals out.shape[0].
-        n_atoms = np.asarray(
-            [len(f) for f in batch_frames], dtype=np.float32).reshape(-1, 1)
-        return out + mean * n_atoms
-    return out + mean
 
 
 def _scalar_acf_fft(signal: np.ndarray) -> np.ndarray:

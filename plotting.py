@@ -146,7 +146,7 @@ def plot_log_val_fitness(history: dict, cfg: TNEPconfig,
 
 def plot_sigma_history(history: dict, cfg: TNEPconfig,
                        save_plots: str | None = None, show_plots: bool = True) -> None:
-    """Plot sigma min/max/mean vs generation on log-y scale with reset markers."""
+    """Plot sigma min/max/mean/median vs generation on log-y scale."""
     g = np.asarray(history["generation"])
     if not history.get("sigma_mean"):
         return

@@ -86,7 +86,6 @@ num_generations  = 60000
 batch_size       = None        # None = full train set per generation
 eta_sigma        = None        # None = auto from problem dimension
 patience         = None        # Early stopping (None = disabled)
-loss_type        = "mse"       # "mse" or "mae"
 
 # SOAP-turbo descriptor
 l_max            = 4

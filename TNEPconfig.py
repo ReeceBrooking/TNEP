@@ -27,33 +27,21 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- dataset & split -----------------------------------------------
-    data_path: str = "datasets/train.xyz"
+    data_path: str = "datasets/train_waterbulk.xyz"
     # Separate test dataset (None = split from data_path; str = path to external .xyz)
-    test_data_path: str | None = "datasets/test.xyz"
+    test_data_path: str | None = "datasets/test_waterbulk.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = [6, 1, 8]
     # Species filter mode: "subset" = keep structures with only allowed species,
     # "exact" = keep structures containing exactly all allowed species
     filter_mode: str = "subset"
-    # When True, drop structures with NaN positions, NaN targets, or
-    # zero-vector targets. Structures with missing targets are always
-    # dropped regardless (they can't be trained against).
-    filter_bad_data: bool = False
     # Test split ratio (only used when test_data_path is None)
     test_ratio: float = 0.3
     # None : uses entire dataset, int : defines maximum structures to use in training
     total_N: int | None = None
     # Seed for randomisation (dataset shuffle, SNES sampling, etc.)
     seed: int | None = 928375439201
-    # Bitwise-reproducible runs. cfg.seed alone makes runs reproducible on
-    # CPU, but GPU reductions (unsorted_segment_sum / atomic adds in the
-    # dipole kernel) are non-deterministic across runs even with a fixed
-    # seed. When True, MasterTNEP calls tf.config.experimental.
-    # enable_op_determinism() so same-seed runs are bitwise identical on GPU
-    # too. Cost: slower GPU ops, and a hard error if any op used has no
-    # deterministic GPU implementation. Leave False for normal runs.
-    deterministic: bool = False
 
     # --- target type, units, conversions -------------------------------
     # 0 : PES (energy), 1 : Dipole, 2 : Polarizability
@@ -116,36 +104,15 @@ class TNEPconfig:
     # scalar is mapped to.
     dipole_rij_power: int = 0
 
-    # Skip H atoms as DESCRIPTOR CENTERS:
-    #   False (default) — every atom (including H) gets its own SOAP
-    #     descriptor and contributes to the predicted total via U_i.
-    #   True            — H atoms are NOT used as descriptor centers,
-    #     so the quippy / TF descriptor builders are never called for
-    #     H-centered windows. H atoms remain in the structure as
-    #     NEIGHBOUR species, so their positions still appear in the
-    #     species-pair blocks of every non-H center's descriptor.
-    # Performance: ~2–3× faster SOAP build and forward pass on typical
-    # organic systems (H is 50-70 % of atoms). Memory similar.
-    # Caveats:
-    #   - Models trained with True are NOT compatible with False
-    #     (the network learns a heavy-atom-only scalar that produces
-    #     the total μ / E / α — switching back changes the meaning).
-    #   - target_mode=0 (energy) loses physical per-H-atom U_i
-    #     interpretation; the model still predicts the right TOTAL E.
-    #   - target_mode=1 (dipole) is the most natural fit — total μ is
-    #     reproduced because non-H atoms' descriptors already encode
-    #     H neighbour info via SOAP species-pair blocks.
-    skip_h_centers: bool = False
-
     # ═══════════════════════════════════════════════════════════════════
     # 2. DESCRIPTOR (SOAP-turbo)
     # ═══════════════════════════════════════════════════════════════════
 
     # --- geometric parameters ------------------------------------------
-    l_max: int = 4
+    l_max: int = 7
     alpha_max: int = 7
-    rcut_hard: float = 6.0
-    rcut_soft: float = 5.5
+    rcut_hard: float = 3.0
+    rcut_soft: float = 2.5
     basis: str = "poly3"
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 1
@@ -195,67 +162,6 @@ class TNEPconfig:
     descriptor_memory_budget_bytes: int | None = None
 
     # Number of parallel workers for SOAP descriptor computation.
-    # None = auto (reads SLURM_CPUS_PER_TASK at DescriptorBuilder init time, falls back to 1)
-    # 1    = serial (current behaviour, default outside SLURM)
-    # N    = use N worker processes
-    num_descriptor_workers: int | None = None
-
-    # --- data-pipeline preprocessing (scaling, centering) --------------
-    # Per-channel descriptor scaling applied at data-pipeline level.
-    #   "none"     : no scaling (current default; preserves baseline).
-    #   "q_scaler" : GPUMD-style multiplicative range normalisation.
-    #                Each channel d gets s_d = 1 / (max_d - min_d) over
-    #                the training set; computed ONCE, frozen for the
-    #                run, persisted in /weights/q_scaler (and /snes/
-    #                q_scaler in checkpoints). Both `descriptors` and
-    #                `grad_values` are multiplied by s in pad_and_stack
-    #                so the entire model code is unchanged (option A
-    #                from the implementation plan — algebraically
-    #                identical to GPUMD's option B but cleaner to plumb).
-    descriptor_scaling: str = "none"
-
-    # Granularity of the q_scaler (only consulted when descriptor_scaling=="q_scaler"):
-    #   "per_component" : one multiplier per scalar descriptor entry (GPUMD-style).
-    #                     Maximises channel-level decorrelation but breaks the
-    #                     within-(pair, l)-block isotropy that l_aware /
-    #                     cross_pair_l mixing layers rotate over.
-    #   "l_block"       : one multiplier per (species-pair, l) block, shared
-    #                     across all α entries within that block. Equalises the
-    #                     dominant inter-l magnitude gap (l=0 ~O(1) vs l=l_max
-    #                     ~O(0.01)) while preserving intra-block axes. Use this
-    #                     when running descriptor_mixing with l_aware/cross_pair_l.
-    q_scaler_granularity: str = "l_block"
-
-    # Per-component target centering. When True, the per-component mean
-    # of the training targets is computed once, subtracted from every
-    # train/val/test target so the network learns in zero-mean output
-    # space, and added back at the inference boundary (model.score,
-    # model.predict, trajectory inference) so user-facing predictions
-    # remain in the original units. Persisted in /weights/target_mean
-    # (and /snes/target_mean in checkpoints) — frozen for the run.
-    #
-    # The network architecture has only one scalar output bias (b1); it
-    # cannot place an independent per-component dipole/polarisability
-    # offset. With non-zero target means (e.g. anisotropic training
-    # data), this forces capacity into shifting the zero point through
-    # W0/W1 interactions, leaving less capacity for the genuine
-    # structure-dependent pattern. Centering decouples the two.
-    #
-    # Caveats:
-    #   - Rotational equivariance: the saved mean is a constant in the
-    #     dataset frame; it does NOT rotate with a rotated input. If the
-    #     mean is non-isotropic (norm ≫ 0 for vector / tensor outputs),
-    #     the network's centered-space predictions ARE equivariant but
-    #     the original-units output (after adding the mean back) is NOT.
-    #     Recommended use: only when the training-set mean is near zero
-    #     or nearly isotropic — e.g. after rotational augmentation. The
-    #     test_rotation_equivariance helper warns when this is violated.
-    #   - RRMSE definition shifts: SNES's RRMSE numerator is computed
-    #     against `sum(targets^2)` of the centered batch — i.e. it
-    #     becomes variance-normalised rather than mean+variance. RRMSE
-    #     values are not directly comparable between centered and
-    #     un-centered runs on the same dataset.
-    target_centering: bool = False
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE
@@ -298,29 +204,6 @@ class TNEPconfig:
     # per (t, p) so the model starts bit-identical to the mixing-
     # disabled baseline regardless of T.
     descriptor_mixing_per_type: bool = False
-    # Linear-mixing architecture variant.
-    #   "linear"       : one [bs_p × bs_p] matrix per pair. Mixes all
-    #                    (n, l) channels within a pair (cross-l within
-    #                    a pair permitted, cross-pair forbidden).
-    #                    Block-diagonal in pair only.
-    #   "l_aware"      : (l_max+1) separate [α_p × α_p] matrices per
-    #                    pair, one per angular momentum. Mixes only
-    #                    radial channels at the same l within the
-    #                    same pair. Block-diagonal in (pair, l).
-    #                    Strictly fewer parameters than "linear" by
-    #                    a factor of (l_max+1).
-    #   "cross_pair_l" : (l_max+1) separate [N_l × N_l] matrices, one
-    #                    per angular momentum, where N_l = Σ_p α_eff_p.
-    #                    Mixes radial channels at the same l ACROSS
-    #                    species pairs (cross-pair within fixed l
-    #                    permitted; cross-l never permitted).
-    #                    Block-diagonal in l only.
-    #                    ⊃ l_aware (strict superset). Not comparable
-    #                    to "linear" — they restrict different axes
-    #                    at similar param count.
-    # All three use the same `_W0_eff = (I + V_full)ᵀ · W0` absorption.
-    # Only consulted when descriptor_mixing=True.
-    descriptor_mixing_arch: str = "l_aware"
     # Parameterisation applied to each V_pair descriptor-mixing block.
     # Both non-off modes are STRUCTURAL constraints (not soft penalties):
     # SNES walks the upper-triangle of a skew-symmetric A and U is
@@ -374,10 +257,8 @@ class TNEPconfig:
     #                    c^{Z_i,Z_j}_{n'',k}. Requires
     #                    compress_mode='trivial'.
     #
-    # l_aware mixing composes with all preprocess modes; other mixing
-    # archs (linear, cross_pair_l) raise NotImplementedError when
-    # preprocess is on.
-    descriptor_preprocess_contract: str = "angular"
+    # Descriptor mixing composes with all preprocess modes.
+    descriptor_preprocess_contract: str = "off"
     # NEP4 learned-basis fold output radial-channel count. Only consulted
     # when descriptor_preprocess_contract == "nep4_radial". When None
     # (default), the layout auto-picks n_max_out = Q_raw / L so that
@@ -422,37 +303,6 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION
     # ═══════════════════════════════════════════════════════════════════
-
-    # Training loss function (controls what SNES ranks against — NOT what
-    # is reported in history; RMSE / RRMSE are always computed alongside
-    # and recorded regardless of this setting).
-    #   "mse"   : Σ r_k²              standard squared error
-    #   "mae"   : Σ |r_k|             absolute error
-    #   "huber" : Σ huber(r_k; δ)     quadratic for |r| ≤ δ, linear beyond.
-    #             Robust to outlier structures with large residuals.
-    #             Does NOT specifically help small-target structures —
-    #             use inverse_weight_mode for that.
-    loss_type: str = "mse"
-    # Transition point between quadratic and linear regimes of Huber loss.
-    # Only used when loss_type == "huber". Sensible default ~ expected
-    # final RMSE for the dataset (run the loss-tuning sweep to confirm).
-    huber_delta: float = 1e-3
-
-    # Inverse-magnitude weighting: upweight small-target structures /
-    # components so they aren't dominated by large-target structures in
-    # the gradient.
-    #   "none"             : uniform (current default)
-    #   "vector_magnitude" : w_b ∝ 1 / max(||target_b||², eps)
-    #                         — one weight per structure (legacy path).
-    #   "per_component"    : w_{b,k} ∝ 1 / max(target_{b,k}², eps)
-    #                         — separate weight per (structure, component).
-    #                         Useful when individual axes of vector
-    #                         targets have systematically small magnitudes.
-    inverse_weight_mode: str = "none"
-    # Epsilon floor for the inverse-weight denominator. Smaller eps
-    # → stronger small-target emphasis but more numerical instability.
-    # Only used when inverse_weight_mode != "none".
-    inverse_weight_eps: float = 1e-4
 
     # Master switch for the L1/L2 regularisation block. When False:
     # both the per-type fitness path and the main fitness add 0
@@ -503,27 +353,6 @@ class TNEPconfig:
     batch_size: int | None = None
     # Learning rate for sigma (None = auto from canonical SNES heuristic)
     eta_sigma: float | None = None
-    # SNES μ vector initialisation scheme.
-    #   "uniform" : each ANN entry drawn uniform[-1, 1] (GPUMD default).
-    #               The biases come in at the same scale as the weights,
-    #               so b0 typically dominates the pre-activation in the
-    #               first generation — this relies on SNES exploration
-    #               to find a sensible magnitude over the first ~100 gens.
-    #   "glorot"  : Glorot/Xavier uniform per weight group:
-    #                 W0   ~ U(-c_W0, c_W0),  c_W0 = √(6 / (Q + H))
-    #                 W1   ~ U(-c_W1, c_W1),  c_W1 = √(6 / (H + 1))
-    #                 b0   = 0
-    #                 b1   = 0
-    #               Keeps initial pre-activations well-scaled regardless
-    #               of Q / H, so SNES doesn't waste generations climbing
-    #               out of a saturated-activation regime. The same
-    #               scheme is applied to the polarisability ANN's
-    #               W0_pol / W1_pol when target_mode == 2. The V_pair
-    #               tail (residual mixing layer) stays at zero in both
-    #               schemes, so the model is bit-identical to the
-    #               mixing-disabled baseline at gen 0 regardless of the
-    #               chosen scheme.
-    mu_init_scheme: str = "glorot"
     # Initial distribution standard deviation
     init_sigma: float = 0.1
     # Lower bound on sigma after each SNES update. Without a floor,
@@ -540,68 +369,9 @@ class TNEPconfig:
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)
     val_interval: int = 1
 
-    # --- early stopping & plateau-triggered sigma reset ----------------
+    # --- early stopping ------------------------------------------------
     # Early stopping patience in val ticks (None = disabled)
     patience: int | None = None
-
-    # Plateau-triggered sigma reset (IPOP-CMA-ES style, simplified for
-    # SNES). When set to an int N, the search distribution's sigma is
-    # re-broadened back toward `init_sigma` after N consecutive val
-    # ticks without improvement on best_val_loss. This re-expands the
-    # local exploration radius without abandoning best_mu, giving the
-    # optimizer a chance to escape a shallow basin.
-    #
-    # Reference: Auger & Hansen (2005) "A Restart CMA Evolution
-    # Strategy With Increasing Population Size" (CEC 2005), which sets
-    # `tolstagnation = int(100 + 100·dim^1.5 / popsize)` as the
-    # canonical default. For your typical dim ≈ 12k, λ = 100 that's
-    # ~1.3M gens — too long to be useful. A more aggressive
-    # 200–500 val ticks is more practical on NN training problems
-    # where val_interval = 10. None = disabled.
-    #
-    # Interaction with cfg.patience: plateau resets fire FIRST (they
-    # broaden σ and reset the no-improvement counter), so a run that
-    # hits plateau_reset_patience repeatedly never reaches early-stop.
-    # Setting patience < plateau_reset_patience disables the reset
-    # path entirely. cfg.max_sigma_resets caps the number of resets.
-    plateau_reset_patience: int | None = None
-    # Multiplier applied to the **current** sigma vector at every
-    # plateau reset (default 2.0 — broadens each dimension's search
-    # width by 2×). This preserves the per-dimension scale structure
-    # that SNES has learned — dimensions where the optimizer
-    # tightened sigma stay tighter than dimensions where it didn't.
-    # Soft re-broadening like this works better than hard reset in
-    # high dimensions because a uniform fresh sigma loses all per-
-    # dim information; with dim ~ 20k, the search would just random-
-    # walk from best_mu before it could rediscover which directions
-    # mattered.
-    #
-    # Typical values: 1.5–5.0. Try 2.0 first; if the model is deep in
-    # a basin and not escaping, bump to 3.0 or 5.0.
-    sigma_reset_factor: float = 2.0
-    # When True, the multiplier above is applied to `init_sigma`
-    # uniformly (i.e. canonical hard reset like IPOP-CMA-ES) rather
-    # than to the current sigma. Loses all learned per-dim scale —
-    # only set True if you have a specific reason (e.g. you want
-    # IPOP-style behaviour or have determined empirically that the
-    # learned sigma is corrupted).
-    sigma_reset_to_init: bool = False
-    # When True, restore mu to best_mu at every sigma reset (warm
-    # restart around the best known position). When False (the
-    # better default in high dim — see comment on sigma_reset_factor),
-    # leave mu where it is so the broadened search continues from
-    # the current position. The combination of (mu = best_mu) +
-    # (broadened sigma) is the canonical IPOP form, but in our
-    # high-dim NN setting it tends to throw away the directional
-    # information that SNES has accumulated.
-    plateau_restore_best_mu: bool = False
-    # Cap on the number of plateau-triggered resets. None = unlimited.
-    # Useful with cfg.patience to bound total wall-time: first hits
-    # plateau_reset_patience trigger resets; once max_sigma_resets is
-    # reached, subsequent plateaus fall through to early stopping
-    # (or just continue if patience is None). No-op when
-    # plateau_reset_patience is None — there are no resets to cap.
-    max_sigma_resets: int | None = None
 
     # ═══════════════════════════════════════════════════════════════════
     # 6. MEMORY & I/O STAGING
@@ -622,51 +392,28 @@ class TNEPconfig:
     # profile drops this to 500 because CPU forward passes prefer
     # smaller chunks (per-op latency >> per-FLOP rate vs GPU).
     batch_chunk_size: int | None = 2000
-    # XLA-compile the per-chunk eval (`_evaluate_chunk`). Fuses the
-    # dipole-kernel pre-compute and the per-type matmul + reduction ops
-    # into a single GPU kernel — typically 1.5-2× faster on Ada/Hopper.
-    # Each unique (B_chunk, P_chunk) shape triggers one XLA compile
-    # (~5-10 s the first time that shape is seen); for full-batch
-    # deterministic chunks this is a one-shot cost paid in the first
-    # generation, then steady-state runs at full XLA speed.
-    eval_jit_compile: bool = False
 
     # Where the static training tensors (descriptors, grad_values,
     # positions, pair indices, etc.) live, and which chunk-staging
     # path the SNES eval / TNEP.score loops use:
     #
     #   True  : tensors stay on host CPU. Per-chunk slice → tf.gather
-    #           → implicit H2D copy each gen. Required when the full
-    #           dataset is too big for VRAM (the disk-backed grad
-    #           cache uses pinned-host / cuFile pools to DMA chunks
-    #           to GPU on demand).
+    #           → implicit H2D copy each gen. Use when the full
+    #           dataset is too big for VRAM.
     #   False : tensors live on /GPU:0 — including grad_values, which
-    #           is loaded fully onto the GPU at startup (read from
-    #           the disk memmap when cache_gradients_to_disk=True).
-    #           The chunk-staging path becomes pure on-device
-    #           gather/strided_slice — no host round-trip, no pinned
-    #           pool, no cuFile. Fastest mode when the working set
-    #           (grad_values + descriptors + activations) fits in
-    #           VRAM.
+    #           is loaded fully onto the GPU at startup. The
+    #           chunk-staging path becomes pure on-device
+    #           gather/strided_slice — no host round-trip. Fastest
+    #           mode when the working set (grad_values + descriptors +
+    #           activations) fits in VRAM.
     pin_data_to_cpu: bool = False
 
     # --- HPC / Slurm mode ----------------------------------------------
     # Master switch for CSC / Slurm-supercomputer mode (Mahti, Puhti,
-    # LUMI etc.). When True:
-    #   - All gradient-caching / IO options are forced off
-    #     (`cache_gradients_to_disk`, `chunk_prefetch`,
-    #     `use_pinned_buffers`, `use_cufile`). Grad_values stays
-    #     in RAM (or VRAM, depending on `pin_data_to_cpu`) — no
-    #     NVMe scratch, no pinned-host pool, no cuFile / GDS. CSC
-    #     nodes have ample host RAM and the cuFile compat-mode
-    #     WSL path doesn't generalise to their kernel / filesystem
-    #     stack.
-    #   - The Slurm-specific scratch-dir resolver
-    #     (`MasterTNEP._resolve_scratch_dir`) is allowed to consult
-    #     `$SLURM_TMPDIR` / `$TMPDIR` / `$LOCAL_SCRATCH`. With this
-    #     flag False those env-vars are ignored even if set, so a
-    #     local dev environment that happens to define `TMPDIR`
-    #     doesn't accidentally land scratch there.
+    # LUMI etc.). When True, `_apply_csc_overrides` tunes the per-chunk
+    # sizing (population_chunk_size / batch_chunk_size / pin_data_to_cpu)
+    # for the detected profile. Grad_values stays in RAM (or VRAM,
+    # depending on `pin_data_to_cpu`).
     # Default False keeps non-HPC behaviour identical.
     csc_enable: bool = False
 
@@ -681,8 +428,7 @@ class TNEPconfig:
     #                      detection heuristic fails (e.g. cuda
     #                      visible but the GPU is reserved).
     #
-    # Profile overrides applied (both share the same disk/pinned/cuFile
-    # disabled common base):
+    # Profile overrides applied:
     #
     #   GPU profile (A100 40 GB, ~32 cores):
     #       population_chunk_size = None    (no chunking)
@@ -697,65 +443,6 @@ class TNEPconfig:
     # See `_apply_csc_overrides` in MasterTNEP.py for the canonical
     # implementation — when these defaults are tuned, update both sides.
     csc_profile: str = "auto"
-
-    # --- disk-backed grad cache + prefetch ring ------------------------
-    # When True, the bulky grad_values COO tensor is written to a
-    # temporary directory on disk (created next to the working directory
-    # so it lands on the same filesystem — NVMe in typical setups) and
-    # accessed via numpy memory-map. The directory is automatically
-    # removed when training ends. For large datasets (S > ~3000 organic
-    # structures) grad_values is the dominant memory term — putting it
-    # on disk cuts host RAM footprint to <500 MB while preserving
-    # precomputed-mode speed (per-chunk disk reads at NVMe sequential
-    # bandwidth ~5-10 ms, vs ~50-100 ms/gen for the rest of the
-    # training step).
-    cache_gradients_to_disk: bool = False
-
-    # Overlap disk → GPU staging of chunks N+1..N+prefetch_depth with
-    # GPU evaluation of chunk N. Up to `prefetch_depth` background
-    # threads run slice_and_complete_chunk concurrently with the
-    # consumer. depth=1 is the simple producer/consumer (one chunk in
-    # flight); depth=2 hides both disk read and host→GPU DMA behind
-    # compute; depth=3 helps further only when GPU compute > 2× disk
-    # pipe. Memory cost: depth × per-chunk grad slice (~few hundred MB
-    # at full-batch chunk_size=500 each). Set chunk_prefetch=False to
-    # bisect threading issues. Force-disabled when csc_enable=True.
-    chunk_prefetch: bool = True
-    prefetch_depth: int = 2
-
-    # --- pinned-host + cuFile pools ------------------------------------
-    # Use page-locked (pinned) host buffers for the disk-backed chunk
-    # staging path. With pinned source, tf.constant dispatches a true
-    # async cudaMemcpyAsync (no driver bounce buffer), saturating PCIe
-    # at ~12-16 GB/s instead of the ~6-8 GB/s pageable rate. Buffers
-    # are allocated via cudaMallocHost. Set False if cudart is not
-    # loadable (rare) or to bisect a regression. Force-disabled when
-    # csc_enable=True (see _apply_csc_overrides).
-    use_pinned_buffers: bool = True
-    # Number of pinned host buffers in the pool. Must be >=
-    # prefetch_depth + 1 (one for the chunk currently held by the
-    # consumer, prefetch_depth for in-flight staging). Each buffer is
-    # sized to the worst-case chunk grad slice — typically a few hundred
-    # MB — and is page-locked, so the total pinned RAM is
-    # pinned_pool_size × buffer_bytes. Bump cautiously.
-    pinned_pool_size: int = 4
-
-    # When True and libcufile is loadable, the disk-backed gradient cache
-    # is read directly from NVMe into pre-allocated GPU buffers via
-    # cuFile (NVIDIA GPUDirect Storage). On systems with the nvidia_fs
-    # kernel module loaded, this is true zero-copy disk→GPU DMA at full
-    # NVMe bandwidth. On WSL or other systems without nvidia_fs, cuFile
-    # falls back transparently to compat mode (kernel-stage buffer +
-    # CUDA-managed copy) which still saturates PCIe at ~17 GB/s once the
-    # page cache is warm — well above the ~3-5 GB/s pinned-host path.
-    # Falls back to the pinned path silently if cuFile isn't usable.
-    # Force-disabled when csc_enable=True (Lustre on Mahti has
-    # unreliable GDS support; see _apply_csc_overrides).
-    use_cufile: bool = True
-    # Number of GPU buffers in the cuFile pool. Each is sized to the
-    # worst-case chunk grad slice; total VRAM cost is
-    # cufile_pool_size × buffer_bytes. Must be >= prefetch_depth + 1.
-    cufile_pool_size: int = 2
 
     # ═══════════════════════════════════════════════════════════════════
     # 7. OUTPUT & DIAGNOSTICS

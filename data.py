@@ -170,19 +170,18 @@ def _extract_target(structure: Atoms, target_key: str) -> tf.Tensor:
 
 
 def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]:
-    """Find structures with NaN values or zero-vector targets.
+    """Find structures with NaN or missing targets.
 
     Args:
         dataset    : list of ase.Atoms
         target_key : key for the target property (e.g. 'dipole', 'pol')
 
     Returns:
-        dict with keys 'nan_positions', 'nan_targets', 'zero_targets',
+        dict with keys 'nan_positions', 'nan_targets', 'missing_targets',
         each mapping to a list of structure indices.
     """
     nan_positions = []
     nan_targets = []
-    zero_targets = []
     missing_targets = []
     for i, structure in enumerate(dataset):
         if np.any(np.isnan(structure.positions)):
@@ -194,11 +193,8 @@ def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]
             continue
         if np.any(np.isnan(target)):
             nan_targets.append(i)
-        if np.allclose(target, 0.0):
-            zero_targets.append(i)
     return {'nan_positions': nan_positions,
             'nan_targets': nan_targets,
-            'zero_targets': zero_targets,
             'missing_targets': missing_targets}
 
 
@@ -207,11 +203,11 @@ def filter_bad_data(
     dataset_types_int: list[np.ndarray],
     cfg: TNEPconfig,
 ) -> tuple[list[Atoms], list[np.ndarray]]:
-    """Remove structures with missing or unusable targets.
+    """Remove untrainable structures (NaN positions, NaN targets, missing targets).
 
-    Structures with missing target keys are always removed (they can't
-    be trained against). When `cfg.filter_bad_data` is True, also
-    remove NaN positions, NaN targets, and zero-vector targets.
+    Always runs. Structures with NaN positions, NaN targets, or a missing
+    target key can't be trained against and are dropped. If any are dropped,
+    a warning listing the per-category and total counts is printed.
 
     Returns:
         filtered_dataset, filtered_types_int : filtered parallel lists
@@ -220,20 +216,18 @@ def filter_bad_data(
     bad = find_bad_data(dataset, target_key)
 
     bad_indices: set[int] = set()
-    if bad['missing_targets']:
-        bad_indices.update(bad['missing_targets'])
-        print(f"  Filtering {len(bad['missing_targets'])} structures with missing '{target_key}' key")
-
-    if cfg.filter_bad_data:
-        for kind in ('nan_positions', 'nan_targets', 'zero_targets'):
-            if bad[kind]:
-                bad_indices.update(bad[kind])
-                print(f"  Filtering {len(bad[kind])} structures with {kind.replace('_', ' ')}")
+    for kind in ('nan_positions', 'nan_targets', 'missing_targets'):
+        bad_indices.update(bad[kind])
 
     if bad_indices:
         dataset = [s for i, s in enumerate(dataset) if i not in bad_indices]
         dataset_types_int = [t for i, t in enumerate(dataset_types_int) if i not in bad_indices]
-        print(f"  Removed {len(bad_indices)} bad structures, {len(dataset)} remaining")
+        print(
+            f"[filter_bad_data] WARNING: dropped {len(bad_indices)} structures "
+            f"(nan_targets={len(bad['nan_targets'])}, "
+            f"nan_positions={len(bad['nan_positions'])}, "
+            f"missing_targets={len(bad['missing_targets'])})"
+        )
 
     return dataset, dataset_types_int
 
@@ -415,17 +409,11 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     builder = make_descriptor_builder(cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(dataset)
     data = assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
-    # Thread q_scaler and target_mean from cfg so the eval dict is in
-    # the same scaled+centered space the model was trained on. Without
-    # this, downstream metrics that aren't shift-invariant (cos_sim,
-    # total_rmse) silently report wrong values when centering is on.
     _self_only = (cfg.target_mode == 1
                   and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
     return pad_and_stack(
         data,
         num_types=cfg.num_types,
-        q_scaler=getattr(cfg, "_q_scaler", None),
-        target_mean=getattr(cfg, "_target_mean", None),
         self_pairs_only=_self_only)
 
 
@@ -500,71 +488,36 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     # Build train + val descriptors. Test descriptors are NOT built here —
     # they're constructed lazily at scoring time by `materialize_test_data`
     # (avoids paying that cost before training, in case the user aborts).
-    # When cache_gradients_to_disk is on the GPU TF backend, gradients go
-    # straight from per-chunk SOAP output into the NVMe scratch file; the
-    # dataset-wide ~10 GB COO is never held in RAM at any point.
-    train_streamed = val_streamed = None
-    gv_dir = getattr(cfg, "_gradient_cache_path", None)
-    if (getattr(cfg, "cache_gradients_to_disk", False)
-            and gv_dir is not None and cfg.descriptor_mode == 1):
-        os_module = __import__("os")
-        train_streamed = builder.build_descriptors_streaming_to_disk(
-            train_dataset,
-            gv_path=os_module.path.join(gv_dir, "grad_values_train.bin"),
-            chunk_size=cfg.descriptor_batch_frames,
-            progress_desc="Building train descriptors (streaming)")
-        val_streamed = builder.build_descriptors_streaming_to_disk(
-            val_dataset,
-            gv_path=os_module.path.join(gv_dir, "grad_values_val.bin"),
-            chunk_size=cfg.descriptor_batch_frames,
-            progress_desc="Building val descriptors (streaming)")
-        train_descriptors = train_streamed["descriptors"]
-        val_descriptors   = val_streamed["descriptors"]
-        # Empty bucket-format placeholders so assemble_data_dict /
-        # pad_and_stack's existing field plumbing keeps working.
-        # pad_and_stack picks up prebuilt_gv from data['_prebuilt_gv'] and
-        # skips its own gradient flatten step.
-        train_gradients  = [[] for _ in range(len(train_dataset))]
-        val_gradients    = [[] for _ in range(len(val_dataset))]
-        train_grad_index = [[] for _ in range(len(train_dataset))]
-        val_grad_index   = [[] for _ in range(len(val_dataset))]
+    # When `dipole_rij_power == 0` the dipole forward consumes only
+    # self-pair gradients ∂q_i/∂r_i. Build in batches and immediately
+    # drop the neighbour-gradient rows that the forward will never
+    # read — bounds peak memory to one batch's worth of the
+    # ~90%-of-COO neighbour-gradient tensor (see
+    # `descriptor_self_batch_size` doc).
+    _self_only_batch = (int(cfg.descriptor_self_batch_size)
+                        if getattr(cfg, "descriptor_self_batch_size", None)
+                        is not None else None)
+    _self_only = (int(getattr(cfg, "dipole_rij_power", 0)) == 0
+                  and cfg.target_mode == 1)
+    if _self_only:
+        _kw = {"progress_desc": "Building train descriptors (self-only, batched)"} \
+            if cfg.descriptor_mode == 1 else {}
+        train_descriptors, train_gradients, train_grad_index = \
+            builder.build_descriptors_self_only(
+                train_dataset, batch_size=_self_only_batch, **_kw)
+        _kw = {"progress_desc": "Building val descriptors (self-only, batched)"} \
+            if cfg.descriptor_mode == 1 else {}
+        val_descriptors, val_gradients, val_grad_index = \
+            builder.build_descriptors_self_only(
+                val_dataset, batch_size=_self_only_batch, **_kw)
     else:
-        # When `dipole_rij_power == 0` the dipole forward consumes only
-        # self-pair gradients ∂q_i/∂r_i. Build in batches and immediately
-        # drop the neighbour-gradient rows that the forward will never
-        # read — bounds peak memory to one batch's worth of the
-        # ~90%-of-COO neighbour-gradient tensor (see
-        # `descriptor_self_batch_size` doc).
-        _self_only_batch = (int(cfg.descriptor_self_batch_size)
-                            if getattr(cfg, "descriptor_self_batch_size", None)
-                            is not None else None)
-        _self_only = (int(getattr(cfg, "dipole_rij_power", 0)) == 0
-                      and cfg.target_mode == 1)
-        if _self_only:
-            _kw = {"progress_desc": "Building train descriptors (self-only, batched)"} \
-                if cfg.descriptor_mode == 1 else {}
-            train_descriptors, train_gradients, train_grad_index = \
-                builder.build_descriptors_self_only(
-                    train_dataset, batch_size=_self_only_batch, **_kw)
-            _kw = {"progress_desc": "Building val descriptors (self-only, batched)"} \
-                if cfg.descriptor_mode == 1 else {}
-            val_descriptors, val_gradients, val_grad_index = \
-                builder.build_descriptors_self_only(
-                    val_dataset, batch_size=_self_only_batch, **_kw)
-        else:
-            _kw = {"progress_desc": "Building train descriptors"} if cfg.descriptor_mode == 1 else {}
-            train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset, **_kw)
-            _kw = {"progress_desc": "Building val descriptors"} if cfg.descriptor_mode == 1 else {}
-            val_descriptors,   val_gradients,   val_grad_index   = builder.build_descriptors(val_dataset, **_kw)
+        _kw = {"progress_desc": "Building train descriptors"} if cfg.descriptor_mode == 1 else {}
+        train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset, **_kw)
+        _kw = {"progress_desc": "Building val descriptors"} if cfg.descriptor_mode == 1 else {}
+        val_descriptors,   val_gradients,   val_grad_index   = builder.build_descriptors(val_dataset, **_kw)
 
     train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
     val_data   = assemble_data_dict(val_dataset,   val_types_int,   val_descriptors,   val_gradients,   val_grad_index,   cfg)
-    if train_streamed is not None:
-        # Streaming-to-disk: hand the streamed descriptor / gradient
-        # metadata to pad_and_stack via a private dict key so the standard
-        # MasterTNEP call path stays unchanged.
-        train_data["_prebuilt_gv"] = train_streamed
-        val_data["_prebuilt_gv"] = val_streamed
     # Test set: deferred. Stash the raw atoms + per-atom type indices so
     # `materialize_test_data` can build descriptors at scoring time. The
     # rest of train_model treats this dict as opaque until then.
@@ -622,37 +575,17 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     test_types_int = test_pending["types_int"]
 
     builder = make_descriptor_builder(cfg)
-    gv_dir = getattr(cfg, "_gradient_cache_path", None)
-    test_streamed = None
-    if (getattr(cfg, "cache_gradients_to_disk", False)
-            and gv_dir is not None and cfg.descriptor_mode == 1):
-        import os as _os
-        test_streamed = builder.build_descriptors_streaming_to_disk(
-            test_dataset,
-            gv_path=_os.path.join(gv_dir, "grad_values_test.bin"),
-            chunk_size=cfg.descriptor_batch_frames,
-            progress_desc="Building test descriptors (streaming)")
-        test_descriptors = test_streamed["descriptors"]
-        test_gradients   = [[] for _ in range(len(test_dataset))]
-        test_grad_index  = [[] for _ in range(len(test_dataset))]
-    else:
-        _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
-        test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(
-            test_dataset, **_kw)
+    _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
+    test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(
+        test_dataset, **_kw)
 
     test_data = assemble_data_dict(
         test_dataset, test_types_int,
         test_descriptors, test_gradients, test_grad_index, cfg)
-    if test_streamed is not None:
-        test_data["_prebuilt_gv"] = test_streamed
     _self_only = (cfg.target_mode == 1
                   and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
     test_data = pad_and_stack(
         test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
-        gradient_cache_path=getattr(cfg, "_gradient_cache_path", None),
-        cache_tag="test",
-        q_scaler=getattr(cfg, "_q_scaler", None),
-        target_mean=getattr(cfg, "_target_mean", None),
         self_pairs_only=_self_only)
     # Pre-stage per-chunk pair indices to GPU. Test eval doesn't go
     # through `_evaluate_chunk` (TNEP.score uses model.predict_batch),
@@ -661,41 +594,6 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     chunk = cfg.batch_chunk_size if cfg.batch_chunk_size is not None else S_test
     test_ranges = [(s, min(s + chunk, S_test)) for s in range(0, S_test, chunk)]
     prestage_chunk_indices(test_data, test_ranges)
-    if (getattr(cfg, "use_pinned_buffers", True)
-            and test_data.get("_gv_disk_backed", False)):
-        n_buffers = max(int(getattr(cfg, "pinned_pool_size", 4)),
-                        int(getattr(cfg, "prefetch_depth", 1)) + 1)
-        pool = make_pinned_pool_for(
-            test_data, batch_chunk_size=cfg.batch_chunk_size,
-            n_buffers=n_buffers)
-        if pool is not None:
-            test_data["_pinned_pool"] = pool
-            print(f"  pinned-buffer pool ({len(pool._all)} × "
-                  f"{pool.buffer_nbytes/1e6:.0f} MB) attached to test_data")
-    if (getattr(cfg, "use_cufile", True)
-            and test_data.get("_gv_disk_backed", False)):
-        try:
-            from cufile_io import (cuFile_available, CuFileHandle,
-                                   make_cufile_pool_for)
-        except Exception:
-            pass
-        else:
-            if cuFile_available():
-                gv = test_data.get("grad_values")
-                if hasattr(gv, "filename"):
-                    n_cf = max(int(getattr(cfg, "cufile_pool_size", 4)),
-                               int(getattr(cfg, "prefetch_depth", 1)) + 1)
-                    pool = make_cufile_pool_for(
-                        test_data, batch_chunk_size=cfg.batch_chunk_size,
-                        n_buffers=n_cf)
-                    if pool is not None:
-                        try:
-                            handle = CuFileHandle(gv.filename)
-                            test_data["_cufile_ctx"] = {"handle": handle, "pool": pool}
-                            print(f"  cuFile pool ({len(pool._all)} × "
-                                  f"{pool.nbytes/1e6:.0f} MB) attached to test_data")
-                        except Exception as e:
-                            print(f"  cuFile open failed for test: {e}")
     test_pending["_built"] = test_data
     # Free the raw atom list now that descriptors are baked in.
     test_pending["dataset"] = None
@@ -703,201 +601,8 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     return test_data
 
 
-def _compute_q_scaler(descriptors_list, dim_q: int,
-                      eps: float = 1e-30) -> np.ndarray:
-    """Compute per-channel range scaler from training-set descriptors.
-
-    Mirrors GPUMD's `find_max_min` kernel (see GPUMD/src/main_nep/tnep.cu):
-
-        For each channel d:
-            range_d   = max over all atoms - min over all atoms
-            scaler_d  = 1 / max(range_d, eps)
-
-    The eps floor avoids divide-by-zero for channels that are
-    constant across the training set (uncommon but possible if SOAP
-    params are pathological; such channels carry no information and
-    will be killed by L1/L2 regularisation downstream anyway).
-
-    Computed via streaming min/max to avoid a 2x-memory concat —
-    important for large training sets.
-
-    Args:
-        descriptors_list : list of [N_i, Q] arrays / tensors (one per
-                           structure in the training set, pre-padding).
-        dim_q            : Q (number of descriptor channels).
-        eps              : floor on the range to avoid 1/0.
-
-    Returns:
-        scaler : [Q] float32 array of per-channel multipliers.
-    """
-    chan_min = None
-    chan_max = None
-    for d in descriptors_list:
-        arr = (d.numpy() if hasattr(d, "numpy") else np.asarray(d))
-        arr = arr.reshape(-1, dim_q)
-        m_min = arr.min(axis=0)
-        m_max = arr.max(axis=0)
-        if chan_min is None:
-            chan_min, chan_max = m_min, m_max
-        else:
-            chan_min = np.minimum(chan_min, m_min)
-            chan_max = np.maximum(chan_max, m_max)
-    chan_range = chan_max - chan_min
-    safe_range = np.maximum(chan_range, eps)
-    return (1.0 / safe_range).astype(np.float32)
-
-
-def _compute_q_scaler_l_block(descriptors_list, layout: dict,
-                              eps: float = 1e-30) -> np.ndarray:
-    """Compute per-(species-pair, l) block-pooled range scaler.
-
-    Same shape as `_compute_q_scaler` ([Q] float32) so the rest of the
-    pipeline (storage, application via `_apply_q_scaler_np`, save/load)
-    is unchanged. The difference is structural: all q-indices that
-    belong to the same (pair, l) angular block share one multiplier.
-
-    Rationale: equalises the dominant magnitude variation in SOAP —
-    which lives ACROSS l (l=0 components are O(1), l=l_max ~O(0.01))
-    — while preserving the WITHIN-block isotropy that the
-    descriptor-mixing rotations (l_aware / cross_pair_l with V_pair
-    parameterised by Cayley) assume. Per-α components within a
-    (pair, l) block are typically already on comparable scales and
-    do not need decorrelating.
-
-    Algorithm:
-        For each (pair, l) block B = layout["pair_ln_index"][pair][l]:
-            range_B   = max(q[atoms, B]) − min(q[atoms, B])    (scalar)
-            for each d in B: scaler[d] = 1 / max(range_B, eps)
-
-    Args:
-        descriptors_list : list of [N_i, Q] arrays / tensors (one per
-                           training structure, pre-padding).
-        layout           : dict from `descriptor_block_layout(cfg)` —
-                           supplies "pair_keys", "pair_ln_index", "dim_q".
-        eps              : floor on the range to avoid 1/0.
-
-    Returns:
-        scaler : [Q] float32 array. Entries within the same (pair, l)
-                 block are identical; entries across blocks differ.
-    """
-    dim_q = int(layout["dim_q"])
-    # Streaming per-element min/max, same as the per-component path —
-    # we then pool across each block's indices in a second pass. Keeping
-    # the streaming pass element-wise avoids a per-block reduce inside
-    # the loop over training structures, which would scale O(num_blocks).
-    chan_min = None
-    chan_max = None
-    for d in descriptors_list:
-        arr = (d.numpy() if hasattr(d, "numpy") else np.asarray(d))
-        arr = arr.reshape(-1, dim_q)
-        m_min = arr.min(axis=0)
-        m_max = arr.max(axis=0)
-        if chan_min is None:
-            chan_min, chan_max = m_min, m_max
-        else:
-            chan_min = np.minimum(chan_min, m_min)
-            chan_max = np.maximum(chan_max, m_max)
-    scaler = np.empty(dim_q, dtype=np.float32)
-    pair_keys = layout["pair_keys"]
-    pair_ln_index = layout["pair_ln_index"]
-    # Track covered indices to catch layout gaps (would indicate a
-    # mismatch between descriptor_block_layout and the actual descriptor
-    # build — same invariant the layout code asserts internally).
-    covered = np.zeros(dim_q, dtype=bool)
-    for pair in pair_keys:
-        for l, idx in pair_ln_index[pair].items():
-            block_min = float(chan_min[idx].min())
-            block_max = float(chan_max[idx].max())
-            block_range = max(block_max - block_min, eps)
-            scaler[idx] = np.float32(1.0 / block_range)
-            covered[idx] = True
-    if not covered.all():
-        missing = np.where(~covered)[0]
-        raise RuntimeError(
-            f"l_block q_scaler: {missing.size} q-indices not covered by "
-            f"pair_ln_index (first few: {missing[:5].tolist()}). "
-            f"descriptor_block_layout / dim_q mismatch.")
-    return scaler
-
-
-def _apply_q_scaler_np(desc_np: np.ndarray,
-                       grad_values_np: np.ndarray | None,
-                       scaler: np.ndarray) -> None:
-    """In-place per-channel scaling of `desc_np` and `grad_values_np`.
-
-    Both tensors are multiplied by the same `[Q]`-shape scaler along
-    their last axis. The dipole chain rule (∂U/∂r = ∂U/∂q' · diag(s)
-    · ∂q/∂r) is satisfied when BOTH descriptor and grad are scaled at
-    the data pipeline — see plan §"Why option (A)".
-
-    Args:
-        desc_np        : [S, A, Q] float32 padded descriptors.
-        grad_values_np : [P, 3, Q] float32 COO gradient values, or
-                         None (e.g. streaming path where grad is
-                         already on disk).
-        scaler         : [Q] float32 per-channel multiplier.
-    """
-    s = scaler.astype(np.float32)
-    desc_np *= s[None, None, :]
-    if grad_values_np is not None:
-        grad_values_np *= s[None, None, :]
-
-
-def _compute_target_mean(targets_list, target_dim: int) -> np.ndarray:
-    """Compute per-component mean over the training-set targets.
-
-    The mean is a `[T_dim]` vector — one offset per output channel
-    (scalar for energy, [3] for dipole, [6] for polarisability). It's
-    subtracted from all targets at the data-pipeline level so the
-    network learns in a zero-mean output space (see
-    `cfg.target_centering` in TNEPconfig). The same mean is added back
-    to predictions at the inference boundary so user-facing values stay
-    in the original units.
-
-    Why centering matters: the ANN has one scalar output bias `b1`; it
-    cannot place an independent per-component offset on the dipole /
-    polarisability output. With a non-zero training target mean (e.g.
-    anisotropic dataset orientations), the model must encode the offset
-    through the W0/W1/SOAP-gradient pathway, consuming capacity that
-    should be going to genuine pattern-fitting. Centering moves the
-    offset into a frozen training-time constant.
-
-    Args:
-        targets_list : list of scalar / [T_dim] arrays / tensors,
-                       one per training structure.
-        target_dim   : T_dim (1, 3, or 6 for target_mode 0, 1, 2).
-
-    Returns:
-        mean : [T_dim] float32 — per-component mean.
-    """
-    if not targets_list:
-        return np.zeros(target_dim, dtype=np.float32)
-    acc = np.zeros(target_dim, dtype=np.float64)
-    for i, t in enumerate(targets_list):
-        arr = (t.numpy() if hasattr(t, "numpy") else np.asarray(t))
-        if arr.shape == ():
-            if target_dim != 1:
-                raise ValueError(
-                    f"_compute_target_mean: target[{i}] is scalar but "
-                    f"target_dim={target_dim}; cannot mix scalar and "
-                    f"vector targets in one list.")
-            acc[0] += float(arr)
-        else:
-            if arr.shape != (target_dim,):
-                raise ValueError(
-                    f"_compute_target_mean: target[{i}] has shape "
-                    f"{arr.shape} but expected ({target_dim},).")
-            acc += arr.astype(np.float64)
-    return (acc / len(targets_list)).astype(np.float32)
-
-
 def pad_and_stack(data: dict, num_types: int | None = None,
                   pin_to_cpu: bool = True,
-                  gradient_cache_path: str | None = None,
-                  cache_tag: str = "data",
-                  prebuilt_gv: dict | None = None,
-                  q_scaler: np.ndarray | None = None,
-                  target_mean: np.ndarray | None = None,
                   self_pairs_only: bool = False) -> dict[str, tf.Tensor]:
     """Convert variable-length list-of-tensors data into COO + padded tensors.
 
@@ -936,12 +641,6 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             num_atoms   : [S]            int32
         where S = num_structures, A = max_atoms, Q = dim_q, P = total atom-neighbor pairs
     """
-    # Pick up streamed-to-disk gradient metadata stamped by split() / the
-    # streaming test-data path. Explicit prebuilt_gv argument takes
-    # precedence so callers can override.
-    if prebuilt_gv is None:
-        prebuilt_gv = data.get("_prebuilt_gv")
-
     S = len(data["descriptors"])
     dim_q = data["descriptors"][0].shape[-1]
     atom_counts = [data["descriptors"][i].shape[0] for i in range(S)]
@@ -953,20 +652,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     has_virials = "virials" in data
 
     # Count pairs per structure to build CSR struct_ptr and size COO arrays.
-    # When prebuilt_gv is provided, the gradient COO is already on disk —
-    # we still need pair_counts/struct_ptr to slice the on-disk file per
-    # chunk, but we don't allocate grad_values_np in RAM.
-    if self_pairs_only and prebuilt_gv is not None:
-        raise NotImplementedError(
-            "self_pairs_only=True (dipole_rij_power=0) is not yet wired "
-            "for the prebuilt_gv / streamed-to-disk gradient path. "
-            "Either disable streaming (set cfg.cache_gradients_to_disk=False) "
-            "or extend the streaming descriptor builders to emit only "
-            "self pairs upstream.")
-
-    if prebuilt_gv is not None:
-        pair_counts = list(prebuilt_gv["pair_count_per_struct"])
-    elif self_pairs_only:
+    if self_pairs_only:
         # Self-only: count how many centres have at least one row in
         # data["grad_index"][s][i] equal to i (the centre's own index).
         # Quippy/soap_turbo emits the zero-image self entry FIRST per
@@ -991,10 +677,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     for s in range(S):
         struct_ptr_np[s + 1] = struct_ptr_np[s] + pair_counts[s]
 
-    # COO arrays: one entry per real atom-neighbor pair. grad_values_np is
-    # only allocated in RAM if we don't already have a streamed disk file.
-    if prebuilt_gv is None:
-        grad_values_np = np.zeros((N_pairs_total, 3, dim_q), dtype=np.float32)
+    # COO arrays: one entry per real atom-neighbor pair.
+    grad_values_np = np.zeros((N_pairs_total, 3, dim_q), dtype=np.float32)
     pair_struct_np = np.zeros(N_pairs_total, dtype=np.int32)
     pair_atom_np   = np.zeros(N_pairs_total, dtype=np.int32)
     pair_gidx_np   = np.zeros(N_pairs_total, dtype=np.int32)
@@ -1041,89 +725,44 @@ def pad_and_stack(data: dict, num_types: int | None = None,
         if has_virials:
             virial_np[s, :] = data["virials"][s].numpy()
 
-        if prebuilt_gv is not None:
-            # Streaming path: pair_atom/pair_gidx already collected per
-            # structure (frame-local). Just stamp pair_struct = s and
-            # advance the offset by the recorded pair count.
-            n_nbrs = pair_counts[s]
-            k_end = pair_offset + n_nbrs
-            if n_nbrs:
+        for i in range(N_s):
+            gv_full = data["gradients"][s][i]
+            gidx_full = np.asarray(data["grad_index"][s][i])
+            if self_pairs_only:
+                # Keep only the FIRST row where the neighbour index ==
+                # centre index. soap_turbo/quippy emit the zero-image
+                # self entry first per centre; any subsequent matches
+                # are periodic IMAGES of atom i (same atom index,
+                # nonzero displacement vector) and would double-count
+                # the self contribution under dipole_rij_power=0, so
+                # we intentionally drop them. Drops the neighbour
+                # pairs entirely — grad_values_np shrinks from
+                # O(N·M) per structure to O(N), and N=0 dipole
+                # becomes a clean Σ_i de_dq[i] · grad_values[i, i].
+                mask = (gidx_full == i)
+                if not bool(np.any(mask)):
+                    continue
+                k0 = int(np.argmax(mask))  # first True index
+                gv_arr = (gv_full.numpy()
+                          if hasattr(gv_full, "numpy") else np.asarray(gv_full))
+                grad_values_np[pair_offset] = gv_arr[k0]
+                pair_struct_np[pair_offset] = s
+                pair_atom_np[pair_offset]   = i
+                pair_gidx_np[pair_offset]   = int(gidx_full[k0])
+                pair_offset += 1
+            else:
+                n_nbrs = gv_full.shape[0]
+                k_end  = pair_offset + n_nbrs
+                grad_values_np[pair_offset:k_end] = (
+                    gv_full.numpy() if hasattr(gv_full, "numpy")
+                    else np.asarray(gv_full))
                 pair_struct_np[pair_offset:k_end] = s
-                pair_atom_np[pair_offset:k_end]   = prebuilt_gv["pair_atom_per_struct"][s]
-                pair_gidx_np[pair_offset:k_end]   = prebuilt_gv["pair_gidx_per_struct"][s]
-            pair_offset = k_end
-        else:
-            for i in range(N_s):
-                gv_full = data["gradients"][s][i]
-                gidx_full = np.asarray(data["grad_index"][s][i])
-                if self_pairs_only:
-                    # Keep only the FIRST row where the neighbour index ==
-                    # centre index. soap_turbo/quippy emit the zero-image
-                    # self entry first per centre; any subsequent matches
-                    # are periodic IMAGES of atom i (same atom index,
-                    # nonzero displacement vector) and would double-count
-                    # the self contribution under dipole_rij_power=0, so
-                    # we intentionally drop them. Drops the neighbour
-                    # pairs entirely — grad_values_np shrinks from
-                    # O(N·M) per structure to O(N), and N=0 dipole
-                    # becomes a clean Σ_i de_dq[i] · grad_values[i, i].
-                    mask = (gidx_full == i)
-                    if not bool(np.any(mask)):
-                        continue
-                    k0 = int(np.argmax(mask))  # first True index
-                    gv_arr = (gv_full.numpy()
-                              if hasattr(gv_full, "numpy") else np.asarray(gv_full))
-                    grad_values_np[pair_offset] = gv_arr[k0]
-                    pair_struct_np[pair_offset] = s
-                    pair_atom_np[pair_offset]   = i
-                    pair_gidx_np[pair_offset]   = int(gidx_full[k0])
-                    pair_offset += 1
-                else:
-                    n_nbrs = gv_full.shape[0]
-                    k_end  = pair_offset + n_nbrs
-                    grad_values_np[pair_offset:k_end] = (
-                        gv_full.numpy() if hasattr(gv_full, "numpy")
-                        else np.asarray(gv_full))
-                    pair_struct_np[pair_offset:k_end] = s
-                    pair_atom_np[pair_offset:k_end]   = i
-                    pair_gidx_np[pair_offset:k_end]   = gidx_full
-                    pair_offset += n_nbrs
-
-    # Apply per-channel descriptor scaling (cfg.descriptor_scaling="q_scaler").
-    # Multiplying BOTH desc and grad_values by the same s[Q] is the
-    # data-pipeline equivalent of GPUMD's "scale q at ANN input + scale
-    # Fp at ANN backward" pattern — see plan section "Why scaling
-    # gradients is necessary". The streaming path (prebuilt_gv) has
-    # grad_values on disk already and is rejected here; rebuild the
-    # dataset without streaming if you need scaling.
-    if q_scaler is not None:
-        if prebuilt_gv is not None:
-            raise ValueError(
-                "q_scaler is not supported with the streaming "
-                "(prebuilt_gv) path because grad_values is already on "
-                "disk and cannot be modified in-place. Rebuild without "
-                "streaming, or pre-scale the .bin file offline.")
-        _apply_q_scaler_np(desc_np, grad_values_np, q_scaler)
-
-    # Per-component target centering (cfg.target_centering=True). One
-    # broadcast subtraction along the T_dim axis. Same mean is used for
-    # train/val/test so the model sees a consistent zero point; the
-    # mean is added back to predictions at the inference boundary so
-    # user-facing values stay in the original units.
-    if target_mean is not None:
-        tm = np.asarray(target_mean, dtype=np.float32).reshape(-1)
-        if tm.shape[0] != tgt_np.shape[1]:
-            raise ValueError(
-                f"target_mean has {tm.shape[0]} components but targets "
-                f"have {tgt_np.shape[1]}; mismatch.")
-        tgt_np -= tm[np.newaxis, :]
+                pair_atom_np[pair_offset:k_end]   = i
+                pair_gidx_np[pair_offset:k_end]   = gidx_full
+                pair_offset += n_nbrs
 
     # Convert each numpy array to a TF tensor then immediately delete the numpy
     # copy so peak RAM stays at ~1x dataset size rather than ~2x.
-    # When gradient_cache_path is set, grad_values is the only field that
-    # is *not* a TF tensor: it's written to disk and replaced by a numpy
-    # memmap. slice_and_complete_chunk reads the per-chunk slice on
-    # demand. Everything else stays as TF tensors as before.
     # When pin_to_cpu, always pin to CPU. Otherwise pin to GPU when one
     # exists; CPU-only nodes fall back to the implicit CPU placement.
     _dev_ctx = (tf.device('/CPU:0') if pin_to_cpu
@@ -1131,49 +770,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     with _dev_ctx:
         result = {}
         result["descriptors"] = tf.constant(desc_np);    del desc_np
-        if prebuilt_gv is not None:
-            # Streaming path: gradient bytes are already on disk. Just
-            # memmap them — no in-RAM grad_values_np was ever allocated.
-            gv_path = prebuilt_gv["gv_path"]
-            gv_shape = prebuilt_gv["gv_shape"]
-            gv_dtype = prebuilt_gv["gv_dtype"]
-            result["grad_values"] = np.memmap(
-                gv_path, dtype=gv_dtype, mode="r", shape=gv_shape)
-            result["_gv_disk_backed"] = True
-            print(f"  pad_and_stack: grad_values streamed at {gv_path} "
-                  f"(shape={gv_shape}, "
-                  f"{int(np.prod(gv_shape, dtype=np.int64)) * np.dtype(gv_dtype).itemsize / 1e9:.2f} GB)")
-        elif gradient_cache_path is not None:
-            import os as _os
-            _os.makedirs(gradient_cache_path, exist_ok=True)
-            gv_path = _os.path.join(
-                gradient_cache_path, f"grad_values_{cache_tag}.bin")
-            gv_shape = grad_values_np.shape
-            gv_dtype = grad_values_np.dtype
-            # Atomic write: tmp file + os.replace. A SIGINT or disk-full
-            # mid-write would otherwise leave a partial .bin that the
-            # next memmap.open silently accepts, feeding garbage tail
-            # bytes into training.
-            tmp_path = gv_path + ".tmp"
-            try:
-                grad_values_np.tofile(tmp_path)
-                _os.replace(tmp_path, gv_path)
-            except BaseException:
-                if _os.path.exists(tmp_path):
-                    _os.remove(tmp_path)
-                raise
-            del grad_values_np
-            # Memory-map view: scattered fancy-index reads serve per-chunk
-            # slices at NVMe sequential bandwidth. The OS page cache
-            # handles repeated access to the same structures.
-            result["grad_values"] = np.memmap(
-                gv_path, dtype=gv_dtype, mode="r", shape=gv_shape)
-            result["_gv_disk_backed"] = True
-            print(f"  pad_and_stack: grad_values cached at {gv_path} "
-                  f"(shape={gv_shape}, "
-                  f"{int(np.prod(gv_shape, dtype=np.int64)) * np.dtype(gv_dtype).itemsize / 1e9:.2f} GB)")
-        else:
-            result["grad_values"] = tf.constant(grad_values_np); del grad_values_np
+        result["grad_values"] = tf.constant(grad_values_np); del grad_values_np
         result["pair_struct"] = tf.constant(pair_struct_np); del pair_struct_np
         result["pair_atom"]   = tf.constant(pair_atom_np);   del pair_atom_np
         result["pair_gidx"]   = tf.constant(pair_gidx_np);   del pair_gidx_np
@@ -1281,8 +878,7 @@ def _is_contiguous_range(arr: np.ndarray) -> bool:
     return bool(np.all(np.diff(arr) == 1))
 
 
-def slice_and_complete_chunk(data: dict, indices,
-                              precomputed: dict | None = None) -> dict:
+def slice_and_complete_chunk(data: dict, indices) -> dict:
     """Build a chunk dict by slicing per-structure fields from `data`.
 
     The returned chunk has the same field contract that `SNES._evaluate_chunk`
@@ -1300,9 +896,8 @@ def slice_and_complete_chunk(data: dict, indices,
         targets      [B_chunk, T]
         types_contained [B_chunk, T]   (only present when caller supplied it)
 
-    When grad_values is a numpy memmap (cfg.cache_gradients_to_disk path),
-    the chunk's pair slice is pulled from disk and shipped to the GPU as a
-    fresh tf.constant; otherwise tf.gather slices the in-memory tensor.
+    The chunk's gradient pair slice is produced by tf.gather over the
+    in-memory grad_values tensor.
     """
     if isinstance(indices, tf.Tensor):
         idx_tf = tf.cast(indices, tf.int32)
@@ -1322,238 +917,26 @@ def slice_and_complete_chunk(data: dict, indices,
     # struct_ptr[idx_tf[i]] : struct_ptr[idx_tf[i]+1] of the flat
     # gradient/pair arrays. Build the flat pair-index list via
     # tf.ragged.range and gather. pair_struct is remapped to chunk-local
-    # indices [0..B_chunk) via value_rowids(). When `precomputed` is
-    # supplied (deterministic full-batch chunks) we skip the ragged
-    # build and reuse the cached arrays.
-    if precomputed is not None:
-        flat_pair_idx_np = precomputed["flat_pair_idx_np"]
-        flat_pair_idx_tf = precomputed["flat_pair_idx_tf"]
-        chunk["pair_struct"] = precomputed["pair_struct_tf"]
-    else:
-        ptr = data["struct_ptr"]
-        pair_starts = tf.gather(ptr, idx_tf)
-        pair_ends   = tf.gather(ptr, idx_tf + 1)
-        pair_ranges = tf.ragged.range(pair_starts, pair_ends)
-        flat_pair_idx_tf = tf.cast(pair_ranges.flat_values, tf.int32)
-        flat_pair_idx_np = None
-        chunk["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
+    # indices [0..B_chunk) via value_rowids().
+    ptr = data["struct_ptr"]
+    pair_starts = tf.gather(ptr, idx_tf)
+    pair_ends   = tf.gather(ptr, idx_tf + 1)
+    pair_ranges = tf.ragged.range(pair_starts, pair_ends)
+    flat_pair_idx_tf = tf.cast(pair_ranges.flat_values, tf.int32)
+    chunk["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
 
     gv = data["grad_values"]
-    if data.get("_gv_disk_backed", False):
-        # Disk-backed: pull this chunk's pair slice from the memmap.
-        # For deterministic contiguous-structure chunks (the full-batch
-        # case, which is the dominant cost path) flat_pair_idx is a
-        # contiguous arange, so a plain slice into the memmap is a
-        # zero-copy view and the subsequent memcpy is *one* sequential
-        # memcpy from page cache instead of the much more expensive
-        # scatter-gather fancy-index. Random-index batches fall back to
-        # the fancy-index path.
-        if flat_pair_idx_np is None:
-            flat_pair_idx_np = flat_pair_idx_tf.numpy()
-        is_contig = _is_contiguous_range(flat_pair_idx_np)
-        if is_contig:
-            lo = int(flat_pair_idx_np[0])
-            hi = int(flat_pair_idx_np[-1]) + 1
-
-        pool: "PinnedBufferPool | None" = data.get("_pinned_pool")
-        buf = pool.acquire() if pool is not None else None
-        if buf is not None:
-            # Memcpy directly into pinned host memory; tf.constant from a
-            # pinned source takes the async cudaMemcpyAsync path (no
-            # driver bounce). The DMA may still be reading the buffer
-            # *after* tf.constant returns — so we attach a holder that
-            # only releases the buffer back to the pool when the chunk
-            # dict itself is garbage-collected (which happens after the
-            # consumer has used the GPU tensor and the DMA has been
-            # implicitly synchronised by the next op).
-            if is_contig:
-                src = gv[lo:hi]
-            else:
-                src = gv[flat_pair_idx_np]
-            pinned_view = buf.view_as(gv.dtype, src.shape)
-            np.copyto(pinned_view, src, casting="no")
-            chunk["grad_values"] = tf.constant(pinned_view)
-            chunk["_pinned_holder"] = _PinnedBufferHolder(buf, pool)
-        else:
-            # Pageable fallback: numpy allocates, tf.constant uses driver
-            # bounce buffer. Still correct, just slower.
-            if is_contig:
-                chunk_grad_np = np.ascontiguousarray(gv[lo:hi])
-            else:
-                chunk_grad_np = np.asarray(gv[flat_pair_idx_np])
-            chunk["grad_values"] = tf.constant(chunk_grad_np)
-    else:
-        chunk["grad_values"] = tf.gather(gv, flat_pair_idx_tf)
+    chunk["grad_values"] = tf.gather(gv, flat_pair_idx_tf)
     chunk["pair_atom"]   = tf.gather(data["pair_atom"],   flat_pair_idx_tf)
     chunk["pair_gidx"]   = tf.gather(data["pair_gidx"],   flat_pair_idx_tf)
     return chunk
 
 
 # ============================================================================
-# Chunk staging + prefetch + GPU LRU cache
+# Chunk staging + prefetch + chunk-index caching
 # ============================================================================
 
-class PinnedBuffer:
-    """Page-locked host buffer allocated via cudaMallocHost.
-
-    Pinned host memory enables true async cudaMemcpyAsync from host to
-    GPU without a driver-managed bounce buffer (which silently downgrades
-    pageable transfers to a synchronous staging copy + async DMA). For
-    bulk H2D the resulting bandwidth is ~12-16 GB/s on PCIe Gen4 vs
-    ~6-8 GB/s with pageable.
-
-    The numpy `.uint8_view` is a writable view directly over the pinned
-    pages; reshape with `view_as(dtype, shape)`.
-    """
-    def __init__(self, nbytes: int):
-        import ctypes as _ct
-        cuda = _get_cudart()
-        cuda.cudaMallocHost.restype = _ct.c_int
-        cuda.cudaMallocHost.argtypes = [_ct.POINTER(_ct.c_void_p), _ct.c_size_t]
-        cuda.cudaFreeHost.restype = _ct.c_int
-        cuda.cudaFreeHost.argtypes = [_ct.c_void_p]
-        self._p = _ct.c_void_p()
-        err = cuda.cudaMallocHost(_ct.byref(self._p), _ct.c_size_t(int(nbytes)))
-        if err != 0:
-            raise RuntimeError(f"cudaMallocHost({nbytes}) failed with code {err}")
-        self.nbytes = int(nbytes)
-        # Stable raw view; numpy slices/reshapes return views over this.
-        self._raw = (_ct.c_uint8 * self.nbytes).from_address(self._p.value)
-
-    def view_as(self, dtype, shape):
-        elems = 1
-        for d in shape:
-            elems *= int(d)
-        item = int(np.dtype(dtype).itemsize)
-        if elems * item > self.nbytes:
-            raise ValueError(
-                f"Requested {elems * item} bytes exceeds buffer {self.nbytes}.")
-        return np.frombuffer(self._raw, dtype=dtype, count=elems).reshape(shape)
-
-    def __del__(self):
-        # Defensive: cudart may have been unloaded by interpreter shutdown.
-        try:
-            if getattr(self, "_p", None) is not None and self._p.value:
-                _get_cudart().cudaFreeHost(self._p)
-                self._p.value = 0
-        except Exception:
-            pass
-
-
-_cudart = None
-def _get_cudart():
-    """Lazy CUDA runtime loader. Returns the loaded ctypes handle or
-    raises OSError if cudart is unavailable on this system."""
-    global _cudart
-    if _cudart is None:
-        import ctypes as _ct
-        for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.11.0"):
-            try:
-                _cudart = _ct.CDLL(name)
-                break
-            except OSError:
-                continue
-        else:
-            raise OSError("Could not load libcudart.so")
-    return _cudart
-
-
-class PinnedBufferPool:
-    """FIFO pool of pinned host buffers for the disk-backed staging path.
-
-    Buffers are checked out by `slice_and_complete_chunk`, used as the
-    destination for the memmap → host memcpy, and passed to tf.constant
-    (which dispatches an async DMA). The buffer is then bundled into the
-    chunk dict via `_PinnedBufferHolder`, so it is only returned to the
-    pool when the chunk dict is destroyed — by which point the consumer
-    has used the GPU tensor and the DMA has been implicitly synchronised
-    by the next op on the same stream.
-
-    Pool size of 4 is enough for prefetch depth 1-2 plus a current
-    in-flight chunk on the GPU side. acquire() returns None when the
-    pool is exhausted; the caller falls back to pageable.
-    """
-    def __init__(self, n_buffers: int, buffer_nbytes: int):
-        from collections import deque
-        self.buffer_nbytes = int(buffer_nbytes)
-        self._all = [PinnedBuffer(buffer_nbytes) for _ in range(n_buffers)]
-        self._free = deque(self._all)
-
-    def acquire(self):
-        if not self._free:
-            return None
-        return self._free.popleft()
-
-    def release(self, buf):
-        if buf is None:
-            return
-        self._free.append(buf)
-
-
-class _PinnedBufferHolder:
-    """Lifetime cookie that returns a pinned buffer to its pool when
-    the holder is garbage-collected. Stored inside the chunk dict so the
-    buffer's release is tied to the consumer dropping the chunk."""
-    __slots__ = ("buf", "pool")
-
-    def __init__(self, buf, pool):
-        self.buf = buf
-        self.pool = pool
-
-    def __del__(self):
-        # Defensive: pool / buf may already be gone at interpreter shutdown.
-        try:
-            if self.buf is not None and self.pool is not None:
-                self.pool.release(self.buf)
-        except Exception:
-            pass
-        self.buf = None
-        self.pool = None
-
-
-def make_pinned_pool_for(data: dict, batch_chunk_size: int,
-                          n_buffers: int = 4) -> "PinnedBufferPool | None":
-    """Build a pinned-buffer pool sized to hold the worst-case grad slice
-    that `slice_and_complete_chunk` will need to stage from `data`.
-
-    Worst-case bytes = max(struct_ptr[s + chunk] - struct_ptr[s]) × 3 × Q
-    × itemsize, with `chunk = batch_chunk_size`. Returns None when cudart
-    can't be loaded (CUDA-less host) — caller falls back to pageable.
-    """
-    try:
-        _get_cudart()
-    except OSError:
-        return None
-    if "grad_values" not in data or "struct_ptr" not in data:
-        return None
-    gv = data["grad_values"]
-    if gv.shape is None or len(gv.shape) < 3:
-        return None
-    Q = int(gv.shape[2])
-    item = int(np.dtype(gv.dtype).itemsize)
-    sp = data["struct_ptr"].numpy() if hasattr(data["struct_ptr"], "numpy") else np.asarray(data["struct_ptr"])
-    S = int(sp.shape[0]) - 1
-    chunk = int(batch_chunk_size) if batch_chunk_size is not None else S
-    chunk = max(1, min(chunk, S))
-    # Sliding window max of struct_ptr deltas; small, fast.
-    max_pairs = 0
-    for s in range(0, S, chunk):
-        e = min(s + chunk, S)
-        d = int(sp[e]) - int(sp[s])
-        if d > max_pairs:
-            max_pairs = d
-    if max_pairs == 0:
-        return None
-    # 5% headroom for ragged endcaps + alignment padding.
-    nbytes = int(max_pairs * 3 * Q * item * 1.05)
-    try:
-        return PinnedBufferPool(n_buffers, nbytes)
-    except RuntimeError:
-        return None
-
-
-def prestage_chunk_indices(data: dict, ranges: list,
-                            pad_to: int | None = None) -> None:
+def prestage_chunk_indices(data: dict, ranges: list) -> None:
     """Pre-build GPU tensors for the per-chunk pair indices
     (pair_atom, pair_gidx, pair_struct) for each (s, e) in `ranges`.
 
@@ -1562,17 +945,9 @@ def prestage_chunk_indices(data: dict, ranges: list,
     per-gen `tf.constant` + DMA work. Stored on the data dict under
     `_pair_idx_gpu_cache` and consumed by `_stage_finalize_tf` when present.
 
-    `pad_to` is forwarded to `data["_max_chunk_pairs"]` so eval-side
-    padding can read it; the *pre-staged* tensors stay unpadded so the
-    validate path (which uses raw model.predict_batch with no padding)
-    keeps shape-consistent inputs. The eval path applies tf.pad
-    on-the-fly when XLA is on.
-
     Memory cost: ~3 × P_chunk × 4 bytes per chunk; tiny.
     """
     cache: dict = data.setdefault("_pair_idx_gpu_cache", {})
-    if pad_to is not None:
-        data["_max_chunk_pairs"] = int(pad_to)
     pa_full = data["pair_atom"]
     pg_full = data["pair_gidx"]
     pa_np = pa_full.numpy() if hasattr(pa_full, "numpy") else np.asarray(pa_full)
@@ -1592,18 +967,6 @@ def prestage_chunk_indices(data: dict, ranges: list,
                 "pair_struct": tf.constant(pair_struct_np),
                 "_real_P":     int(flat.shape[0]),
             }
-
-
-def compute_max_chunk_pairs(data: dict, ranges: list) -> int:
-    """Worst-case pair count across the given chunk ranges. Used to pad
-    grad_values / pair indices for XLA-compiled eval."""
-    sp = data["struct_ptr"].numpy() if hasattr(data["struct_ptr"], "numpy") else np.asarray(data["struct_ptr"])
-    m = 0
-    for s, e in ranges:
-        d = int(sp[int(e)]) - int(sp[int(s)])
-        if d > m:
-            m = d
-    return int(m)
 
 
 class ChunkIndexCache:
@@ -1628,9 +991,9 @@ class ChunkIndexCache:
             pair_ranges = tf.ragged.range(pair_starts, pair_ends)
             flat_pair_idx_tf = tf.cast(pair_ranges.flat_values, tf.int32)
             pair_struct_tf   = tf.cast(pair_ranges.value_rowids(), tf.int32)
-            # Materialise the int32 indices to numpy so the disk-backed
-            # path can do the memmap fancy-index without an extra sync
-            # per call. Small (< 100 K ints typically).
+            # Materialise the int32 indices to numpy so the staging paths
+            # can fancy-index the passthrough pair arrays without an extra
+            # device sync per call. Small (< 100 K ints typically).
             flat_pair_idx_np = flat_pair_idx_tf.numpy()
             item = {
                 "flat_pair_idx_tf": flat_pair_idx_tf,
@@ -1656,16 +1019,13 @@ def get_chunk_index_cache() -> ChunkIndexCache:
 
 
 def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
-    """Worker-safe portion of chunk staging: only numpy + memmap, no TF.
+    """Numpy-only first phase of chunk staging (no TF ops).
 
-    Reads the chunk's gradient pair slice into a pinned (or pageable)
-    host buffer and packages every other slice as a small ndarray. The
-    main thread then converts this dict to TF tensors via
-    `_stage_finalize_tf`. Splitting the staging like this avoids TF
-    eager mode's thread-safety pitfalls — calling tf.constant /
-    tf.gather from a non-main thread occasionally produces tensors with
-    corrupted shape descriptors (rank or dim mismatches) under load,
-    which surfaces later as cryptic StridedSlice / shape errors.
+    Packages the chunk's per-structure slices as small ndarrays and
+    passes the in-RAM gradient/pair tensors through untouched.
+    `_stage_finalize_tf` then turns this dict into TF tensors. Both
+    phases run serially on the main thread; the split just keeps the
+    plain-numpy slicing separate from the TF-constant conversion.
     """
     precomputed = get_chunk_index_cache().get(data, s_start, s_end)
     idx_np = np.arange(int(s_start), int(s_end), dtype=np.int32)
@@ -1686,83 +1046,24 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     desc_np = desc.numpy() if hasattr(desc, "numpy") else np.asarray(desc)
     out["_np_descriptors"] = desc_np[idx_np]
 
-    # Gradient: disk-backed → memmap copy into pinned (or pageable) numpy.
-    # When cuFile is configured *and* the chunk's pair indices form a
-    # contiguous range, we issue a direct disk→GPU read instead — pure C
-    # call, worker-safe, and ~4× faster than the host-memcpy path on WSL
-    # compat-mode (saturates PCIe Gen4 once warm).
-    gv = data["grad_values"]
-    if data.get("_gv_disk_backed", False):
-        is_contig = _is_contiguous_range(flat_pair_idx_np)
-        if is_contig:
-            lo = int(flat_pair_idx_np[0])
-            hi = int(flat_pair_idx_np[-1]) + 1
-
-        cf_ctx = data.get("_cufile_ctx")
-        if cf_ctx is not None and is_contig:
-            cf_pool = cf_ctx["pool"]
-            cf_buf = cf_pool.acquire()
-            if cf_buf is not None:
-                Q = int(gv.shape[2])
-                item = int(np.dtype(gv.dtype).itemsize)
-                file_offset = int(lo) * 3 * Q * item
-                nbytes = int(hi - lo) * 3 * Q * item
-                try:
-                    cf_ctx["handle"].read(cf_buf.devptr, nbytes, file_offset)
-                    out["_cufile_buf"] = cf_buf
-                    out["_cufile_pool"] = cf_pool
-                    out["_cufile_shape"] = (int(hi - lo), 3, Q)
-                    out["_cufile_dtype"] = gv.dtype
-                    pa_np = data["pair_atom"].numpy() if hasattr(data["pair_atom"], "numpy") else np.asarray(data["pair_atom"])
-                    pg_np = data["pair_gidx"].numpy() if hasattr(data["pair_gidx"], "numpy") else np.asarray(data["pair_gidx"])
-                    out["_np_pair_atom"] = pa_np[flat_pair_idx_np]
-                    out["_np_pair_gidx"] = pg_np[flat_pair_idx_np]
-                    return out
-                except Exception:
-                    cf_pool.release(cf_buf)
-                    # Fall through to pinned/pageable.
-
-        if is_contig:
-            src = gv[lo:hi]
-        else:
-            src = gv[flat_pair_idx_np]
-        pool: "PinnedBufferPool | None" = data.get("_pinned_pool")
-        buf = pool.acquire() if pool is not None else None
-        if buf is not None:
-            view = buf.view_as(gv.dtype, src.shape)
-            np.copyto(view, src, casting="no")
-            out["_np_grad_values"] = view
-            out["_pinned_buf"] = buf
-            out["_pinned_pool"] = pool
-        else:
-            out["_np_grad_values"] = np.ascontiguousarray(src)
-        # Pair indices: use numpy view of pair_atom/pair_gidx, gathered with
-        # the cached flat_pair_idx_np.
-        pa_np = data["pair_atom"].numpy() if hasattr(data["pair_atom"], "numpy") else np.asarray(data["pair_atom"])
-        pg_np = data["pair_gidx"].numpy() if hasattr(data["pair_gidx"], "numpy") else np.asarray(data["pair_gidx"])
-        out["_np_pair_atom"] = pa_np[flat_pair_idx_np]
-        out["_np_pair_gidx"] = pg_np[flat_pair_idx_np]
-    else:
-        # In-RAM: hand back the original tensors / arrays untouched.
-        # Main thread will tf.gather them.
-        out["_passthrough_grad_values"] = data["grad_values"]
-        out["_passthrough_pair_atom"]   = data["pair_atom"]
-        out["_passthrough_pair_gidx"]   = data["pair_gidx"]
+    # In-RAM: hand back the original tensors / arrays untouched.
+    # Main thread will tf.gather them.
+    out["_passthrough_grad_values"] = data["grad_values"]
+    out["_passthrough_pair_atom"]   = data["pair_atom"]
+    out["_passthrough_pair_gidx"]   = data["pair_gidx"]
     return out
 
 
 def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
                         s_start: int | None = None,
-                        s_end: int | None = None,
-                        pad_pairs_to: int | None = None) -> dict:
+                        s_end: int | None = None) -> dict:
     """Main-thread half of staging: convert the worker's numpy output to
     TF tensors. Cheap (just tf.constant calls), runs in the foreground.
 
     When `data["_pair_idx_gpu_cache"]` has a pre-staged entry for the
     chunk's (s_start, s_end) range, the deterministic pair-index tensors
     (pair_atom, pair_gidx, pair_struct) are reused from the cache instead
-    of being rebuilt each call. The grad_values still goes through
-    cuFile / pinned / pageable as usual."""
+    of being rebuilt each call."""
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
@@ -1787,76 +1088,29 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
             chunk["pair_struct"] = (tf.identity(raw["_precomputed"]["pair_struct_tf"])
                                      if pin_to_cpu else
                                      raw["_precomputed"]["pair_struct_tf"])
-        if "_cufile_buf" in raw:
-            # cuFile path: grad_values already on the GPU, wrap as TF
-            # tensor via a manual DLPack capsule whose deleter releases
-            # the buffer back to the pool when TF destroys the tensor.
-            from cufile_io import build_dlpack_capsule
-            cf_buf  = raw["_cufile_buf"]
-            cf_pool = raw["_cufile_pool"]
-            shape   = raw["_cufile_shape"]
-            dtype   = raw["_cufile_dtype"]
-            def _release(_buf=cf_buf, _pool=cf_pool):
-                _pool.release(_buf)
-            capsule = build_dlpack_capsule(cf_buf.devptr, dtype, shape, _release)
-            chunk["grad_values"] = tf.experimental.dlpack.from_dlpack(capsule)
+        # In-RAM passthrough. When the chunk's pair indices form a
+        # contiguous range (the common case for sequential full-batch
+        # chunking), use tf.strided_slice — pure GPU slice, no D2D gather
+        # of the full chunk. Otherwise (random sub-sampling) fall back to
+        # tf.gather.
+        flat_pair_idx_np = raw["_precomputed"]["flat_pair_idx_np"]
+        is_contig = _is_contiguous_range(flat_pair_idx_np)
+        if is_contig:
+            lo = int(flat_pair_idx_np[0])
+            hi = int(flat_pair_idx_np[-1]) + 1
+            gv = raw["_passthrough_grad_values"]
+            chunk["grad_values"] = gv[lo:hi]
             if pair_idx_entry is not None:
                 chunk["pair_atom"] = pair_idx_entry["pair_atom"]
                 chunk["pair_gidx"] = pair_idx_entry["pair_gidx"]
             else:
-                chunk["pair_atom"] = tf.constant(raw["_np_pair_atom"])
-                chunk["pair_gidx"] = tf.constant(raw["_np_pair_gidx"])
-        elif "_np_grad_values" in raw:
-            chunk["grad_values"] = tf.constant(raw["_np_grad_values"])
-            if pair_idx_entry is not None:
-                chunk["pair_atom"] = pair_idx_entry["pair_atom"]
-                chunk["pair_gidx"] = pair_idx_entry["pair_gidx"]
-            else:
-                chunk["pair_atom"] = tf.constant(raw["_np_pair_atom"])
-                chunk["pair_gidx"] = tf.constant(raw["_np_pair_gidx"])
-            buf = raw.get("_pinned_buf")
-            pool = raw.get("_pinned_pool")
-            if buf is not None and pool is not None:
-                chunk["_pinned_holder"] = _PinnedBufferHolder(buf, pool)
+                chunk["pair_atom"] = raw["_passthrough_pair_atom"][lo:hi]
+                chunk["pair_gidx"] = raw["_passthrough_pair_gidx"][lo:hi]
         else:
-            # In-RAM passthrough. When the chunk's pair indices form a
-            # contiguous range (the common case for sequential
-            # full-batch chunking), use tf.strided_slice — pure GPU
-            # slice, no D2D gather of the full chunk. Otherwise (random
-            # sub-sampling) fall back to tf.gather.
-            flat_pair_idx_np = raw["_precomputed"]["flat_pair_idx_np"]
-            is_contig = _is_contiguous_range(flat_pair_idx_np)
-            if is_contig:
-                lo = int(flat_pair_idx_np[0])
-                hi = int(flat_pair_idx_np[-1]) + 1
-                gv = raw["_passthrough_grad_values"]
-                chunk["grad_values"] = gv[lo:hi]
-                if pair_idx_entry is not None:
-                    chunk["pair_atom"] = pair_idx_entry["pair_atom"]
-                    chunk["pair_gidx"] = pair_idx_entry["pair_gidx"]
-                else:
-                    chunk["pair_atom"] = raw["_passthrough_pair_atom"][lo:hi]
-                    chunk["pair_gidx"] = raw["_passthrough_pair_gidx"][lo:hi]
-            else:
-                flat_pair_idx_tf = tf.constant(flat_pair_idx_np)
-                chunk["grad_values"] = tf.gather(raw["_passthrough_grad_values"], flat_pair_idx_tf)
-                chunk["pair_atom"]   = tf.gather(raw["_passthrough_pair_atom"],   flat_pair_idx_tf)
-                chunk["pair_gidx"]   = tf.gather(raw["_passthrough_pair_gidx"],   flat_pair_idx_tf)
-
-        # Optional pad of all four pair-aligned tensors to a fixed size
-        # so XLA-compiled `_evaluate_chunk` sees one (B, P) shape across
-        # all chunks and compiles once. Padded entries contribute zero
-        # to the per-structure dipole sum (grad_values pad is zero;
-        # pair_struct/atom pad to 0 → zero contribution into segment 0).
-        if pad_pairs_to is not None:
-            P_real = int(chunk["grad_values"].shape[0])
-            if P_real < int(pad_pairs_to):
-                npad = int(pad_pairs_to) - P_real
-                chunk["grad_values"] = tf.pad(
-                    chunk["grad_values"], [[0, npad], [0, 0], [0, 0]])
-                chunk["pair_atom"]   = tf.pad(chunk["pair_atom"],   [[0, npad]])
-                chunk["pair_gidx"]   = tf.pad(chunk["pair_gidx"],   [[0, npad]])
-                chunk["pair_struct"] = tf.pad(chunk["pair_struct"], [[0, npad]])
+            flat_pair_idx_tf = tf.constant(flat_pair_idx_np)
+            chunk["grad_values"] = tf.gather(raw["_passthrough_grad_values"], flat_pair_idx_tf)
+            chunk["pair_atom"]   = tf.gather(raw["_passthrough_pair_atom"],   flat_pair_idx_tf)
+            chunk["pair_gidx"]   = tf.gather(raw["_passthrough_pair_gidx"],   flat_pair_idx_tf)
     return chunk
 
 
@@ -1906,12 +1160,11 @@ def move_data_to_gpu(data: dict) -> None:
                 # tf.Tensor: identity-on-GPU is cheap if already there.
                 data[k] = tf.identity(v)
             else:
-                # numpy / memmap (only valid when not _gv_disk_backed)
+                # numpy → GPU tensor
                 data[k] = tf.constant(np.asarray(v))
 
 
-def _stage_chunk_resident(data: dict, s_start: int, s_end: int,
-                           pad_pairs_to: int | None = None) -> dict:
+def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
     """Pure-GPU chunk staging for `_gv_resident_gpu` data dicts.
 
     All inputs are GPU tensors. Per-chunk work is tf.gather on a
@@ -1965,14 +1218,6 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int,
         else:
             pair_struct = precomputed["pair_struct_tf"]
 
-        if pad_pairs_to is not None:
-            P_real = int(grad_slc.shape[0])
-            if P_real < int(pad_pairs_to):
-                npad = int(pad_pairs_to) - P_real
-                grad_slc = tf.pad(grad_slc, [[0, npad], [0, 0], [0, 0]])
-                pair_atom = tf.pad(pair_atom, [[0, npad]])
-                pair_gidx = tf.pad(pair_gidx, [[0, npad]])
-                pair_struct = tf.pad(pair_struct, [[0, npad]])
         chunk["grad_values"] = grad_slc
         chunk["pair_atom"] = pair_atom
         chunk["pair_gidx"] = pair_gidx
@@ -1980,104 +1225,39 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int,
     return chunk
 
 
-def stage_chunk(data: dict, s_start: int, s_end: int,
-                pin_to_cpu: bool = False,
-                pad_pairs_to: int | None = None) -> tuple:
-    """Single-thread fallback: do disk-only + finalize-tf in sequence.
-
-    Used for the depth=1, prefetch=False case and as a synchronous
-    fallback when the prefetch worker errors out.
-    """
-    raw = _stage_disk_only(data, s_start, s_end)
-    chunk = _stage_finalize_tf(data, raw, pin_to_cpu=pin_to_cpu,
-                                s_start=s_start, s_end=s_end,
-                                pad_pairs_to=pad_pairs_to)
-    return s_start, s_end, chunk
-
-
-def prefetched_chunks(data: dict, ranges: list, pin_to_cpu: bool,
-                      enabled: bool = True,
-                      depth: int = 1,
-                      pad_pairs_to: int | None = None):
+def prefetched_chunks(data: dict, ranges: list, pin_to_cpu: bool):
     """Yield (s_start, s_end, chunk) tuples for each (s, e) in `ranges`.
 
-    Three modes, picked by the data dict's state:
+    Chunks are staged serially on the main thread; the name is kept for
+    historical reasons (an earlier prefetch thread was removed). Two
+    modes, picked by the data dict's state:
 
     1. **GPU-resident** (`_gv_resident_gpu=True`): chunks are built
-       purely on-device via `_stage_chunk_resident`. No worker
-       thread, no host↔GPU traffic. Fastest mode — used when the
-       grad cache fits in VRAM.
+       purely on-device via `_stage_chunk_resident`. No host↔GPU
+       traffic. Fastest mode — used when the grad cache fits in VRAM.
 
-    2. **Disk-backed + prefetch** (`enabled=True`, `depth >= 1`): up
-       to `depth` background threads stage chunks N+1..N+depth while
-       the consumer evaluates chunk N, overlapping disk→host→GPU
-       traffic with GPU compute. Useful when the grad cache is too
-       big to fit in VRAM.
-
-    3. **Disk-backed serial** (`enabled=False` or only one range):
-       single-threaded staging. Fallback / debugging path.
-
-    Memory cost per pipeline slot in mode 2: one chunk's grad slice
-    transient (~few hundred MB at full-batch `batch_chunk_size=500`).
-    The pinned / cuFile pool size must be >= depth + 1 — see
-    cfg.pinned_pool_size / cfg.cufile_pool_size.
+    2. **In-RAM serial**: chunks are staged via `_stage_disk_only`
+       (numpy passthrough) + `_stage_finalize_tf` (TF conversion),
+       both on the main thread.
     """
     if not ranges:
         return
 
     if data.get("_gv_resident_gpu", False):
         for s, e in ranges:
-            yield int(s), int(e), _stage_chunk_resident(
-                data, int(s), int(e), pad_pairs_to=pad_pairs_to)
+            yield int(s), int(e), _stage_chunk_resident(data, int(s), int(e))
         return
 
-    # Pre-warm the chunk-index cache from the main thread so workers
-    # never trigger a TF op on cache miss. Calling tf.range / tf.gather
-    # / tf.ragged.range from a non-main eager thread occasionally
-    # produces tensors with corrupted shape descriptors under
-    # concurrency, surfacing later as cryptic StridedSlice / dim
-    # errors.
+    # Pre-warm the chunk-index cache from the main thread so the
+    # staging path never triggers a TF op on cache miss.
     idx_cache = get_chunk_index_cache()
     for _s, _e in ranges:
         idx_cache.get(data, _s, _e)
 
-    def _stage_worker(s, e):
-        return _stage_disk_only(data, s, e)
-
-    def _finalize(s, e, raw):
-        return _stage_finalize_tf(data, raw, pin_to_cpu=pin_to_cpu,
-                                   s_start=s, s_end=e,
-                                   pad_pairs_to=pad_pairs_to)
-
-    depth = max(1, int(depth))
-    if not enabled or len(ranges) <= 1:
-        for s, e in ranges:
-            raw = _stage_worker(s, e)
-            yield s, e, _finalize(s, e, raw)
-        return
-
-    import concurrent.futures
-    n_ranges = len(ranges)
-    depth = min(depth, n_ranges)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=depth) as pool:
-        slots: list = [(ranges[i][0], ranges[i][1],
-                        pool.submit(_stage_worker, *ranges[i]))
-                       for i in range(depth)]
-        next_to_submit = depth
-        for i in range(n_ranges):
-            slot = i % depth
-            s, e, fut = slots[slot]
-            try:
-                raw = fut.result()
-            except BaseException:
-                raw = _stage_worker(s, e)
-            yield_chunk = _finalize(s, e, raw)
-
-            if next_to_submit < n_ranges:
-                ns, ne = ranges[next_to_submit]
-                slots[slot] = (ns, ne, pool.submit(_stage_worker, ns, ne))
-                next_to_submit += 1
-            yield s, e, yield_chunk
+    for s, e in ranges:
+        raw = _stage_disk_only(data, s, e)
+        yield s, e, _stage_finalize_tf(data, raw, pin_to_cpu=pin_to_cpu,
+                                        s_start=s, s_end=e)
 
 
 def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray], allowed_Z: list[int | str], mode: str = "subset") -> tuple[list[Atoms], list[np.ndarray]]:

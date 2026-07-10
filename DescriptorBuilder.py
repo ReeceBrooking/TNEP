@@ -41,21 +41,14 @@ def _describe_structure_worker(
     Reuses thread-local Descriptor objects across calls — the previous version
     rebuilt them per frame, which dominated runtime for trajectory inference.
 
-    args = (structure, soap_strings) or (structure, soap_strings, do_grad)
-        or (structure, soap_strings, do_grad, skip_indices).
-    do_grad defaults to True. `skip_indices` is a tuple of builder
-    indices to NOT call (used for skip_h_centers).
+    args = (structure, soap_strings) or (structure, soap_strings, do_grad).
+    do_grad defaults to True.
     """
     if len(args) == 2:
         structure, soap_strings = args
         do_grad = True
-        skip_indices: tuple[int, ...] = ()
-    elif len(args) == 3:
-        structure, soap_strings, do_grad = args
-        skip_indices = ()
     else:
-        structure, soap_strings, do_grad, skip_indices = args
-        skip_indices = tuple(skip_indices)
+        structure, soap_strings, do_grad = args
 
     cell = structure.cell.array
     if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
@@ -71,10 +64,7 @@ def _describe_structure_worker(
     )
 
     builders = _get_thread_builders(soap_strings)
-    # Skip the builders requested by the caller (e.g. H-center skip).
-    # These builders' descriptors and gradients never compute.
-    outs = [b.calc(structure, grad=do_grad)
-            for i, b in enumerate(builders) if i not in skip_indices]
+    outs = [b.calc(structure, grad=do_grad) for b in builders]
 
     N = len(structure)
     descriptors  = [[] for _ in range(N)]
@@ -93,18 +83,6 @@ def _describe_structure_worker(
                 neighbour = out["grad_index_0based"][j][1]
                 gradients[center].append(out["grad_data"][j])
                 grad_indexes[center].append(neighbour)
-
-    # When some builders were skipped, atoms in the skipped types have
-    # no descriptor row populated. Pre-fill those rows with zeros so
-    # the np.array(...) conversion below doesn't trip on an inhomogeneous
-    # list shape. We get Q from the first non-empty row.
-    if skip_indices:
-        dim_q = next((d_list[0].shape[0] for d_list in descriptors if d_list),
-                     None)
-        if dim_q is not None:
-            for i, d_list in enumerate(descriptors):
-                if not d_list:
-                    descriptors[i] = [np.zeros(dim_q, dtype=np.float32)]
 
     descriptors_np = np.array(descriptors, dtype=np.float32).squeeze(axis=1)
     Q = descriptors_np.shape[-1]
@@ -127,7 +105,6 @@ def _describe_structure_worker_flat(
     soap_strings: list[str],
     dim_q: int,
     do_grad: bool = True,
-    skip_indices: tuple[int, ...] = (),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute SOAP descriptors and return flat COO arrays directly.
 
@@ -157,11 +134,7 @@ def _describe_structure_worker_flat(
     N = len(structure)
 
     builders = _get_thread_builders(soap_strings)
-    # Skip the builders requested by the caller. Atoms in skipped types
-    # get zero descriptors (because `descriptors` is pre-allocated with
-    # np.zeros) and have no associated gradient pairs in the output COO.
-    outs = [b.calc(structure, grad=do_grad)
-            for i, b in enumerate(builders) if i not in skip_indices]
+    outs = [b.calc(structure, grad=do_grad) for b in builders]
 
     descriptors = np.zeros((N, dim_q), dtype=np.float32)
     grad_chunks = []
@@ -328,23 +301,8 @@ class DescriptorBuilder(layers.Layer):
         ]
         self.builders = [Descriptor(s) for s in self._soap_strings]
 
-        if cfg.num_descriptor_workers is None:
-            _slurm = os.environ.get('SLURM_CPUS_PER_TASK')
-            self._num_workers = int(_slurm) if _slurm else max(os.cpu_count() // 2, 1)
-        else:
-            self._num_workers = cfg.num_descriptor_workers
-
-        # When `cfg.skip_h_centers` is True, identify which entry in
-        # `self.builders` corresponds to H (Z=1) and add it to the
-        # skip list. Workers will not call b.calc() for these indices,
-        # so the H descriptor and H-centered gradients are never
-        # computed. H atoms still appear as neighbours in every other
-        # builder's pair list through species_Z, so their geometric/
-        # species info still feeds non-H centers.
-        self._skip_builder_indices: tuple[int, ...] = ()
-        if bool(getattr(cfg, "skip_h_centers", False)):
-            self._skip_builder_indices = tuple(
-                i for i, z in enumerate(self.types) if int(z) == 1)
+        _slurm = os.environ.get('SLURM_CPUS_PER_TASK')
+        self._num_workers = int(_slurm) if _slurm else max(os.cpu_count() // 2, 1)
 
     def build_descriptors(
         self,
@@ -390,11 +348,8 @@ class DescriptorBuilder(layers.Layer):
                     cell=cell,
                     pbc=pbc,
                 )
-                # Skip the configured-out builders (e.g. H-center skip).
-                # Those atoms get zero descriptor rows pre-filled below.
-                _skip = self._skip_builder_indices
                 outs = [b.calc(structure, grad=calc_gradients)
-                        for i, b in enumerate(self.builders) if i not in _skip]
+                        for b in self.builders]
 
                 N = len(structure)
                 descriptors  = [[] for _ in range(N)]
@@ -413,19 +368,6 @@ class DescriptorBuilder(layers.Layer):
                             neighbour = out["grad_index_0based"][j][1]
                             gradients[center].append(out["grad_data"][j])
                             grad_indexes[center].append(neighbour)
-
-                # Pre-fill rows for skipped-builder atoms with zeros so
-                # the convert-to-tensor / squeeze chain below doesn't
-                # trip on an inhomogeneous list shape.
-                if _skip:
-                    dim_q_local = next(
-                        (d_list[0].shape[0] for d_list in descriptors if d_list),
-                        None)
-                    if dim_q_local is not None:
-                        for i, d_list in enumerate(descriptors):
-                            if not d_list:
-                                descriptors[i] = [np.zeros(dim_q_local,
-                                                            dtype=np.float32)]
 
                 descriptors = tf.convert_to_tensor(descriptors, dtype=tf.float32)
                 descriptors = tf.squeeze(descriptors, axis=1)
@@ -457,11 +399,9 @@ class DescriptorBuilder(layers.Layer):
             # soap_strings is captured by closure — no serialisation needed.
             soap_strings = self._soap_strings
 
-            _skip_indices_local = self._skip_builder_indices
-
             def _thread_worker(structure):
                 return _describe_structure_worker(
-                    (structure, soap_strings, calc_gradients, _skip_indices_local))
+                    (structure, soap_strings, calc_gradients))
 
             # OMP_NUM_THREADS is process-wide; setting it before the pool starts
             # means each thread's first quippy OMP context picks up omp_per_worker.
@@ -582,12 +522,10 @@ class DescriptorBuilder(layers.Layer):
         soap_strings = self._soap_strings
         dim_q = self.cfg.dim_q
 
-        _skip = self._skip_builder_indices
-
         if self._num_workers <= 1:
             return [_describe_structure_worker_flat(
                         s, soap_strings, dim_q,
-                        do_grad=calc_gradients, skip_indices=_skip)
+                        do_grad=calc_gradients)
                     for s in dataset]
 
         _total_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
@@ -596,7 +534,7 @@ class DescriptorBuilder(layers.Layer):
         def _thread_worker(structure):
             return _describe_structure_worker_flat(
                 structure, soap_strings, dim_q,
-                do_grad=calc_gradients, skip_indices=_skip)
+                do_grad=calc_gradients)
 
         old_omp = os.environ.get('OMP_NUM_THREADS')
         os.environ['OMP_NUM_THREADS'] = str(omp_per_worker)
