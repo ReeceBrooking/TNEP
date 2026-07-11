@@ -109,3 +109,28 @@ def test_predict_batch_analytic_de_dq_matches_autodiff(activation):
         model._W0_eff(model.W0), model.b0, model.W1, model.b1,
         Wh=model.Wh, bh=model.bh, W_atom=train["_W_atom"])
     assert np.allclose(got.numpy(), ref.numpy(), atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("activation", ["tanh", "swish"])
+def test_calc_forces_two_layer_matches_autodiff(activation):
+    cfg = _tiny_cfg(num_hidden_layers=2, mixing=False); cfg.activation = activation
+    model, _, _ = _build(cfg)                     # for model.activation + calc_forces
+    N, H, Q, M = 5, cfg.num_neurons, cfg.dim_q, 4
+    g = tf.random.Generator.from_seed(0)
+    q     = g.normal([N, Q]);   W0_t = g.normal([N, Q, H]); b0_t = g.normal([N, H])
+    Wh_t  = g.normal([N, H, H]); bh_t = g.normal([N, H]);    W1_t = g.normal([N, H])
+    grads = g.normal([N, M, 3, Q]); nmask = tf.ones([N, M])
+    # autodiff reference de_dq of the local energy U = sum_h h2*W1 (b1 drops out of d/dq)
+    with tf.GradientTape() as tape:
+        tape.watch(q)
+        z1 = tf.einsum('nq,nqh->nh', q, W0_t) + b0_t; h1 = model.activation(z1)
+        z2 = tf.einsum('nh,nhg->ng', h1, Wh_t) + bh_t; h2 = model.activation(z2)
+        Us = tf.reduce_sum(tf.reduce_sum(h2 * W1_t, axis=1))
+    de_dq_auto = tape.gradient(Us, q)                       # [N,Q]
+    ref = tf.einsum('nq,nmcq->nmc', de_dq_auto, grads)
+    # calc_forces recomputes nothing internally - it receives h1,z1,h2,z2:
+    z1 = tf.einsum('nq,nqh->nh', q, W0_t) + b0_t; h1 = model.activation(z1)
+    z2 = tf.einsum('nh,nhg->ng', h1, Wh_t) + bh_t; h2 = model.activation(z2)
+    got = model.calc_forces(h1, grads, W1_t, W0_t, nmask, z=z1,
+                            Wh_t=Wh_t, h2=h2, z2=z2)
+    assert np.allclose(got.numpy(), ref.numpy(), atol=1e-5, rtol=1e-4)

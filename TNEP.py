@@ -646,9 +646,20 @@ class TNEP(layers.Layer):
         # Mask out padded atoms
         h = h * atom_mask[:, tf.newaxis]                   # [A, H]
 
+        # Optional second hidden layer: h →[Wh,bh]→ act → h2.
+        Wh_t = h2 = z2 = None
+        if self.num_hidden_layers == 2:
+            Wh_t = tf.gather(self.Wh, Z)      # [A,H,H]
+            bh_t = tf.gather(self.bh, Z)      # [A,H]
+            z2 = tf.einsum('nh,nhg->ng', h, Wh_t) + bh_t
+            h2 = self.activation(z2) * atom_mask[:, tf.newaxis]
+            h_out = h2
+        else:
+            h_out = h
+
         if self.cfg.target_mode == 0:
             # PES: E = -sum_i (h_i . W1[t_i] + b1)
-            E_per_atom = tf.reduce_sum(h * W1_t, axis=1) + self.b1  # [A]
+            E_per_atom = tf.reduce_sum(h_out * W1_t, axis=1) + self.b1  # [A]
             E_per_atom = E_per_atom * atom_mask                       # zero padding
             E = tf.reduce_sum(E_per_atom)
             out = tf.expand_dims(-E, axis=0)  # [1]
@@ -656,7 +667,7 @@ class TNEP(layers.Layer):
 
         # Modes 1 and 2 need forces
         forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask,
-                                  z=z)  # [A, M, 3]
+                                  z=z, Wh_t=Wh_t, h2=h2, z2=z2)  # [A, M, 3]
 
         if self.cfg.target_mode == 1:
             # Dipole. cfg.dipole_rij_power selects the per-pair weight:
@@ -741,23 +752,37 @@ class TNEP(layers.Layer):
 
     def calc_forces(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
                     W0_t: tf.Tensor, neighbor_mask: tf.Tensor,
-                    z: tf.Tensor | None = None) -> tf.Tensor:
+                    z: tf.Tensor | None = None,
+                    Wh_t: tf.Tensor | None = None,
+                    h2: tf.Tensor | None = None, z2: tf.Tensor | None = None) -> tf.Tensor:
         """Compute dU_i/dR_j for every atom i and neighbour j via chain rule (padded).
 
         Args:
-            h              : [N, H]              hidden activations f(z)
+            h              : [N, H]              first hidden-layer activations f(z)
             gradients      : [N, M, 3, dim_q]   padded descriptor gradients
-            W1_t           : [N, H]              per-atom output weights
+            W1_t           : [N, H]              per-atom output weights (H = last
+                                                   hidden layer's width)
             W0_t           : [N, dim_q, H]       per-atom input weights
             neighbor_mask  : [N, M]              1.0 for real neighbors, 0.0 for padding
-            z              : [N, H]              pre-activation; required for swish.
+            z              : [N, H]              pre-activation for `h`; required for swish.
+            Wh_t           : [N, H, H]           optional per-atom middle-layer weights
+                                                   (2-layer only). When given, `h2`/`z2`
+                                                   must also be given and `h`/`z` are
+                                                   treated as the first hidden layer.
+            h2             : [N, H]              optional second hidden-layer activations
+            z2             : [N, H]              optional second hidden-layer pre-activation
 
         Returns:
             forces : [N, M, 3]  dU_i/dR_j per atom per neighbor
         """
-        # dU/dh * dh/da = W1 * f'(z)
-        dact = self._activation_grad(h, z)                       # [N, H]
-        de_da = dact * W1_t                                       # [N, H]
+        if Wh_t is not None:
+            # Outer link on the last hidden layer.
+            de_da = self._activation_grad(h2, z2) * W1_t             # [N,H2]
+            dh1 = tf.einsum('ng,nhg->nh', de_da, Wh_t)              # dU/dh1  [N,H1]
+            de_da = self._activation_grad(h, z) * dh1               # dU/dz1
+        else:
+            # dU/dh * dh/da = W1 * f'(z)
+            de_da = self._activation_grad(h, z) * W1_t               # [N, H]
         # dU/dq = dU/da @ W0^T  ->  [N, dim_q]
         de_dq = tf.einsum('nh,nqh->nq', de_da, W0_t)             # [N, dim_q]
         # Contract dU/dq with dq/dR_j: sum over dim_q
