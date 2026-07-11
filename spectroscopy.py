@@ -672,6 +672,9 @@ def _get_fused_predict(model: 'TNEP'):
     b0p_t = _to_tensor(getattr(model, "b0_pol", None))
     W1p_t = _to_tensor(getattr(model, "W1_pol", None))
     b1p_t = _to_tensor(getattr(model, "b1_pol", None))
+    # Optional second hidden layer (None for 1-layer models → single-layer forward).
+    Wh_t  = _to_tensor(getattr(model, "Wh", None))
+    bh_t  = _to_tensor(getattr(model, "bh", None))
 
     # Not jit_compile: predict_batch has shape-dependent stacks in
     # _calc_forces_coo (varying P per call) that XLA can't lower, and the
@@ -702,6 +705,7 @@ def _get_fused_predict(model: 'TNEP'):
             positions, Z, boxes, atom_mask,
             W0_t, b0_t, W1_t, b1_t,
             W0p_t, b0p_t, W1p_t, b1p_t,
+            Wh=Wh_t, bh=bh_t,
         )
         # predict_batch returns the TOTAL dipole (not per-atom) regardless of
         # cfg.scale_targets, so do NOT multiply by num_atoms.
@@ -957,6 +961,7 @@ def predict_trajectory_batch(
             getattr(model, 'b0_pol', None),
             getattr(model, 'W1_pol', None),
             getattr(model, 'b1_pol', None),
+            Wh=getattr(model, 'Wh', None), bh=getattr(model, 'bh', None),
         )
         # predict_batch returns the TOTAL dipole regardless of
         # cfg.scale_targets; no per-atom→total rescaling needed.

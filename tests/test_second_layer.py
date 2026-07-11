@@ -160,6 +160,58 @@ def test_adam_reg_includes_wh_bh():
     assert int(tp.shape[0]) == Q * H + H + H * H + H + H
 
 
+def test_predict_trajectory_batch_uses_second_layer():
+    """Regression test for the bug where spectroscopy.predict_trajectory_batch
+    (legacy quippy/eager path) called model.predict_batch(...) without threading
+    Wh/bh, silently skipping the second hidden layer during trajectory/IR
+    inference for a trained 2-layer dipole model.
+
+    Strategy: build a 2-layer model with randomised Wh/bh, run real trajectory
+    frames through predict_trajectory_batch, and compare against a 1-layer
+    model that shares the identical W0/b0/W1/b1. If Wh/bh were dropped (the
+    bug), predict_batch would fall back to its single-layer branch and the
+    two predictions would be numerically identical to the 1-layer model's —
+    exactly what the bug produced. With the fix, the second layer is a
+    nontrivial nonlinear transform, so the outputs must differ.
+    """
+    import ase.io
+    from data import assign_type_indices
+    from spectroscopy import predict_trajectory_batch
+
+    cfg = _tiny_cfg(num_hidden_layers=2, mixing=False)
+    model, _, _ = _build(cfg)
+    for v in (model.W0, model.b0, model.Wh, model.bh, model.W1):
+        v.assign(tf.random.stateless_normal(v.shape, [7, 8], stddev=0.3))
+
+    allowed = set(cfg.types)
+    frames = [f for f in ase.io.read(cfg.data_path, index=':6')
+              if set(f.numbers.tolist()) <= allowed]
+    assert len(frames) >= 2, "need at least 2 in-species frames from test.xyz"
+    batch_types = assign_type_indices(frames, cfg.types)
+
+    dip_2layer = predict_trajectory_batch(
+        model, model.builder, frames, batch_types,
+        pin_to_cpu=True, descriptor_batch_frames=1)
+
+    cfg1 = _tiny_cfg(num_hidden_layers=1, mixing=False)
+    model1, _, _ = _build(cfg1)
+    assert cfg1.types == cfg.types  # same data_path/allowed_species => same order
+    model1.W0.assign(model.W0); model1.b0.assign(model.b0)
+    model1.W1.assign(model.W1); model1.b1.assign(model.b1)
+    assert getattr(model1, "Wh", None) is None
+
+    dip_1layer = predict_trajectory_batch(
+        model1, model1.builder, frames, batch_types,
+        pin_to_cpu=True, descriptor_batch_frames=1)
+
+    assert np.all(np.isfinite(dip_2layer)) and dip_2layer.shape == (len(frames), 3)
+    # The buggy code (Wh/bh dropped) collapses to exactly the 1-layer forward;
+    # the fix makes the second layer's nonlinearity actually matter.
+    assert not np.allclose(dip_2layer, dip_1layer, atol=1e-6), (
+        "predict_trajectory_batch output is identical whether or not Wh/bh "
+        "are present — the second hidden layer is being silently dropped")
+
+
 def test_model_io_roundtrip_two_layer(tmp_path):
     import model_io
     cfg = _tiny_cfg(num_hidden_layers=2, mixing=False)
