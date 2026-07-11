@@ -7,6 +7,7 @@ from typing import Callable
 
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
+from Adam import make_optimizer
 from TNEPconfig import TNEPconfig
 
 
@@ -82,6 +83,19 @@ class TNEP(layers.Layer):
             self.dim_q_forward = int(cfg.dim_q)
         self.num_types = cfg.num_types
         self.num_neurons = cfg.num_neurons
+        self.num_hidden_layers = int(getattr(cfg, "num_hidden_layers", 1))
+        if self.num_hidden_layers not in (1, 2):
+            raise ValueError(
+                f"num_hidden_layers must be 1 or 2, got {self.num_hidden_layers}.")
+        if self.num_hidden_layers == 2 and cfg.target_mode == 2:
+            raise ValueError(
+                "num_hidden_layers=2 is not supported for target_mode=2 "
+                "(polarizability). Use a single hidden layer for mode 2.")
+        if (self.num_hidden_layers == 2
+                and str(getattr(cfg, "optimizer", "snes")).lower() != "adam"):
+            raise ValueError(
+                "num_hidden_layers=2 requires optimizer='adam'; the SNES "
+                "flat-genome path does not support a second hidden layer.")
         self._H_final = cfg.num_neurons
         # Any tf.keras.activations.get name is accepted here; _activation_grad
         # raises NotImplementedError at first dipole/pol pass if not plumbed.
@@ -318,7 +332,7 @@ class TNEP(layers.Layer):
                 # Linear-fold-only attrs left None; branch-checked in _W0_preprocess_eff.
                 self._preprocess_q_to_q_new = None
                 self._preprocess_scatter = None
-                self.optimizer = SNES(self)
+                self.optimizer = make_optimizer(self)
                 return
             Q_raw_pre = int(self._preprocess_layout["coef_shape"][0])
 
@@ -437,7 +451,7 @@ class TNEP(layers.Layer):
             self._preprocess_q_to_q_new = None
             self._preprocess_scatter = None
 
-        self.optimizer = SNES(self)
+        self.optimizer = make_optimizer(self)
 
     # ---- descriptor mixing helpers ----------------------------------------
 

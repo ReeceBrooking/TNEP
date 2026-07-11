@@ -118,7 +118,11 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # Hidden-layer width of the per-type ANN.
-    num_neurons: int = 30
+    num_neurons: int = 80
+    # Number of hidden layers in the per-type ANN: 1 (default) or 2. A value of 2
+    # inserts one extra num_neurons-wide hidden layer (Wh,bh). Supported only with
+    # optimizer="adam" and target_mode 0/1 (energy/dipole); raises otherwise.
+    num_hidden_layers: int = 1
     # Hidden-layer activation (any tf.keras.activations name for the forward
     # pass). Dipole/polarisability training (target_mode 1/2) has a hand-coded
     # backward — only "tanh" and "swish" (alias "silu") supported there;
@@ -202,6 +206,25 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- core ----------------------------------------------------------
+    # Optimizer: "snes" (evolutionary) or "adam" (gradient descent).
+    optimizer: str = "adam"
+    # Adam hyperparameters (only used when optimizer == "adam").
+    adam_learning_rate: float = 1e-3
+    adam_beta_1: float = 0.9
+    adam_beta_2: float = 0.999
+    adam_epsilon: float = 1e-8
+    # Weight EMA (Polyak averaging): evaluate / return an exponential moving
+    # average of the weights instead of the raw iterate. Cancels the end-of-run
+    # bounce that a fixed step size leaves around the minimum.
+    adam_use_ema: bool = False
+    adam_ema_momentum: float = 0.999
+    # Plateau LR decay: when val RMSE stalls for adam_lr_decay_patience val ticks,
+    # multiply the learning rate by adam_lr_decay_factor (floored at adam_lr_min).
+    # The gradient-descent analog of SNES sigma annealing.
+    adam_lr_decay: bool = False
+    adam_lr_decay_factor: float = 0.5
+    adam_lr_decay_patience: int = 3
+    adam_lr_min: float = 1e-6
     # Number of samples made in each train generation
     pop_size: int | None = 100
     # Number of training generations (number of updates to the model)
