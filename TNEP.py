@@ -838,6 +838,7 @@ class TNEP(layers.Layer):
                 getattr(self, 'b0_pol', None),
                 getattr(self, 'W1_pol', None),
                 getattr(self, 'b1_pol', None),
+                Wh=getattr(self, 'Wh', None), bh=getattr(self, 'bh', None),
             ))
             del chunk
         raw_preds = tf.concat(pred_parts, axis=0)
@@ -1125,6 +1126,7 @@ class TNEP(layers.Layer):
                       W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor, b1: tf.Tensor,
                       W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
                       W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
+                      Wh: tf.Tensor | None = None, bh: tf.Tensor | None = None,
                       W_atom: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
@@ -1174,15 +1176,34 @@ class TNEP(layers.Layer):
         h1 = self.activation(z1)
         h1 = h1 * atom_mask[:, :, tf.newaxis]
 
+        # Optional second hidden layer (Wh None => single-layer, unchanged).
+        if Wh is not None:
+            bh_t = tf.gather(bh, Z)  # [B,A,H]
+            z2 = tf.add_n([
+                tf.einsum('bah,hg->bag', h1, Wh[t]) * type_masks[t]
+                for t in range(self.num_types)
+            ]) + bh_t
+            h2 = self.activation(z2)
+            h2 = h2 * atom_mask[:, :, tf.newaxis]
+            h_out, z_out = h2, z2
+        else:
+            h_out, z_out = h1, z1
+
         if self.cfg.target_mode == 0:
-            E = tf.reduce_sum(h1 * W1_t, axis=2) + b1  # [B, A]
+            E = tf.reduce_sum(h_out * W1_t, axis=2) + b1  # [B, A]
             E = E * atom_mask
             E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
             return -E
 
-        # Single-hidden backward chain (∂U/∂q):
-        #   ∂U/∂h1 = W1, ∂U/∂a1 = activation'(h1, z1)·W1, ∂U/∂q = ∂U/∂a1·W0^T
-        de_da = self._activation_grad(h1, z1) * W1_t
+        # Backward chain (∂U/∂q). Outer link on the last hidden layer (h_out,z_out);
+        # when 2-layer, propagate through Wh to h1, then to q.
+        de_da = self._activation_grad(h_out, z_out) * W1_t          # [B,A,H]
+        if Wh is not None:
+            dh1 = tf.add_n([
+                tf.einsum('bag,hg->bah', de_da, Wh[t]) * type_masks[t]
+                for t in range(self.num_types)
+            ])                                                       # dU/dh1
+            de_da = self._activation_grad(h1, z1) * dh1               # dU/dz1
         de_dq = tf.add_n([
             tf.einsum('bah,qh->baq', de_da, W0_use[t]) * type_masks[t]
             for t in range(self.num_types)

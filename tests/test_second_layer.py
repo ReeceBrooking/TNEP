@@ -2,6 +2,8 @@ import os
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
 import pytest
+import numpy as np
+import tensorflow as tf
 
 # Reuse the tiny-model fixture pattern from tests/test_adam.py, adding num_hidden_layers.
 def _tiny_cfg(num_hidden_layers=2, target_mode=1, optimizer="adam", mixing=True):
@@ -62,3 +64,48 @@ def test_wh_bh_absent_when_one_layer():
     model, _, _ = _build(_tiny_cfg(num_hidden_layers=1, mixing=False))
     assert getattr(model, "Wh", None) is None
     assert getattr(model, "bh", None) is None
+
+
+def _autodiff_reference_dipole(model, batch):
+    """Reference dipole using AUTODIFF de_dq through a plain 2-layer energy,
+    contracted with the SAME precomputed W_atom that predict_batch uses."""
+    m = model
+    desc = tf.identity(batch["descriptors"])          # [B,A,Q]
+    Z = batch["Z_int"]; amask = batch["atom_mask"]
+    W0 = m._W0_eff(m.W0)                               # fold mixing like the caller
+    type_masks = [tf.cast(tf.equal(Z, t), tf.float32)[:, :, None] for t in range(m.num_types)]
+    with tf.GradientTape() as tape:
+        tape.watch(desc)
+        b0_t = tf.gather(m.b0, Z); W1_t = tf.gather(m.W1, Z)
+        z1 = tf.add_n([tf.einsum('baq,qh->bah', desc, W0[t]) * type_masks[t]
+                       for t in range(m.num_types)]) + b0_t
+        h1 = m.activation(z1) * amask[:, :, None]
+        bh_t = tf.gather(m.bh, Z)
+        z2 = tf.add_n([tf.einsum('bah,hg->bag', h1, m.Wh[t]) * type_masks[t]
+                       for t in range(m.num_types)]) + bh_t
+        h2 = m.activation(z2) * amask[:, :, None]
+        U = (tf.reduce_sum(h2 * W1_t, axis=2) + m.b1) * amask   # [B,A] local energies
+        Usum = tf.reduce_sum(U)
+    de_dq = tape.gradient(Usum, desc)                 # [B,A,Q] — exact per-atom de_dq
+    W_atom = batch["_W_atom"]
+    return -tf.einsum('baq,basq->bs', de_dq, W_atom)  # [B,3]
+
+
+@pytest.mark.parametrize("activation", ["tanh", "swish"])
+def test_predict_batch_analytic_de_dq_matches_autodiff(activation):
+    cfg = _tiny_cfg(num_hidden_layers=2, mixing=False)
+    cfg.activation = activation
+    model, train, _ = _build(cfg)
+    # randomize weights so the check isn't trivially satisfied at init
+    for v in (model.W0, model.b0, model.Wh, model.bh, model.W1):
+        v.assign(tf.random.stateless_normal(v.shape, [1, 2], stddev=0.3))
+    from Adam import Adam
+    opt = Adam(model); opt._precompute_W_atom(train)
+    ref = _autodiff_reference_dipole(model, train)
+    got = model.predict_batch(
+        train["descriptors"], train["grad_values"], train["pair_atom"],
+        train["pair_gidx"], train["pair_struct"], train["positions"],
+        train["Z_int"], train["boxes"], train["atom_mask"],
+        model._W0_eff(model.W0), model.b0, model.W1, model.b1,
+        Wh=model.Wh, bh=model.bh, W_atom=train["_W_atom"])
+    assert np.allclose(got.numpy(), ref.numpy(), atol=1e-5, rtol=1e-4)
