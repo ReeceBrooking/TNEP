@@ -313,6 +313,9 @@ def _print_param_breakdown(model) -> None:
     # Primary ANN — per-layer breakdown.
     rows.append(("ANN  W0  [T·Q·H]", int(opt._n_W0)))
     rows.append(("ANN  b0  [T·H]",   int(opt._n_b0)))
+    if int(getattr(opt, "_n_Wh", 0)) > 0:
+        rows.append(("ANN  Wh  [T·H·H]", int(opt._n_Wh)))
+        rows.append(("ANN  bh  [T·H]",   int(opt._n_bh)))
     rows.append(("ANN  W1  [T·H]",   int(opt._n_W1)))
     rows.append(("ANN  b1",          int(opt._n_b1)))
 
@@ -437,7 +440,9 @@ def _train_model_inner(cfg: TNEPconfig,
         print(f"Preprocess contraction ({cfg.descriptor_preprocess_contract}): "
               f"Q_raw={q_raw} → Q_new={q_new}  "
               f"(×{ratio:.2f} compression, {reduce:.1f}% reduction)")
-    print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
+    ps = getattr(model.optimizer, "pop_size", None)
+    tail = f"  |  Population Size: {ps}" if ps is not None else ""
+    print(f"Model Parameters: {model.optimizer.dim}{tail}")
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
     print("Parameter Root: " + str(np.sqrt(model.optimizer.dim)))
     _print_param_breakdown(model)
