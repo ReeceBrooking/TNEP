@@ -134,3 +134,27 @@ def test_calc_forces_two_layer_matches_autodiff(activation):
     got = model.calc_forces(h1, grads, W1_t, W0_t, nmask, z=z1,
                             Wh_t=Wh_t, h2=h2, z2=z2)
     assert np.allclose(got.numpy(), ref.numpy(), atol=1e-5, rtol=1e-4)
+
+
+def test_adam_trains_two_layer_and_scores():
+    cfg = _tiny_cfg(num_hidden_layers=2, mixing=True)
+    cfg.num_generations = 30; cfg.adam_learning_rate = 1e-2
+    model, train, val = _build(cfg)
+    from Adam import Adam
+    opt = Adam(model)
+    l0 = float(opt._batch_loss(train))
+    history, final_model, best = opt.fit(train, val)
+    assert float(opt._batch_loss(train)) < l0
+    m, _ = best.score(val); assert float(m["rmse"]) < 1.0
+    assert tuple(final_model.Wh.shape) == (cfg.num_types, cfg.num_neurons, cfg.num_neurons)
+
+def test_adam_reg_includes_wh_bh():
+    cfg = _tiny_cfg(num_hidden_layers=2, mixing=False)
+    cfg.lambda_1 = 0.01; cfg.lambda_2 = 0.01
+    model, train, _ = _build(cfg)
+    from Adam import Adam
+    opt = Adam(model)
+    tp = opt._type_params(0)
+    H = cfg.num_neurons; Q = cfg.dim_q
+    # W0(Q*H) + b0(H) + Wh(H*H) + bh(H) + W1(H)
+    assert int(tp.shape[0]) == Q * H + H + H * H + H + H
