@@ -50,3 +50,15 @@ def test_guard_snes_rejected():
     # SNES + 2 layers must raise at TNEP construction (guard reads cfg.optimizer).
     with pytest.raises(ValueError):
         _build(_tiny_cfg(num_hidden_layers=2, optimizer="snes"))
+
+def test_wh_bh_created_with_correct_shapes():
+    cfg = _tiny_cfg(num_hidden_layers=2, mixing=False)
+    model, _, _ = _build(cfg)
+    T, H = cfg.num_types, cfg.num_neurons
+    assert tuple(model.Wh.shape) == (T, H, H)
+    assert tuple(model.bh.shape) == (T, H)
+
+def test_wh_bh_absent_when_one_layer():
+    model, _, _ = _build(_tiny_cfg(num_hidden_layers=1, mixing=False))
+    assert getattr(model, "Wh", None) is None
+    assert getattr(model, "bh", None) is None

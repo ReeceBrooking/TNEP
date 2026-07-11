@@ -136,6 +136,18 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
+        # Optional second hidden layer (square, num_neurons wide). Inserted
+        # between h1 and the W1/b1 output layer. Adam-only, modes 0/1 (guarded).
+        self.Wh = None
+        self.bh = None
+        if self.num_hidden_layers == 2:
+            self.Wh = self.add_weight(
+                name="Wh", shape=(cfg.num_types, cfg.num_neurons, cfg.num_neurons),
+                initializer="glorot_uniform", trainable=True)
+            self.bh = self.add_weight(
+                name="bh", shape=(cfg.num_types, cfg.num_neurons),
+                initializer="zeros", trainable=True)
+
         # Validate dipole contraction power (mode 1 only) at construction time.
         if cfg.target_mode == 1:
             _N = int(getattr(cfg, "dipole_rij_power", 2))
