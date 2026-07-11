@@ -158,3 +158,28 @@ def test_adam_reg_includes_wh_bh():
     H = cfg.num_neurons; Q = cfg.dim_q
     # W0(Q*H) + b0(H) + Wh(H*H) + bh(H) + W1(H)
     assert int(tp.shape[0]) == Q * H + H + H * H + H + H
+
+
+def test_model_io_roundtrip_two_layer(tmp_path):
+    import model_io
+    cfg = _tiny_cfg(num_hidden_layers=2, mixing=False)
+    model, train, _ = _build(cfg)
+    from Adam import Adam
+    opt = Adam(model); opt._precompute_W_atom(train)
+    pred_before = model.predict_batch(
+        train["descriptors"], train["grad_values"], train["pair_atom"],
+        train["pair_gidx"], train["pair_struct"], train["positions"],
+        train["Z_int"], train["boxes"], train["atom_mask"],
+        model._W0_eff(model.W0), model.b0, model.W1, model.b1,
+        Wh=model.Wh, bh=model.bh, W_atom=train["_W_atom"]).numpy()
+    p = str(tmp_path / "m.h5")
+    model_io.save_model(model, cfg, path=p)
+    loaded = model_io.load_model(p)
+    opt2 = Adam(loaded); opt2._precompute_W_atom(train)
+    pred_after = loaded.predict_batch(
+        train["descriptors"], train["grad_values"], train["pair_atom"],
+        train["pair_gidx"], train["pair_struct"], train["positions"],
+        train["Z_int"], train["boxes"], train["atom_mask"],
+        loaded._W0_eff(loaded.W0), loaded.b0, loaded.W1, loaded.b1,
+        Wh=loaded.Wh, bh=loaded.bh, W_atom=train["_W_atom"]).numpy()
+    assert np.allclose(pred_before, pred_after, atol=1e-6)

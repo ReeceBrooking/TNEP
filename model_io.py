@@ -192,6 +192,9 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         wg.create_dataset("b0", data=model.b0.numpy())
         wg.create_dataset("W1", data=model.W1.numpy())
         wg.create_dataset("b1", data=model.b1.numpy())
+        if getattr(model, "Wh", None) is not None:
+            wg.create_dataset("Wh", data=model.Wh.numpy())
+            wg.create_dataset("bh", data=model.bh.numpy())
         if cfg.target_mode == 2:
             wg.create_dataset("W0_pol", data=model.W0_pol.numpy())
             wg.create_dataset("b0_pol", data=model.b0_pol.numpy())
@@ -398,11 +401,22 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
-                  U_pair=None, W_pre_angular=None) -> None:
+                  U_pair=None, W_pre_angular=None, Wh=None, bh=None) -> None:
     model.W0.assign(W0)
     model.b0.assign(b0)
     model.W1.assign(W1)
     model.b1.assign(b1)
+    if Wh is not None:
+        if getattr(model, "Wh", None) is None:
+            raise ValueError(
+                "Saved model has a second hidden layer (Wh) but "
+                "cfg.num_hidden_layers=1; set it to 2 to load.")
+        model.Wh.assign(Wh)
+        model.bh.assign(bh)
+    elif getattr(model, "Wh", None) is not None:
+        raise ValueError(
+            "cfg.num_hidden_layers=2 but the saved model has no Wh; "
+            "load with num_hidden_layers=1.")
     if cfg.target_mode == 2:
         model.W0_pol.assign(W0_pol)
         model.b0_pol.assign(b0_pol)
@@ -474,6 +488,8 @@ def _load_model_h5(path: str) -> TNEP:
             "U_pair": wg["U_pair"][:] if "U_pair" in wg else None,
             "W_pre_angular": (wg["W_pre_angular"][:]
                               if "W_pre_angular" in wg else None),
+            "Wh": wg["Wh"][:] if "Wh" in wg else None,
+            "bh": wg["bh"][:] if "bh" in wg else None,
         }
 
     for k, v in config_dict.items():
