@@ -833,7 +833,7 @@ class TNEP(layers.Layer):
         # Overall R² = 1 - SS_res / SS_tot
         ss_res = tf.reduce_sum(tf.square(diff))
         ss_tot = tf.reduce_sum(tf.square(targets - tf.reduce_mean(targets, axis=0)))
-        r2 = 1.0 - ss_res / ss_tot
+        r2 = 1.0 - ss_res / tf.maximum(ss_tot, 1e-12)   # guard degenerate (e.g. 1-structure) sets
 
         # Per-component R²
         ss_res_comp = tf.reduce_sum(tf.square(diff), axis=0)       # [T]
@@ -856,7 +856,7 @@ class TNEP(layers.Layer):
             total_ss_res = tf.reduce_sum(tf.square(total_diff))
             total_ss_tot = tf.reduce_sum(tf.square(
                 total_targets - tf.reduce_mean(total_targets, axis=0)))
-            total_r2 = 1.0 - total_ss_res / total_ss_tot
+            total_r2 = 1.0 - total_ss_res / tf.maximum(total_ss_tot, 1e-12)
             total_ss_res_comp = tf.reduce_sum(tf.square(total_diff), axis=0)
             total_ss_tot_comp = tf.reduce_sum(tf.square(
                 total_targets - tf.reduce_mean(total_targets, axis=0)), axis=0)
@@ -1378,12 +1378,17 @@ class TNEP(layers.Layer):
             rij : [A, M]     scalar distances to neighbors
         """
         box_inv = tf.linalg.inv(box)
-        s = tf.einsum('ij,nj->ni', box_inv, positions)       # [A, 3]
+        # ASE row-vector cell convention: fractional s = r @ inv(cell), i.e.
+        # contract the FIRST index of box_inv (='ji'), so the minimum-image
+        # round() below happens in the true fractional basis. Using 'ij' here
+        # transposes the basis and gives wrong MIC wrapping for non-orthogonal
+        # (triclinic/sheared) cells (no-op for orthorhombic/diagonal boxes).
+        s = tf.einsum('ji,nj->ni', box_inv, positions)       # [A, 3]
         s_j = tf.gather(s, grad_index)                        # [A, M, 3]
         s_i = s[:, tf.newaxis, :]                             # [A, 1, 3]
         ds = s_j - s_i
         ds = ds - tf.round(ds)
-        dr = tf.einsum('ij,nmj->nmi', box, ds)                # [A, M, 3]
+        dr = tf.einsum('ji,nmj->nmi', box, ds)                # [A, M, 3]
         rij = tf.linalg.norm(dr, axis=-1)                     # [A, M]
         return dr, rij
 
@@ -1456,11 +1461,14 @@ class TNEP(layers.Layer):
         pos_n   = tf.gather_nd(positions, ba_n)              # [P, 3]
         box_k   = tf.gather(boxes,   pair_struct)            # [P, 3, 3]
         binv_k  = tf.gather(box_inv, pair_struct)            # [P, 3, 3]
-        s_c = tf.einsum('kij,kj->ki', binv_k, pos_c)        # [P, 3] fractional
-        s_n = tf.einsum('kij,kj->ki', binv_k, pos_n)
+        # ASE row-vector convention: s = r @ inv(cell) → contract the first
+        # (row) index of box_inv (='kji'), matching _neighbor_displacements_single.
+        # 'kij' transposes the fractional basis → wrong MIC for triclinic cells.
+        s_c = tf.einsum('kji,kj->ki', binv_k, pos_c)        # [P, 3] fractional
+        s_n = tf.einsum('kji,kj->ki', binv_k, pos_n)
         ds  = s_n - s_c
         ds  = ds - tf.round(ds)                              # MIC wrap
-        dr  = tf.einsum('kij,kj->ki', box_k, ds)            # [P, 3] Cartesian
+        dr  = tf.einsum('kji,kj->ki', box_k, ds)            # [P, 3] Cartesian
         rij2 = tf.reduce_sum(tf.square(dr), axis=-1)         # [P]
         return dr, rij2
 

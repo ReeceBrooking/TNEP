@@ -25,9 +25,9 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- dataset & split -----------------------------------------------
-    data_path: str = "datasets/train_waterbulk.xyz"
+    data_path: str = "datasets/train.xyz"
     # Separate test dataset (None = split from data_path; str = path to external .xyz)
-    test_data_path: str | None = "datasets/test_waterbulk.xyz"
+    test_data_path: str | None = "datasets/test.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = [6, 1, 8]
@@ -49,7 +49,7 @@ class TNEPconfig:
     # Set to a custom string to support non-standard dataset labels (e.g. "mu", "alpha").
     target_key: str | None = None
     # Scale dipole targets by atom count (per-atom dipole training)
-    scale_targets: bool = True
+    scale_targets: bool = False
     # Native units of dipole targets in the dataset: "e*angstrom" (e·Å),
     # "e*bohr" (e·a₀, × 0.5292 → e·Å), "debye" (× 0.2082 → e·Å). Sets the
     # e·Å conversion factor and the plot/stats unit label.
@@ -74,13 +74,13 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- geometric parameters ------------------------------------------
-    l_max: int = 7
-    alpha_max: int = 7
-    rcut_hard: float = 3.0
-    rcut_soft: float = 2.5
+    l_max: int = 4
+    alpha_max: int = 4
+    rcut_hard: float = 6.0
+    rcut_soft: float = 5.5
     basis: str = "poly3"
     scaling_mode: str = "polynomial"
-    radial_enhancement: int = 1
+    radial_enhancement: int = 0
     compress_mode: str = "trivial"
     atom_sigma_r: float = 0.5
     atom_sigma_t: float = 0.5
@@ -102,7 +102,7 @@ class TNEPconfig:
     # Structures per SOAP graph call: 1 = per-frame (lowest VRAM), int>1 =
     # batched, None = auto-fit to memory budget. Used by training and
     # trajectory inference; process_trajectory kwarg overrides per call.
-    descriptor_batch_frames: int | None = 500
+    descriptor_batch_frames: int | None = 100
 
     # Pair-tile size for the gradient compute: 0 = single-shot (higher peak
     # VRAM), >0 = tile pairs (cuts VRAM; at fp32 also enables XLA fusion).
@@ -162,14 +162,14 @@ class TNEPconfig:
     preprocess_sigma_scale: float = 1.0
     # Angular contraction threshold (angular/both modes): l < angular_l_keep
     # kept as passthrough channels, l ≥ it summed into one output channel.
-    descriptor_preprocess_angular_l_keep: int = 2
+    descriptor_preprocess_angular_l_keep: int = 4
     # True = W_pre coefficients per central-atom type; False = global across
     # centre types (symmetric, smallest param count).
     descriptor_preprocess_per_type: bool = False
     # L1/L2 strengths on (coefficient − init): soft prior toward the chosen
     # init, not zero. Both 0.0 = disable.
-    descriptor_preprocess_lambda_1: float = 0.0005
-    descriptor_preprocess_lambda_2: float = 0.0005
+    descriptor_preprocess_lambda_1: float = 0.0
+    descriptor_preprocess_lambda_2: float = 0.0
 
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION
@@ -181,8 +181,8 @@ class TNEPconfig:
     # L1/L2 strengths: None = auto sqrt(dim*1e-6/num_types), -1.0 = dynamic
     # (adapt every lambda_adapt_interval gens toward lambda_target_ratio of
     # data RMSE), float = fixed.
-    lambda_1: float | None = 0.0005
-    lambda_2: float | None = 0.0005
+    lambda_1: float | None = 0.01
+    lambda_2: float | None = 0.01
     # Dynamic-λ controls (only when lambda_1 or lambda_2 == -1):
     #   target_ratio : target reg-penalty / data-RMSE ratio
     #   damping      : step exponent, λ_new = λ·(target/r)^d (smaller = gentler)

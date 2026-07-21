@@ -18,6 +18,28 @@ from ase import Atoms
 _thread_local = threading.local()
 
 
+def _allocated_cpus() -> int:
+    """CPU cores actually granted to this process (mirrors
+    MasterTNEP._allocated_cpu_count). os.cpu_count() reports the whole physical
+    node and ignores the Slurm cgroup/cpuset, so using it inside a partial-node
+    allocation over-subscribes the worker pool. Prefer the Slurm allocation, then
+    the cpuset affinity mask, and only fall back to cpu_count()//2 off Slurm.
+    """
+    for _var in ('SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE'):
+        _val = os.environ.get(_var)
+        if _val:
+            try:
+                return max(int(_val.split('(')[0]), 1)   # guard "128(x2)"
+            except ValueError:
+                pass
+    if os.environ.get('SLURM_JOB_ID') or os.environ.get('SLURM_JOBID'):
+        try:
+            return max(len(os.sched_getaffinity(0)), 1)
+        except AttributeError:                           # non-Linux
+            pass
+    return max((os.cpu_count() or 2) // 2, 1)
+
+
 def _get_thread_builders(soap_strings: list[str]) -> list:
     """Return this thread's cached Descriptor objects, building them on first use."""
     cache = getattr(_thread_local, "cache", None)
@@ -285,8 +307,7 @@ class DescriptorBuilder(layers.Layer):
         ]
         self.builders = [Descriptor(s) for s in self._soap_strings]
 
-        _slurm = os.environ.get('SLURM_CPUS_PER_TASK')
-        self._num_workers = int(_slurm) if _slurm else max(os.cpu_count() // 2, 1)
+        self._num_workers = _allocated_cpus()
 
     def build_descriptors(
         self,
@@ -370,7 +391,7 @@ class DescriptorBuilder(layers.Layer):
                 dataset_grad_index.append(grad_indexes)
 
         else:
-            _total_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+            _total_cpus = _allocated_cpus()
             omp_per_worker = max(1, _total_cpus // self._num_workers)
 
             # quippy's Descriptor.calc() is a C extension that releases the GIL,
@@ -483,7 +504,7 @@ class DescriptorBuilder(layers.Layer):
                         do_grad=calc_gradients)
                     for s in dataset]
 
-        _total_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+        _total_cpus = _allocated_cpus()
         omp_per_worker = max(1, _total_cpus // self._num_workers)
 
         def _thread_worker(structure):

@@ -2405,7 +2405,11 @@ def build_neighbour_list_numpy(
             is_periodic = False
             n_imgs = np.zeros(3, dtype=np.int32)
         else:
-            b_norms = np.linalg.norm(cell_inv, axis=1)
+            # Reciprocal vectors are the COLUMNS of inv(cell) (a_i·b_j=δ_ij with
+            # rows(cell)=a_i), so the per-axis reciprocal norm is axis=0. axis=1
+            # (rows) under-counts periodic images for non-orthogonal cells,
+            # silently dropping neighbours near rcut (no-op for orthorhombic).
+            b_norms = np.linalg.norm(cell_inv, axis=0)
             n_imgs = np.where(pbc, np.ceil(rcut * b_norms).astype(np.int32), 0)
             # Wrap into the primary cell: the image search only spans rcut
             # around each atom, so unwrapped atoms would miss real neighbours.

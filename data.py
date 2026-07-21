@@ -170,7 +170,10 @@ def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]
         except KeyError:
             missing_targets.append(i)
             continue
-        if np.any(np.isnan(target)):
+        # size==0 catches an all-NaN target that _extract_target's trailing-NaN
+        # strip reduced to empty — otherwise it evades the isnan check and later
+        # crashes pad_and_stack instead of being dropped here.
+        if target.size == 0 or np.any(np.isnan(target)):
             nan_targets.append(i)
     return {'nan_positions': nan_positions,
             'nan_targets': nan_targets,

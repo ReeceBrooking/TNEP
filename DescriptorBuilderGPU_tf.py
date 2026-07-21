@@ -1335,7 +1335,10 @@ def _compute_image_vectors(cell: np.ndarray, pbc: np.ndarray, rcut: float):
         cell_inv = np.linalg.inv(cell)
     except np.linalg.LinAlgError:
         return np.zeros((1, 3), dtype=np.float64), 0
-    b_norms = np.linalg.norm(cell_inv, axis=1)
+    # Reciprocal vectors are COLUMNS of inv(cell) → per-axis norm is axis=0;
+    # axis=1 under-counts periodic images for non-orthogonal cells (no-op for
+    # orthorhombic). Mirrors build_neighbour_list_numpy.
+    b_norms = np.linalg.norm(cell_inv, axis=0)
     n_imgs = np.where(pbc, np.ceil(rcut * b_norms).astype(np.int32), 0)
     nx, ny, nz = int(n_imgs[0]), int(n_imgs[1]), int(n_imgs[2])
     image_int = np.stack(np.meshgrid(
@@ -1603,7 +1606,10 @@ def _mic_is_safe(cell: np.ndarray, pbc: np.ndarray, rcut: float) -> bool:
         cell_inv = np.linalg.inv(cell)
     except np.linalg.LinAlgError:
         return False  # degenerate cell — fall back to image-enumeration NL
-    proj = 1.0 / np.linalg.norm(cell_inv, axis=1)  # [3]
+    # Inter-plane spacing along axis d = 1/|b_d|, b_d = COLUMN d of inv(cell),
+    # so norm over axis=0. axis=1 gives the wrong spacing for triclinic cells and
+    # can wrongly deem MIC "safe" (no-op for orthorhombic).
+    proj = 1.0 / np.linalg.norm(cell_inv, axis=0)  # [3]
     for d in range(3):
         if bool(pbc[d]) and rcut >= 0.5 * proj[d]:
             return False
