@@ -1477,7 +1477,9 @@ def _wrap_to_cell(positions: np.ndarray, cell: np.ndarray, pbc: np.ndarray) -> n
         return np.asarray(positions, dtype=np.float64)
     pos = np.asarray(positions, dtype=np.float64)
     frac = pos @ cell_inv
-    frac -= np.floor(frac)
+    # Wrap ONLY periodic axes (a [T,T,F] slab must not have its z wrapped);
+    # mirrors build_neighbour_list_numpy and the per-axis n_imgs handling.
+    frac -= np.floor(frac) * np.asarray(pbc, dtype=frac.dtype)
     return frac @ cell
 
 

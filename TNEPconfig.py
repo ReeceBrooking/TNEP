@@ -291,6 +291,16 @@ class TNEPconfig:
     type_map: dict = {}
     indices: np.ndarray
 
+    def __init__(self) -> None:
+        # Give every instance its OWN mutable containers. Without this, the
+        # class-level list/dict defaults are shared objects — an in-place
+        # append/assign on a fresh TNEPconfig() would leak into every other
+        # instance in the process (e.g. back-to-back configs in a sweep).
+        self.types = []
+        self.type_map = {}
+        if type(self).allowed_species is not None:
+            self.allowed_species = list(type(self).allowed_species)
+
     def randomise(self, dataset: list) -> None:
         """Shuffle dataset indices and truncate to total_N.
 

@@ -2415,7 +2415,10 @@ def build_neighbour_list_numpy(
             # around each atom, so unwrapped atoms would miss real neighbours.
             # Matches quippy's internal wrap (translation invariance).
             frac = positions @ cell_inv
-            frac -= np.floor(frac)
+            # Wrap ONLY periodic axes: wrapping a non-periodic axis (e.g. z of a
+            # [T,T,F] slab) teleports atoms outside the nominal cell and corrupts
+            # the descriptor. n_imgs already respects pbc per-axis; match it here.
+            frac -= np.floor(frac) * np.asarray(pbc, dtype=frac.dtype)
             positions = frac @ cell
     else:
         n_imgs = np.zeros(3, dtype=np.int32)

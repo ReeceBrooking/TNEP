@@ -90,7 +90,11 @@ class SNES:
         n_b1 = 1
         self.n_typed = n_W0 + n_b0 + n_W1
         # Per-type param count (per type t): W0 Q·H + b0 H + W1 H.
-        self._n_per_type = self.cfg.dim_q * self.H + 2 * self.H
+        # Per-type param count. target_mode==2 has a second (polarizability) ANN
+        # whose type-t block is ALSO extracted for per-type regularization, so
+        # the denominator doubles to match _extract_type_params.
+        self._n_per_type = ((self.cfg.dim_q * self.H + 2 * self.H)
+                            * (2 if self.cfg.target_mode == 2 else 1))
         self.n_primary = self.n_typed + n_b1
         self._n_W0 = n_W0
         self._n_b0 = n_b0
@@ -409,10 +413,13 @@ class SNES:
             l1 = total_l1 / T + self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / n_typed_total
             l2 = total_l2 / T + self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed)) / n_typed_total)
         else:
-            # Single-type: exclude cayley/expm V_pair A entries from the
-            # L1/L2 sum — shrinking A → 0 collapses U → I, defeating the map.
-            ann = pv[:self.n_anns_total] if self._mix_cayley else pv
-            ann_n = self.n_anns_total if self._mix_cayley else self.dim
+            # Single-type: regularize ONLY the ANN weights — exclude the mixing
+            # V_pair tail (shrinking A → 0 collapses U → I) AND the preprocess
+            # tail (has its own init-prior, must not be pulled to 0), regardless
+            # of the mixing parameterisation. pv[:n_anns_total] == pv when there
+            # is no tail, so this reduces to the old behaviour in that case.
+            ann = pv[:self.n_anns_total]
+            ann_n = self.n_anns_total
             l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann)) / ann_n
             l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(ann)) / ann_n)
 
@@ -566,11 +573,22 @@ class SNES:
         w1_start = w1_offset + t * H
         w1_end = w1_start + H
 
-        return tf.concat([
+        blocks = [
             pv[w0_start:w0_end],
             pv[b0_start:b0_end],
             pv[w1_start:w1_end],
-        ], axis=0)
+        ]
+        if self.cfg.target_mode == 2:
+            # Polarizability ANN: identical layout offset by n_primary. Its
+            # type-t block must share the per-type penalty (else it's only
+            # weakly reached by the global term — asymmetric regularization).
+            p = self.n_primary
+            blocks += [
+                pv[p + w0_start:p + w0_end],
+                pv[p + b0_start:p + b0_end],
+                pv[p + w1_start:p + w1_end],
+            ]
+        return tf.concat(blocks, axis=0)
 
     def _build_type_of_variable(self) -> np.ndarray:
         """Map each param index to its atom type → [dim] int array.
@@ -1625,14 +1643,11 @@ class SNES:
 
             reg = total_l1 / T + global_l1 + total_l2 / T + global_l2
         else:
-            # Single-type: exclude cayley/expm V_pair A entries — pulling
-            # A → 0 collapses U → I and defeats the rotation map.
-            if self._mix_cayley:
-                ann = param_vectors[:, :self.n_anns_total]
-                ann_n = self.n_anns_total
-            else:
-                ann = param_vectors
-                ann_n = self.dim
+            # Single-type: regularize ONLY the ANN weights — exclude the mixing
+            # V_pair tail (A → 0 collapses U → I) and the preprocess tail. Reduces
+            # to the whole vector when there is no tail (n_anns_total == dim).
+            ann = param_vectors[:, :self.n_anns_total]
+            ann_n = self.n_anns_total
             l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann), axis=1) / ann_n
             l2 = self.lambda_2 * tf.sqrt(
                 tf.reduce_sum(tf.square(ann), axis=1) / ann_n)
@@ -1657,11 +1672,19 @@ class SNES:
         w1_start = w1_offset + t * H
         w1_end = w1_start + H
 
-        return tf.concat([
+        blocks = [
             param_vectors[:, w0_start:w0_end],
             param_vectors[:, b0_start:b0_end],
             param_vectors[:, w1_start:w1_end],
-        ], axis=1)
+        ]
+        if self.cfg.target_mode == 2:
+            p = self.n_primary   # polarizability ANN block (see _extract_type_params)
+            blocks += [
+                param_vectors[:, p + w0_start:p + w0_end],
+                param_vectors[:, p + b0_start:p + b0_end],
+                param_vectors[:, p + w1_start:p + w1_end],
+            ]
+        return tf.concat(blocks, axis=1)
 
     def evaluate_population(self, samples_tf: tf.Tensor, batch_data: dict[str, tf.Tensor],
                             return_per_type: bool = False) -> tf.Tensor:

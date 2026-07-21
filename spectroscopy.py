@@ -629,7 +629,12 @@ def _get_fused_predict(model: 'TNEP'):
         return cached
 
     cfg = model.cfg
-    dim_q = cfg.dim_q
+    # Builder emits RAW-width descriptors. With preprocess on, cfg.dim_q is the
+    # contracted Q_new, so pack at dim_q_raw (matches the raw-dim einsum score()
+    # feeds predict_batch after _W0_preprocess_eff expands W0 back to Q_raw).
+    dim_q = (int(cfg.dim_q_raw)
+             if model.descriptor_preprocess_contract != "off"
+             else int(cfg.dim_q))
     sig = [
         tf.TensorSpec(shape=[None, dim_q],     dtype=tf.float32),  # soap_concat
         tf.TensorSpec(shape=[None, 3, dim_q],  dtype=tf.float32),  # grad_concat
@@ -664,6 +669,14 @@ def _get_fused_predict(model: 'TNEP'):
     else:
         W0_eff_var = model.W0
         W0p_eff_var = getattr(model, "W0_pol", None)
+    # Second fold: expand W0 Q_new → Q_raw when preprocess is on, so the forward
+    # matmul runs at raw descriptor width. Mirrors score() (TNEP.py:796-799);
+    # without this, a preprocess-contracted model mis-predicts/crashes in
+    # trajectory inference (spectra silently wrong).
+    if model.descriptor_preprocess_contract != "off":
+        W0_eff_var = model._W0_preprocess_eff(W0_eff_var)
+        if W0p_eff_var is not None:
+            W0p_eff_var = model._W0_preprocess_eff(W0p_eff_var)
     W0_t  = _to_tensor(W0_eff_var)
     b0_t  = _to_tensor(model.b0)
     W1_t  = _to_tensor(model.W1)
@@ -931,8 +944,13 @@ def predict_trajectory_batch(
             batch_frames=descriptor_batch_frames,
             memory_budget_bytes=descriptor_memory_budget_bytes,
         )
+        # Builder emits raw-width descriptors; pack at dim_q_raw when preprocess
+        # is on (cfg.dim_q is the contracted Q_new there).
+        _dim_q_pack = (int(cfg.dim_q_raw)
+                       if model.descriptor_preprocess_contract != "off"
+                       else int(cfg.dim_q))
         batch = _pack_traj_batch_from_flat(frame_results, batch_frames, batch_types,
-                                           cfg.dim_q, pin_to_cpu=pin_to_cpu)
+                                           _dim_q_pack, pin_to_cpu=pin_to_cpu)
         del frame_results
 
         # Apply mixing absorption in the same order as the fused path so both
@@ -946,6 +964,11 @@ def predict_trajectory_batch(
         else:
             W0_pred = model.W0
             W0p_pred = getattr(model, "W0_pol", None)
+        # Preprocess fold (Q_new → Q_raw), mirroring score() and the fused path.
+        if model.descriptor_preprocess_contract != "off":
+            W0_pred = model._W0_preprocess_eff(W0_pred)
+            if W0p_pred is not None:
+                W0p_pred = model._W0_preprocess_eff(W0p_pred)
 
         preds = model.predict_batch(
             batch["descriptors"], batch["grad_values"],
