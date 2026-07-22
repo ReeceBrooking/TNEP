@@ -35,18 +35,42 @@ def _allocated_cpu_count() -> int:
 
 _cpu_threads = _allocated_cpu_count()
 
-# Threading budget. GPU run: >4 main-process threads cost more scheduler
-# overhead than they save (heavy work is on-device). CPU-only run: the
-# matmul-heavy forward pass needs the full Slurm allocation. NUMEXPR /
-# OPENBLAS pinned so NumPy paths in data.py don't oversubscribe.
+
+def _csc_use_all_cpus() -> bool:
+    """Use the FULL CPU allocation even on a GPU node when running on CSC/Mahti
+    (billing is per-node/GPU, so idle CPU cores are free).
+
+    Must be decided HERE — before TensorFlow imports — because the thread env
+    vars below freeze at import and no cfg instance exists yet. So read an env
+    override first (TNEP_CSC_ENABLE), then the TNEPconfig.csc_enable class
+    default. A per-instance cfg.csc_enable=True set after import is too late to
+    grow TF's thread pools; export TNEP_CSC_ENABLE=1 in the launch script.
+    """
+    env = os.environ.get('TNEP_CSC_ENABLE')
+    if env is not None:
+        return env.strip().lower() not in ('', '0', 'false', 'no', 'off')
+    try:
+        from TNEPconfig import TNEPconfig
+        return bool(getattr(TNEPconfig, 'csc_enable', False))
+    except Exception:
+        return False
+
+
+# Threading budget. A GPU run normally caps the main process at 4 threads (heavy
+# work is on-device, so extra threads just add scheduler overhead). But on
+# CSC/Mahti billing is per-node/GPU — idle cores are free — so csc_enable uses
+# the FULL allocation for the numpy/BLAS/quippy paths even on a GPU node.
+# CPU-only runs always use the full allocation. NUMEXPR/OPENBLAS pinned so the
+# NumPy paths in data.py don't oversubscribe.
 # NOTE: these env vars MUST be set before TensorFlow is imported below.
-_main_threads = 4 if _has_gpu else _cpu_threads
+_use_all_cpus = (not _has_gpu) or _csc_use_all_cpus()
+_main_threads = _cpu_threads if _use_all_cpus else 4
 os.environ['OMP_NUM_THREADS'] = str(_main_threads)
 os.environ['MKL_NUM_THREADS'] = str(_main_threads)
 os.environ['OPENBLAS_NUM_THREADS'] = str(_main_threads)
 os.environ['NUMEXPR_NUM_THREADS'] = str(_main_threads)
 os.environ['TF_NUM_INTRAOP_THREADS'] = str(_main_threads)
-os.environ['TF_NUM_INTEROP_THREADS'] = '2' if _has_gpu else '4'
+os.environ['TF_NUM_INTEROP_THREADS'] = '4' if _use_all_cpus else '2'
 if _has_gpu:
     os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 
@@ -131,6 +155,13 @@ def _apply_csc_overrides(cfg: TNEPconfig) -> None:
             setattr(cfg, k, v)
     print(f"  csc_enable=True ({profile} profile, OMP={_main_threads})"
           + (f" — {', '.join(changed)}" if changed else " — no changes needed"))
+    # Thread env vars froze at import; if csc_enable was set only on this cfg
+    # instance (not the class default / env), a GPU run is still capped at 4.
+    if _has_gpu and _main_threads < _cpu_threads:
+        print(f"  NOTE: main-process threads are {_main_threads}, not the full "
+              f"{_cpu_threads} allocated cores. Export TNEP_CSC_ENABLE=1 (or set "
+              f"the TNEPconfig.csc_enable class default) before launch to use all "
+              f"cores on a GPU node — TF thread pools cannot grow after import.")
 
 
 def train_model(cfg: TNEPconfig | None = None,

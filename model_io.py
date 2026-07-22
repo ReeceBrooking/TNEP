@@ -54,17 +54,23 @@ def _apply_legacy_field_defaults(cfg: TNEPconfig,
 
 
 def setup_run_directory(cfg: TNEPconfig) -> str:
-    """Create a timestamped run directory under models/ (with plots/ and a
-    human-readable config.txt) and set cfg.save_path/save_plots in place.
+    """Create a timestamped run directory (with plots/ and a human-readable
+    config.txt) and set cfg.save_path/save_plots in place.
 
-    Requires cfg.dim_q (call after descriptor building). Returns the run dir path.
+    The base directory is taken from cfg.save_path — the timestamped run dir is
+    created under `dirname(cfg.save_path)`, so save_path='myruns/auto' saves under
+    myruns/, and the default 'models/auto' saves under models/. Requires cfg.dim_q
+    (call after descriptor building). Returns the run dir path.
     """
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pop = cfg.pop_size if cfg.pop_size is not None else "auto"
     dir_name = f"n{cfg.num_neurons}_q{cfg.dim_q}_pop{pop}_{timestamp}"
-    run_dir = os.path.join("models", dir_name)
+    # Honor the user's chosen base directory (the part before the trailing
+    # 'auto'); fall back to models/ when save_path has no directory component.
+    base_dir = os.path.dirname(cfg.save_path) if cfg.save_path else ""
+    run_dir = os.path.join(base_dir or "models", dir_name)
     plots_dir = os.path.join(run_dir, "plots")
 
     os.makedirs(plots_dir, exist_ok=True)
