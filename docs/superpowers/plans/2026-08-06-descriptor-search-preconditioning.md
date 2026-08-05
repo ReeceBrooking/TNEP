@@ -125,7 +125,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 ```
 
-- [ ] **Step 2: Remove the stale bytecode from the 2026-05-13 attempt**
+- [ ] **Step 2: Remove the stale bytecode from the 2026-05-13 attempt** (housekeeping only — Python will not import it without a sibling `.py`)
 
 ```bash
 rm -f tests/__pycache__/test_descriptor_scaling.*.pyc
@@ -270,7 +270,7 @@ def test_zero_std_channel_stays_finite():
 
 
 def test_unknown_mode_raises():
-    with pytest.raises(ValueError, match="not in"):
+    with pytest.raises(ValueError, match="no statistic"):
         channel_multipliers(_stats([1.0], [1.0]), "zscore", 8.0, 1.0)
 
 
@@ -339,7 +339,10 @@ def channel_statistic(stats: dict, mode: str) -> np.ndarray:
         std = np.asarray(stats["std"], dtype=np.float64)
         mean = np.abs(np.asarray(stats["mean"], dtype=np.float64))
         return std / np.maximum(mean, _EPS)
-    raise ValueError(f"mode={mode!r} not in {VALID_MODES}")
+    raise ValueError(
+        f"mode={mode!r} has no statistic (expected one of "
+        f"{[m for m in VALID_MODES if m != 'off']}; 'off' is handled by the "
+        f"caller and must never reach here)")
 
 
 def channel_multipliers(stats: dict, mode: str, clamp: float,
@@ -724,7 +727,11 @@ git commit -m "SNES: resolve preconditioning modes and guards in one place"
 def test_mode_a_scales_only_the_w0_block():
     """sigma is multiplied on W0 coordinates and left alone elsewhere."""
     from TNEP import TNEP
-    cfg = _tiny_cfg(descriptor_sigma_scaling="std")
+    # Override exponent AND clamp: at the defaults (0.5, 64.0) the softening
+    # halves the log-ratio and the clamp then truncates it, giving ~8.9.
+    cfg = _tiny_cfg(descriptor_sigma_scaling="std",
+                    descriptor_scaling_exponent=1.0,
+                    descriptor_scaling_clamp=1e9)
     q, h, t = int(cfg.dim_q), cfg.num_neurons, cfg.num_types
     std = np.ones(q, np.float32); std[0] = 0.01          # one small channel
     cfg._descriptor_channel_stats = {
@@ -736,6 +743,40 @@ def test_mode_a_scales_only_the_w0_block():
     assert s[0] / s[h] == pytest.approx(100.0, rel=1e-4)
     # b0/W1/b1 coordinates untouched
     np.testing.assert_allclose(s[n_w0:], cfg.init_sigma, rtol=1e-6)
+
+
+def test_mode_a_scales_the_pol_block_too():
+    """target_mode=2 has a second W0 at offset n_primary — the only place the
+    offset arithmetic is exercised, and where both review rounds found bugs."""
+    from TNEP import TNEP
+    cfg = _tiny_cfg(target_mode=2, descriptor_sigma_scaling="std",
+                    descriptor_scaling_exponent=1.0,
+                    descriptor_scaling_clamp=1e9)
+    q, h = int(cfg.dim_q), cfg.num_neurons
+    std = np.ones(q, np.float32); std[0] = 0.01
+    cfg._descriptor_channel_stats = {
+        "mean": np.ones(q, np.float32), "std": std,
+        "rms": np.ones(q, np.float32), "count": 100}
+    snes = TNEP(cfg).optimizer
+    s = snes.sigma.numpy()
+    p = snes.n_primary
+    assert s[0] / s[h] == pytest.approx(100.0, rel=1e-4)            # main ANN
+    assert s[p] / s[p + h] == pytest.approx(100.0, rel=1e-4)        # pol ANN
+
+
+def test_model_round_trip_restores_the_multiplier(tmp_path):
+    """A preconditioned model must be loadable. _load_model_h5 rebuilds cfg
+    from JSON (which carries the mode strings) and calls TNEP(cfg); without a
+    restored multiplier the Task 3.1 guard would reject every saved model."""
+    from TNEP import TNEP
+    from model_io import save_model, load_model
+    cfg = _tiny_cfg(descriptor_sigma_scaling="std")
+    m = TNEP(cfg)
+    save_model(m, cfg, path=str(tmp_path))
+    import glob
+    m2 = load_model(glob.glob(str(tmp_path / "*.h5"))[0])
+    np.testing.assert_allclose(m2.optimizer._chan_mult, m.optimizer._chan_mult,
+                               rtol=1e-6)
 
 
 def test_mode_a_off_leaves_sigma_uniform():
@@ -905,12 +946,13 @@ Expected: 2 failed
 
 - [ ] **Step 3: Implement**
 
-In both `ckpt_state` dicts in `SNES.fit`:
+In both `ckpt_state` dicts in `SNES.fit` (the dicts at `SNES.py:1154-1160` and
+`:1174-1180`; the `save_checkpoint` calls are eight lines below each). Persist
+`_chan_mult`, not `_w0_reparam` — mode A needs it too, both so a resumed run
+never re-derives the multiplier and so a saved model can be loaded at all:
 
 ```python
-                    "descriptor_scale": (self._w0_reparam
-                                         if self._w0_reparam is not None
-                                         else None),
+                    "descriptor_scale": self._chan_mult,   # None when off
 ```
 
 In `save_checkpoint`, inside the `/snes` group (`sg`, created at `model_io.py:307`):
@@ -924,24 +966,36 @@ In `save_checkpoint`, inside the `/snes` group (`sg`, created at `model_io.py:30
 
 In `load_checkpoint`, after the `/snes` reads (`sg = f["snes"]`, `:364`):
 
+Note the indent: `load_checkpoint`'s file body sits at **8 spaces** inside the
+`with h5py.File(...)` block (`model_io.py:364`), which closes after `:390`.
+Pasting this at 4 spaces would query a closed HDF5 group.
+
 ```python
-    if "descriptor_scale" in sg:
-        cfg.descriptor_scale = sg["descriptor_scale"][:].astype(np.float32)
-    elif str(getattr(cfg, "descriptor_weight_reparam", "off")) != "off":
-        raise ValueError(
-            f"{path!r} was trained with descriptor_weight_reparam="
-            f"{cfg.descriptor_weight_reparam!r} but has no "
-            f"/snes/descriptor_scale. mu holds the reparameterised W0, so "
-            f"resuming without the multiplier would train a different model.")
+        if "descriptor_scale" in sg:
+            cfg.descriptor_scale = sg["descriptor_scale"][:].astype(np.float32)
+        elif str(getattr(cfg, "descriptor_weight_reparam", "off")) != "off":
+            raise ValueError(
+                f"{path!r} was trained with descriptor_weight_reparam="
+                f"{cfg.descriptor_weight_reparam!r} but has no "
+                f"/snes/descriptor_scale. mu holds the reparameterised W0, so "
+                f"resuming without the multiplier would train a different "
+                f"model.")
 ```
 
-In `save_model`, inside the existing `/descriptor` group (`dg`, `model_io.py:223`) — provenance and future warm-start only; inference needs nothing, because `save_model` writes the *effective* `W0`:
+In `save_model`, inside the existing `/descriptor` group (`dg`, `model_io.py:223`). This is **required**, not provenance: `_load_model_h5` restores cfg from the config JSON — which does contain the two mode strings, since `_serialize_config` walks `__annotations__` — and then calls `TNEP(cfg)` at `model_io.py:496`. On that path there are no channel statistics (underscore-prefixed, deliberately not serialised), so without a restored multiplier the Task 3.1 guard fires and **every preconditioned model is unloadable**. Write it for both modes:
 
 ```python
-        if getattr(model.optimizer, "_w0_reparam", None) is not None:
+        if getattr(model.optimizer, "_chan_mult", None) is not None:
             dg.create_dataset("channel_scale",
-                              data=model.optimizer._w0_reparam)
-            dg.attrs["descriptor_weight_reparam"] = cfg.descriptor_weight_reparam
+                              data=model.optimizer._chan_mult)
+```
+
+In `_load_model_h5`, **before** `model = TNEP(cfg)` at `model_io.py:496`:
+
+```python
+        if "descriptor" in f and "channel_scale" in f["descriptor"]:
+            cfg.descriptor_scale = (
+                f["descriptor"]["channel_scale"][:].astype(np.float32))
 ```
 
 In `_LEGACY_FIELD_DEFAULTS`:
@@ -995,11 +1049,18 @@ if cfg.target_mode == 0:
 opt, stat = os.environ.get("OPT"), os.environ.get("STAT", "std")
 if opt:
     setattr(cfg, f"descriptor_{opt}", stat)
-cfg.total_N = int(os.environ.get("N", 60))
+if os.environ.get("PRE"):                       # exercise the preprocess guard
+    cfg.descriptor_preprocess_contract = os.environ["PRE"]
+# N unset (or empty) means the WHOLE dataset. total_N=0 is not "no limit":
+# TNEPconfig.randomise (TNEPconfig.py:314) truncates to zero structures and
+# build_and_reduce then raises on the empty dataset.
+_n = os.environ.get("N")
+cfg.total_N = int(_n) if _n else None
 cfg.num_generations = int(os.environ.get("GENS", 6))
 cfg.val_interval = 2
 cfg.checkpoint_interval = 10 ** 9
-cfg.save_plots = cfg.show_plots = False
+cfg.save_plots = None                           # str | None, not bool
+cfg.show_plots = False
 cfg.save_path = os.environ.get("OUT", "models/smoke")
 train_model(cfg=cfg)
 print(f"OK mode={cfg.target_mode} opt={opt or 'off'} stat={stat}")
@@ -1013,7 +1074,7 @@ git add scripts/smoke_modes.py && git commit -m "scripts: smoke runner for targe
 
 ### Task 6.2: Defaults must be bit-identical
 
-- [ ] Run `GENS=200 N=0 OUT=models/verify_off python scripts/smoke_modes.py` before and after the whole change.
+- [ ] Run `GENS=200 OUT=models/verify_off python scripts/smoke_modes.py` before and after the whole change (`N` unset = full dataset).
 - [ ] **Acceptance:** `val_loss` arrays from the two `history.csv` files are `np.array_equal`. Anything else means a default path was disturbed. This is the check that the first draft of this plan would have passed while still harbouring a mode-B `NameError`, so do not treat it as sufficient on its own — Task 6.3 must also pass.
 
 ### Task 6.3: Every mode and option combination constructs
@@ -1021,7 +1082,7 @@ git add scripts/smoke_modes.py && git commit -m "scripts: smoke runner for targe
 - [ ] `MODE ∈ {0,1,2}` with no option → all succeed.
 - [ ] `MODE ∈ {1,2}` × `OPT ∈ {sigma_scaling, weight_reparam}` × `STAT=std` → all succeed.
 - [ ] `MODE=0 OPT=sigma_scaling` → raises the `target_mode` guard.
-- [ ] `OPT=sigma_scaling` with `descriptor_preprocess_contract="species_pair"` → raises the preprocess guard.
+- [ ] `MODE=2 OPT=sigma_scaling PRE=species_pair` → raises the preprocess guard.
 - [ ] Resume: run 20 generations under `weight_reparam=std`, resume from `checkpoint.h5`, confirm the first resumed `val_loss` matches the last pre-resume value.
 
 ### Task 6.4: Confirm the block granularity actually commutes
@@ -1059,6 +1120,7 @@ git add scripts/smoke_modes.py && git commit -m "scripts: smoke runner for targe
 - Mode B at generation 0 produces an effective `W0` identical to `"off"` (Task 5.1) — proving reparameterisation, not model change.
 - Statistics come from the training split only and are frozen across resume.
 - A mode-B checkpoint missing its multiplier raises rather than silently training a different model.
+- A model saved under **either** mode loads back successfully (`test_model_round_trip_restores_the_multiplier`).
 - Task 6.5 recorded with real numbers, and the code reverted if they do not support keeping it.
 
 ## Reusable skills
