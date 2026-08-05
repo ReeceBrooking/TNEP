@@ -265,7 +265,7 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
         total_preds = preds_np * scale
         total_rmse_scalar = float(metrics["total_rmse"])
     else:
-        # cfg.scale_targets=False or PES — `targets` is already total.
+        # scaling inactive (cfg.scale_targets=False or PES) — already total.
         total_targets = targets
         total_preds = preds_np
         total_rmse_scalar = float(metrics["rmse"])
@@ -419,17 +419,25 @@ def _train_model_inner(cfg: TNEPconfig,
     # the dipole sum, so drop neighbour pairs (grad_values O(N·M) → O(N)).
     _self_only = (cfg.target_mode == 1
                   and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
-    train_data = pad_and_stack(
-        train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
-        self_pairs_only=_self_only)
-    val_data   = pad_and_stack(
-        val_data,   num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
-        self_pairs_only=_self_only)
-    if _self_only:
-        n_train_pairs = int(train_data["grad_values"].shape[0])
-        n_val_pairs   = int(val_data["grad_values"].shape[0])
-        print(f"  dipole_rij_power=0: COO restricted to self-pairs only "
-              f"(train P={n_train_pairs}, val P={n_val_pairs})")
+    if "_W_atom" in train_data:
+        # split() already padded and reduced these to the geometry kernel
+        # (target_mode 1/2); the per-pair gradients no longer exist.
+        _kshape = tuple(int(s) for s in train_data["_W_atom"].shape)
+        _mib = np.prod(_kshape) * 4 / 2**20
+        print(f"  descriptor gradients reduced to kernel {_kshape} "
+              f"({_mib:.0f} MiB train); per-pair gradients discarded")
+    else:
+        train_data = pad_and_stack(
+            train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
+            self_pairs_only=_self_only)
+        val_data   = pad_and_stack(
+            val_data,   num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
+            self_pairs_only=_self_only)
+        if _self_only:
+            n_train_pairs = int(train_data["grad_values"].shape[0])
+            n_val_pairs   = int(val_data["grad_values"].shape[0])
+            print(f"  dipole_rij_power=0: COO restricted to self-pairs only "
+                  f"(train P={n_train_pairs}, val P={n_val_pairs})")
 
     _setup_grad_staging(cfg, train_data, val_data)
 

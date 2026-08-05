@@ -926,24 +926,31 @@ class SNES:
                                "num_atoms", "targets", "atom_mask"]
                 if "types_contained" in train_data:
                     struct_keys.append("types_contained")
+                # _W_atom is a per-structure field, so reduced staging needs
+                # nothing beyond the gather below — there is no COO to select.
+                if "_W_atom" in train_data:
+                    struct_keys.append("_W_atom")
                 batch_data = {
                     key: tf.gather(train_data[key], batch_idx_tf)
                     for key in struct_keys
                 }
-                # COO pair gather: select pairs of the sampled structures.
-                pair_starts = tf.gather(train_data["struct_ptr"], batch_idx_tf)
-                pair_ends   = tf.gather(train_data["struct_ptr"], batch_idx_tf + 1)
-                pair_ranges = tf.ragged.range(pair_starts, pair_ends)
-                flat_pair_idx = tf.cast(pair_ranges.flat_values, tf.int32)
-                gv_full = train_data["grad_values"]
-                batch_data["grad_values"] = tf.gather(gv_full, flat_pair_idx)
-                batch_data["pair_atom"]   = tf.gather(train_data["pair_atom"],   flat_pair_idx)
-                batch_data["pair_gidx"]   = tf.gather(train_data["pair_gidx"],   flat_pair_idx)
-                batch_data["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
-                # Build batch-local struct_ptr for struct_chunk slicing
-                batch_pair_counts = tf.cast(pair_ranges.row_lengths(), tf.int32)
-                batch_data["struct_ptr"] = tf.concat(
-                    [[0], tf.cumsum(batch_pair_counts)], axis=0)
+                if train_data.get("_gv_resident_gpu", False):
+                    batch_data["_gv_resident_gpu"] = True
+                if "grad_values" in train_data:
+                    # COO pair gather: select pairs of the sampled structures.
+                    pair_starts = tf.gather(train_data["struct_ptr"], batch_idx_tf)
+                    pair_ends   = tf.gather(train_data["struct_ptr"], batch_idx_tf + 1)
+                    pair_ranges = tf.ragged.range(pair_starts, pair_ends)
+                    flat_pair_idx = tf.cast(pair_ranges.flat_values, tf.int32)
+                    gv_full = train_data["grad_values"]
+                    batch_data["grad_values"] = tf.gather(gv_full, flat_pair_idx)
+                    batch_data["pair_atom"]   = tf.gather(train_data["pair_atom"],   flat_pair_idx)
+                    batch_data["pair_gidx"]   = tf.gather(train_data["pair_gidx"],   flat_pair_idx)
+                    batch_data["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
+                    # Build batch-local struct_ptr for struct_chunk slicing
+                    batch_pair_counts = tf.cast(pair_ranges.row_lengths(), tf.int32)
+                    batch_data["struct_ptr"] = tf.concat(
+                        [[0], tf.cumsum(batch_pair_counts)], axis=0)
 
             t1 = time.perf_counter()
 
@@ -1296,7 +1303,7 @@ class SNES:
             # across gens when val_size is None (static chunks); random
             # subsets bypass the cache. Two-level dict: id(val_data) → chunk_idx.
             W_atom_v = None
-            if self.cfg.target_mode == 1:
+            if self.cfg.target_mode in (1, 2):
                 _can_cache = (self.cfg.val_size is None)
                 if _can_cache:
                     _vd_id = id(val_data)
@@ -1308,24 +1315,34 @@ class SNES:
                     _sub = _cache_top.setdefault(_vd_id, {})
                     W_atom_v = _sub.get(chunk_idx)
                 if W_atom_v is None:
+                    # Staged data may already carry the kernel (split() reduced
+                    # it); otherwise build it from the COO gradients.
+                    W_atom_v = chunk.get("_W_atom")
+                if W_atom_v is None:
                     B_arg = chunk["descriptors"].shape[0]
                     A_arg = chunk["descriptors"].shape[1]
-                    W_atom_v = self.model._precompute_dipole_kernel(
+                    _kfn = (self.model._precompute_dipole_kernel
+                            if self.cfg.target_mode == 1
+                            else self.model._precompute_pol_kernel)
+                    W_atom_v = _kfn(
                         chunk["grad_values"], chunk["pair_struct"],
                         chunk["pair_atom"], chunk["pair_gidx"],
                         chunk["positions"], chunk["boxes"],
                         B_arg, A_arg)
                     if _can_cache:
                         _sub[chunk_idx] = W_atom_v
+            # COO fields are absent once staging has reduced to _W_atom; the
+            # kernel branch in predict_batch returns before touching them.
             preds = self.model.predict_batch(
-                chunk["descriptors"], chunk["grad_values"],
-                chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
+                chunk["descriptors"], chunk.get("grad_values"),
+                chunk.get("pair_atom"), chunk.get("pair_gidx"),
+                chunk.get("pair_struct"),
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
                 W_atom=W_atom_v,
             )
-            if self.cfg.scale_targets and self.cfg.target_mode == 1:
+            if self.cfg.scale_targets and self.cfg.target_mode in (1, 2):
                 num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
                 preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]
             diff = preds - chunk["targets"]
@@ -1750,12 +1767,14 @@ class SNES:
             # Slice precomputed [B]-shaped quantities to this chunk's range.
             tc_chunk = tc_full[chunk_lo:chunk_hi] if return_per_type else None
 
-            # Precompute candidate-independent W_atom [B,A,3,Q] ONCE per struct
-            # chunk. Full-batch (batch_size None): W_atom is gen-invariant →
+            # Precompute the candidate-independent geometry kernel ONCE per
+            # struct chunk: [B,A,3,Q] for dipole, [B,A,6,Q] for polarizability.
+            # Full-batch (batch_size None): the kernel is gen-invariant →
             # cache keyed by (chunk_idx, id(batch_data)). With batch_size set,
             # each gen resamples → recompute (cache invalidated on id change).
             _W_atom_cached = None
-            if self.cfg.target_mode == 1:
+            _mode = self.cfg.target_mode
+            if _mode in (1, 2):
                 if getattr(self.cfg, "batch_size", None) is None:
                     _bd_id = id(batch_data)
                     _cache = getattr(self, "_W_atom_static_cache", None)
@@ -1765,7 +1784,7 @@ class SNES:
                     _W_atom_cached = _cache.get(chunk_idx)
                 if _W_atom_cached is not None:
                     chunk["_W_atom"] = _W_atom_cached
-            if self.cfg.target_mode == 1 and "_W_atom" not in chunk:
+            if _mode in (1, 2) and "_W_atom" not in chunk:
                 _gv = chunk["grad_values"]
                 _ps = chunk["pair_struct"]
                 _pa = chunk["pair_atom"]
@@ -1777,9 +1796,14 @@ class SNES:
                 _A_st = _desc.shape[1]
                 _B_arg = _B_st if _B_st is not None else tf.shape(_desc)[0]
                 _A_arg = _A_st if _A_st is not None else tf.shape(_desc)[1]
-                chunk["_W_atom"] = self.model._precompute_dipole_kernel(
+                _kernel_fn = (self.model._precompute_dipole_kernel if _mode == 1
+                              else self.model._precompute_pol_kernel)
+                chunk["_W_atom"] = _kernel_fn(
                     _gv, _ps, _pa, _pg, _pos, _boxes, _B_arg, _A_arg)
-                # Write through to the static cache for reuse (full-batch only).
+                # Write through to the static cache for reuse (full-batch
+                # only). Only a kernel we derived here is worth caching —
+                # pre-reduced data already holds it resident, so caching the
+                # staged copy would pin a second [B,A,3|6,Q] tensor.
                 if (getattr(self.cfg, "batch_size", None) is None
                         and getattr(self, "_W_atom_static_cache", None)
                             is not None
@@ -1870,10 +1894,11 @@ class SNES:
             batch_data    : dict of [B, ...] tensors
         """
         desc        = batch_data["descriptors"]   # [B, A, Q]
-        grad_values = batch_data["grad_values"]   # [P, 3, Q]
-        pair_atom   = batch_data["pair_atom"]     # [P]
-        pair_gidx   = batch_data["pair_gidx"]     # [P]
-        pair_struct = batch_data["pair_struct"]   # [P]
+        # COO fields are absent once staging has reduced to _W_atom.
+        grad_values = batch_data.get("grad_values")   # [P, 3, Q] or None
+        pair_atom   = batch_data.get("pair_atom")     # [P] or None
+        pair_gidx   = batch_data.get("pair_gidx")     # [P] or None
+        pair_struct = batch_data.get("pair_struct")   # [P] or None
         pos         = batch_data["positions"]     # [B, A, 3]
         Z           = batch_data["Z_int"]         # [B, A]
         boxes       = batch_data["boxes"]         # [B, 3, 3]
@@ -1881,7 +1906,7 @@ class SNES:
         amask       = batch_data["atom_mask"]     # [B, A]
 
         # Precompute per-atom normalization factor once (not per-candidate).
-        _scale_preds = self.cfg.scale_targets and self.cfg.target_mode == 1
+        _scale_preds = self.cfg.scale_targets and self.cfg.target_mode in (1, 2)
         if _scale_preds:
             num_atoms = tf.reduce_sum(amask, axis=1)  # [B]
             inv_num_atoms = 1.0 / tf.maximum(num_atoms, 1.0)  # [B]
@@ -1900,62 +1925,38 @@ class SNES:
         U_pair_cand = named.get("U_pair")
         W_pre_angular_cand = named.get("W_pre_angular")
 
-        if self.cfg.target_mode == 2:
-            pol_weights = self._pol_weights  # [6] component weights
-            # Pre-absorb U_pair^T into W0/W0_pol per candidate (linear _W0_eff
-            # broadcasts over the candidate axis) so the loop uses raw descriptors.
-            if U_pair_cand is not None:
-                W0 = self.model._W0_eff(W0, U_pair_cand)
-                W0p = self.model._W0_eff(W0p, U_pair_cand)
+        # The geometry kernel is candidate-independent: [B,A,3,Q] for dipole,
+        # [B,A,6,Q] for polarizability. evaluate_population stashes it on
+        # batch_data["_W_atom"] per struct chunk so the population loop reuses
+        # it; inline fallback for other callers (score, etc.).
+        W_atom = batch_data.get("_W_atom")
+        if W_atom is None and self.cfg.target_mode in (1, 2):
+            B_static = desc.shape[0]
+            A_static = desc.shape[1]
+            B_arg = B_static if B_static is not None else tf.shape(desc)[0]
+            A_arg = A_static if A_static is not None else tf.shape(desc)[1]
+            kernel_fn = (self.model._precompute_dipole_kernel
+                         if self.cfg.target_mode == 1
+                         else self.model._precompute_pol_kernel)
+            W_atom = kernel_fn(grad_values, pair_struct, pair_atom, pair_gidx,
+                               pos, boxes, B_arg, A_arg)
 
-            fitness_comp_w = pol_weights[tf.newaxis]  # [1, 6]
-            sq_comp_w = pol_weights[tf.newaxis]
+        # Evaluate all C candidates via batched GEMMs (one GEMM per type
+        # per direction, not C matmuls inside vectorized_map).
+        preds = self.model.predict_batch_candidates(
+            desc, W_atom, Z, amask, W0, b0, W1, b1,
+            W0_pol=W0p, b0_pol=b0p, W1_pol=W1p, b1_pol=b1p,
+            U_pair=U_pair_cand,
+            W_pre_angular=W_pre_angular_cand)  # [C, B, T_dim]
 
-            def _forward_one_candidate(args):
-                w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
-                preds = self.model.predict_batch(
-                    desc, grad_values, pair_atom, pair_gidx, pair_struct,
-                    pos, Z, boxes, amask,
-                    w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
-                )
-                diff = preds - targets  # [B, 6]
-                fitness = squared_error_per_structure(
-                    diff, component_weights=fitness_comp_w)
-                sq = squared_error_per_structure(diff, component_weights=sq_comp_w)
-                return tf.stack([fitness, sq], axis=0)  # [2, B]
+        if _scale_preds:
+            preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]
 
-            stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
-            both = tf.vectorized_map(_forward_one_candidate, stacked)  # [C, 2, B]
-            return both[:, 0, :], both[:, 1, :]
-
-        else:
-
-            # W_atom [B,A,3,Q] is candidate-independent. evaluate_population
-            # stashes it on batch_data["_W_atom"] per struct chunk so the pop
-            # loop reuses it; inline fallback for other callers (score, etc.).
-            W_atom = batch_data.get("_W_atom")
-            if W_atom is None:
-                B_static = desc.shape[0]
-                A_static = desc.shape[1]
-                B_arg = B_static if B_static is not None else tf.shape(desc)[0]
-                A_arg = A_static if A_static is not None else tf.shape(desc)[1]
-                if self.cfg.target_mode == 1:
-                    W_atom = self.model._precompute_dipole_kernel(
-                        grad_values, pair_struct, pair_atom, pair_gidx,
-                        pos, boxes,
-                        B_arg, A_arg)
-
-            # Evaluate all C candidates via batched GEMMs (one GEMM per type
-            # per direction, not C matmuls inside vectorized_map).
-            preds = self.model.predict_batch_candidates(
-                desc, W_atom, Z, amask, W0, b0, W1, b1,
-                U_pair=U_pair_cand,
-                W_pre_angular=W_pre_angular_cand)  # [C, B, T_dim]
-
-            if _scale_preds:
-                preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]
-
-            diff = preds - targets[tf.newaxis]  # [C, B, T_dim]
-            fitness = squared_error_per_structure(diff)
-            sq = fitness  # unweighted MSE, for RMSE/RRMSE
-            return fitness, sq
+        diff = preds - targets[tf.newaxis]  # [C, B, T_dim]
+        # Mode 2 weights the shear components by lambda_shear² in both the
+        # ranking objective and the reported square error (unchanged behaviour).
+        comp_w = (self._pol_weights[tf.newaxis]
+                  if self.cfg.target_mode == 2 else None)
+        fitness = squared_error_per_structure(diff, component_weights=comp_w)
+        sq = fitness
+        return fitness, sq

@@ -25,9 +25,9 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- dataset & split -----------------------------------------------
-    data_path: str = "datasets/train.xyz"
+    data_path: str = "datasets/train_waterbulk.xyz"
     # Separate test dataset (None = split from data_path; str = path to external .xyz)
-    test_data_path: str | None = "datasets/test.xyz"
+    test_data_path: str | None = "datasets/test_waterbulk.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = [6, 1, 8]
@@ -43,13 +43,15 @@ class TNEPconfig:
 
     # --- target type, units, conversions -------------------------------
     # 0 : PES (energy), 1 : Dipole, 2 : Polarizability
-    target_mode: int = 1
+    target_mode: int = 2
     # Override the info/results key used to read targets from ASE structures.
     # None = use the default for target_mode ("energy", "dipole", "pol").
     # Set to a custom string to support non-standard dataset labels (e.g. "mu", "alpha").
     target_key: str | None = None
-    # Scale dipole targets by atom count (per-atom dipole training)
-    scale_targets: bool = False
+    # Scale dipole/polarizability targets by atom count (per-atom training,
+    # as GPUMD does). Both are extensive. Rescaling the target rescales the
+    # ANN output too, so lambda_1/lambda_2 need retuning to match.
+    scale_targets: bool = True
     # Native units of dipole targets in the dataset: "e*angstrom" (e·Å),
     # "e*bohr" (e·a₀, × 0.5292 → e·Å), "debye" (× 0.2082 → e·Å). Sets the
     # e·Å conversion factor and the plot/stats unit label.
@@ -75,9 +77,9 @@ class TNEPconfig:
 
     # --- geometric parameters ------------------------------------------
     l_max: int = 4
-    alpha_max: int = 4
-    rcut_hard: float = 6.0
-    rcut_soft: float = 5.5
+    alpha_max: int = 7
+    rcut_hard: float = 4.0
+    rcut_soft: float = 3.5
     basis: str = "poly3"
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 0
@@ -118,7 +120,7 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # Hidden-layer width of the per-type ANN.
-    num_neurons: int = 30
+    num_neurons: int = 20
     # Hidden-layer activation (any tf.keras.activations name for the forward
     # pass). Dipole/polarisability training (target_mode 1/2) has a hand-coded
     # backward — only "tanh" and "swish" (alias "silu") supported there;
@@ -181,8 +183,8 @@ class TNEPconfig:
     # L1/L2 strengths: None = auto sqrt(dim*1e-6/num_types), -1.0 = dynamic
     # (adapt every lambda_adapt_interval gens toward lambda_target_ratio of
     # data RMSE), float = fixed.
-    lambda_1: float | None = 0.01
-    lambda_2: float | None = 0.01
+    lambda_1: float | None = 0.001
+    lambda_2: float | None = 0.001
     # Dynamic-λ controls (only when lambda_1 or lambda_2 == -1):
     #   target_ratio : target reg-penalty / data-RMSE ratio
     #   damping      : step exponent, λ_new = λ·(target/r)^d (smaller = gentler)

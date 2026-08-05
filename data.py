@@ -5,6 +5,7 @@ import numpy as np
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import make_descriptor_builder
 from ase.io import read
+import kernels
 from ase import Atoms
 
 
@@ -13,6 +14,24 @@ DEBYE_TO_EANGSTROM = 0.20819434
 
 # No-PBC box: 1000 Å cube, large enough that MIC never wraps any displacement.
 _NO_PBC_BOX = 1000.0 * np.eye(3, dtype=np.float32)
+
+
+def is_reduced(data: dict) -> bool:
+    """True if `data` has been reduced to the geometry kernel and no longer
+    carries COO gradients. build_and_reduce pops the five COO keys together,
+    so any one of them is a valid probe; this keeps that invariant in one place.
+    """
+    return "grad_values" not in data
+
+
+def _dipole_rij_power(cfg) -> int:
+    """cfg.dipole_rij_power with one shared default.
+
+    This used to be read with two different fallbacks in this file; disagreeing
+    defaults would make pad_and_stack keep only self pairs while the kernel
+    weighted them by rij²=0, silently zeroing every predicted dipole.
+    """
+    return int(getattr(cfg, "dipole_rij_power", 2))
 
 
 def cell_to_box(atoms) -> np.ndarray:
@@ -321,7 +340,11 @@ def assemble_data_dict(
     """Assemble a data dict from structures, type indices, and descriptors.
 
     Applies dipole unit conversion (× _dipole_conversion_factor) and, when
-    cfg.scale_targets, per-atom scaling (target / N_atoms) for dipole mode.
+    cfg.scale_targets, per-atom scaling (target / N_atoms) for the tensorial
+    modes. Dipole and polarizability are both extensive, and GPUMD trains
+    both per atom (structure.cu divides the virial target by num_atom), so
+    per-atom is what makes RMSE comparable across cell sizes and with the
+    NEP papers.
 
     Args:
         dataset     : list of ase.Atoms
@@ -341,7 +364,7 @@ def assemble_data_dict(
         factor = _dipole_conversion_factor(cfg.dipole_units)
         if factor != 1.0:
             targets = [t * factor for t in targets]
-    if cfg.scale_targets and cfg.target_mode == 1:
+    if cfg.scale_targets and cfg.target_mode in (1, 2):
         targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
     data = {
         "positions": [tf.convert_to_tensor(s.positions, dtype=tf.float32) for s in dataset],
@@ -377,14 +400,14 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     """
     types_int = assign_type_indices(dataset, cfg.types)
     builder = make_descriptor_builder(cfg)
+    if cfg.target_mode in (1, 2):
+        # Same batched build-and-reduce as training staging, so evaluating an
+        # external dataset never materialises the full gradient tensor either.
+        return build_and_reduce(dataset, types_int, cfg, builder,
+                                num_types=cfg.num_types, pin_to_cpu=True)
     descriptors, gradients, grad_index = builder.build_descriptors(dataset)
     data = assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
-    _self_only = (cfg.target_mode == 1
-                  and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
-    return pad_and_stack(
-        data,
-        num_types=cfg.num_types,
-        self_pairs_only=_self_only)
+    return pad_and_stack(data, num_types=cfg.num_types)
 
 
 def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> tuple[dict, dict, dict]:
@@ -459,30 +482,25 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     # dipole_rij_power==0 → dipole forward reads only self-pair gradients
     # ∂q_i/∂r_i, so build self-only in batches and drop the ~90%-of-COO
     # neighbour rows the forward never reads (bounds peak memory to one batch).
-    _self_only_batch = (int(cfg.descriptor_self_batch_size)
-                        if getattr(cfg, "descriptor_self_batch_size", None)
-                        is not None else None)
-    _self_only = (int(getattr(cfg, "dipole_rij_power", 0)) == 0
-                  and cfg.target_mode == 1)
-    if _self_only:
-        _kw = {"progress_desc": "Building train descriptors (self-only, batched)"} \
-            if cfg.descriptor_mode == 1 else {}
-        train_descriptors, train_gradients, train_grad_index = \
-            builder.build_descriptors_self_only(
-                train_dataset, batch_size=_self_only_batch, **_kw)
-        _kw = {"progress_desc": "Building val descriptors (self-only, batched)"} \
-            if cfg.descriptor_mode == 1 else {}
-        val_descriptors, val_gradients, val_grad_index = \
-            builder.build_descriptors_self_only(
-                val_dataset, batch_size=_self_only_batch, **_kw)
+    if cfg.target_mode in (1, 2):
+        # Tensorial modes: build in batches and reduce straight to the geometry
+        # kernel, so the per-pair gradients are never all resident. Returns
+        # padded dicts — MasterTNEP skips its own pad_and_stack for these.
+        train_data = build_and_reduce(
+            train_dataset, train_types_int, cfg, builder,
+            num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
+            label="train descriptors")
+        val_data = build_and_reduce(
+            val_dataset, val_types_int, cfg, builder,
+            num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
+            label="val descriptors")
     else:
         _kw = {"progress_desc": "Building train descriptors"} if cfg.descriptor_mode == 1 else {}
         train_descriptors, train_gradients, train_grad_index = builder.build_descriptors(train_dataset, **_kw)
         _kw = {"progress_desc": "Building val descriptors"} if cfg.descriptor_mode == 1 else {}
         val_descriptors,   val_gradients,   val_grad_index   = builder.build_descriptors(val_dataset, **_kw)
-
-    train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
-    val_data   = assemble_data_dict(val_dataset,   val_types_int,   val_descriptors,   val_gradients,   val_grad_index,   cfg)
+        train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
+        val_data   = assemble_data_dict(val_dataset,   val_types_int,   val_descriptors,   val_gradients,   val_grad_index,   cfg)
     # Deferred test set: stash raw atoms + type indices for
     # materialize_test_data to build descriptors at scoring time.
     test_pending = {
@@ -500,6 +518,107 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         print(f"{n_structures} structures split into train ({n_train}) + test ({n_test}) + val ({n_val}) "
               f"(test descriptors deferred to scoring)")
     return train_data, test_pending, val_data
+
+
+# Per-batch budget for the transient COO gradient block inside
+# build_and_reduce. The batch size adapts to hold roughly this much, so peak
+# staging memory is set by a byte count rather than a structure count (a batch
+# of 3000-atom cells is ~1000x a batch of water monomers).
+# Budget is on grad_values alone; the reduction's own [P,Q] intermediates and
+# the host copies inside pad_and_stack push actual peak to roughly 3x this, so
+# 256 MiB here means ~800 MiB of staging headroom.
+_REDUCE_BATCH_BYTES = 256 << 20
+_REDUCE_BATCH_MIN, _REDUCE_BATCH_MAX = 1, 256
+
+
+def build_and_reduce(dataset: list, types_int: list, cfg: 'TNEPconfig',
+                     builder, num_types: int | None, pin_to_cpu: bool,
+                     label: str = "") -> dict:
+    """Build descriptors in batches and reduce each batch to the geometry
+    kernel, freeing the per-pair gradients before the next batch starts.
+
+    The dipole/polarizability forward reads ``grad_values`` through exactly one
+    parameter-free contraction (see kernels.py), so the reduced ``_W_atom`` is
+    a sufficient statistic and the gradients are dead once it exists. Building
+    the whole set first and reducing afterwards would still peak at the full
+    gradient size — which is what OOMs at large rcut — so the reduction has to
+    happen inside the build loop.
+
+    Only valid for target_mode 1 and 2. PES needs true per-pair forces and
+    keeps the COO path.
+
+    Returns:
+        Padded dict with ``_W_atom`` [S, A, 3|6, Q] and no COO fields
+        (grad_values / pair_atom / pair_gidx / pair_struct / struct_ptr).
+    """
+    S = len(dataset)
+    if S == 0:
+        raise ValueError("build_and_reduce got an empty dataset")
+    # Dataset-wide padding width so per-batch results concatenate.
+    max_atoms = max(len(a) for a in dataset)
+    self_only = (cfg.target_mode == 1
+                 and _dipole_rij_power(cfg) == 0)
+    n_comp = kernels.kernel_components(cfg)
+    place = tf.device('/CPU:0') if pin_to_cpu else _gpu_device_ctx()
+    # The reduction reads the whole COO block, so run it wherever that block
+    # already lives. pad_and_stack below builds it on the host; sending it to
+    # the GPU just to sum it would reintroduce the peak this function avoids.
+    reduce_place = tf.device('/CPU:0') if pin_to_cpu else _gpu_device_ctx()
+
+    buffers: dict | None = None
+    batch_size, lo = 8, 0
+    while lo < S:
+        hi = min(lo + batch_size, S)
+        sub_ds, sub_ti = dataset[lo:hi], types_int[lo:hi]
+        if self_only and hasattr(builder, "build_descriptors_self_only"):
+            d, g, gi = builder.build_descriptors_self_only(sub_ds)
+        else:
+            # No self-only fast path on this backend: build everything and let
+            # pad_and_stack(self_pairs_only=True) drop the neighbour rows.
+            d, g, gi = builder.build_descriptors(sub_ds)
+        sub = assemble_data_dict(sub_ds, sub_ti, d, g, gi, cfg)
+        del d, g, gi
+        # Pad on the host: the COO block is the large transient and it is
+        # consumed by the reduction immediately below.
+        padded = pad_and_stack(sub, num_types=num_types, pin_to_cpu=True,
+                               self_pairs_only=self_only, max_atoms=max_atoms)
+        del sub
+
+        gv_bytes = int(np.prod(padded["grad_values"].shape)) * 4
+        with reduce_place:
+            W = kernels.precompute_kernel(
+                cfg, padded["grad_values"], padded["pair_struct"],
+                padded["pair_atom"], padded["pair_gidx"],
+                padded["positions"], padded["boxes"], hi - lo, max_atoms)
+        for k in ("grad_values", "pair_atom", "pair_gidx",
+                  "pair_struct", "struct_ptr"):
+            padded.pop(k, None)
+        if buffers is None:
+            buffers = {k: np.empty((S,) + tuple(v.shape[1:]), v.dtype.as_numpy_dtype)
+                       for k, v in padded.items()}
+            buffers["_W_atom"] = np.empty(
+                (S,) + tuple(W.shape[1:]), W.dtype.as_numpy_dtype)
+        for k, v in padded.items():
+            buffers[k][lo:hi] = v.numpy()
+        buffers["_W_atom"][lo:hi] = W.numpy()
+        del padded, W
+
+        # Retune from the batch just measured: bytes/structure is only known
+        # after a build, so the first batch is deliberately small.
+        per_struct = max(gv_bytes // (hi - lo), 1)
+        batch_size = int(np.clip(_REDUCE_BATCH_BYTES // per_struct,
+                                 _REDUCE_BATCH_MIN, _REDUCE_BATCH_MAX))
+        lo = hi
+        if label:
+            print(f"  {label}: reduced {hi}/{S} structures "
+                  f"(kernel [·, {max_atoms}, {n_comp}, ·], "
+                  f"batch={batch_size}, {per_struct/2**20:.1f} MiB/struct)",
+                  end="\r")
+    if label:
+        print()
+
+    with place:
+        return {k: tf.constant(v) for k, v in buffers.items()}
 
 
 def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
@@ -535,20 +654,23 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     test_types_int = test_pending["types_int"]
 
     builder = make_descriptor_builder(cfg)
-    _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
-    test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(
-        test_dataset, **_kw)
-
-    test_data = assemble_data_dict(
-        test_dataset, test_types_int,
-        test_descriptors, test_gradients, test_grad_index, cfg)
-    _self_only = (cfg.target_mode == 1
-                  and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
-    test_data = pad_and_stack(
-        test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
-        self_pairs_only=_self_only)
+    if cfg.target_mode in (1, 2):
+        test_data = build_and_reduce(
+            test_dataset, test_types_int, cfg, builder,
+            num_types=num_types, pin_to_cpu=pin_to_cpu,
+            label="test descriptors")
+    else:
+        _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
+        test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(
+            test_dataset, **_kw)
+        test_data = assemble_data_dict(
+            test_dataset, test_types_int,
+            test_descriptors, test_gradients, test_grad_index, cfg)
+        test_data = pad_and_stack(
+            test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
+            self_pairs_only=False)
     # Pre-stage per-chunk pair indices to GPU (test eval uses predict_batch,
-    # not _evaluate_chunk, so no XLA padding needed).
+    # not _evaluate_chunk, so no XLA padding needed). No-op once reduced.
     S_test = int(test_data["num_atoms"].shape[0])
     chunk = cfg.batch_chunk_size if cfg.batch_chunk_size is not None else S_test
     test_ranges = [(s, min(s + chunk, S_test)) for s in range(0, S_test, chunk)]
@@ -562,7 +684,8 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
 
 def pad_and_stack(data: dict, num_types: int | None = None,
                   pin_to_cpu: bool = True,
-                  self_pairs_only: bool = False) -> dict[str, tf.Tensor]:
+                  self_pairs_only: bool = False,
+                  max_atoms: int | None = None) -> dict[str, tf.Tensor]:
     """Convert variable-length list data into COO gradients + padded tensors.
 
     Gradients use COO (only real atom-neighbor pairs) to avoid the dense
@@ -600,7 +723,13 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     S = len(data["descriptors"])
     dim_q = data["descriptors"][0].shape[-1]
     atom_counts = [data["descriptors"][i].shape[0] for i in range(S)]
-    max_atoms = max(atom_counts)
+    if max_atoms is None:
+        max_atoms = max(atom_counts)
+    elif max_atoms < max(atom_counts):
+        raise ValueError(
+            f"max_atoms={max_atoms} is smaller than the largest structure in "
+            f"this batch ({max(atom_counts)}). Pass the dataset-wide maximum "
+            f"so batched staging produces concatenable padding.")
 
     target_sample = data["targets"][0]
     target_dim = 1 if target_sample.shape == () else target_sample.shape[0]
@@ -841,12 +970,14 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials")
+                  "forces", "virials", "_W_atom")
     for k in SMALL_KEYS:
         if k in data:
             chunk[k] = tf.gather(data[k], idx_tf)
 
     chunk["descriptors"] = tf.gather(data["descriptors"], idx_tf)
+    if is_reduced(data):
+        return chunk          # reduced to _W_atom; no COO to gather
     # COO pair gather: pairs for structure idx_tf[i] live in
     # struct_ptr[idx_tf[i]:idx_tf[i]+1]. Flatten via tf.ragged.range;
     # pair_struct → chunk-local [0..B_chunk) via value_rowids().
@@ -876,6 +1007,8 @@ def prestage_chunk_indices(data: dict, ranges: list) -> None:
     startup saves ~3-5 ms/chunk of per-gen tf.constant + DMA. Stored under
     data["_pair_idx_gpu_cache"], consumed by the staging paths.
     """
+    if is_reduced(data):
+        return                # reduced to _W_atom; no pair indices exist
     cache: dict = data.setdefault("_pair_idx_gpu_cache", {})
     pa_full = data["pair_atom"]
     pg_full = data["pair_gidx"]
@@ -948,15 +1081,16 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     ndarrays and pass the in-RAM gradient/pair tensors through untouched.
     _stage_finalize_tf converts the result to TF tensors.
     """
-    precomputed = get_chunk_index_cache().get(data, s_start, s_end)
+    reduced = "grad_values" not in data
+    precomputed = (None if reduced
+                   else get_chunk_index_cache().get(data, s_start, s_end))
     idx_np = np.arange(int(s_start), int(s_end), dtype=np.int32)
-    flat_pair_idx_np = precomputed["flat_pair_idx_np"]
 
     # Slice every CPU-resident structure-padded field into numpy.
     out: dict = {"_idx_np": idx_np, "_precomputed": precomputed}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials")
+                  "forces", "virials", "_W_atom")
     for k in SMALL_KEYS:
         if k in data:
             v = data[k]
@@ -967,9 +1101,10 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     out["_np_descriptors"] = desc_np[idx_np]
 
     # In-RAM: hand back the original grad/pair tensors untouched (finalize gathers).
-    out["_passthrough_grad_values"] = data["grad_values"]
-    out["_passthrough_pair_atom"]   = data["pair_atom"]
-    out["_passthrough_pair_gidx"]   = data["pair_gidx"]
+    if not reduced:
+        out["_passthrough_grad_values"] = data["grad_values"]
+        out["_passthrough_pair_atom"]   = data["pair_atom"]
+        out["_passthrough_pair_gidx"]   = data["pair_gidx"]
     return out
 
 
@@ -982,7 +1117,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials")
+                  "forces", "virials", "_W_atom")
     # pin_to_cpu=True ⇒ host RAM, upload each chunk to GPU if present.
     # False ⇒ already on-device, no device context needed.
     ctx = _gpu_device_ctx() if pin_to_cpu else _NullCtx()
@@ -996,6 +1131,8 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
             if np_key in raw:
                 chunk[k] = tf.constant(raw[np_key])
         chunk["descriptors"] = tf.constant(raw["_np_descriptors"])
+        if raw["_precomputed"] is None:
+            return chunk      # reduced to _W_atom; no COO to stage
         if pair_idx_entry is not None:
             chunk["pair_struct"] = pair_idx_entry["pair_struct"]
         else:
@@ -1044,13 +1181,14 @@ def _gpu_device_ctx():
 
 _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                          "targets", "atom_mask", "types_contained",
-                         "forces", "virials")
+                         "forces", "virials", "_W_atom")
 
 
 def move_data_to_gpu(data: dict) -> None:
     """Move every static (non-helper) field in `data` onto /GPU:0 so staging
     avoids host round-trips. Resident tensors are left alone (identity-on-GPU
-    is a no-op); underscore-prefixed helper keys are skipped.
+    is a no-op). Only the keys listed below move — note _W_atom is a real
+    tensor despite its underscore, unlike the helper dicts.
     """
     keys = list(_RESIDENT_SMALL_KEYS) + [
         "descriptors", "pair_atom", "pair_gidx", "pair_struct",
@@ -1081,14 +1219,21 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
     pair_idx_cache = data.get("_pair_idx_gpu_cache")
     pair_idx_entry = (pair_idx_cache.get((s_lo, s_hi))
                        if pair_idx_cache is not None else None)
+    # Whole-array chunk (the common batch_chunk_size >= S case): hand the
+    # tensors through untouched. A gather here would copy every field, and
+    # _W_atom is the largest of them — that copy would be paid every
+    # generation for nothing.
+    S_all = int(data["descriptors"].shape[0])
+    passthrough = (s_lo == 0 and s_hi == S_all)
     with _gpu_device_ctx():
-        idx_tf = tf.range(s_lo, s_hi, dtype=tf.int32)
-        for k in _RESIDENT_SMALL_KEYS:
+        idx_tf = None if passthrough else tf.range(s_lo, s_hi, dtype=tf.int32)
+        for k in list(_RESIDENT_SMALL_KEYS) + ["descriptors"]:
             v = data.get(k)
             if v is None:
                 continue
-            chunk[k] = tf.gather(v, idx_tf)
-        chunk["descriptors"] = tf.gather(data["descriptors"], idx_tf)
+            chunk[k] = v if passthrough else tf.gather(v, idx_tf)
+        if is_reduced(data):
+            return chunk      # reduced to _W_atom; no COO to slice
 
         # Grad slice + pair indices.
         precomputed = get_chunk_index_cache().get(data, s_lo, s_hi)
@@ -1144,9 +1289,11 @@ def prefetched_chunks(data: dict, ranges: list, pin_to_cpu: bool):
         return
 
     # Pre-warm the chunk-index cache so staging never hits a TF op on miss.
-    idx_cache = get_chunk_index_cache()
-    for _s, _e in ranges:
-        idx_cache.get(data, _s, _e)
+    # Reduced data has no COO, so there are no pair indices to cache.
+    if not is_reduced(data):
+        idx_cache = get_chunk_index_cache()
+        for _s, _e in ranges:
+            idx_cache.get(data, _s, _e)
 
     for s, e in ranges:
         raw = _stage_disk_only(data, s, e)

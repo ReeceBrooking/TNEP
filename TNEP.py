@@ -8,6 +8,7 @@ from typing import Callable
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import TNEPconfig
+import kernels
 
 
 class TNEP(layers.Layer):
@@ -802,9 +803,12 @@ class TNEP(layers.Layer):
         for _, _, chunk in prefetched_chunks(
                 test_data, ranges,
                 pin_to_cpu=self.cfg.pin_data_to_cpu):
+            # Pre-reduced data carries _W_atom and has no COO fields; the
+            # kernel branch in predict_batch returns before touching them.
             pred_parts.append(self.predict_batch(
-                chunk["descriptors"], chunk["grad_values"],
-                chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
+                chunk["descriptors"], chunk.get("grad_values"),
+                chunk.get("pair_atom"), chunk.get("pair_gidx"),
+                chunk.get("pair_struct"),
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],
                 W0_eff, self.b0, self.W1, self.b1,
@@ -812,6 +816,7 @@ class TNEP(layers.Layer):
                 getattr(self, 'b0_pol', None),
                 getattr(self, 'W1_pol', None),
                 getattr(self, 'b1_pol', None),
+                W_atom=chunk.get("_W_atom"),
             ))
             del chunk
         raw_preds = tf.concat(pred_parts, axis=0)
@@ -819,7 +824,7 @@ class TNEP(layers.Layer):
         targets = test_data["targets"]
 
         # Normalize predictions to per-atom space when target scaling is active
-        if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
+        if self.cfg.scale_targets and self.cfg.target_mode in (1, 2) and "num_atoms" in test_data:
             num_atoms = tf.cast(test_data["num_atoms"], tf.float32)  # [S]
             num_atoms_col = tf.maximum(num_atoms, 1.0)[:, tf.newaxis]  # [S, 1]
             preds = raw_preds / num_atoms_col
@@ -848,7 +853,7 @@ class TNEP(layers.Layer):
         }
 
         # Total (un-scaled) metrics when target scaling is active.
-        if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
+        if self.cfg.scale_targets and self.cfg.target_mode in (1, 2) and "num_atoms" in test_data:
             total_targets = targets * num_atoms_col
             total_preds = raw_preds
             total_diff = total_preds - total_targets
@@ -1076,14 +1081,14 @@ class TNEP(layers.Layer):
         # Per-atom (always populated):
         rrmse_pa = (1.0 - m["r2"]) ** 0.5
         print(f"  PER-ATOM space (matches GPUMD loss.out 'rmse_virial'):")
-        print(f"    RMSE  = {m['rmse']:.6f}  e·bohr / atom / component")
+        print(f"    RMSE  = {m['rmse']:.6f}  per atom / component")
         print(f"    R²    = {m['r2']:.6f}")
         print(f"    RRMSE = √(1−R²) = {rrmse_pa:.4%}")
         # Total (only when scale_targets active):
         if "total_rmse" in m and "total_r2" in m:
             rrmse_tot = (1.0 - m["total_r2"]) ** 0.5
-            print(f"  TOTAL-DIPOLE space (matches NEP paper headline RMSE / R²):")
-            print(f"    RMSE  = {m['total_rmse']:.6f}  e·bohr / structure / component")
+            print(f"  TOTAL (per-structure) space:")
+            print(f"    RMSE  = {m['total_rmse']:.6f}  per structure / component")
             print(f"    R²    = {m['total_r2']:.6f}")
             print(f"    RRMSE = √(1−R²) = {rrmse_tot:.4%}")
         if "cos_sim_mean" in m:
@@ -1120,12 +1125,12 @@ class TNEP(layers.Layer):
             W1          : [T, H]      output weights
             b1          : ()          scalar bias
             W0_pol..b1_pol : same shapes, for mode 2 only (None otherwise)
+            W_atom      : [B, A, 3, Q] dipole kernel (mode 1) or [B, A, 6, Q]
+                          polarizability kernel (mode 2); None → COO fallback
 
         Returns:
             predictions : [B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
-        box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
-
         # Pure forward primitive: caller decides whether W0/W0_pol are raw or
         # already U-absorbed, so no double-mixing here.
         W0_use = W0
@@ -1164,13 +1169,22 @@ class TNEP(layers.Layer):
 
         B = tf.shape(descriptors)[0]
 
-        if self.cfg.target_mode == 1 and W_atom is not None:
-            # Precomputed-kernel path (avoids [C, P, Q]):
-            # dipole[b,s] = -Σ_{a,q} de_dq[b,a,q]·W_atom[b,a,s,q], identical to
-            # the COO forces path by W_atom's definition.
-            return -tf.einsum('baq,basq->bs', de_dq, W_atom)  # [B, 3]
+        if W_atom is not None and self.cfg.target_mode in (1, 2):
+            # Precomputed-kernel path (avoids the [P, Q] gather, and [C, P, Q]
+            # once pfor vectorises it over candidates). Identical to the COO
+            # path by the kernels' definitions:
+            #   mode 1: dipole[b,s] = -Σ_{a,q} de_dq[b,a,q]·W_atom[b,a,s,q]
+            #   mode 2: same contraction over the 6 rank-2 components, then the
+            #           isotropic scalar ANN added on the diagonal.
+            contracted = -tf.einsum('baq,basq->bs', de_dq, W_atom)  # [B, 3|6]
+            if self.cfg.target_mode == 1:
+                return contracted
+            return contracted + self._pol_diag_add(
+                self._pol_scalar_sum(descriptors, Z, atom_mask,
+                                     W0_pol_use, b0_pol, W1_pol, b1_pol))
 
-        # Standard COO path (W_atom not precomputed: score(), predict()).
+        # Standard COO path (no kernel supplied: spectroscopy, PES eval).
+        box_inv = tf.linalg.inv(boxes)  # [B, 3, 3] — COO branch only
         forces_per_pair = self._calc_forces_coo(de_dq, grad_values, pair_struct, pair_atom)
 
         if self.cfg.target_mode == 1:
@@ -1196,11 +1210,15 @@ class TNEP(layers.Layer):
                                   atom_mask: tf.Tensor,
                                   W0: tf.Tensor, b0: tf.Tensor,
                                   W1: tf.Tensor, b1: tf.Tensor,
+                                  W0_pol: tf.Tensor | None = None,
+                                  b0_pol: tf.Tensor | None = None,
+                                  W1_pol: tf.Tensor | None = None,
+                                  b1_pol: tf.Tensor | None = None,
                                   U_pair: tf.Tensor | None = None,
                                   W_pre_angular: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
-        Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
+        Replaces vectorized_map for all three target modes.
         Both the input→hidden and hidden→descriptor matmuls are executed as
         single large GEMMs over all C candidates simultaneously:
 
@@ -1211,16 +1229,18 @@ class TNEP(layers.Layer):
 
         Args:
             descriptors : [B, A, Q]
-            W_atom      : [B, A, 3, Q]  precomputed dipole kernel (mode 1 only)
+            W_atom      : [B, A, 3, Q] dipole kernel (mode 1) or [B, A, 6, Q]
+                          polarizability kernel (mode 2); unused for mode 0
             Z           : [B, A]        type indices
             atom_mask   : [B, A]        1.0 real, 0.0 pad
             W0          : [C, T, Q, H]
             b0          : [C, T, H]
             W1          : [C, T, H]
             b1          : [C]
+            W0_pol..b1_pol : same shapes, isotropic scalar ANN (mode 2 only)
 
         Returns:
-            predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
+            predictions : [C, B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
         # Q = dim seen by the matmul: Q_raw after the preprocess fold, else Q_new.
         Q = self.dim_q_forward
@@ -1242,12 +1262,17 @@ class TNEP(layers.Layer):
         # in raw-desc space (de_dq combines with raw grad_values). See _W0_eff.
         if self.descriptor_mixing and U_pair is not None:
             W0 = self._W0_eff(W0, U_pair)
+            if W0_pol is not None:
+                W0_pol = self._W0_eff(W0_pol, U_pair)
 
         # Preprocess fold: W0 Q_new → Q_raw so the matmul below is uniform at
         # Q_raw and de_dq comes out at Q_raw for the raw-W_atom sum. Mutually
         # exclusive with mixing.
         if self.descriptor_preprocess_contract != "off":
             W0 = self._W0_preprocess_eff(W0, W_pre_override=W_pre_angular)
+            if W0_pol is not None:
+                W0_pol = self._W0_preprocess_eff(
+                    W0_pol, W_pre_override=W_pre_angular)
 
         # ── Forward: input→hidden ─────────────────────────────────────────────
         # Per type: [B*A, Q] @ [Q, C*H] → [C, B, A, H]. One GEMM/type, not C.
@@ -1279,53 +1304,66 @@ class TNEP(layers.Layer):
             E = E * atom_mask[tf.newaxis]
             return -tf.reduce_sum(E, axis=2, keepdims=True)  # [C, B, 1]
 
-        # ── Dipole: backward matmul ───────────────────────────────────────────
+        # ── Dipole / polarizability: backward matmul ──────────────────────────
         # ∂U/∂a1 = activation'(h1, z1)·W1.
-        de_da    = self._activation_grad(h1, z1) * W1_t_all   # [C, B, A, H]
-        de_da_flat = tf.reshape(de_da, [C, B * A, H])         # [C, B*A, H]
+        de_da = self._activation_grad(h1, z1) * W1_t_all      # [C, B, A, H]
 
-        # Per type: [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]  (batched GEMM over C)
-        de_dq_terms = []
+        # Apply the type masks on the H-sized tensor and fuse the T per-type
+        # GEMMs into one. Masking after the matmul would instead touch T full
+        # [C,B,A,Q] tensors and hold them all live for the add_n — Q/H times
+        # more traffic for the same result. Concatenating along H turns the
+        # sum-over-types into a single contraction.
+        de_da_masked = tf.concat(
+            [de_da * type_masks[t][tf.newaxis] for t in range(T)],
+            axis=-1)                                          # [C, B, A, T*H]
+        W0_all = tf.reshape(tf.transpose(W0, [0, 1, 3, 2]),
+                            [C, T * H, Q])                    # [C, T*H, Q]
+        de_dq = tf.reshape(
+            tf.matmul(tf.reshape(de_da_masked, [C, B * A, T * H]), W0_all),
+            [C, B, A, Q])                                     # [C, B, A, Q]
+
+        # W_atom [B, A, 3|6, Q]: pred[c,b,s] = -Σ_{a,q} de_dq[c,b,a,q]*W_atom[b,a,s,q]
+        contracted = -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3|6]
+        if self.cfg.target_mode == 1:
+            return contracted
+
+        # ── Polarizability: isotropic scalar ANN on the diagonal ──────────────
+        # Same GEMM pattern as the main forward, on the second (scalar) ANN.
+        pre_hp_terms = []
         for t in range(T):
-            W0_t_T  = tf.transpose(W0[:, t, :, :], [0, 2, 1])    # [C, H, Q]
-            dq_flat = tf.matmul(de_da_flat, W0_t_T)               # [C, B*A, Q]
-            dq      = tf.reshape(dq_flat, [C, B, A, Q])
-            de_dq_terms.append(dq * type_masks[t][tf.newaxis])
-        de_dq = tf.add_n(de_dq_terms)  # [C, B, A, Q]
+            W0p_t     = W0_pol[:, t, :, :]                                         # [C, Q, H]
+            W0p_t_mat = tf.reshape(tf.transpose(W0p_t, [1, 0, 2]), [Q, C * H])    # [Q, C*H]
+            php_flat  = tf.matmul(desc_flat, W0p_t_mat)                           # [B*A, C*H]
+            php       = tf.transpose(tf.reshape(php_flat, [B, A, C, H]), [2, 0, 1, 3])
+            pre_hp_terms.append(php * type_masks[t][tf.newaxis])
+        pre_hp = tf.add_n(pre_hp_terms)  # [C, B, A, H]
 
-        # W_atom [B, A, 3, Q]: dipole[c,b,s] = -Σ_{a,q} de_dq[c,b,a,q]*W_atom[b,a,s,q]
-        return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
+        b0p_all = tf.reshape(tf.gather(b0_pol, Z_flat, axis=1), [C, B, A, H])
+        W1p_all = tf.reshape(tf.gather(W1_pol, Z_flat, axis=1), [C, B, A, H_final])
+
+        h_pol = self.activation(pre_hp + b0p_all)
+        h_pol = h_pol * atom_mask[tf.newaxis, :, :, tf.newaxis]
+        F_pol = tf.reduce_sum(h_pol * W1p_all, axis=3) + b1_pol[:, tf.newaxis, tf.newaxis]
+        F_pol = F_pol * atom_mask[tf.newaxis]
+        scalar_sum = tf.reduce_sum(F_pol, axis=2)  # [C, B]
+
+        return contracted + self._pol_diag_add(scalar_sum)
 
     def _scalar_rij_pow(self, rij2: tf.Tensor) -> tf.Tensor:
         """|r_ij|^N per-pair weight from the rij² primitive (N ≥ 1; avoids sqrt
         for even N). N=0 (self-pairs only) is handled by _dipole_pair_weight_*.
             N=1 → √rij²;  N=2 → rij²;  even≥4 → rij²^(N/2);  odd≥3 → rij²^((N-1)/2)·√rij²
         """
-        N = int(getattr(self.cfg, "dipole_rij_power", 2))
-        if N == 1:
-            return tf.sqrt(rij2)
-        if N == 2:
-            return rij2
-        if N % 2 == 0:
-            return tf.pow(rij2, N // 2)
-        # Odd N ≥ 3
-        return tf.pow(rij2, (N - 1) // 2) * tf.sqrt(rij2)
+        return kernels.scalar_rij_pow(
+            int(getattr(self.cfg, "dipole_rij_power", 2)), rij2)
 
     def _dipole_pair_weight_coo(self, rij2: tf.Tensor,
                                  pair_atom: tf.Tensor,
                                  pair_gidx: tf.Tensor) -> tf.Tensor:
-        """Per-pair dipole weight, COO-pair interface.
-            N == 0 : 1 where pair_atom==pair_gidx AND rij²<1e-20 (true self pair),
-                     else 0. The rij² guard rejects periodic self-images (same
-                     atom index, nonzero displacement) that would double-count.
-            N >= 1 : |r_ij|^N (self pairs → 0, images weighted correctly).
-        """
-        N = int(getattr(self.cfg, "dipole_rij_power", 2))
-        if N == 0:
-            is_self = tf.logical_and(tf.equal(pair_atom, pair_gidx),
-                                     rij2 < 1e-20)
-            return tf.cast(is_self, rij2.dtype)
-        return self._scalar_rij_pow(rij2)
+        """Per-pair dipole weight, COO-pair interface. See kernels.pair_weight_coo."""
+        return kernels.pair_weight_coo(
+            int(getattr(self.cfg, "dipole_rij_power", 2)),
+            rij2, pair_atom, pair_gidx)
 
     def _dipole_pair_weight_padded(self, rij2: tf.Tensor,
                                     grad_index: tf.Tensor) -> tf.Tensor:
@@ -1397,80 +1435,27 @@ class TNEP(layers.Layer):
                                   pair_gidx: tf.Tensor, positions: tf.Tensor,
                                   boxes: tf.Tensor, B: tf.Tensor,
                                   A: tf.Tensor) -> tf.Tensor:
-        """Aggregate rij²-weighted gradients per (structure, atom); candidate-independent.
-            W_atom[b,a,s,q] = Σ_{p: struct=b, atom=a} rij²[p]·grad_values[p,s,q]
-        Dipole is then -einsum('baq,basq->bs', de_dq, W_atom), no P axis inside
-        the candidate loop (eliminates the [C, P, Q] intermediate).
+        """[B, A, 3, Q] dipole geometry kernel. See kernels.precompute_dipole_kernel."""
+        return kernels.precompute_dipole_kernel(
+            int(getattr(self.cfg, "dipole_rij_power", 2)),
+            grad_values, pair_struct, pair_atom, pair_gidx, positions, boxes, B, A)
 
-        Args:
-            grad_values : [P, 3, Q]  (already scaled if descriptor scaling is active)
-            pair_struct : [P]
-            pair_atom   : [P]
-            pair_gidx   : [P]
-            positions   : [B, A, 3]
-            boxes       : [B, 3, 3]
-            B           : number of structures
-            A           : max atoms (padded)
-
-        Returns:
-            W_atom : [B, A, 3, Q]
-        """
-        P = tf.shape(grad_values)[0]
-        Q = tf.shape(grad_values)[2]
-        # N == 0 : weight = 1 everywhere — the COO list is already filtered to
-        #          self-pairs (data.py self_pairs_only), so skip displacements
-        #          + tf.linalg.inv(boxes) entirely.
-        # N >= 1 : per-pair |r|^N weight; needs displacements.
-        _N = int(getattr(self.cfg, "dipole_rij_power", 2))
-        if _N == 0:
-            weight = tf.ones([P], dtype=grad_values.dtype)
-        else:
-            box_inv = tf.linalg.inv(boxes)
-            _, rij2 = self._neighbor_displacements_coo(
-                positions, boxes, box_inv,
-                pair_struct, pair_atom, pair_gidx)
-            weight = self._dipole_pair_weight_coo(rij2, pair_atom, pair_gidx)  # [P]
-        W = weight[:, tf.newaxis, tf.newaxis] * grad_values   # [P, 3, Q]
-        W_flat = tf.reshape(W, [P, 3 * Q])                  # [P, 3*Q]
-        ba_linear = pair_struct * A + pair_atom              # [P] linear index into [B*A]
-        W_atom_flat = tf.math.unsorted_segment_sum(
-            W_flat, ba_linear, num_segments=B * A)           # [B*A, 3*Q]
-        return tf.reshape(W_atom_flat, [B, A, 3, Q])         # [B, A, 3, Q]
+    def _precompute_pol_kernel(self, grad_values: tf.Tensor,
+                               pair_struct: tf.Tensor, pair_atom: tf.Tensor,
+                               pair_gidx: tf.Tensor, positions: tf.Tensor,
+                               boxes: tf.Tensor, B: tf.Tensor,
+                               A: tf.Tensor) -> tf.Tensor:
+        """[B, A, 6, Q] polarizability geometry kernel. See kernels.precompute_pol_kernel."""
+        return kernels.precompute_pol_kernel(
+            grad_values, pair_struct, pair_atom, pair_gidx, positions, boxes, B, A)
 
     def _neighbor_displacements_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
                                     box_inv: tf.Tensor, pair_struct: tf.Tensor,
                                     pair_atom: tf.Tensor,
                                     pair_gidx: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute per-pair displacements in COO format with MIC wrapping.
-
-        Args:
-            positions  : [B, A, 3]
-            boxes      : [B, 3, 3]
-            box_inv    : [B, 3, 3]
-            pair_struct: [P]  batch-relative structure index
-            pair_atom  : [P]  center atom index
-            pair_gidx  : [P]  neighbor atom index
-
-        Returns:
-            dr   : [P, 3]  displacement vectors (neighbor - center)
-            rij2 : [P]     squared distances
-        """
-        ba_c = tf.stack([pair_struct, pair_atom], axis=1)   # [P, 2]
-        ba_n = tf.stack([pair_struct, pair_gidx], axis=1)   # [P, 2]
-        pos_c   = tf.gather_nd(positions, ba_c)              # [P, 3]
-        pos_n   = tf.gather_nd(positions, ba_n)              # [P, 3]
-        box_k   = tf.gather(boxes,   pair_struct)            # [P, 3, 3]
-        binv_k  = tf.gather(box_inv, pair_struct)            # [P, 3, 3]
-        # ASE row-vector convention: s = r @ inv(cell) → contract the first
-        # (row) index of box_inv (='kji'), matching _neighbor_displacements_single.
-        # 'kij' transposes the fractional basis → wrong MIC for triclinic cells.
-        s_c = tf.einsum('kji,kj->ki', binv_k, pos_c)        # [P, 3] fractional
-        s_n = tf.einsum('kji,kj->ki', binv_k, pos_n)
-        ds  = s_n - s_c
-        ds  = ds - tf.round(ds)                              # MIC wrap
-        dr  = tf.einsum('kji,kj->ki', box_k, ds)            # [P, 3] Cartesian
-        rij2 = tf.reduce_sum(tf.square(dr), axis=-1)         # [P]
-        return dr, rij2
+        """(dr [P,3], rij2 [P]) with MIC wrapping. See kernels.neighbor_displacements_coo."""
+        return kernels.neighbor_displacements_coo(
+            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
 
     def _dipole_coo(self, forces_per_pair: tf.Tensor, pair_struct: tf.Tensor,
                     pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
@@ -1529,7 +1514,54 @@ class TNEP(layers.Layer):
         dr, _ = self._neighbor_displacements_coo(positions, boxes, box_inv,
                                                   pair_struct, pair_atom, pair_gidx)
 
-        # Scalar ANN (isotropic contribution) — same type-loop pattern as main ANN
+        scalar_sum = self._pol_scalar_sum(descriptors, Z, atom_mask,
+                                          W0_pol, b0_pol, W1_pol, b1_pol)  # [B]
+
+        # Tensor part: per-pair outer product, then segment-sum per structure
+        pol_outer = -tf.einsum('ki,kj->kij', dr, forces_per_pair)  # [P, 3, 3]
+        pol_flat  = tf.reshape(pol_outer, [-1, 9])                  # [P, 9]
+        pol_mat_flat = tf.math.unsorted_segment_sum(
+            pol_flat, pair_struct, num_segments=B)                  # [B, 9]
+        pol_matrix = tf.reshape(pol_mat_flat, [B, 3, 3])
+
+        pol = tf.stack([pol_matrix[:, i, j] for i, j in self._POL_COMPONENTS],
+                       axis=1)  # [B, 6]
+        return pol + self._pol_diag_add(scalar_sum)
+
+    _POL_COMPONENTS = kernels.POL_COMPONENTS
+
+    @staticmethod
+    def _pol_diag_add(scalar_sum: tf.Tensor) -> tf.Tensor:
+        """Broadcast the isotropic scalar ANN output onto the xx/yy/zz slots.
+
+        Args:
+            scalar_sum : [...]  trailing-axis-free scalar per structure
+
+        Returns:
+            [..., 6] with the scalar on the three diagonal components, 0 elsewhere
+        """
+        zeros = tf.zeros_like(scalar_sum)
+        return tf.stack([scalar_sum, scalar_sum, scalar_sum, zeros, zeros, zeros],
+                        axis=-1)
+
+    def _pol_scalar_sum(self, descriptors: tf.Tensor, Z: tf.Tensor,
+                        atom_mask: tf.Tensor, W0_pol: tf.Tensor,
+                        b0_pol: tf.Tensor, W1_pol: tf.Tensor,
+                        b1_pol: tf.Tensor) -> tf.Tensor:
+        """Isotropic scalar ANN summed over atoms, single weight set.
+
+        Args:
+            descriptors : [B, A, Q]
+            Z           : [B, A]
+            atom_mask   : [B, A]
+            W0_pol      : [T, Q, H]   (caller supplies U-absorbed weights)
+            b0_pol      : [T, H]
+            W1_pol      : [T, H]
+            b1_pol      : ()
+
+        Returns:
+            scalar_sum : [B]
+        """
         b0p_t = tf.gather(b0_pol, Z)   # [B, A, H]
         W1p_t = tf.gather(W1_pol, Z)   # [B, A, H]
         type_masks_p = [
@@ -1544,22 +1576,4 @@ class TNEP(layers.Layer):
         h_pol = h_pol * atom_mask[:, :, tf.newaxis]
         F_pol = tf.reduce_sum(h_pol * W1p_t, axis=2) + b1_pol  # [B, A]
         F_pol = F_pol * atom_mask
-        scalar_sum = tf.reduce_sum(F_pol, axis=1)               # [B]
-
-        # Tensor part: per-pair outer product, then segment-sum per structure
-        pol_outer = -tf.einsum('ki,kj->kij', dr, forces_per_pair)  # [P, 3, 3]
-        pol_flat  = tf.reshape(pol_outer, [-1, 9])                  # [P, 9]
-        pol_mat_flat = tf.math.unsorted_segment_sum(
-            pol_flat, pair_struct, num_segments=B)                  # [B, 9]
-        pol_matrix = tf.reshape(pol_mat_flat, [B, 3, 3])
-
-        pol = tf.stack([
-            pol_matrix[:, 0, 0], pol_matrix[:, 1, 1], pol_matrix[:, 2, 2],
-            pol_matrix[:, 0, 1], pol_matrix[:, 1, 2], pol_matrix[:, 2, 0],
-        ], axis=1)  # [B, 6]
-
-        diag_add = tf.stack([scalar_sum, scalar_sum, scalar_sum,
-                             tf.zeros_like(scalar_sum),
-                             tf.zeros_like(scalar_sum),
-                             tf.zeros_like(scalar_sum)], axis=1)
-        return pol + diag_add
+        return tf.reduce_sum(F_pol, axis=1)                     # [B]
