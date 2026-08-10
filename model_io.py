@@ -26,6 +26,7 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     # would build a mixing layer with random weights and mis-predict.
     "descriptor_mixing": False,
     "descriptor_mixing_per_type": False,
+    "descriptor_mixing_separate_pol": False,
     "descriptor_mixing_regularizer": "off",
     # Pre-existence: no radial enhancement (class default now 1).
     "radial_enhancement": 0,
@@ -39,6 +40,11 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "preprocess_sigma_scale": 1.0,
     # Pre-existence: not present; None preserves Q_raw (nep4_radial mode only).
     "descriptor_nep4_n_max_out": None,
+    # Pre-existence: no search preconditioning — uniform σ, μ holds W0 itself.
+    "descriptor_sigma_scaling": "off",
+    "descriptor_weight_reparam": "off",
+    "descriptor_scaling_exponent": 0.5,
+    "descriptor_scaling_clamp": 64.0,
 }
 
 
@@ -171,8 +177,12 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         path  : output file path. None or ending "auto" = auto-generate.
         label : optional suffix before .h5 (e.g. "best_val", "final_gen")
     """
-    if path is None or path.endswith("auto"):
-        directory = os.path.dirname(path) if path and os.path.dirname(path) else "."
+    if path is None or path.endswith("auto") or os.path.isdir(path):
+        if path and os.path.isdir(path):
+            directory = path
+        else:
+            directory = (os.path.dirname(path)
+                         if path and os.path.dirname(path) else ".")
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, _generate_model_filename(cfg))
 
@@ -208,6 +218,11 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         # V = U - I; loaders fall back to V=0 (U_full=I, no-op) when absent.
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             wg.create_dataset("U_pair", data=model.U_pair.numpy())
+            # Second rotation for the pol scalar ANN
+            # (descriptor_mixing_separate_pol); absent otherwise.
+            if getattr(model, "U_pair_pol", None) is not None:
+                wg.create_dataset("U_pair_pol",
+                                  data=model.U_pair_pol.numpy())
 
         # Optional preprocess contraction tail, stored only when trained with
         # cfg.descriptor_preprocess_contract != "off". Loaders fall back to
@@ -222,6 +237,12 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         # Descriptor metadata
         dg = f.create_group("descriptor")
         dg.create_dataset("z_to_type_index", data=z_to_type_index)
+        # Channel multiplier for either preconditioning mode. The channel
+        # statistics it was derived from are not serialised, so without this
+        # a preconditioned model could not be reconstructed at all.
+        if getattr(model.optimizer, "_chan_mult", None) is not None:
+            dg.create_dataset("channel_scale",
+                              data=model.optimizer._chan_mult)
 
         # Full config as JSON string
         f.create_dataset("config", data=json.dumps(config_dict))
@@ -314,6 +335,14 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
             sg.create_dataset("best_sigma", data=_np(state["best_sigma"]))
         sg.attrs["best_val_loss"] = float(state["best_val_loss"])
         sg.attrs["gens_without_improvement"] = int(state["gens_without_improvement"])
+        # Descriptor channel multiplier. Mandatory under
+        # descriptor_weight_reparam (μ holds W0_hat, so the effective W0 is
+        # unrecoverable without it); also saved under sigma-scaling so the
+        # resumed run reuses the exact multiplier instead of re-deriving it.
+        if state.get("descriptor_scale") is not None:
+            sg.create_dataset("descriptor_scale",
+                              data=np.asarray(state["descriptor_scale"],
+                                              dtype=np.float32))
         rng = state.get("tf_rng_state")
         if rng is not None:
             sg.create_dataset("rng_state", data=_np(rng))
@@ -380,6 +409,15 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
             resume_state["cr_psg"] = sg["cr_psg"][:]
             resume_state["cr_pc"]  = sg["cr_pc"][:]
             resume_state["cr_sig"] = float(sg.attrs["cr_sig"])
+        if "descriptor_scale" in sg:
+            cfg.descriptor_scale = sg["descriptor_scale"][:].astype(np.float32)
+        elif str(getattr(cfg, "descriptor_weight_reparam", "off")) != "off":
+            raise ValueError(
+                f"{path!r} was trained with descriptor_weight_reparam="
+                f"{cfg.descriptor_weight_reparam!r} but has no "
+                f"/snes/descriptor_scale. mu holds the reparameterised W0, so "
+                f"resuming without the multiplier would train a different "
+                f"model.")
         hg = f["history"]
         history = {}
         for k in hg:
@@ -404,7 +442,8 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
-                  U_pair=None, W_pre_angular=None) -> None:
+                  U_pair=None, U_pair_pol=None,
+                  W_pre_angular=None) -> None:
     model.W0.assign(W0)
     model.b0.assign(b0)
     model.W1.assign(W1)
@@ -431,6 +470,19 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                 f"Re-train from scratch, or rebuild the cfg to match "
                 f"the saved model.")
         model.U_pair.assign(U_pair)
+    # Optional second rotation (descriptor_mixing_separate_pol). Absent in
+    # shared-rotation checkpoints → model.U_pair_pol is None too.
+    if (U_pair_pol is not None
+            and getattr(model, "U_pair_pol", None) is not None):
+        if tuple(U_pair_pol.shape) != tuple(model.U_pair_pol.shape):
+            raise ValueError(
+                f"saved U_pair_pol shape {tuple(U_pair_pol.shape)} != "
+                f"model.U_pair_pol shape {tuple(model.U_pair_pol.shape)}. "
+                f"The descriptor-mixing layout (alpha_max / l_max / "
+                f"per_type) likely changed between save and load. "
+                f"Re-train from scratch, or rebuild the cfg to match "
+                f"the saved model.")
+        model.U_pair_pol.assign(U_pair_pol)
     # Optional W_pre_angular restore. Absent in pre-preprocess checkpoints
     # → keep init-time values.
     if (W_pre_angular is not None
@@ -469,6 +521,12 @@ def _load_model_h5(path: str) -> TNEP:
         cfg.type_map = {int(row[0]): int(row[1])
                         for row in f["descriptor/z_to_type_index"][:]}
 
+        # Search-preconditioning channel multiplier (absent unless the model
+        # was trained with one). Read here because the handle closes below.
+        dg = f["descriptor"]
+        channel_scale = (dg["channel_scale"][:].astype(np.float32)
+                         if "channel_scale" in dg else None)
+
         wg = f["weights"]
         weights = {
             "W0": wg["W0"][:], "b0": wg["b0"][:],
@@ -476,8 +534,13 @@ def _load_model_h5(path: str) -> TNEP:
             "W0_pol": wg["W0_pol"][:] if "W0_pol" in wg else None,
             "b0_pol": wg["b0_pol"][:] if "b0_pol" in wg else None,
             "W1_pol": wg["W1_pol"][:] if "W1_pol" in wg else None,
-            "b1_pol": wg["b1_pol"][:] if "b1_pol" in wg else None,
+            # b1_pol is a scalar dataset like b1, so it needs [()]; [:] raises
+            # "Illegal slicing argument for scalar dataspace" and made every
+            # target_mode=2 model unloadable.
+            "b1_pol": wg["b1_pol"][()] if "b1_pol" in wg else None,
             "U_pair": wg["U_pair"][:] if "U_pair" in wg else None,
+            "U_pair_pol": (wg["U_pair_pol"][:]
+                           if "U_pair_pol" in wg else None),
             "W_pre_angular": (wg["W_pre_angular"][:]
                               if "W_pre_angular" in wg else None),
         }
@@ -492,6 +555,10 @@ def _load_model_h5(path: str) -> TNEP:
             continue
         setattr(cfg, k, v)
     _apply_legacy_field_defaults(cfg, config_dict.keys())
+    # Must precede TNEP(cfg): the channel statistics are not serialised, so
+    # SNES can only rebuild the multiplier from this restored copy.
+    if channel_scale is not None:
+        cfg.descriptor_scale = channel_scale
 
     model = TNEP(cfg)
     _load_weights(model, cfg, **weights)

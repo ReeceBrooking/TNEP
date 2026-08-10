@@ -290,6 +290,23 @@ def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> Non
         print("Per-component R²:  " + "  ".join(
             f"{lbl}={r2_comp[i]:.4f}" for i, lbl in enumerate(labels)))
 
+    # Polarizability: the pooled R² above is dominated by the diagonal, which
+    # carries ~80% of the target variance. Split it so the anisotropy — the
+    # part that sets depolarised Raman intensity, and the part a local model is
+    # most likely to miss — is visible on its own. The diagonal RRMSE is the
+    # figure Xu et al. quote, so that row compares directly with the paper.
+    if "diag_rmse" in metrics:
+        for label, key in (("diagonal    ", "diag"),
+                           ("off-diagonal", "offdiag")):
+            for space, pre in (("per-atom", ""), ("total   ", "total_")):
+                if f"{pre}{key}_rmse" not in metrics:
+                    continue
+                g_rmse = float(metrics[f"{pre}{key}_rmse"])
+                g_r2 = float(metrics[f"{pre}{key}_r2"])
+                rrmse = (1.0 - g_r2) ** 0.5 if g_r2 <= 1.0 else float("nan")
+                print(f"{label} ({space}): RMSE={g_rmse:.4f}  "
+                      f"R²={g_r2:.4f}  RRMSE={rrmse:.2%}")
+
     if "cos_sim_mean" in metrics:
         cos_mean = float(metrics["cos_sim_mean"])
         cos_all = metrics["cos_sim_all"].numpy()
@@ -489,7 +506,7 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         train_data = build_and_reduce(
             train_dataset, train_types_int, cfg, builder,
             num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
-            label="train descriptors")
+            label="train descriptors", collect_stats=_wants_stats(cfg))
         val_data = build_and_reduce(
             val_dataset, val_types_int, cfg, builder,
             num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
@@ -531,9 +548,48 @@ _REDUCE_BATCH_BYTES = 256 << 20
 _REDUCE_BATCH_MIN, _REDUCE_BATCH_MAX = 1, 256
 
 
+def _accumulate_channel_stats(acc: dict | None, desc: np.ndarray) -> dict:
+    """Fold one [N, Q] block of per-atom descriptors into running sums.
+
+    float64 accumulation: sums run over ~1e4 atoms while channels span 1e4
+    in magnitude, so float32 would lose exactly the small channels this
+    exists to measure.
+    """
+    d = np.asarray(desc, dtype=np.float64)
+    if acc is None:
+        acc = {"n": 0, "sum": np.zeros(d.shape[1], np.float64),
+               "sumsq": np.zeros(d.shape[1], np.float64)}
+    acc["n"] += d.shape[0]
+    acc["sum"] += d.sum(0)
+    acc["sumsq"] += (d ** 2).sum(0)
+    return acc
+
+
+def _finalize_channel_stats(acc: dict) -> dict:
+    """Running sums -> {"mean", "std", "rms", "count"}."""
+    n = max(int(acc["n"]), 1)
+    mean = acc["sum"] / n
+    msq = acc["sumsq"] / n
+    var = np.maximum(msq - mean ** 2, 0.0)
+    return {"mean": mean.astype(np.float32),
+            "std": np.sqrt(var).astype(np.float32),
+            "rms": np.sqrt(msq).astype(np.float32),
+            "count": int(acc["n"])}
+
+
+def _wants_stats(cfg) -> bool:
+    """Statistics are only collected when a preconditioning mode needs them.
+
+    Keeps the default path free of both the accumulation cost and the
+    cfg attribute (see _serialize_config's handling of runtime extras).
+    """
+    return (str(getattr(cfg, "descriptor_sigma_scaling", "off")) != "off"
+            or str(getattr(cfg, "descriptor_weight_reparam", "off")) != "off")
+
+
 def build_and_reduce(dataset: list, types_int: list, cfg: 'TNEPconfig',
                      builder, num_types: int | None, pin_to_cpu: bool,
-                     label: str = "") -> dict:
+                     label: str = "", collect_stats: bool = False) -> dict:
     """Build descriptors in batches and reduce each batch to the geometry
     kernel, freeing the per-pair gradients before the next batch starts.
 
@@ -566,6 +622,7 @@ def build_and_reduce(dataset: list, types_int: list, cfg: 'TNEPconfig',
     reduce_place = tf.device('/CPU:0') if pin_to_cpu else _gpu_device_ctx()
 
     buffers: dict | None = None
+    stats_acc: dict | None = None
     batch_size, lo = 8, 0
     while lo < S:
         hi = min(lo + batch_size, S)
@@ -590,6 +647,12 @@ def build_and_reduce(dataset: list, types_int: list, cfg: 'TNEPconfig',
                 cfg, padded["grad_values"], padded["pair_struct"],
                 padded["pair_atom"], padded["pair_gidx"],
                 padded["positions"], padded["boxes"], hi - lo, max_atoms)
+        if collect_stats:
+            # Real atoms only — padded rows are all-zero and would drag every
+            # channel's mean and std toward zero.
+            dsc = padded["descriptors"].numpy()
+            msk = padded["atom_mask"].numpy().astype(bool)
+            stats_acc = _accumulate_channel_stats(stats_acc, dsc[msk])
         for k in ("grad_values", "pair_atom", "pair_gidx",
                   "pair_struct", "struct_ptr"):
             padded.pop(k, None)
@@ -618,7 +681,10 @@ def build_and_reduce(dataset: list, types_int: list, cfg: 'TNEPconfig',
         print()
 
     with place:
-        return {k: tf.constant(v) for k, v in buffers.items()}
+        out = {k: tf.constant(v) for k, v in buffers.items()}
+    if collect_stats:
+        out["_channel_stats"] = _finalize_channel_stats(stats_acc)
+    return out
 
 
 def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',

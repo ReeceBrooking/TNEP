@@ -662,7 +662,7 @@ def _get_fused_predict(model: 'TNEP'):
     # predict_batch trusts the caller to do this. Mirrors score() in TNEP.py.
     if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
         W0_eff_var = model._W0_eff(model.W0)
-        W0p_eff_var = (model._W0_eff(model.W0_pol)
+        W0p_eff_var = (model._W0_eff(model.W0_pol, model._pol_U())
                         if (cfg.target_mode == 2
                             and getattr(model, "W0_pol", None) is not None)
                         else getattr(model, "W0_pol", None))
@@ -957,7 +957,7 @@ def predict_trajectory_batch(
         # backends produce identical predictions.
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             W0_pred = model._W0_eff(model.W0)
-            W0p_pred = (model._W0_eff(model.W0_pol)
+            W0p_pred = (model._W0_eff(model.W0_pol, model._pol_U())
                          if (cfg.target_mode == 2
                              and getattr(model, "W0_pol", None) is not None)
                          else getattr(model, "W0_pol", None))

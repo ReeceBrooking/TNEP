@@ -357,6 +357,9 @@ def _print_param_breakdown(model) -> None:
     # Optional add-ons.
     if int(opt.n_U_pair) > 0:
         rows.append(("input-side mixing  U_pair", int(opt.n_U_pair)))
+    if int(getattr(opt, "n_U_pair_pol", 0)) > 0:
+        rows.append(("input-side mixing  U_pair_pol",
+                     int(opt.n_U_pair_pol)))
     if int(opt.n_preprocess) > 0:
         rows.append(("preprocess  W_pre (summed only)", int(opt.n_preprocess)))
 
@@ -409,6 +412,11 @@ def _train_model_inner(cfg: TNEPconfig,
     # Split into train/val (built now) and a deferred test placeholder; test
     # descriptors are built lazily on first scoring (materialize_test_data).
     train_data, test_pending, val_data = split(dataset, dataset_types_int, cfg)
+    if "_channel_stats" in train_data:
+        # Underscore-prefixed: _serialize_config (model_io.py:127, :131)
+        # skips these, and the ndarray values would otherwise blow up
+        # json.dumps on the first checkpoint write.
+        cfg._descriptor_channel_stats = train_data.pop("_channel_stats")
 
     # Resolve dim_q before any consumer needs it; cross-checked below.
     from DescriptorBuilderGPU import compute_dim_q
@@ -524,6 +532,7 @@ def _train_model_inner(cfg: TNEPconfig,
                 f"time on at least one architectural field "
                 f"(num_neurons, descriptor_mixing, "
                 f"descriptor_mixing_per_type, "
+                f"descriptor_mixing_separate_pol, "
                 f"target_mode, num_types, alpha_max, l_max). The most "
                 f"likely cause is legacy checkpoints that pre-date the "
                 f"_serialize_config fix — class-default fields weren't "

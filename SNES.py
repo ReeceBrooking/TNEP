@@ -32,6 +32,7 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight tensors from reconstruct_params_tf into the model's Variables.
 
     Tail order: W0,b0,W1,b1 | +pol ANN (mode 2) | +U_pair (mixing)
+    | +U_pair_pol (descriptor_mixing_separate_pol)
     | +W_pre_angular (preprocess_contract != "off").
     """
     params = list(params)
@@ -49,6 +50,10 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
             and getattr(model, "U_pair", None) is not None
             and idx < len(params)):
         model.U_pair.assign(params[idx]); idx += 1
+    if (getattr(model, "_mix_separate_pol", False)
+            and getattr(model, "U_pair_pol", None) is not None
+            and idx < len(params)):
+        model.U_pair_pol.assign(params[idx]); idx += 1
     if (idx < len(params)
             and getattr(model, "descriptor_preprocess_contract", "off") != "off"
             and getattr(model, "W_pre_angular", None) is not None):
@@ -156,6 +161,11 @@ class SNES:
                 self.n_U_pair = self.cfg.num_types * per_T_block
             else:
                 self.n_U_pair = per_T_block
+            # Optional second rotation for the pol scalar ANN — identical
+            # layout, its own tail immediately after U_pair's.
+            self.n_U_pair_pol = (
+                self.n_U_pair
+                if getattr(self.model, "_mix_separate_pol", False) else 0)
             # Pre-build Cayley scatter matrices (one per unique block size)
             # at init so they're captured as eager constants, keeping dict
             # construction out of the @tf.function-traced reconstruct path
@@ -235,6 +245,7 @@ class SNES:
             self._mix_orth_map = None
             self._cayley_scatter_cache = {}
             self.n_U_pair = 0
+            self.n_U_pair_pol = 0
 
         # Preprocessing contraction tail (descriptor_preprocess_contract):
         # per-(centre type, raw channel) scalars folding into W0 via
@@ -297,28 +308,106 @@ class SNES:
             self._preprocess_init_scheme = "mean"
             self._preprocess_init_per_q_raw = None
 
-        self.dim = self.n_anns_total + self.n_U_pair + self.n_preprocess
+        self.dim = (self.n_anns_total + self.n_U_pair + self.n_U_pair_pol
+                    + self.n_preprocess)
 
         # Search distribution params as tf.Variables (stay on GPU). μ init
         # is Glorot (W0/W1 scaled by sqrt(6/(fan_in+fan_out)), biases zero);
         # the U_pair tail stays zero so gen 0 is bit-identical to mixing-off.
         # Sigma is uniform.
         rng = np.random.default_rng(self.cfg.seed)
+        # ── Search preconditioning: resolve BOTH modes before _build_mu_init
+        # (mode B divides there) and before sigma_init_vec (mode A multiplies
+        # there). One block so the two can never disagree.
+        import descriptor_scaling as dsc
+        sigma_mode = str(getattr(self.cfg, "descriptor_sigma_scaling", "off"))
+        reparam_mode = str(getattr(self.cfg, "descriptor_weight_reparam", "off"))
+        for name, val in (("descriptor_sigma_scaling", sigma_mode),
+                          ("descriptor_weight_reparam", reparam_mode)):
+            if val not in dsc.VALID_MODES:
+                raise ValueError(f"cfg.{name}={val!r} not in {dsc.VALID_MODES}")
+        if sigma_mode != "off" and reparam_mode != "off":
+            raise ValueError(
+                "descriptor_sigma_scaling and descriptor_weight_reparam are "
+                "mutually exclusive — mode B already yields a scale-fair "
+                "search, so enabling both applies the multiplier twice.")
+
+        self._chan_mult = None
+        if sigma_mode != "off" or reparam_mode != "off":
+            if self.cfg.target_mode == 0:
+                raise ValueError(
+                    "Search preconditioning requires target_mode 1 or 2: the "
+                    "channel statistics are collected in build_and_reduce, "
+                    "which the PES path does not use.")
+            if self.cfg.descriptor_preprocess_contract != "off":
+                raise ValueError(
+                    "Search preconditioning requires "
+                    "descriptor_preprocess_contract='off': W0 is stored at "
+                    "Q_new while the channel statistics are at Q_raw.")
+            # A restored multiplier always wins — a resumed run must never
+            # re-derive it from a differently-sampled statistic.
+            restored = getattr(self.cfg, "descriptor_scale", None)
+            if restored is not None:
+                self._chan_mult = np.asarray(restored, np.float32)
+            else:
+                stats = getattr(self.cfg, "_descriptor_channel_stats", None)
+                if stats is None:
+                    raise ValueError(
+                        "Search preconditioning is enabled but no descriptor "
+                        "channel statistics are available. They are collected "
+                        "in data.split() when a mode is active — check that "
+                        "cfg was set before split() ran.")
+                # Block granularity whenever mixing is on: diag(m) must
+                # commute with U, which is block-diagonal over (pair, l).
+                blocks = None
+                if getattr(self.model, "descriptor_mixing", False):
+                    from DescriptorBuilderGPU import descriptor_block_layout
+                    lay = descriptor_block_layout(self.cfg)
+                    blocks = [lay["pair_ln_index"][pk][l]
+                              for pk in lay["pair_keys"]
+                              for l in sorted(lay["pair_ln_index"][pk])]
+                self._chan_mult = dsc.channel_multipliers(
+                    stats, sigma_mode if sigma_mode != "off" else reparam_mode,
+                    float(self.cfg.descriptor_scaling_clamp),
+                    float(self.cfg.descriptor_scaling_exponent),
+                    blocks=blocks)
+            if len(self._chan_mult) != self.cfg.dim_q:
+                raise ValueError(
+                    f"channel multiplier has {len(self._chan_mult)} entries "
+                    f"but dim_q={self.cfg.dim_q}")
+        # Mode B only: mu holds W0_hat, so reconstruct multiplies by this.
+        self._w0_reparam = self._chan_mult if reparam_mode != "off" else None
+        self._w0_reparam_tf = (tf.constant(self._w0_reparam)
+                               if self._w0_reparam is not None else None)
+        self._w0_coord_scale = (
+            dsc.expand_to_w0_coords(self._chan_mult, self.cfg.num_types,
+                                    self.cfg.num_neurons)
+            if self._chan_mult is not None else None)
+        self._sigma_precondition = (sigma_mode != "off")
         mu_init = self._build_mu_init(rng)
         self.mu = tf.Variable(mu_init, trainable=False, name="snes_mu")
         sigma_init_vec = np.full(self.dim, float(self.cfg.init_sigma),
                                  dtype=np.float32)
+        if self._sigma_precondition:
+            sigma_init_vec[:self._n_W0] *= self._w0_coord_scale
+            if self.cfg.target_mode == 2:
+                p = self.n_primary
+                sigma_init_vec[p:p + self._n_W0] *= self._w0_coord_scale
         # Per-block σ for the mixing tail: scales only the V_pair search.
         mix_scale = float(getattr(self.cfg, "mixing_sigma_scale", 1.0))
         if self.n_U_pair > 0 and mix_scale != 1.0:
             mix_start = self.n_anns_total
             sigma_init_vec[mix_start:mix_start + self.n_U_pair] *= mix_scale
+            pol_start = mix_start + self.n_U_pair
+            sigma_init_vec[
+                pol_start:pol_start + self.n_U_pair_pol] *= mix_scale
         # Per-block σ for the preprocess tail: decouples noise on
         # coefficients near 1/L from the ANN σ.
         preprocess_scale = float(getattr(
             self.cfg, "preprocess_sigma_scale", 1.0))
         if self.n_preprocess > 0 and preprocess_scale != 1.0:
-            pre_start = self.n_anns_total + self.n_U_pair
+            pre_start = (self.n_anns_total + self.n_U_pair
+                         + self.n_U_pair_pol)
             sigma_init_vec[pre_start:pre_start + self.n_preprocess] *= preprocess_scale
         self.sigma = tf.Variable(sigma_init_vec, trainable=False, name="snes_sigma")
 
@@ -460,14 +549,24 @@ class SNES:
         off = _fill_ann(0)
         if self.cfg.target_mode == 2:
             off = _fill_ann(off)
+        # Mode B: μ holds W0_hat = W0 / m, so reconstruct's ×m gives back
+        # exactly the Glorot draw above — gen 0 is bit-identical to mode off.
+        if self._w0_reparam is not None:
+            inv = 1.0 / self._w0_coord_scale
+            mu[:self._n_W0] *= inv
+            if self.cfg.target_mode == 2:
+                p = self.n_primary
+                mu[p:p + self._n_W0] *= inv
         # V_pair tail: zeroed so U_full = I at gen 0.
         if self.n_U_pair > 0:
-            mu[self.n_anns_total:self.n_anns_total + self.n_U_pair] = 0.0
+            mu[self.n_anns_total:
+               self.n_anns_total + self.n_U_pair + self.n_U_pair_pol] = 0.0
         # Preprocess tail: init per descriptor_preprocess_init (mean → 1/L,
         # sum → 1.0, glorot → 0.0 + σ spread). μ holds only the summed
         # entries; per-summed init read off the model's W_pre Variable.
         if self.n_preprocess > 0:
-            pre_start = self.n_anns_total + self.n_U_pair
+            pre_start = (self.n_anns_total + self.n_U_pair
+                         + self.n_U_pair_pol)
             W_pre_init = self.model.W_pre_angular.numpy().reshape(-1)
             flat_idx = self.model._preprocess_summed_flat_idx.numpy()
             summed_init = W_pre_init[flat_idx]
@@ -628,15 +727,21 @@ class SNES:
         # across central types); per-type V_pair → T contiguous slabs, each
         # labelled by its central type (0..T-1, driven by that type's fitness).
         tail_labels_parts = []
-        if self.n_U_pair > 0:
+
+        def _mix_labels(n: int) -> np.ndarray:
             if self._mix_per_type:
-                per_T = self.n_U_pair // T
-                u_labels = np.empty(self.n_U_pair, dtype=np.int32)
+                per_T = n // T
+                lab = np.empty(n, dtype=np.int32)
                 for t_idx in range(T):
-                    u_labels[t_idx * per_T:(t_idx + 1) * per_T] = t_idx
-            else:
-                u_labels = np.full(self.n_U_pair, T, dtype=np.int32)
-            tail_labels_parts.append(u_labels)
+                    lab[t_idx * per_T:(t_idx + 1) * per_T] = t_idx
+                return lab
+            return np.full(n, T, dtype=np.int32)
+
+        if self.n_U_pair > 0:
+            tail_labels_parts.append(_mix_labels(self.n_U_pair))
+        # Second rotation (pol scalar ANN): same labelling rule.
+        if self.n_U_pair_pol > 0:
+            tail_labels_parts.append(_mix_labels(self.n_U_pair_pol))
         # Preprocess tail labels (μ holds only summed W_pre entries):
         #   per_type=True : W_pre [T, Q_raw] t-major → t = flat_idx // Q_raw.
         #   per_type=False: W_pre [Q_raw], global label T.
@@ -1157,6 +1262,7 @@ class SNES:
                     "best_val_loss": best_val_loss,
                     "gens_without_improvement": gens_without_improvement,
                     "tf_rng_state": self.tf_rng.state,
+                    "descriptor_scale": self._chan_mult,   # None when off
                 }
                 ckpt_state["best_sigma"] = best_sigma
                 save_checkpoint(ckpt_path, cfg, ckpt_state, history, gen)
@@ -1177,6 +1283,7 @@ class SNES:
                     "best_val_loss": best_val_loss,
                     "gens_without_improvement": gens_without_improvement,
                     "tf_rng_state": self.tf_rng.state,
+                    "descriptor_scale": self._chan_mult,   # None when off
                 }
                 save_checkpoint(ckpt_path, cfg, ckpt_state, history, gen)
                 sys.stdout.write(
@@ -1250,12 +1357,15 @@ class SNES:
             W1p = named.get("W1_pol")
             b1p = named.get("b1_pol")
             U_pair_val = named.get("U_pair")
+            U_pair_pol_val = named.get("U_pair_pol")
             W_pre_angular_val = named.get("W_pre_angular")
-            # Absorb U_pair^T into W0 (and W0_pol).
+            # Absorb U_pair^T into W0 (and W0_pol — its own rotation when
+            # descriptor_mixing_separate_pol).
             if U_pair_val is not None:
                 W0 = self.model._W0_eff(W0, U_pair_val)
                 if W0p is not None:
-                    W0p = self.model._W0_eff(W0p, U_pair_val)
+                    W0p = self.model._W0_eff(
+                        W0p, self.model._pol_U(U_pair_val, U_pair_pol_val))
             # Preprocess fold (composes with mixing under l_aware).
             if (getattr(self.model, "descriptor_preprocess_contract", "off")
                     != "off"):
@@ -1280,7 +1390,7 @@ class SNES:
             if getattr(self.model, "descriptor_mixing", False):
                 W0 = self.model._W0_eff(W0)
                 if W0p is not None:
-                    W0p = self.model._W0_eff(W0p)
+                    W0p = self.model._W0_eff(W0p, self.model._pol_U())
             if (getattr(self.model, "descriptor_preprocess_contract", "off")
                     != "off"):
                 W0 = self.model._W0_preprocess_eff(W0)
@@ -1380,9 +1490,11 @@ class SNES:
         """Parse the reconstruct_params_tf tuple into a named dict.
 
         Tail order: W0,b0,W1,b1 | W0_pol.. (mode 2) | U_pair (mixing)
+        | U_pair_pol (descriptor_mixing_separate_pol)
         | W_pre_angular (preprocess != "off").
         """
-        out: dict = {"U_pair": None, "W_pre_angular": None}
+        out: dict = {"U_pair": None, "U_pair_pol": None,
+                     "W_pre_angular": None}
         idx = 0
         out["W0"] = params[idx]; idx += 1
         out["b0"] = params[idx]; idx += 1
@@ -1395,6 +1507,8 @@ class SNES:
             out["b1_pol"] = params[idx]; idx += 1
         if self.n_U_pair > 0 and idx < len(params):
             out["U_pair"] = params[idx]; idx += 1
+        if self.n_U_pair_pol > 0 and idx < len(params):
+            out["U_pair_pol"] = params[idx]; idx += 1
         if self.n_preprocess > 0 and idx < len(params):
             out["W_pre_angular"] = params[idx]; idx += 1
         return out
@@ -1425,6 +1539,11 @@ class SNES:
             """Extract one ANN's weights → (W0, b0, W1, b1, offset)."""
             W0 = tf.reshape(pv[..., offset:offset + n_W0],
                             [-1, T, Q, H] if is_batched else [T, Q, H])
+            # Mode B: μ stores W0_hat; the effective W0 carries the channel
+            # multiplier. [1, Q, 1] broadcasts against [T, Q, H] and
+            # [C, T, Q, H] alike, so both ANNs are covered by one line.
+            if self._w0_reparam_tf is not None:
+                W0 = W0 * self._w0_reparam_tf[tf.newaxis, :, tf.newaxis]
             offset += n_W0
             b0 = tf.reshape(pv[..., offset:offset + n_b0],
                             [-1, T, H] if is_batched else [T, H])
@@ -1455,6 +1574,14 @@ class SNES:
                 U_flat, is_batched, self._mix_per_type, T)
             offset += self.n_U_pair
             tail = tail + (U_pair_k,)
+
+        # Second mixing tail (pol scalar ANN), identical layout.
+        if self.n_U_pair_pol > 0:
+            U_flat_pol = param_vectors[..., offset:offset + self.n_U_pair_pol]
+            U_pair_pol_k = self._reconstruct_one_mixing_layer(
+                U_flat_pol, is_batched, self._mix_per_type, T)
+            offset += self.n_U_pair_pol
+            tail = tail + (U_pair_pol_k,)
 
         # Optional preprocess tail: μ holds only the summed coefficients.
         # Rebuild full W_pre = base template (kept=1.0, summed=0) + scattered
@@ -1923,6 +2050,7 @@ class SNES:
         b1p = named.get("b1_pol")
         # Per-candidate mixing / preprocess tensors (None when disabled).
         U_pair_cand = named.get("U_pair")
+        U_pair_pol_cand = named.get("U_pair_pol")
         W_pre_angular_cand = named.get("W_pre_angular")
 
         # The geometry kernel is candidate-independent: [B,A,3,Q] for dipole,
@@ -1947,6 +2075,7 @@ class SNES:
             desc, W_atom, Z, amask, W0, b0, W1, b1,
             W0_pol=W0p, b0_pol=b0p, W1_pol=W1p, b1_pol=b1p,
             U_pair=U_pair_cand,
+            U_pair_pol=U_pair_pol_cand,
             W_pre_angular=W_pre_angular_cand)  # [C, B, T_dim]
 
         if _scale_preds:

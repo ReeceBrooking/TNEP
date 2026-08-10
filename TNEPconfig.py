@@ -120,7 +120,7 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # Hidden-layer width of the per-type ANN.
-    num_neurons: int = 20
+    num_neurons: int = 10
     # Hidden-layer activation (any tf.keras.activations name for the forward
     # pass). Dipole/polarisability training (target_mode 1/2) has a hand-coded
     # backward — only "tanh" and "swish" (alias "silu") supported there;
@@ -135,6 +135,11 @@ class TNEPconfig:
     # When True (with descriptor_mixing), U_pair becomes per-central-type
     # ([T, num_pairs, max_bs, max_bs]) — more expressive, T× the param count.
     descriptor_mixing_per_type: bool = False
+    # target_mode=2 only: give the isotropic scalar ANN its own rotation
+    # instead of sharing the tensor ANN's. The two heads predict different
+    # things (anisotropy vs trace) so they may want different bases. Doubles
+    # n_U_pair — a real cost against SNES's sample efficiency.
+    descriptor_mixing_separate_pol: bool = True
     # Parameterisation of each descriptor-mixing block (structural, not a
     # penalty); only used when descriptor_mixing=True:
     #   "off"    : unregularised, bs² params per block
@@ -172,6 +177,47 @@ class TNEPconfig:
     # init, not zero. Both 0.0 = disable.
     descriptor_preprocess_lambda_1: float = 0.0
     descriptor_preprocess_lambda_2: float = 0.0
+
+    # ── Search preconditioning ─────────────────────────────────────────
+    # SOAP-turbo L2-normalises each atom's descriptor, but per-CHANNEL
+    # magnitudes still span ~1e4 (measured: std 1.6e-05 .. 2.1e-01 at
+    # l_max=4, alpha_max=7). A channel needing a 300x larger W0 row to
+    # matter is explored by SNES at the same sigma as every other, and
+    # pays a 300x larger L1 penalty for the same effect. These options fix
+    # that WITHOUT touching the descriptor or its gradients — see
+    # docs/superpowers/plans/2026-08-06-descriptor-search-preconditioning.md
+    # for why descriptor-side scaling (removed, 2026-05-13) is different.
+    #
+    # Statistic behind the per-channel multiplier m_k ∝ (1/s_k)**exponent:
+    #   "off" : no preconditioning (default)
+    #   "std" : s_k = std(q_k)                 — recommended
+    #   "rms" : s_k = sqrt(mean(q_k^2))        — zero-mean-safe variant
+    #   "cv"  : s_k = std(q_k)/|mean(q_k)|     — MEASURED to scale the
+    #           OPPOSITE way (boosts l=0, suppresses l>=3); kept only so
+    #           the claim stays falsifiable.
+    #
+    # A: scale SNES's per-coordinate sigma on the W0 block only. Model and
+    #    mu semantics unchanged; nothing extra to persist.
+    descriptor_sigma_scaling: str = "off"
+    # B: reparameterise the search space — mu holds W0_hat, effective
+    #    W0 = W0_hat * m_k. Subsumes A AND makes the existing uniform L1/L2
+    #    penalty scale-fair. Requires the multiplier in the checkpoint.
+    #    Mutually exclusive with A.
+    descriptor_weight_reparam: str = "std"
+    # Softening. 1.0 fully equalises the perturbation each channel causes
+    # in z; 0.0 is a no-op. MEASURED mean multiplier per l:
+    #        exponent=1.0            exponent=0.5
+    #   l=0    0.049 (sigma /20)       0.22
+    #   l=4   11.51                    3.39
+    # Full equalisation cuts l=0's sigma 20-fold, and l=0 carries ~78% of
+    # the model's ablation importance — a bad trade against a speculative
+    # gain on l>=3. 0.5 keeps most of the boost at a quarter of the damage.
+    descriptor_scaling_exponent: float = 0.5
+    # Max ratio between the largest and smallest multiplier. Enforced by
+    # clipping to [clamp**-0.5, clamp**+0.5] about the geometric mean;
+    # the later renormalisation is a uniform rescale and so preserves the
+    # ratio. The raw unclamped spread at exponent=1.0 is ~13,420x.
+    descriptor_scaling_clamp: float = 1e9
 
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION

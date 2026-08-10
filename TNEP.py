@@ -242,8 +242,18 @@ class TNEP(layers.Layer):
                 initializer="zeros",
                 trainable=True,
             )
+            # Optional second rotation for the polarizability scalar ANN, so
+            # the trace head can pick a different basis from the tensor head.
+            self._mix_separate_pol = bool(
+                getattr(cfg, "descriptor_mixing_separate_pol", False)
+                and cfg.target_mode == 2)
+            self.U_pair_pol = (self.add_weight(
+                name="U_pair_pol", shape=shape, initializer="zeros",
+                trainable=True) if self._mix_separate_pol else None)
         else:
             self.U_pair = None
+            self._mix_separate_pol = False
+            self.U_pair_pol = None
 
         # Preprocess contraction phase 2/2: W_pre_* allocation. cfg.dim_q was
         # already overridden in phase 1 so W0 above is sized at Q_new.
@@ -497,6 +507,17 @@ class TNEP(layers.Layer):
             return tf.einsum('...tqp,...tqh->...tph', U_full, W0)
         return tf.einsum('...qp,...tqh->...tph', U_full, W0)
 
+    def _pol_U(self, U_pair=None, U_pair_pol=None):
+        """Rotation for the polarizability scalar ANN.
+
+        Shared with the tensor ANN unless descriptor_mixing_separate_pol,
+        in which case the scalar head gets its own. Explicit arguments win
+        (candidate evaluation passes per-candidate tensors).
+        """
+        if getattr(self, "_mix_separate_pol", False):
+            return U_pair_pol if U_pair_pol is not None else self.U_pair_pol
+        return U_pair if U_pair is not None else self.U_pair
+
     def _W0_preprocess_eff(self, W0: tf.Tensor,
                             W_pre_override: tf.Tensor | None = None) -> tf.Tensor:
         """Fold the angular preprocess contraction into W0, giving raw-dim weights:
@@ -650,7 +671,7 @@ class TNEP(layers.Layer):
             dr_gathered, _ = self._neighbor_displacements_single(positions, box, grad_index)
 
             # --- Scalar ANN (isotropic) ---
-            W0_pol_eff = self._W0_eff(self.W0_pol)
+            W0_pol_eff = self._W0_eff(self.W0_pol, self._pol_U())
             if self.descriptor_preprocess_contract != "off":
                 W0_pol_eff = self._W0_preprocess_eff(W0_pol_eff)
             W0p_t = tf.gather(W0_pol_eff, Z)   # [A, dim_q, H]
@@ -788,7 +809,7 @@ class TNEP(layers.Layer):
         # Pre-fold U_pairᵀ into W0 (and W0_pol) once so every chunk shares the
         # absorbed weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
-        W0_pol_eff = (self._W0_eff(self.W0_pol)
+        W0_pol_eff = (self._W0_eff(self.W0_pol, self._pol_U())
                       if (self.cfg.target_mode == 2
                           and getattr(self, "W0_pol", None) is not None)
                       else getattr(self, "W0_pol", None))
@@ -852,6 +873,19 @@ class TNEP(layers.Layer):
             "r2_components": r2_components,
         }
 
+        # Polarizability: report the two component groups separately. The
+        # diagonal (xx,yy,zz) is the isotropic response and carries ~80% of the
+        # target variance; the off-diagonal (xy,yz,zx) is the anisotropy, which
+        # is what sets depolarised Raman intensity. A pooled R² is dominated by
+        # the diagonal and hides whether the anisotropy is fitted at all. Xu et
+        # al. quote the diagonal alone, so this is also what makes the numbers
+        # comparable with the paper.
+        if self.cfg.target_mode == 2 and int(targets.shape[-1]) == 6:
+            for name, lo, hi in (("diag", 0, 3), ("offdiag", 3, 6)):
+                g_rmse, g_r2 = self._group_metrics(diff, targets, lo, hi)
+                metrics[f"{name}_rmse"] = g_rmse
+                metrics[f"{name}_r2"] = g_r2
+
         # Total (un-scaled) metrics when target scaling is active.
         if self.cfg.scale_targets and self.cfg.target_mode in (1, 2) and "num_atoms" in test_data:
             total_targets = targets * num_atoms_col
@@ -869,6 +903,12 @@ class TNEP(layers.Layer):
             metrics["total_rmse"] = total_rmse
             metrics["total_r2"] = total_r2
             metrics["total_r2_components"] = total_r2_comp
+            if self.cfg.target_mode == 2 and int(targets.shape[-1]) == 6:
+                for name, lo, hi in (("diag", 0, 3), ("offdiag", 3, 6)):
+                    g_rmse, g_r2 = self._group_metrics(
+                        total_diff, total_targets, lo, hi)
+                    metrics[f"total_{name}_rmse"] = g_rmse
+                    metrics[f"total_{name}_r2"] = g_r2
 
         # Cosine similarity for vector targets (modes 1 and 2)
         if self.cfg.target_mode >= 1:
@@ -880,6 +920,26 @@ class TNEP(layers.Layer):
             metrics["cos_sim_all"] = cos_sim
 
         return metrics, preds
+
+    @staticmethod
+    def _group_metrics(diff: tf.Tensor, targets: tf.Tensor,
+                       lo: int, hi: int) -> tuple[tf.Tensor, tf.Tensor]:
+        """RMSE and centred R² over components [lo:hi] of the target axis.
+
+        R² is centred per component, matching the overall `r2`, so
+        RRMSE = √(1−R²) stays the same quantity across every group.
+
+        Args:
+            diff    : [S, T] prediction − target
+            targets : [S, T] reference values
+            lo, hi  : half-open component slice
+        """
+        d = diff[:, lo:hi]
+        t = targets[:, lo:hi]
+        rmse = tf.sqrt(tf.maximum(tf.reduce_mean(tf.square(d)), 0.0))
+        ss_res = tf.reduce_sum(tf.square(d))
+        ss_tot = tf.reduce_sum(tf.square(t - tf.reduce_mean(t, axis=0)))
+        return rmse, 1.0 - ss_res / tf.maximum(ss_tot, 1e-12)
 
     def score_from_file(self, path: str, *,
                          allowed_species: list | None = None,
@@ -1091,6 +1151,23 @@ class TNEP(layers.Layer):
             print(f"    RMSE  = {m['total_rmse']:.6f}  per structure / component")
             print(f"    R²    = {m['total_r2']:.6f}")
             print(f"    RRMSE = √(1−R²) = {rrmse_tot:.4%}")
+        # Polarizability: the pooled numbers above are dominated by the
+        # diagonal, so split them. The diagonal RRMSE is the figure Xu et al.
+        # quote (16.28% for liquid water), making this row directly comparable.
+        if "diag_rmse" in m:
+            print(f"  POLARIZABILITY split "
+                  f"(diagonal = xx,yy,zz | off-diagonal = xy,yz,zx):")
+            for label, key in (("diagonal    ", "diag"),
+                               ("off-diagonal", "offdiag")):
+                for space, pre in (("per-atom", ""), ("total   ", "total_")):
+                    rmse_key = f"{pre}{key}_rmse"
+                    if rmse_key not in m:
+                        continue
+                    r2g = m[f"{pre}{key}_r2"]
+                    rrmse = (1.0 - r2g) ** 0.5 if r2g <= 1.0 else float("nan")
+                    print(f"    {label} [{space}]  "
+                          f"RMSE = {m[rmse_key]:.6f}   "
+                          f"R² = {r2g:.6f}   RRMSE = {rrmse:.4%}")
         if "cos_sim_mean" in m:
             print(f"  Vector quality:")
             print(f"    cos_sim_mean = {m['cos_sim_mean']:.6f}")
@@ -1215,6 +1292,7 @@ class TNEP(layers.Layer):
                                   W1_pol: tf.Tensor | None = None,
                                   b1_pol: tf.Tensor | None = None,
                                   U_pair: tf.Tensor | None = None,
+                                  U_pair_pol: tf.Tensor | None = None,
                                   W_pre_angular: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
@@ -1263,7 +1341,8 @@ class TNEP(layers.Layer):
         if self.descriptor_mixing and U_pair is not None:
             W0 = self._W0_eff(W0, U_pair)
             if W0_pol is not None:
-                W0_pol = self._W0_eff(W0_pol, U_pair)
+                W0_pol = self._W0_eff(W0_pol,
+                                      self._pol_U(U_pair, U_pair_pol))
 
         # Preprocess fold: W0 Q_new → Q_raw so the matmul below is uniform at
         # Q_raw and de_dq comes out at Q_raw for the raw-W_atom sum. Mutually
