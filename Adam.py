@@ -5,7 +5,7 @@ import time
 import numpy as np
 import tensorflow as tf
 from typing import TYPE_CHECKING
-from SNES import _set_model_params, _format_duration
+from SNES import _set_model_params, _format_duration, sample_minibatch
 if TYPE_CHECKING:
     from TNEP import TNEP
 
@@ -117,9 +117,11 @@ class Adam:
                     + self._n_A + self.n_preprocess)
         self.pop_size = None
 
+        # amsgrad: the converged NequIP/MACE choice (max-of-second-moment
+        # variant, monotone effective step) — no config knob on purpose.
         self._keras = tf.keras.optimizers.Adam(
             cfg.adam_learning_rate, cfg.adam_beta_1,
-            cfg.adam_beta_2, cfg.adam_epsilon)
+            cfg.adam_beta_2, cfg.adam_epsilon, amsgrad=True)
 
         # --- weight EMA (Polyak averaging), opt-in via cfg.adam_use_ema ---
         # Shadow copies of every watched var, initialised to the starting weights.
@@ -360,11 +362,11 @@ class Adam:
             batch["pair_gidx"], batch["positions"], batch["boxes"], B, A)
 
     def fit(self, train_data, val_data, plot_callback=None, resume_state=None):
-        """Full-batch Adam training. Returns (history, final_model, best_val_model).
+        """Adam training. Returns (history, final_model, best_val_model).
 
         Mirrors SNES.fit's return contract so it drops into TNEP.fit unchanged.
-        Minibatch (cfg.batch_size) is not implemented here — the full train_data
-        dict is always used as the batch (matches the default batch_size=None).
+        cfg.batch_size = None trains full-batch; an int samples that many
+        structures per step (same sampler as SNES.fit).
         """
         if resume_state is not None:
             raise NotImplementedError(
@@ -372,13 +374,20 @@ class Adam:
                 "use optimizer='snes' for checkpointing.")
 
         cfg = self.cfg
-        batch = train_data
-        # W_atom is geometry-only (weights-independent): precompute ONCE. Only the
-        # train batch is fed through _forward/predict_batch; score() recomputes its
-        # own W_atom internally, so val doesn't strictly need it, but precompute for
-        # symmetry / future minibatch reuse. Mode 2 uses the COO path (no W_atom).
-        self._precompute_W_atom(batch)
+        # W_atom is geometry-only (weights-independent): precompute ONCE on the
+        # full train set; sample_minibatch gathers the per-structure rows along
+        # with the rest. score() recomputes its own W_atom internally, so val
+        # doesn't strictly need it, but precompute for symmetry. Mode 2 uses
+        # the COO path (no W_atom).
+        self._precompute_W_atom(train_data)
         self._precompute_W_atom(val_data)
+
+        S_train = int(train_data["targets"].shape[0])
+        minibatch = cfg.batch_size is not None and int(cfg.batch_size) < S_train
+        if minibatch:
+            rng = (tf.random.Generator.from_seed(cfg.seed)
+                   if cfg.seed is not None
+                   else tf.random.Generator.from_non_deterministic_state())
 
         history = {"generation": [], "train_loss": [], "val_loss": []}
         best_val = float("inf")
@@ -391,6 +400,11 @@ class Adam:
         last_val = float("nan")
 
         for gen in range(n_gen):
+            if minibatch:
+                idx = tf.argsort(rng.uniform(shape=[S_train]))[:cfg.batch_size]
+                batch = sample_minibatch(train_data, idx)
+            else:
+                batch = train_data
             loss = self._train_step(batch)
 
             if (gen + 1) % val_interval == 0 or gen == n_gen - 1:
@@ -404,9 +418,10 @@ class Adam:
                         self.model.U_pair.assign(self._reconstruct_V())
                     m, _ = self.model.score(val_data)
                     vloss = float(m["rmse"])
-                    # Reg-free train RMSE, same scale as val rmse (plot parity).
-                    train_rmse = float(tf.sqrt(tf.reduce_mean(
-                        tf.square(self._forward(batch) - batch["targets"]))))
+                    # Reg-free FULL-train RMSE, same scale as val rmse (plot
+                    # parity) — always the whole train set, not the minibatch.
+                    train_rmse = float(tf.sqrt(tf.reduce_mean(tf.square(
+                        self._forward(train_data) - train_data["targets"]))))
                     snap = self._snapshot()
                 # All three history keys appended TOGETHER, only on val ticks, so
                 # they stay equal-length (mirrors SNES.fit history recording).

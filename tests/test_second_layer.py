@@ -17,7 +17,7 @@ def _tiny_cfg(num_hidden_layers=2, target_mode=1, optimizer="adam", mixing=True)
     cfg.num_neurons = 8; cfg.num_hidden_layers = num_hidden_layers
     cfg.descriptor_mode = 0; cfg.descriptor_mixing = mixing
     cfg.descriptor_mixing_regularizer = "expm"; cfg.descriptor_preprocess_contract = "off"
-    cfg.pop_size = 8; cfg.num_generations = 3
+    cfg.pop_size = 8; cfg.num_generations = 3; cfg.batch_size = None
     cfg.population_chunk_size = None; cfg.batch_chunk_size = None
     cfg.pin_data_to_cpu = True; cfg.save_path = None; cfg.checkpoint_interval = None
     cfg.lambda_1 = 0.0; cfg.lambda_2 = 0.0; cfg.seed = 0

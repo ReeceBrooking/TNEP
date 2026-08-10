@@ -54,6 +54,30 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
             and getattr(model, "W_pre_angular", None) is not None):
         model.W_pre_angular.assign(params[idx]); idx += 1
 
+
+def sample_minibatch(train_data: dict, batch_idx: tf.Tensor) -> dict:
+    """Gather the structure minibatch `batch_idx` from a full train_data dict.
+
+    Padded per-structure keys are gathered on axis 0; the COO pair arrays
+    (grad_values, pair_atom, pair_gidx) are re-indexed to the sampled
+    structures via struct_ptr, with batch-local pair_struct/struct_ptr rebuilt.
+    Shared by SNES.fit and Adam.fit.
+    """
+    struct_keys = ["descriptors", "positions", "Z_int", "boxes", "num_atoms",
+                   "targets", "atom_mask", "types_contained", "_W_atom"]
+    batch = {key: tf.gather(train_data[key], batch_idx)
+             for key in struct_keys if key in train_data}
+    pair_starts = tf.gather(train_data["struct_ptr"], batch_idx)
+    pair_ends = tf.gather(train_data["struct_ptr"], batch_idx + 1)
+    pair_ranges = tf.ragged.range(pair_starts, pair_ends)
+    flat_pair_idx = tf.cast(pair_ranges.flat_values, tf.int32)
+    for key in ("grad_values", "pair_atom", "pair_gidx"):
+        batch[key] = tf.gather(train_data[key], flat_pair_idx)
+    batch["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
+    pair_counts = tf.cast(pair_ranges.row_lengths(), tf.int32)
+    batch["struct_ptr"] = tf.concat([[0], tf.cumsum(pair_counts)], axis=0)
+    return batch
+
 class SNES:
     """Separable NES optimizer for TNEP.
 
@@ -904,28 +928,7 @@ class SNES:
             else:
                 batch_idx_tf = tf.argsort(
                     self.tf_rng.uniform(shape=[S_train]))[:cfg.batch_size]
-                struct_keys = ["descriptors", "positions", "Z_int", "boxes",
-                               "num_atoms", "targets", "atom_mask"]
-                if "types_contained" in train_data:
-                    struct_keys.append("types_contained")
-                batch_data = {
-                    key: tf.gather(train_data[key], batch_idx_tf)
-                    for key in struct_keys
-                }
-                # COO pair gather: select pairs of the sampled structures.
-                pair_starts = tf.gather(train_data["struct_ptr"], batch_idx_tf)
-                pair_ends   = tf.gather(train_data["struct_ptr"], batch_idx_tf + 1)
-                pair_ranges = tf.ragged.range(pair_starts, pair_ends)
-                flat_pair_idx = tf.cast(pair_ranges.flat_values, tf.int32)
-                gv_full = train_data["grad_values"]
-                batch_data["grad_values"] = tf.gather(gv_full, flat_pair_idx)
-                batch_data["pair_atom"]   = tf.gather(train_data["pair_atom"],   flat_pair_idx)
-                batch_data["pair_gidx"]   = tf.gather(train_data["pair_gidx"],   flat_pair_idx)
-                batch_data["pair_struct"] = tf.cast(pair_ranges.value_rowids(), tf.int32)
-                # Build batch-local struct_ptr for struct_chunk slicing
-                batch_pair_counts = tf.cast(pair_ranges.row_lengths(), tf.int32)
-                batch_data["struct_ptr"] = tf.concat(
-                    [[0], tf.cumsum(batch_pair_counts)], axis=0)
+                batch_data = sample_minibatch(train_data, batch_idx_tf)
 
             t1 = time.perf_counter()
 
