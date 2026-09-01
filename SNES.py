@@ -926,6 +926,8 @@ class SNES:
                                "num_atoms", "targets", "atom_mask"]
                 if "types_contained" in train_data:
                     struct_keys.append("types_contained")
+                if "V_atom" in train_data:
+                    struct_keys.append("V_atom")
                 batch_data = {
                     key: tf.gather(train_data[key], batch_idx_tf)
                     for key in struct_keys
@@ -1308,13 +1310,18 @@ class SNES:
                     _sub = _cache_top.setdefault(_vd_id, {})
                     W_atom_v = _sub.get(chunk_idx)
                 if W_atom_v is None:
-                    B_arg = chunk["descriptors"].shape[0]
-                    A_arg = chunk["descriptors"].shape[1]
-                    W_atom_v = self.model._precompute_dipole_kernel(
-                        chunk["grad_values"], chunk["pair_struct"],
-                        chunk["pair_atom"], chunk["pair_gidx"],
-                        chunk["positions"], chunk["boxes"],
-                        B_arg, A_arg)
+                    if getattr(self.model, "_neighbor_readout", False):
+                        # Neighbor readout: V [B,A,3] geometry kernel,
+                        # precomputed in data.py — same slot as W_atom.
+                        W_atom_v = chunk["V_atom"]
+                    else:
+                        B_arg = chunk["descriptors"].shape[0]
+                        A_arg = chunk["descriptors"].shape[1]
+                        W_atom_v = self.model._precompute_dipole_kernel(
+                            chunk["grad_values"], chunk["pair_struct"],
+                            chunk["pair_atom"], chunk["pair_gidx"],
+                            chunk["positions"], chunk["boxes"],
+                            B_arg, A_arg)
                     if _can_cache:
                         _sub[chunk_idx] = W_atom_v
             preds = self.model.predict_batch(
@@ -1766,19 +1773,24 @@ class SNES:
                 if _W_atom_cached is not None:
                     chunk["_W_atom"] = _W_atom_cached
             if self.cfg.target_mode == 1 and "_W_atom" not in chunk:
-                _gv = chunk["grad_values"]
-                _ps = chunk["pair_struct"]
-                _pa = chunk["pair_atom"]
-                _pg = chunk["pair_gidx"]
-                _pos = chunk["positions"]
-                _boxes = chunk["boxes"]
-                _desc = chunk["descriptors"]
-                _B_st = _desc.shape[0]
-                _A_st = _desc.shape[1]
-                _B_arg = _B_st if _B_st is not None else tf.shape(_desc)[0]
-                _A_arg = _A_st if _A_st is not None else tf.shape(_desc)[1]
-                chunk["_W_atom"] = self.model._precompute_dipole_kernel(
-                    _gv, _ps, _pa, _pg, _pos, _boxes, _B_arg, _A_arg)
+                if getattr(self.model, "_neighbor_readout", False):
+                    # Neighbor readout: V [B,A,3] geometry kernel from
+                    # data.py rides the batch — same slot as W_atom.
+                    chunk["_W_atom"] = chunk["V_atom"]
+                else:
+                    _gv = chunk["grad_values"]
+                    _ps = chunk["pair_struct"]
+                    _pa = chunk["pair_atom"]
+                    _pg = chunk["pair_gidx"]
+                    _pos = chunk["positions"]
+                    _boxes = chunk["boxes"]
+                    _desc = chunk["descriptors"]
+                    _B_st = _desc.shape[0]
+                    _A_st = _desc.shape[1]
+                    _B_arg = _B_st if _B_st is not None else tf.shape(_desc)[0]
+                    _A_arg = _A_st if _A_st is not None else tf.shape(_desc)[1]
+                    chunk["_W_atom"] = self.model._precompute_dipole_kernel(
+                        _gv, _ps, _pa, _pg, _pos, _boxes, _B_arg, _A_arg)
                 # Write through to the static cache for reuse (full-batch only).
                 if (getattr(self.cfg, "batch_size", None) is None
                         and getattr(self, "_W_atom_static_cache", None)
@@ -1934,12 +1946,18 @@ class SNES:
             # stashes it on batch_data["_W_atom"] per struct chunk so the pop
             # loop reuses it; inline fallback for other callers (score, etc.).
             W_atom = batch_data.get("_W_atom")
-            if W_atom is None:
-                B_static = desc.shape[0]
-                A_static = desc.shape[1]
-                B_arg = B_static if B_static is not None else tf.shape(desc)[0]
-                A_arg = A_static if A_static is not None else tf.shape(desc)[1]
-                if self.cfg.target_mode == 1:
+            if W_atom is None and self.cfg.target_mode == 1:
+                if getattr(self.model, "_neighbor_readout", False):
+                    # Neighbor readout: V [B,A,3] geometry kernel from
+                    # data.py — same slot as W_atom.
+                    W_atom = batch_data["V_atom"]
+                else:
+                    B_static = desc.shape[0]
+                    A_static = desc.shape[1]
+                    B_arg = (B_static if B_static is not None
+                             else tf.shape(desc)[0])
+                    A_arg = (A_static if A_static is not None
+                             else tf.shape(desc)[1])
                     W_atom = self.model._precompute_dipole_kernel(
                         grad_values, pair_struct, pair_atom, pair_gidx,
                         pos, boxes,

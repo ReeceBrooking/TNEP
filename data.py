@@ -353,6 +353,14 @@ def assemble_data_dict(
         "grad_index": grad_index,
     }
 
+    # Neighbor-basis dipole readout: precompute the per-structure geometry
+    # kernel V (data-static; delivered to the forwards via the W_atom slot).
+    if (cfg.target_mode == 1
+            and getattr(cfg, "dipole_readout", "tnep") == "neighbor"):
+        _neighbor_dipole_guards(dataset, targets, cfg)
+        data["V_atom"] = [_neighbor_dipole_V(s, float(cfg.dipole_rc))
+                          for s in dataset]
+
     # Auto-detect and include force/virial targets for PES mode
     if cfg.target_mode == 0:
         if _dataset_has_key(dataset, _get_forces):
@@ -367,6 +375,71 @@ def assemble_data_dict(
     return data
 
 
+def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
+    """True when mode-1 batches need only self descriptor gradients:
+    dipole_rij_power=0 (self-pair readout) or the neighbor readout (which
+    reads no descriptor gradients at all)."""
+    return cfg.target_mode == 1 and (
+        int(getattr(cfg, "dipole_rij_power", 2)) == 0
+        or getattr(cfg, "dipole_readout", "tnep") == "neighbor")
+
+
+def _neighbor_dipole_V(atoms: Atoms, rc: float) -> np.ndarray:
+    """Per-atom geometry vector of the neighbor-basis dipole readout:
+    v_i = Σ_{j≠i, |d|<rc} f_c(|d|)·d, d = r_i − r_j (image pairs),
+    f_c(r) = ((1+cos(πr/rc))/2)². float64 accumulate → float32 [N, 3]."""
+    from ase.neighborlist import neighbor_list
+    i, j, D = neighbor_list("ijD", atoms, rc)
+    keep = i != j                                  # drop self-image pairs
+    i, d = i[keep], -D[keep].astype(np.float64)    # ase D = r_j − r_i
+    r = np.linalg.norm(d, axis=1)
+    w = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    V = np.zeros((len(atoms), 3))
+    np.add.at(V, i, w[:, None] * d)
+    return V.astype(np.float32)
+
+
+def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
+                            cfg: TNEPconfig) -> None:
+    """Box/label guards for the neighbor-basis dipole readout.
+
+    Raises when a box is too small for MIC to be exact (a second image of the
+    same pair would MIC-map onto the same vector and double-count the bond);
+    warns on net-charged frames and on label distributions with ~e·L gaps
+    (branch-inconsistent Berry-phase labels).
+    """
+    rc, rd = float(cfg.dipole_rc), float(cfg.rcut_hard)
+    L_min = np.inf
+    for k, s in enumerate(dataset):
+        if s.pbc.any():
+            # Face-to-face cell heights: 1/‖column k of inv(cell)‖.
+            h = 1.0 / np.linalg.norm(np.linalg.inv(s.cell[:]), axis=0)
+            L = float(h[s.pbc].min())
+            if rc + rd > L or 2.0 * rc >= L:
+                raise ValueError(
+                    f"dipole_readout='neighbor': structure {k} has minimum "
+                    f"box height {L:.2f} Å but needs dipole_rc + rcut_hard "
+                    f"≤ L and dipole_rc < L/2 (dipole_rc={rc}, "
+                    f"rcut_hard={rd}); smaller boxes double-count bonds "
+                    f"whose second image MIC-maps to the same vector.")
+            L_min = min(L_min, L)
+        q = s.arrays.get("charges", s.arrays.get("initial_charges"))
+        if q is not None and abs(float(np.sum(q))) > 1e-6 * len(s):
+            print(f"  WARNING: structure {k} has net charge "
+                  f"{float(np.sum(q)):+.3g}; the origin-free neighbor "
+                  f"readout cannot fit its label convention.")
+    # Branch consistency: per-component gaps ≳ the polarization quantum e·L
+    # suggest branch-inconsistent Berry-phase labels (warning, not rejection).
+    if np.isfinite(L_min) and len(targets) > 3:
+        conv = getattr(cfg, "convert_dipole_to_eangstrom", True)
+        quantum = (L_min if conv
+                   else L_min / _dipole_conversion_factor(cfg.dipole_units))
+        t = np.stack([np.asarray(x) for x in targets])       # [S, 3]
+        if float(np.max(np.diff(np.sort(t, axis=0), axis=0))) > 0.6 * quantum:
+            print("  WARNING: dipole labels show per-component gaps ≳ e·L — "
+                  "possibly branch-inconsistent Berry-phase labels.")
+
+
 def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Tensor]:
     """Chain assign_type_indices → build_descriptors → assemble_data_dict →
     pad_and_stack into a padded data dict ready for score()/predict_batch().
@@ -379,12 +452,10 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     builder = make_descriptor_builder(cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(dataset)
     data = assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
-    _self_only = (cfg.target_mode == 1
-                  and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
     return pad_and_stack(
         data,
         num_types=cfg.num_types,
-        self_pairs_only=_self_only)
+        self_pairs_only=dipole_self_pairs_only(cfg))
 
 
 def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> tuple[dict, dict, dict]:
@@ -456,14 +527,14 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         train_types_int = [dataset_types_int[i] for i in train_idx]
 
     # Build train + val descriptors; test is deferred to materialize_test_data.
-    # dipole_rij_power==0 → dipole forward reads only self-pair gradients
+    # dipole_rij_power==0 (and the neighbor readout, which reads no descriptor
+    # gradients at all) → dipole forward needs only self-pair gradients
     # ∂q_i/∂r_i, so build self-only in batches and drop the ~90%-of-COO
     # neighbour rows the forward never reads (bounds peak memory to one batch).
     _self_only_batch = (int(cfg.descriptor_self_batch_size)
                         if getattr(cfg, "descriptor_self_batch_size", None)
                         is not None else None)
-    _self_only = (int(getattr(cfg, "dipole_rij_power", 0)) == 0
-                  and cfg.target_mode == 1)
+    _self_only = dipole_self_pairs_only(cfg)
     if _self_only:
         _kw = {"progress_desc": "Building train descriptors (self-only, batched)"} \
             if cfg.descriptor_mode == 1 else {}
@@ -542,11 +613,9 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     test_data = assemble_data_dict(
         test_dataset, test_types_int,
         test_descriptors, test_gradients, test_grad_index, cfg)
-    _self_only = (cfg.target_mode == 1
-                  and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
     test_data = pad_and_stack(
         test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
-        self_pairs_only=_self_only)
+        self_pairs_only=dipole_self_pairs_only(cfg))
     # Pre-stage per-chunk pair indices to GPU (test eval uses predict_batch,
     # not _evaluate_chunk, so no XLA padding needed).
     S_test = int(test_data["num_atoms"].shape[0])
@@ -606,6 +675,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     target_dim = 1 if target_sample.shape == () else target_sample.shape[0]
     has_forces = "forces" in data
     has_virials = "virials" in data
+    has_V = "V_atom" in data  # neighbor-basis dipole geometry kernel
 
     # Count pairs per structure to build CSR struct_ptr and size COO arrays.
     if self_pairs_only:
@@ -645,6 +715,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
         force_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
     if has_virials:
         virial_np = np.zeros((S, 6), dtype=np.float32)
+    if has_V:
+        V_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
     if num_types is not None:
         types_contained_np = np.zeros((S, num_types), dtype=np.float32)
 
@@ -674,6 +746,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             force_np[s, :N_s, :] = data["forces"][s].numpy()
         if has_virials:
             virial_np[s, :] = data["virials"][s].numpy()
+        if has_V:
+            V_np[s, :N_s, :] = data["V_atom"][s]
 
         for i in range(N_s):
             gv_full = data["gradients"][s][i]
@@ -726,6 +800,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             result["forces"]  = tf.constant(force_np);       del force_np
         if has_virials:
             result["virials"] = tf.constant(virial_np);      del virial_np
+        if has_V:
+            result["V_atom"]  = tf.constant(V_np);           del V_np
         if num_types is not None:
             result["types_contained"] = tf.constant(types_contained_np); del types_contained_np
     return result
@@ -841,7 +917,7 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials")
+                  "forces", "virials", "V_atom")
     for k in SMALL_KEYS:
         if k in data:
             chunk[k] = tf.gather(data[k], idx_tf)
@@ -956,7 +1032,7 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     out: dict = {"_idx_np": idx_np, "_precomputed": precomputed}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials")
+                  "forces", "virials", "V_atom")
     for k in SMALL_KEYS:
         if k in data:
             v = data[k]
@@ -982,7 +1058,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials")
+                  "forces", "virials", "V_atom")
     # pin_to_cpu=True ⇒ host RAM, upload each chunk to GPU if present.
     # False ⇒ already on-device, no device context needed.
     ctx = _gpu_device_ctx() if pin_to_cpu else _NullCtx()
@@ -1044,7 +1120,7 @@ def _gpu_device_ctx():
 
 _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                          "targets", "atom_mask", "types_contained",
-                         "forces", "virials")
+                         "forces", "virials", "V_atom")
 
 
 def move_data_to_gpu(data: dict) -> None:

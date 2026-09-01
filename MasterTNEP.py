@@ -90,7 +90,8 @@ from TNEPconfig import TNEPconfig
 from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
                   assign_type_indices, prepare_eval_data, print_score_summary,
-                  _resolve_target_key, materialize_test_data)
+                  _resolve_target_key, materialize_test_data,
+                  dipole_self_pairs_only)
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
                       plot_timing, plot_correlation, plot_cosine_similarity,
                       plot_loss_breakdown, plot_error_vs_magnitude)
@@ -345,7 +346,11 @@ def _print_param_breakdown(model) -> None:
     rows.append(("ANN  W0  [T·Q·H]", int(opt._n_W0)))
     rows.append(("ANN  b0  [T·H]",   int(opt._n_b0)))
     rows.append(("ANN  W1  [T·H]",   int(opt._n_W1)))
-    rows.append(("ANN  b1",          int(opt._n_b1)))
+    # b1 stays in the SNES tail for layout stability but cancels identically
+    # in the neighbor-basis dipole readout (Σ_i v_i ≡ 0).
+    _b1_label = ("ANN  b1  (unused: neighbor readout)"
+                 if getattr(model, "_neighbor_readout", False) else "ANN  b1")
+    rows.append((_b1_label,          int(opt._n_b1)))
 
     # Polarisability ANN — same per-layer shape, mirrored doubling.
     if cfg.target_mode == 2:
@@ -415,10 +420,9 @@ def _train_model_inner(cfg: TNEPconfig,
     cfg.dim_q = compute_dim_q(cfg)
 
     # Pad to dense tensors for GPU-batched eval (test_data padded lazily).
-    # When dipole_rij_power=0 (target_mode=1) only self-pairs contribute to
-    # the dipole sum, so drop neighbour pairs (grad_values O(N·M) → O(N)).
-    _self_only = (cfg.target_mode == 1
-                  and int(getattr(cfg, "dipole_rij_power", 2)) == 0)
+    # dipole_rij_power=0 / neighbor readout: only self-pair gradients are
+    # read, so drop neighbour pairs (grad_values O(N·M) → O(N)).
+    _self_only = dipole_self_pairs_only(cfg)
     train_data = pad_and_stack(
         train_data, num_types=cfg.num_types, pin_to_cpu=cfg.pin_data_to_cpu,
         self_pairs_only=_self_only)
@@ -428,7 +432,10 @@ def _train_model_inner(cfg: TNEPconfig,
     if _self_only:
         n_train_pairs = int(train_data["grad_values"].shape[0])
         n_val_pairs   = int(val_data["grad_values"].shape[0])
-        print(f"  dipole_rij_power=0: COO restricted to self-pairs only "
+        _reason = ("neighbor readout"
+                   if getattr(cfg, "dipole_readout", "tnep") == "neighbor"
+                   else "dipole_rij_power=0")
+        print(f"  {_reason}: COO restricted to self-pairs only "
               f"(train P={n_train_pairs}, val P={n_val_pairs})")
 
     _setup_grad_staging(cfg, train_data, val_data)
@@ -468,6 +475,10 @@ def _train_model_inner(cfg: TNEPconfig,
         print(f"Preprocess contraction ({cfg.descriptor_preprocess_contract}): "
               f"Q_raw={q_raw} → Q_new={q_new}  "
               f"(×{ratio:.2f} compression, {reduce:.1f}% reduction)")
+    if getattr(model, "_neighbor_readout", False):
+        print(f"Dipole readout: neighbor basis — μ = Σ_i s_i·v_i, "
+              f"v_i = Σ_j f_c(|d_ij|)·d_ij, f_c = ((1+cos(πr/r_c))/2)², "
+              f"r_c = {cfg.dipole_rc} Å")
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
     print("Parameter Root: " + str(np.sqrt(model.optimizer.dim)))

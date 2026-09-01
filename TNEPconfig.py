@@ -69,6 +69,17 @@ class TNEPconfig:
     # Models must be re-trained if N changes.
     dipole_rij_power: int = 0
 
+    # Dipole readout form (target_mode=1 only):
+    #   "tnep"     : descriptor-gradient form above (dipole_rij_power applies)
+    #   "neighbor" : neighbor basis μ = Σ_i s_i·v_i, v_i = Σ_j f_c(|d_ij|)·d_ij,
+    #                d_ij = r_i − r_j (MIC), f_c(r) = ((1+cos(πr/r_c))/2)²
+    dipole_readout: str = "tnep"
+    # Neighbor-readout cutoff r_c (Å). Must be ≤ rcut_hard (checked at model
+    # init) and satisfy dipole_rc + rcut_hard ≤ L_min for every training box
+    # (checked at data assembly). Squared cosine narrows effective support —
+    # tune r_c for it, don't inherit a plain-cosine value.
+    dipole_rc: float = 3.5
+
     # ═══════════════════════════════════════════════════════════════════
     # 2. DESCRIPTOR (SOAP-turbo)
     # ═══════════════════════════════════════════════════════════════════

@@ -123,6 +123,9 @@ class TNEP(layers.Layer):
         )
 
         # Validate dipole contraction power (mode 1 only) at construction time.
+        _readout = str(getattr(cfg, "dipole_readout", "tnep"))
+        self._neighbor_readout = (cfg.target_mode == 1
+                                  and _readout == "neighbor")
         if cfg.target_mode == 1:
             _N = int(getattr(cfg, "dipole_rij_power", 2))
             if _N < 0:
@@ -133,6 +136,23 @@ class TNEP(layers.Layer):
                     f"2 = |r|²·F (Xu et al. JCTC 2024 default), "
                     f"≥3 = higher radial moments."
                 )
+            if _readout not in ("tnep", "neighbor"):
+                raise ValueError(
+                    f"cfg.dipole_readout must be 'tnep' or 'neighbor', "
+                    f"got {_readout!r}.")
+            if self._neighbor_readout:
+                _rc = float(getattr(cfg, "dipole_rc", 3.5))
+                if not 0.0 < _rc <= float(cfg.rcut_hard):
+                    raise ValueError(
+                        f"cfg.dipole_rc={_rc} must satisfy "
+                        f"0 < dipole_rc ≤ rcut_hard={cfg.rcut_hard} so bonded "
+                        f"pairs see each other in their descriptors (box-size "
+                        f"gates are checked at data assembly).")
+                if float(getattr(cfg, "charge_aux_weight", 0) or 0) > 0:
+                    raise ValueError(
+                        "charge_aux_weight > 0 is incompatible with "
+                        "dipole_readout='neighbor': the site scalar s is an "
+                        "electronegativity-like potential, not a charge.")
 
         # Scalar ANN for polarizability mode (target_mode == 2)
         if cfg.target_mode == 2:
@@ -628,6 +648,24 @@ class TNEP(layers.Layer):
             out = tf.expand_dims(-E, axis=0)  # [1]
             return out
 
+        if self._neighbor_readout:
+            # Neighbor-basis readout: μ = Σ_i s_i·v_i, v_i = Σ_j f_c(|d|)·d,
+            # d = r_i − r_j (MIC). No de_dq backward chain here — the readout
+            # reads no descriptor gradients; don't re-add it. b1 omitted from
+            # s: Σ_i v_i ≡ 0 per structure, so it cancels identically in μ.
+            s = tf.reduce_sum(h * W1_t, axis=1)                          # [A]
+            dr, rij = self._neighbor_displacements_single(
+                positions, box, grad_index)          # dr = neighbor − center
+            rc = float(self.cfg.dipole_rc)
+            center = tf.range(tf.shape(grad_index)[0],
+                              dtype=grad_index.dtype)[:, tf.newaxis]
+            keep = tf.logical_and(rij < rc, tf.not_equal(grad_index, center))
+            fc = tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * rij)))
+            w = fc * tf.cast(keep, rij.dtype) * neighbor_mask         # [A, M]
+            V = tf.reduce_sum(                       # float64 accumulate
+                tf.cast(w[:, :, tf.newaxis] * -dr, tf.float64), axis=1)
+            return tf.einsum('a,as->s', s, tf.cast(V, s.dtype))          # [3]
+
         # Modes 1 and 2 need forces
         forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask,
                                   z=z)  # [A, M, 3]
@@ -812,6 +850,7 @@ class TNEP(layers.Layer):
                 getattr(self, 'b0_pol', None),
                 getattr(self, 'W1_pol', None),
                 getattr(self, 'b1_pol', None),
+                W_atom=chunk.get("V_atom"),  # neighbor readout: [B,A,3] kernel
             ))
             del chunk
         raw_preds = tf.concat(pred_parts, axis=0)
@@ -1154,6 +1193,22 @@ class TNEP(layers.Layer):
             E = tf.reduce_sum(E, axis=1, keepdims=True)  # [B, 1]
             return -E
 
+        if self._neighbor_readout:
+            # Neighbor-basis readout: μ[b] = Σ_a s[b,a]·V[b,a,:]. The de_dq
+            # backward chain is skipped entirely — the readout reads no
+            # descriptor gradients; don't re-add it. b1 omitted from s
+            # (Σ_a V[b,a] ≡ 0 per structure → cancels identically in μ).
+            s = tf.reduce_sum(h1 * W1_t, axis=2)                      # [B, A]
+            V = W_atom  # [B, A, 3] geometry kernel via the W_atom slot
+            if V is None:
+                # Full-pair callers (spectroscopy fused / legacy pack):
+                # build V in-graph from the r_d pair stream (r_c ≤ rcut_hard).
+                V = self._neighbor_V_coo(
+                    positions, boxes, box_inv, pair_struct, pair_atom,
+                    pair_gidx, tf.shape(descriptors)[0],
+                    tf.shape(descriptors)[1])
+            return tf.einsum('ba,bas->bs', s, V)                      # [B, 3]
+
         # Single-hidden backward chain (∂U/∂q):
         #   ∂U/∂h1 = W1, ∂U/∂a1 = activation'(h1, z1)·W1, ∂U/∂q = ∂U/∂a1·W0^T
         de_da = self._activation_grad(h1, z1) * W1_t
@@ -1211,7 +1266,8 @@ class TNEP(layers.Layer):
 
         Args:
             descriptors : [B, A, Q]
-            W_atom      : [B, A, 3, Q]  precomputed dipole kernel (mode 1 only)
+            W_atom      : [B, A, 3, Q]  precomputed dipole kernel (mode 1 only);
+                          neighbor readout: V [B, A, 3] geometry kernel instead
             Z           : [B, A]        type indices
             atom_mask   : [B, A]        1.0 real, 0.0 pad
             W0          : [C, T, Q, H]
@@ -1278,6 +1334,14 @@ class TNEP(layers.Layer):
             E = tf.reduce_sum(h1 * W1_t_all, axis=3) + b1[:, tf.newaxis, tf.newaxis]
             E = E * atom_mask[tf.newaxis]
             return -tf.reduce_sum(E, axis=2, keepdims=True)  # [C, B, 1]
+
+        # ── Dipole, neighbor-basis readout ────────────────────────────────────
+        if self._neighbor_readout:
+            # W_atom slot carries V [B, A, 3] (SNES threads it); no backward
+            # matmul — the readout reads no descriptor gradients. b1 omitted
+            # (cancels identically in μ).
+            s = tf.reduce_sum(h1 * W1_t_all, axis=3)               # [C, B, A]
+            return tf.einsum('cba,bas->cbs', s, W_atom)            # [C, B, 3]
 
         # ── Dipole: backward matmul ───────────────────────────────────────────
         # ∂U/∂a1 = activation'(h1, z1)·W1.
@@ -1471,6 +1535,32 @@ class TNEP(layers.Layer):
         dr  = tf.einsum('kji,kj->ki', box_k, ds)            # [P, 3] Cartesian
         rij2 = tf.reduce_sum(tf.square(dr), axis=-1)         # [P]
         return dr, rij2
+
+    def _neighbor_V_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
+                        box_inv: tf.Tensor, pair_struct: tf.Tensor,
+                        pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
+                        B: tf.Tensor, A: tf.Tensor) -> tf.Tensor:
+        """Geometry kernel of the neighbor-basis dipole readout:
+            V[b,a,:] = Σ_{pairs (a,j), |d|<r_c} f_c(|d|)·d,  d = r_a − r_j (MIC),
+            f_c(r) = ((1+cos(πr/r_c))/2)².
+        Pairs come from the r_d descriptor list (r_c ≤ rcut_hard guarantees
+        coverage); j==a self-image entries are excluded. Accumulated in
+        float64, cast back to the pipeline dtype.
+
+        Returns:
+            V : [B, A, 3]
+        """
+        dr, rij2 = self._neighbor_displacements_coo(
+            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
+        rc = float(self.cfg.dipole_rc)
+        r = tf.sqrt(rij2)
+        fc = tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * r)))
+        keep = tf.logical_and(r < rc, tf.not_equal(pair_atom, pair_gidx))
+        w = fc * tf.cast(keep, fc.dtype)                             # [P]
+        contrib = tf.cast(w[:, tf.newaxis] * -dr, tf.float64)  # d = − (nbr−ctr)
+        V = tf.math.unsorted_segment_sum(
+            contrib, pair_struct * A + pair_atom, num_segments=B * A)
+        return tf.reshape(tf.cast(V, dr.dtype), [B, A, 3])
 
     def _dipole_coo(self, forces_per_pair: tf.Tensor, pair_struct: tf.Tensor,
                     pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
