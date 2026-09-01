@@ -363,8 +363,10 @@ def assemble_data_dict(
     # kernel V (data-static; delivered to the forwards via the W_atom slot).
     if (cfg.target_mode == 1
             and getattr(cfg, "dipole_readout", "tnep") == "neighbor"):
-        data["V_atom"] = [_neighbor_dipole_V(s, float(cfg.dipole_rc or cfg.rcut_hard))
-                          for s in dataset]
+        data["V_atom"] = [
+            _neighbor_dipole_V(s, t, float(cfg.dipole_rc or cfg.rcut_hard),
+                               int(cfg.dipole_channels), int(cfg.num_types))
+            for s, t in zip(dataset, types_int)]
 
     # Auto-detect and include force/virial targets for PES mode
     if cfg.target_mode == 0:
@@ -389,18 +391,28 @@ def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
         or getattr(cfg, "dipole_readout", "tnep") == "neighbor")
 
 
-def _neighbor_dipole_V(atoms: Atoms, rc: float) -> np.ndarray:
-    """Per-atom geometry vector of the neighbor-basis dipole readout:
-    v_i = Σ_{j≠i, |d|<rc} f_c(|d|)·d, d = r_i − r_j (image pairs),
-    f_c(r) = ((1+cos(πr/rc))/2)². float64 accumulate → float32 [N, 3]."""
+def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
+                       C: int, T: int) -> np.ndarray:
+    """Per-atom geometry kernel of the neighbor-basis dipole readout:
+    V_i[:,n,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·d, d = r_i − r_j (image
+    pairs), R_n(r) = T_n(2r/rc − 1)·f_c(r), f_c = ((1+cos(πr/rc))/2)².
+    float64 accumulate → float32 [N, 3, C, T]."""
     i, j, D = neighbor_list("ijD", atoms, rc)
     keep = i != j                                  # drop self-image pairs
-    i, d = i[keep], -D[keep].astype(np.float64)    # ase D = r_j − r_i
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
     r = np.linalg.norm(d, axis=1)
-    w = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
-    V = np.zeros((len(atoms), 3))
-    np.add.at(V, i, w[:, None] * d)
-    return V.astype(np.float32)
+    x = 2.0 * r / rc - 1.0
+    Tn = np.empty((len(r), C))
+    Tn[:, 0] = 1.0
+    if C > 1:
+        Tn[:, 1] = x
+    for n in range(2, C):
+        Tn[:, n] = 2.0 * x * Tn[:, n - 1] - Tn[:, n - 2]
+    Rw = Tn * (((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2)[:, None]  # [P, C]
+    V = np.zeros((len(atoms), T, 3, C))
+    np.add.at(V, (i, np.asarray(types_int)[j]),
+              d[:, :, None] * Rw[:, None, :])
+    return V.transpose(0, 2, 3, 1).astype(np.float32)      # [N, 3, C, T]
 
 
 def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
@@ -720,7 +732,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     if has_virials:
         virial_np = np.zeros((S, 6), dtype=np.float32)
     if has_V:
-        V_np = np.zeros((S, max_atoms, 3), dtype=np.float32)
+        V_np = np.zeros((S, max_atoms) + np.shape(data["V_atom"][0])[1:],
+                        dtype=np.float32)
     if num_types is not None:
         types_contained_np = np.zeros((S, num_types), dtype=np.float32)
 
@@ -751,7 +764,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
         if has_virials:
             virial_np[s, :] = data["virials"][s].numpy()
         if has_V:
-            V_np[s, :N_s, :] = data["V_atom"][s]
+            V_np[s, :N_s] = data["V_atom"][s]
 
         for i in range(N_s):
             gv_full = data["gradients"][s][i]

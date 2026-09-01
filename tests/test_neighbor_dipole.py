@@ -82,35 +82,71 @@ def _bulk_setup():
 
 
 def _site_scalars_np(model, data):
-    """s_i replicated in numpy float64 (tanh ANN, b1 excluded by design)."""
+    """s_i^n replicated in numpy float64 (tanh ANN, b1 excluded by design)."""
     desc = data["descriptors"][0].numpy().astype(np.float64)   # [A, Q]
     Z = data["Z_int"][0].numpy()                                # [A]
     W0 = model.W0.numpy().astype(np.float64)
     b0 = model.b0.numpy().astype(np.float64)
-    W1 = model.W1.numpy().astype(np.float64)
+    W1 = model.W1.numpy().astype(np.float64)                    # [T, H, C]
     h = np.tanh(np.einsum('aq,aqh->ah', desc, W0[Z]) + b0[Z])
-    return np.sum(h * W1[Z], axis=1)                            # [A]
+    return np.einsum('ah,ahn->an', h, W1[Z])                    # [A, C]
 
 
 def _fc(r, rc):
     return ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
 
 
-# ── 10: pair-difference double sum == model's Σ s_i v_i ─────────────────────
+def _R_np(r, rc, C):
+    """R_n(r) = T_n(2r/rc − 1)·f_c(r), Chebyshev recurrence → [P, C]."""
+    x = 2.0 * r / rc - 1.0
+    Tn = np.empty((len(r), C))
+    Tn[:, 0] = 1.0
+    if C > 1:
+        Tn[:, 1] = x
+    for n in range(2, C):
+        Tn[:, n] = 2.0 * x * Tn[:, n - 1] - Tn[:, n - 2]
+    return Tn * _fc(r, rc)[:, None]
+
+
+def _pair_index(T):
+    """Unordered-pair index table [T, T] matching TNEP._pair_idx."""
+    M = np.zeros((T, T), dtype=int)
+    p = 0
+    for t in range(T):
+        for t2 in range(t, T):
+            M[t, t2] = M[t2, t] = p
+            p += 1
+    return M
+
+
+# ── 10: pair-difference double sum == model's per-atom collapsed form ───────
 
 def test_pair_difference_sum_matches_model():
-    cfg, model, atoms, data = _bulk_setup()
-    s = _site_scalars_np(model, data)
+    # Learned c exercised: dipole_species_pairs=True + randomized table.
+    cfg = _cfg(dipole_species_pairs=True)
+    model = _model(cfg)
+    rng = np.random.default_rng(3)
+    model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape)
+                        .astype(np.float32))
+    atoms = _bulk_frame()
+    data = prepare_eval_data([atoms], cfg)
+    s = _site_scalars_np(model, data)                          # [A, C]
     mu_model = _mu(model, atoms, cfg)
 
+    Zt = data["Z_int"][0].numpy()
+    c = model.c_pair.numpy().astype(np.float64)                # [C, P]
+    pidx = _pair_index(cfg.num_types)
     i, j, D = neighbor_list("ijD", atoms, float(cfg.dipole_rc))
     keep = i != j
     i, j, D = i[keep], j[keep], D[keep].astype(np.float64)
     d = -D                                       # d = r_i − r_j (+ image)
     r = np.linalg.norm(d, axis=1)
-    w = _fc(r, float(cfg.dipole_rc))
-    # Ordered pairs: each unordered pair counted twice with identical term.
-    mu_pair = 0.5 * np.sum(w[:, None] * (s[i] - s[j])[:, None] * d, axis=0)
+    R = _R_np(r, float(cfg.dipole_rc), int(cfg.dipole_channels))  # [P, C]
+    cn = c[:, pidx[Zt[i], Zt[j]]].T                               # [P, C]
+    # b_ij = Σ_n c_n[p(t_i,t_j)]·R_n(r_ij)·(s_i^n − s_j^n); ordered pairs
+    # count each unordered pair twice with identical term.
+    b = np.sum(cn * R * (s[i] - s[j]), axis=1)                    # [P]
+    mu_pair = 0.5 * np.sum(b[:, None] * d, axis=0)
 
     scale = max(np.linalg.norm(mu_model), 1e-6)
     assert np.allclose(mu_model, mu_pair, atol=1e-4 * max(scale, 1.0), rtol=1e-4)
@@ -270,13 +306,63 @@ def test_water_monomer_bisector():
 
 def test_gauge_shift_cancels():
     cfg, model, atoms, data = _bulk_setup()
-    V = data["V_atom"][0].numpy()                        # [A, 3], model's own V
-    # μ(s+c) − μ(s) = c·Σ_i v_i; assert Σ_i v_i ≈ 0 to float32 cancellation.
-    residual = np.abs(V.sum(axis=0))
-    assert np.all(residual < 1e-4 * np.abs(V).sum())
+    V = data["V_atom"][0].numpy()               # [A, 3, C, T], model's own V
+    # Per channel n: shifting s^n uniformly across ALL atoms moves μ by
+    # g_n·Σ_{a,t'} V[a,:,n,t'] ≡ 0 (ordered-pair cancellation, c symmetric).
+    residual = np.abs(V.sum(axis=(0, 3)))                # [3, C]
+    total = np.abs(V).sum(axis=(0, 3))                   # [3, C]
+    assert np.all(residual < 1e-4 * total)
+
+
+# ── 17: species-pair coefficient table ──────────────────────────────────────
+
+def test_same_species_coefficient_zeroes_contribution():
+    # Frame of only O atoms → every pair is the OO pair. c[:, OO]=0 must
+    # zero μ identically; c=1 must leave it nonzero (random W1 environments).
+    cfg = _cfg(dipole_species_pairs=True)
+    model = _model(cfg)
+    at = Atoms("O4", positions=[[8.0, 8.0, 8.0], [9.1, 8.4, 8.2],
+                                [8.3, 9.2, 8.9], [10.0, 9.5, 8.1]],
+               cell=20.0 * np.eye(3), pbc=True)
+    at.info["dipole"] = np.zeros(3)
+    oo = _pair_index(cfg.num_types)[0, 0]         # types [8, 1] → O is type 0
+    c = np.ones(model.c_pair.shape, dtype=np.float32)
+    model.c_pair.assign(c)
+    mu_on = _mu(model, at, cfg)
+    c[:, oo] = 0.0
+    model.c_pair.assign(c)
+    mu_off = _mu(model, at, cfg)
+    assert np.linalg.norm(mu_on) > 1e-6
+    assert np.allclose(mu_off, 0.0, atol=1e-10)
+
+
+def test_species_pairs_off_is_frozen_ones():
+    # Default dipole_species_pairs=False: no c parameters in the SNES tail,
+    # and the forward equals the learnable model at its c=1 init.
+    from SNES import SNES
+    cfg_off = _cfg()
+    assert cfg_off.dipole_species_pairs is False           # class default
+    model_off = _model(cfg_off)
+    assert not isinstance(model_off.c_pair, tf.Variable)
+    cfg_on = _cfg(dipole_species_pairs=True)
+    model_on = _model(cfg_on)                              # same seed → same W
+    atoms = _bulk_frame()
+    assert np.allclose(_mu(model_off, atoms, cfg_off),
+                       _mu(model_on, atoms, cfg_on), atol=1e-6)
+    n_pairs = cfg_on.num_types * (cfg_on.num_types + 1) // 2
+    opt_off, opt_on = SNES(model_off), SNES(model_on)
+    assert opt_off.n_c == 0
+    assert opt_on.n_c == int(cfg_on.dipole_channels) * n_pairs
+    assert opt_on.dim == opt_off.dim + opt_on.n_c
 
 
 # ── 18t: config gates ───────────────────────────────────────────────────────
+
+def test_dipole_channels_lt_1_raises_at_init():
+    cfg = _cfg(dipole_channels=0)
+    with pytest.raises(ValueError, match="dipole_channels"):
+        _model(cfg)
+
 
 def test_dipole_rc_exceeding_rcut_raises_at_init():
     cfg = _cfg(dipole_rc=5.0)                            # > rcut_hard = 3.5

@@ -345,12 +345,16 @@ def _print_param_breakdown(model) -> None:
     # Primary ANN — per-layer breakdown.
     rows.append(("ANN  W0  [T·Q·H]", int(opt._n_W0)))
     rows.append(("ANN  b0  [T·H]",   int(opt._n_b0)))
-    rows.append(("ANN  W1  [T·H]",   int(opt._n_W1)))
+    _w1_label = ("ANN  W1  [T·H·C]" if model._neighbor_readout
+                 else "ANN  W1  [T·H]")
+    rows.append((_w1_label,          int(opt._n_W1)))
     # b1 stays in the SNES tail for layout stability but cancels identically
     # in the neighbor-basis dipole readout (Σ_i v_i ≡ 0).
     _b1_label = ("ANN  b1  (unused: neighbor readout)"
                  if model._neighbor_readout else "ANN  b1")
     rows.append((_b1_label,          int(opt._n_b1)))
+    if int(getattr(opt, "n_c", 0)) > 0:
+        rows.append(("c_pair  [C·T(T+1)/2]", int(opt.n_c)))
 
     # Polarisability ANN — same per-layer shape, mirrored doubling.
     if cfg.target_mode == 2:
@@ -476,8 +480,14 @@ def _train_model_inner(cfg: TNEPconfig,
               f"Q_raw={q_raw} → Q_new={q_new}  "
               f"(×{ratio:.2f} compression, {reduce:.1f}% reduction)")
     if model._neighbor_readout:
-        print(f"Dipole readout: neighbor basis — μ = Σ_i s_i·v_i, "
-              f"v_i = Σ_j f_c(|d_ij|)·d_ij, f_c = ((1+cos(πr/r_c))/2)², "
+        _c_desc = ("learned species-pair coefficients c[C, T(T+1)/2]"
+                   if model._species_pairs else "c ≡ 1")
+        print(f"Dipole readout: neighbor basis — "
+              f"b_ij = Σ_n c_n[p(t_i,t_j)]·R_n(r_ij)·(s_i^n − s_j^n), "
+              f"μ = Σ_(i<j) b_ij·(r_i − r_j); "
+              f"R_n = T_n(2r/r_c − 1)·f_c (Chebyshev), "
+              f"f_c = ((1+cos(πr/r_c))/2)², "
+              f"C = {model._dipole_channels} channels, {_c_desc}, "
               f"r_c = {cfg.dipole_rc} Å")
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))

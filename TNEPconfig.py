@@ -71,9 +71,23 @@ class TNEPconfig:
 
     # Dipole readout form (target_mode=1 only):
     #   "tnep"     : descriptor-gradient form above (dipole_rij_power applies)
-    #   "neighbor" : neighbor basis μ = Σ_i s_i·v_i, v_i = Σ_j f_c(|d_ij|)·d_ij,
-    #                d_ij = r_i − r_j (MIC), f_c(r) = ((1+cos(πr/r_c))/2)²
+    #   "neighbor" : neighbor basis with C radial channels and species-pair
+    #                coefficients:
+    #                  b_ij = Σ_n c_n[p(t_i,t_j)]·R_n(r_ij)·(s_i^n − s_j^n)
+    #                  μ = Σ_{i<j} b_ij·(r_i − r_j)   (MIC displacements)
+    #                R_n(r) = T_n(2r/r_c − 1)·f_c(r) (Chebyshev, 1st kind),
+    #                f_c(r) = ((1+cos(πr/r_c))/2)²
     dipole_readout: str = "neighbor"
+    # Number of Chebyshev radial channels C of the neighbor readout (n =
+    # 0..C−1). C=1 with c≡1 reduces to the plain f_c single-channel form.
+    # Widens the site head W1 to [T, H, C]. Validated ≥ 1 at model init.
+    # Models must be re-trained if C changes.
+    dipole_channels: int = 4
+    # Learn the species-pair coefficient table c [C, T(T+1)/2] (init 1.0,
+    # unordered-pair indexed, in the SNES tail + regularization). False =
+    # c frozen at 1 with no learnable parameters; the forward contracts
+    # through the same table either way.
+    dipole_species_pairs: bool = False
     # Neighbor-readout cutoff r_c (Å). None = inherit rcut_hard (resolved at
     # model init). Must be ≤ rcut_hard and satisfy dipole_rc + rcut_hard ≤
     # L_min for every training box (checked at data assembly). Note the

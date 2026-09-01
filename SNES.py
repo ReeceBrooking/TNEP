@@ -31,7 +31,8 @@ def _format_duration(seconds: float) -> str:
 def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight tensors from reconstruct_params_tf into the model's Variables.
 
-    Tail order: W0,b0,W1,b1 | +pol ANN (mode 2) | +U_pair (mixing)
+    Tail order: W0,b0,W1,b1 | +c_pair (neighbor readout, species pairs on)
+    | +pol ANN (mode 2) | +U_pair (mixing)
     | +W_pre_angular (preprocess_contract != "off").
     """
     params = list(params)
@@ -40,6 +41,8 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     model.b0.assign(params[idx]); idx += 1
     model.W1.assign(params[idx]); idx += 1
     model.b1.assign(params[idx]); idx += 1
+    if getattr(model, "_neighbor_readout", False) and model._species_pairs:
+        model.c_pair.assign(params[idx]); idx += 1
     if model.cfg.target_mode == 2:
         model.W0_pol.assign(params[idx]); idx += 1
         model.b0_pol.assign(params[idx]); idx += 1
@@ -84,18 +87,27 @@ class SNES:
 
         # Total number of trainable parameters
         self.H = int(self.cfg.num_neurons)
+        # Neighbor dipole readout: W1 gains a radial-channel axis [T, H, Ch];
+        # with dipole_species_pairs a learnable c_pair table [Ch, T(T+1)/2]
+        # follows b1 in the tail (else c ≡ 1 frozen: Ch = 1 / n_c = 0
+        # in every other mode).
+        self._Ch = (int(model._dipole_channels)
+                    if model._neighbor_readout else 1)
+        self.n_c = (self._Ch * self.cfg.num_types * (self.cfg.num_types + 1) // 2
+                    if model._neighbor_readout and model._species_pairs else 0)
         n_W0 = self.cfg.num_types * self.cfg.dim_q * self.H
         n_b0 = self.cfg.num_types * self.H
-        n_W1 = self.cfg.num_types * self.H
+        n_W1 = self.cfg.num_types * self.H * self._Ch
         n_b1 = 1
         self.n_typed = n_W0 + n_b0 + n_W1
-        # Per-type param count (per type t): W0 Q·H + b0 H + W1 H.
+        # Per-type param count (per type t): W0 Q·H + b0 H + W1 H·Ch.
         # Per-type param count. target_mode==2 has a second (polarizability) ANN
         # whose type-t block is ALSO extracted for per-type regularization, so
         # the denominator doubles to match _extract_type_params.
-        self._n_per_type = ((self.cfg.dim_q * self.H + 2 * self.H)
+        self._n_per_type = ((self.cfg.dim_q * self.H + self.H
+                             + self.H * self._Ch)
                             * (2 if self.cfg.target_mode == 2 else 1))
-        self.n_primary = self.n_typed + n_b1
+        self.n_primary = self.n_typed + n_b1 + self.n_c
         self._n_W0 = n_W0
         self._n_b0 = n_b0
         self._n_W1 = n_W1
@@ -407,6 +419,11 @@ class SNES:
             # Global term over typed params only (excludes b1).
             typed = tf.concat([pv[:self.n_typed]], axis=0)
             n_typed_total = self.n_typed
+            if self.n_c > 0:  # c_pair rides the global term (pair-indexed)
+                typed = tf.concat(
+                    [typed, pv[self.n_typed + 1:self.n_typed + 1 + self.n_c]],
+                    axis=0)
+                n_typed_total += self.n_c
             if self.cfg.target_mode == 2:
                 typed = tf.concat([typed, pv[self.n_primary:self.n_primary + self.n_typed]], axis=0)
                 n_typed_total = 2 * self.n_typed
@@ -437,11 +454,11 @@ class SNES:
         # Activation-dependent Glorot gain (gain=1 → tanh init).
         gain = float(getattr(self.model, "_glorot_gain", 1.0))
         c_W0 = gain * float(np.sqrt(6.0 / (Q + H)))
-        c_W1 = gain * float(np.sqrt(6.0 / (H + 1)))
+        c_W1 = gain * float(np.sqrt(6.0 / (H + self._Ch)))
 
         def _fill_ann(off: int) -> int:
             """Fill one ANN's worth of weights starting at ``off``.
-            Layout: [W0(T,Q,H) | b0(T,H) | W1(T,H) | b1(1)].
+            Layout: [W0(T,Q,H) | b0(T,H) | W1(T,H·Ch) | b1(1)].
             """
             n_W0 = T * Q * H
             mu[off:off + n_W0] = rng.uniform(
@@ -449,7 +466,7 @@ class SNES:
             off += n_W0
             # b0 zero
             off += T * H
-            n_W1 = T * H
+            n_W1 = T * H * self._Ch
             mu[off:off + n_W1] = rng.uniform(
                 -c_W1, c_W1, size=n_W1).astype(np.float32)
             off += n_W1
@@ -458,6 +475,10 @@ class SNES:
             return off
 
         off = _fill_ann(0)
+        # c_pair table: init 1.0 (C=1 with c=1 ≈ the single-channel readout).
+        if self.n_c > 0:
+            mu[off:off + self.n_c] = 1.0
+            off += self.n_c
         if self.cfg.target_mode == 2:
             off = _fill_ann(off)
         # V_pair tail: zeroed so U_full = I at gen 0.
@@ -570,8 +591,8 @@ class SNES:
 
         # W1 block: after all b0
         w1_offset = b0_offset + T * H
-        w1_start = w1_offset + t * H
-        w1_end = w1_start + H
+        w1_start = w1_offset + t * H * self._Ch
+        w1_end = w1_start + H * self._Ch
 
         blocks = [
             pv[w0_start:w0_end],
@@ -611,12 +632,12 @@ class SNES:
             for t in range(T):
                 tov[offset:offset + H] = t
                 offset += H
-            # W1: [T, H]
+            # W1: [T, H·Ch]
             for t in range(T):
-                tov[offset:offset + H] = t
-                offset += H
-            # b1: global (label = T)
-            tov[offset] = T
+                tov[offset:offset + H * self._Ch] = t
+                offset += H * self._Ch
+            # b1 (and the c_pair table, when present): global (label = T)
+            tov[offset:] = T
             return tov
 
         if self.cfg.target_mode == 2:
@@ -686,6 +707,12 @@ class SNES:
         # Global ranking (type T): regularize over all typed params, excluding b1
         typed = samples[:, :self.n_typed]
         n_typed_total = self.n_typed
+        if self.n_c > 0:  # c_pair rides the global term (pair-indexed)
+            typed = tf.concat(
+                [typed,
+                 samples[:, self.n_typed + 1:self.n_typed + 1 + self.n_c]],
+                axis=1)
+            n_typed_total += self.n_c
         if self.cfg.target_mode == 2:
             typed = tf.concat([typed, samples[:, self.n_primary:self.n_primary + self.n_typed]], axis=1)
             n_typed_total = 2 * self.n_typed
@@ -1246,6 +1273,7 @@ class SNES:
             b1p = named.get("b1_pol")
             U_pair_val = named.get("U_pair")
             W_pre_angular_val = named.get("W_pre_angular")
+            c_pair_val = named.get("c_pair")
             # Absorb U_pair^T into W0 (and W0_pol).
             if U_pair_val is not None:
                 W0 = self.model._W0_eff(W0, U_pair_val)
@@ -1262,12 +1290,13 @@ class SNES:
             # Stash folded tensors for the next validate() call this gen.
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
-                "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p),
+                "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val),
             }
         elif _cache_hit:
-            (W0, b0, W1, b1, W0p, b0p, W1p, b1p) = _cache["fold"]
+            (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val) = _cache["fold"]
         else:
             W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
+            c_pair_val = None  # predict_batch falls back to model.c_pair
             W0p = getattr(self.model, 'W0_pol', None)
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
@@ -1330,7 +1359,7 @@ class SNES:
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
-                W_atom=W_atom_v,
+                W_atom=W_atom_v, c_pair=c_pair_val,
             )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
                 num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
@@ -1369,15 +1398,18 @@ class SNES:
     def _split_reconstructed(self, params: tuple) -> dict:
         """Parse the reconstruct_params_tf tuple into a named dict.
 
-        Tail order: W0,b0,W1,b1 | W0_pol.. (mode 2) | U_pair (mixing)
-        | W_pre_angular (preprocess != "off").
+        Tail order: W0,b0,W1,b1 | c_pair (neighbor readout, species pairs on)
+        | W0_pol.. (mode 2) | U_pair (mixing) | W_pre_angular (preprocess !=
+        "off").
         """
-        out: dict = {"U_pair": None, "W_pre_angular": None}
+        out: dict = {"U_pair": None, "W_pre_angular": None, "c_pair": None}
         idx = 0
         out["W0"] = params[idx]; idx += 1
         out["b0"] = params[idx]; idx += 1
         out["W1"] = params[idx]; idx += 1
         out["b1"] = params[idx]; idx += 1
+        if self.n_c > 0:
+            out["c_pair"] = params[idx]; idx += 1
         if self.cfg.target_mode == 2:
             out["W0_pol"] = params[idx]; idx += 1
             out["b0_pol"] = params[idx]; idx += 1
@@ -1406,8 +1438,11 @@ class SNES:
 
         n_W0 = T * Q * H
         n_b0 = T * H
-        n_W1 = T * H
+        n_W1 = T * H * self._Ch
         n_b1 = 1
+        # W1 shape: [T, H] except the neighbor readout's channel axis.
+        w1_shape = ([T, H, self._Ch] if self.model._neighbor_readout
+                    else [T, H])
 
         is_batched = len(param_vectors.shape) == 2
 
@@ -1420,7 +1455,7 @@ class SNES:
                             [-1, T, H] if is_batched else [T, H])
             offset += n_b0
             W1 = tf.reshape(pv[..., offset:offset + n_W1],
-                            [-1, T, H] if is_batched else [T, H])
+                            ([-1] + w1_shape) if is_batched else w1_shape)
             offset += n_W1
             b1 = pv[..., offset]
             offset += n_b1
@@ -1429,6 +1464,15 @@ class SNES:
         first = _extract(param_vectors, 0)
         offset = first[-1]
         primary = first[:-1]
+
+        # c_pair table (neighbor readout + dipole_species_pairs): after b1.
+        if self.n_c > 0:
+            n_pairs = self.n_c // self._Ch
+            c = tf.reshape(param_vectors[..., offset:offset + self.n_c],
+                           [-1, self._Ch, n_pairs] if is_batched
+                           else [self._Ch, n_pairs])
+            offset += self.n_c
+            primary = primary + (c,)
 
         if self.cfg.target_mode == 2:
             second = _extract(param_vectors, offset)
@@ -1641,6 +1685,12 @@ class SNES:
             # Global term over typed params only (excludes b1).
             typed = param_vectors[:, :self.n_typed]  # [P, n_typed]
             n_typed_total = self.n_typed
+            if self.n_c > 0:  # c_pair rides the global term (pair-indexed)
+                typed = tf.concat(
+                    [typed, param_vectors[
+                        :, self.n_typed + 1:self.n_typed + 1 + self.n_c]],
+                    axis=1)
+                n_typed_total += self.n_c
             if self.cfg.target_mode == 2:
                 typed2 = param_vectors[:, self.n_primary:self.n_primary + self.n_typed]
                 typed = tf.concat([typed, typed2], axis=1)
@@ -1676,8 +1726,8 @@ class SNES:
         b0_end = b0_start + H
 
         w1_offset = b0_offset + T * H
-        w1_start = w1_offset + t * H
-        w1_end = w1_start + H
+        w1_start = w1_offset + t * H * self._Ch
+        w1_end = w1_start + H * self._Ch
 
         blocks = [
             param_vectors[:, w0_start:w0_end],
@@ -1968,7 +2018,8 @@ class SNES:
             preds = self.model.predict_batch_candidates(
                 desc, W_atom, Z, amask, W0, b0, W1, b1,
                 U_pair=U_pair_cand,
-                W_pre_angular=W_pre_angular_cand)  # [C, B, T_dim]
+                W_pre_angular=W_pre_angular_cand,
+                c_pair=named.get("c_pair"))  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]

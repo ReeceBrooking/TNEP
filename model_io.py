@@ -206,6 +206,10 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             wg.create_dataset("b0_pol", data=model.b0_pol.numpy())
             wg.create_dataset("W1_pol", data=model.W1_pol.numpy())
             wg.create_dataset("b1_pol", data=model.b1_pol.numpy())
+        # Neighbor readout: learned species-pair coefficient table (only when
+        # dipole_species_pairs; frozen c ≡ 1 is rebuilt at load, not stored).
+        if getattr(model, "_neighbor_readout", False) and model._species_pairs:
+            wg.create_dataset("c_pair", data=model.c_pair.numpy())
         # Optional descriptor-mixing layer, stored only when trained with
         # cfg.descriptor_mixing=True. Dataset "U_pair" holds the residual
         # V = U - I; loaders fall back to V=0 (U_full=I, no-op) when absent.
@@ -407,7 +411,22 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
-                  U_pair=None, W_pre_angular=None) -> None:
+                  U_pair=None, W_pre_angular=None, c_pair=None) -> None:
+    if getattr(model, "_neighbor_readout", False):
+        # Clean break: the multi-channel readout changed the tail layout
+        # (W1 [T, H, C]; c_pair when dipole_species_pairs). Old neighbor-mode
+        # saves cannot be mapped — fail loudly. tnep-mode saves unaffected.
+        if tuple(np.shape(W1)) != tuple(model.W1.shape) or (
+                model._species_pairs and c_pair is None):
+            raise ValueError(
+                f"neighbor-readout save predates the multi-channel Chebyshev "
+                f"readout (saved W1 shape {tuple(np.shape(W1))}, model needs "
+                f"{tuple(model.W1.shape)}"
+                + (", c_pair missing" if model._species_pairs and c_pair is None
+                   else "")
+                + "). Old neighbor-mode saves are unsupported — re-train.")
+        if model._species_pairs:
+            model.c_pair.assign(c_pair)
     model.W0.assign(W0)
     model.b0.assign(b0)
     model.W1.assign(W1)
@@ -481,6 +500,7 @@ def _load_model_h5(path: str) -> TNEP:
             "W1_pol": wg["W1_pol"][:] if "W1_pol" in wg else None,
             "b1_pol": wg["b1_pol"][:] if "b1_pol" in wg else None,
             "U_pair": wg["U_pair"][:] if "U_pair" in wg else None,
+            "c_pair": wg["c_pair"][:] if "c_pair" in wg else None,
             "W_pre_angular": (wg["W_pre_angular"][:]
                               if "W_pre_angular" in wg else None),
         }
