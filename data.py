@@ -363,7 +363,7 @@ def assemble_data_dict(
     # kernel V (data-static; delivered to the forwards via the W_atom slot).
     if (cfg.target_mode == 1
             and getattr(cfg, "dipole_readout", "tnep") == "neighbor"):
-        data["V_atom"] = [_neighbor_dipole_V(s, float(cfg.dipole_rc))
+        data["V_atom"] = [_neighbor_dipole_V(s, float(cfg.dipole_rc or cfg.rcut_hard))
                           for s in dataset]
 
     # Auto-detect and include force/virial targets for PES mode
@@ -412,7 +412,7 @@ def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
     warns on net-charged frames and on label distributions with ~e·L gaps
     (branch-inconsistent Berry-phase labels).
     """
-    rc, rd = float(cfg.dipole_rc), float(cfg.rcut_hard)
+    rc, rd = float(cfg.dipole_rc or cfg.rcut_hard), float(cfg.rcut_hard)
     L_min = np.inf
     for k, s in enumerate(dataset):
         if s.pbc.any():

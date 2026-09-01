@@ -25,9 +25,9 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- dataset & split -----------------------------------------------
-    data_path: str = "datasets/train.xyz"
+    data_path: str = "datasets/train_waterbulk.xyz"
     # Separate test dataset (None = split from data_path; str = path to external .xyz)
-    test_data_path: str | None = "datasets/test.xyz"
+    test_data_path: str | None = "datasets/test_waterbulk.xyz"
     # Filter dataset to structures containing only these species
     # (None = no filter; list of int or str, e.g. [6, 1, 8] or ["C", "H", "O"])
     allowed_species: list[int | str] | None = [6, 1, 8]
@@ -73,12 +73,12 @@ class TNEPconfig:
     #   "tnep"     : descriptor-gradient form above (dipole_rij_power applies)
     #   "neighbor" : neighbor basis μ = Σ_i s_i·v_i, v_i = Σ_j f_c(|d_ij|)·d_ij,
     #                d_ij = r_i − r_j (MIC), f_c(r) = ((1+cos(πr/r_c))/2)²
-    dipole_readout: str = "tnep"
-    # Neighbor-readout cutoff r_c (Å). Must be ≤ rcut_hard (checked at model
-    # init) and satisfy dipole_rc + rcut_hard ≤ L_min for every training box
-    # (checked at data assembly). Squared cosine narrows effective support —
-    # tune r_c for it, don't inherit a plain-cosine value.
-    dipole_rc: float = 3.5
+    dipole_readout: str = "neighbor"
+    # Neighbor-readout cutoff r_c (Å). None = inherit rcut_hard (resolved at
+    # model init). Must be ≤ rcut_hard and satisfy dipole_rc + rcut_hard ≤
+    # L_min for every training box (checked at data assembly). Note the
+    # squared cosine narrows effective support vs the plain cosine.
+    dipole_rc: float | None = None
 
     # ═══════════════════════════════════════════════════════════════════
     # 2. DESCRIPTOR (SOAP-turbo)

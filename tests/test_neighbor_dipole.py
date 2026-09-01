@@ -284,6 +284,12 @@ def test_dipole_rc_exceeding_rcut_raises_at_init():
         _model(cfg)
 
 
+def test_dipole_rc_inherits_rcut_hard():
+    cfg = _cfg(dipole_rc=None)                           # default: inherit
+    _model(cfg)
+    assert cfg.dipole_rc == cfg.rcut_hard
+
+
 def test_charge_aux_weight_raises_at_init():
     cfg = _cfg()
     setattr(cfg, "charge_aux_weight", 0.5)

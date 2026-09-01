@@ -23,7 +23,7 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "dipole_rij_power": 2,
     # Pre-existence: only the TNEP-form readout existed.
     "dipole_readout": "tnep",
-    "dipole_rc": 3.5,
+    "dipole_rc": None,
     # Architecture-affecting fields (silent-mismatch danger zone): a
     # pre-mixing model has no U_pair, so letting the True default through
     # would build a mixing layer with random weights and mis-predict.

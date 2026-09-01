@@ -141,7 +141,9 @@ class TNEP(layers.Layer):
                     f"cfg.dipole_readout must be 'tnep' or 'neighbor', "
                     f"got {_readout!r}.")
             if self._neighbor_readout:
-                _rc = float(getattr(cfg, "dipole_rc", 3.5))
+                if getattr(cfg, "dipole_rc", None) is None:
+                    cfg.dipole_rc = float(cfg.rcut_hard)  # inherit descriptor cutoff
+                _rc = float(cfg.dipole_rc)
                 if not 0.0 < _rc <= float(cfg.rcut_hard):
                     raise ValueError(
                         f"cfg.dipole_rc={_rc} must satisfy "
