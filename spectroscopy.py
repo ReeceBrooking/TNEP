@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
-from data import cell_to_box
+from data import cell_to_box, assign_type_indices
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from ase import Atoms
@@ -675,6 +676,9 @@ def _get_fused_predict(model: 'TNEP'):
     # Optional second hidden layer (None for 1-layer models → single-layer forward).
     Wh_t  = _to_tensor(getattr(model, "Wh", None))
     bh_t  = _to_tensor(getattr(model, "bh", None))
+    # Optional charge head.
+    W1q_t = _to_tensor(getattr(model, "W1_q", None))
+    bq_t  = _to_tensor(getattr(model, "b_q", None))
 
     # Not jit_compile: predict_batch has shape-dependent stacks in
     # _calc_forces_coo (varying P per call) that XLA can't lower, and the
@@ -706,6 +710,7 @@ def _get_fused_predict(model: 'TNEP'):
             W0_t, b0_t, W1_t, b1_t,
             W0p_t, b0p_t, W1p_t, b1p_t,
             Wh=Wh_t, bh=bh_t,
+            W1_q=W1q_t, b_q=bq_t,
         )
         # predict_batch returns the TOTAL dipole (not per-atom) regardless of
         # cfg.scale_targets, so do NOT multiply by num_atoms.
@@ -962,6 +967,7 @@ def predict_trajectory_batch(
             getattr(model, 'W1_pol', None),
             getattr(model, 'b1_pol', None),
             Wh=getattr(model, 'Wh', None), bh=getattr(model, 'bh', None),
+            W1_q=getattr(model, 'W1_q', None), b_q=getattr(model, 'b_q', None),
         )
         # predict_batch returns the TOTAL dipole regardless of
         # cfg.scale_targets; no per-atom→total rescaling needed.
@@ -1147,3 +1153,174 @@ def plot_raman_spectrum(freq_cm: np.ndarray, I_VV: np.ndarray, I_VH: np.ndarray,
     ax.legend()
     plt.tight_layout()
     _finish_fig(fig, cfg, "raman_spectrum", save_plots, show_plots)
+
+
+# --------------------------------------------------------------------------
+# Finite-difference dipole derivatives: ∂μ_α/∂r_iβ and ∂²μ_α/∂r_iβ∂r_jγ.
+# The SOAP backends supply first descriptor derivatives only and enter TF as
+# tf.constant(rjs, thetas, phis) built in NumPy, so there is no differentiable
+# positions → μ path; FD over predict_trajectory_batch is the whole method.
+# --------------------------------------------------------------------------
+
+
+def _fd_stencil(D: int):
+    """Yield central-difference points as ((dof, sign), ...), in the order
+    _fd_assemble indexes them: base, the 2·D single displacements (shared by
+    the first derivative and both second-derivative formulas), then the two
+    diagonal points (++, --) per off-diagonal pair.
+
+    1 + 2D + D(D-1) points ≈ D² — half the 4-point mixed formula's cost at the
+    same O(h²) error, because the singles are reused.
+    """
+    yield ()
+    for a in range(D):
+        yield ((a, 1),)
+        yield ((a, -1),)
+    for a in range(D):
+        for b in range(a + 1, D):
+            yield ((a, 1), (b, 1))
+            yield ((a, -1), (b, -1))
+
+
+def _fd_assemble(P: np.ndarray, D: int, h: float):
+    """Turn the [n_points, 3] stencil evaluations into (μ, ∂μ, ∂²μ).
+
+        ∂μ/∂x_a    = [f(+a) - f(-a)] / 2h
+        ∂²μ/∂x_a²  = [f(+a) - 2f(0) + f(-a)] / h²
+        ∂²μ/∂x_a∂x_b = [f(+a+b) + f(-a-b) - f(+a) - f(-a) - f(+b) - f(-b)
+                        + 2f(0)] / 2h²
+    """
+    mu = P[0]
+    sp = P[1:1 + 2 * D:2]           # f(+a)
+    sm = P[2:1 + 2 * D:2]           # f(-a)
+    pp = P[1 + 2 * D::2]            # f(+a+b), pair order = np.triu_indices
+    mm = P[2 + 2 * D::2]            # f(-a-b)
+
+    dmu = (sp - sm) / (2.0 * h)
+
+    d2 = np.empty((D, D, 3), dtype=np.float64)
+    ia, ib = np.triu_indices(D, 1)
+    off = (pp + mm - sp[ia] - sm[ia] - sp[ib] - sm[ib] + 2.0 * mu) / (2.0 * h * h)
+    d2[ia, ib] = off
+    d2[ib, ia] = off
+    d = np.arange(D)
+    d2[d, d] = (sp - 2.0 * mu + sm) / (h * h)
+    return mu, dmu, d2
+
+
+def _fd_derivatives(model, frames, dofs, h, builder, batch_size, verbose,
+                    **traj_kw) -> np.ndarray:
+    """Evaluate the FD stencil for `dofs` on every frame; returns [F, n_points, C].
+
+    One flat stream of (frame, stencil point) over the WHOLE trajectory, fed to
+    predict_trajectory_batch in full-size batches — the same batching the
+    process_trajectory path relies on. Chunking per frame instead would leave
+    the last chunk of every frame short and re-pay the XLA retrace each time.
+    """
+    from itertools import islice
+
+    D = len(dofs)
+    n_points = 1 + 2 * D + D * (D - 1)
+    types_per_frame = assign_type_indices(frames, model.cfg.types)
+
+    def _points():
+        for fi, frame in enumerate(frames):
+            for pts in _fd_stencil(D):
+                yield fi, frame, pts
+
+    stream = _points()
+    preds = []
+    pbar = tqdm(total=len(frames) * n_points, desc="FD evals",
+                unit="eval", disable=not verbose)
+    while True:
+        chunk = list(islice(stream, batch_size))
+        if not chunk:
+            break
+        batch, batch_types = [], []
+        for fi, frame, pts in chunk:
+            f = frame.copy()
+            for a, s in pts:
+                i, c = dofs[a]
+                f.positions[i, c] += s * h
+            batch.append(f)
+            batch_types.append(types_per_frame[fi])
+        preds.append(predict_trajectory_batch(
+            model, builder, batch, batch_types, **traj_kw))
+        pbar.update(len(chunk))
+    pbar.close()
+
+    # Stream is frame-major, so a flat concat reshapes straight into frames.
+    P = np.concatenate(preds, axis=0).astype(np.float64)
+    return P.reshape(len(frames), n_points, P.shape[-1])
+
+
+def dipole_derivatives_fd(
+    model: 'TNEP',
+    frames,
+    atom_idx=None,
+    h: float = 0.02,
+    builder: DescriptorBuilder | None = None,
+    batch_size: int = 64,
+    index: str = ':',
+    verbose: bool = True,
+    **traj_kw,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dipoles and their first and second position derivatives for a truncated
+    trajectory, by central finite differences over predict_trajectory_batch.
+
+    Args:
+        model     : trained dipole model (cfg.target_mode == 1)
+        frames    : list of ase.Atoms, or a path to an .xyz read with `index`
+        atom_idx  : atoms to differentiate w.r.t. (default: all — see cost).
+                    Restrict this: cost is ≈ (3·n_sel)² dipole evaluations PER
+                    FRAME, so a 192-atom box is ~3.3e5 evals/frame while one
+                    water molecule is 91.
+        h         : displacement in Å. Predictions are float32, so the second
+                    derivative's roundoff floor scales as ~1e-7/h²; below
+                    ~0.01 Å the noise beats the O(h²) truncation error.
+        builder   : descriptor builder (default: model.builder)
+        **traj_kw : forwarded to predict_trajectory_batch (descriptor_precision,
+                    pin_to_cpu, ...)
+
+    Returns:
+        mu   : [F, 3]
+        dmu  : [F, n_sel, 3, 3]            ∂μ_α/∂r_iβ  (index order i, β, α)
+        d2mu : [F, n_sel, 3, n_sel, 3, 3]  ∂²μ_α/∂r_iβ∂r_jγ
+    """
+    if model.cfg.target_mode != 1:
+        raise ValueError(
+            f"dipole_derivatives_fd needs a dipole model (target_mode=1), "
+            f"got target_mode={model.cfg.target_mode}.")
+
+    if isinstance(frames, str):
+        from ase.io import read as _ase_read
+        frames = _ase_read(frames, index=index)
+    if not isinstance(frames, list):
+        frames = list(frames)
+    if builder is None:
+        builder = model.builder
+
+    n_atoms = len(frames[0])
+    if atom_idx is None:
+        atom_idx = np.arange(n_atoms)
+    atom_idx = np.asarray(atom_idx, dtype=int)
+    dofs = [(int(i), c) for i in atom_idx for c in range(3)]
+    D = len(dofs)
+    n_points = 1 + 2 * D + D * (D - 1)
+
+    if verbose:
+        print(f"FD dipole derivatives: {len(frames)} frames × {n_points} "
+              f"dipole evaluations ({D} DOF, h={h} Å) = "
+              f"{len(frames) * n_points} total")
+
+    P = _fd_derivatives(model, frames, dofs, h, builder, batch_size, verbose,
+                        **traj_kw)
+
+    mu_all, dmu_all, d2_all = [], [], []
+    for fi in range(len(frames)):
+        mu, dmu, d2 = _fd_assemble(P[fi], D, h)
+        mu_all.append(mu)
+        dmu_all.append(dmu.reshape(len(atom_idx), 3, 3))
+        d2_all.append(d2.reshape(len(atom_idx), 3, len(atom_idx), 3, 3))
+
+    return (np.stack(mu_all), np.stack(dmu_all), np.stack(d2_all))
