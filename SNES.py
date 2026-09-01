@@ -41,7 +41,7 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     model.b0.assign(params[idx]); idx += 1
     model.W1.assign(params[idx]); idx += 1
     model.b1.assign(params[idx]); idx += 1
-    if getattr(model, "_neighbor_readout", False) and model._species_pairs:
+    if model._neighbor_readout and model._species_pairs:
         model.c_pair.assign(params[idx]); idx += 1
     if model.cfg.target_mode == 2:
         model.W0_pol.assign(params[idx]); idx += 1
@@ -388,6 +388,25 @@ class SNES:
         recomb_w_np = self._recomb_w.numpy()
         self._mu_eff = float(1.0 / np.sum(recomb_w_np ** 2))
 
+    def _global_typed(self, pv):
+        """Global-reg parameter slice for batched [P, dim] vectors → (typed
+        [P, n], n). Typed ANN weights, plus c_pair (pair-indexed, rides the
+        global term) when present, plus the mode-2 second ANN. Excludes b1.
+        Single source of truth for the tail-skip arithmetic."""
+        typed = pv[:, :self.n_typed]
+        n = self.n_typed
+        if self.n_c > 0:
+            typed = tf.concat(
+                [typed, pv[:, self.n_typed + 1:self.n_typed + 1 + self.n_c]],
+                axis=1)
+            n += self.n_c
+        if self.cfg.target_mode == 2:
+            typed = tf.concat(
+                [typed, pv[:, self.n_primary:self.n_primary + self.n_typed]],
+                axis=1)
+            n = 2 * self.n_typed
+        return typed, n
+
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray
                                ) -> tuple[float, float, float]:
         """Compute L1 and L2 regularisation penalties (eager, on μ).
@@ -417,16 +436,7 @@ class SNES:
                 total_l2 += self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(type_params)) / n_per_type)
 
             # Global term over typed params only (excludes b1).
-            typed = tf.concat([pv[:self.n_typed]], axis=0)
-            n_typed_total = self.n_typed
-            if self.n_c > 0:  # c_pair rides the global term (pair-indexed)
-                typed = tf.concat(
-                    [typed, pv[self.n_typed + 1:self.n_typed + 1 + self.n_c]],
-                    axis=0)
-                n_typed_total += self.n_c
-            if self.cfg.target_mode == 2:
-                typed = tf.concat([typed, pv[self.n_primary:self.n_primary + self.n_typed]], axis=0)
-                n_typed_total = 2 * self.n_typed
+            typed, n_typed_total = self._global_typed(pv[tf.newaxis])
             l1 = total_l1 / T + self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / n_typed_total
             l2 = total_l2 / T + self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed)) / n_typed_total)
         else:
@@ -705,17 +715,7 @@ class SNES:
             fitness_per_type.append(fitness_per_type_rmse[:, t] + l1 + l2)
 
         # Global ranking (type T): regularize over all typed params, excluding b1
-        typed = samples[:, :self.n_typed]
-        n_typed_total = self.n_typed
-        if self.n_c > 0:  # c_pair rides the global term (pair-indexed)
-            typed = tf.concat(
-                [typed,
-                 samples[:, self.n_typed + 1:self.n_typed + 1 + self.n_c]],
-                axis=1)
-            n_typed_total += self.n_c
-        if self.cfg.target_mode == 2:
-            typed = tf.concat([typed, samples[:, self.n_primary:self.n_primary + self.n_typed]], axis=1)
-            n_typed_total = 2 * self.n_typed
+        typed, n_typed_total = self._global_typed(samples)
         global_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed), axis=1) / n_typed_total
         global_l2 = self.lambda_2 * tf.sqrt(
             tf.reduce_sum(tf.square(typed), axis=1) / n_typed_total)
@@ -1683,18 +1683,7 @@ class SNES:
                 total_l2 += self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(type_params), axis=1) / n_per_type)
 
             # Global term over typed params only (excludes b1).
-            typed = param_vectors[:, :self.n_typed]  # [P, n_typed]
-            n_typed_total = self.n_typed
-            if self.n_c > 0:  # c_pair rides the global term (pair-indexed)
-                typed = tf.concat(
-                    [typed, param_vectors[
-                        :, self.n_typed + 1:self.n_typed + 1 + self.n_c]],
-                    axis=1)
-                n_typed_total += self.n_c
-            if self.cfg.target_mode == 2:
-                typed2 = param_vectors[:, self.n_primary:self.n_primary + self.n_typed]
-                typed = tf.concat([typed, typed2], axis=1)
-                n_typed_total = 2 * self.n_typed
+            typed, n_typed_total = self._global_typed(param_vectors)
             global_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed), axis=1) / n_typed_total
             global_l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed), axis=1) / n_typed_total)
 

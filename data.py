@@ -401,14 +401,8 @@ def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
     keep = i != j                                  # drop self-image pairs
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
     r = np.linalg.norm(d, axis=1)
-    x = 2.0 * r / rc - 1.0
-    Tn = np.empty((len(r), C))
-    Tn[:, 0] = 1.0
-    if C > 1:
-        Tn[:, 1] = x
-    for n in range(2, C):
-        Tn[:, n] = 2.0 * x * Tn[:, n - 1] - Tn[:, n - 2]
-    Rw = Tn * (((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2)[:, None]  # [P, C]
+    Tn = np.polynomial.chebyshev.chebvander(2.0 * r / rc - 1.0, C - 1)  # [P, C]
+    Rw = Tn * (((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2)[:, None]
     V = np.zeros((len(atoms), T, 3, C))
     np.add.at(V, (i, np.asarray(types_int)[j]),
               d[:, :, None] * Rw[:, None, :])
@@ -732,7 +726,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     if has_virials:
         virial_np = np.zeros((S, 6), dtype=np.float32)
     if has_V:
-        V_np = np.zeros((S, max_atoms) + np.shape(data["V_atom"][0])[1:],
+        V_np = np.zeros((S, max_atoms) + data["V_atom"][0].shape[1:],
                         dtype=np.float32)
     if num_types is not None:
         types_contained_np = np.zeros((S, num_types), dtype=np.float32)

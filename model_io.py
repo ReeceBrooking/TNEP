@@ -208,7 +208,7 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             wg.create_dataset("b1_pol", data=model.b1_pol.numpy())
         # Neighbor readout: learned species-pair coefficient table (only when
         # dipole_species_pairs; frozen c ≡ 1 is rebuilt at load, not stored).
-        if getattr(model, "_neighbor_readout", False) and model._species_pairs:
+        if model._neighbor_readout and model._species_pairs:
             wg.create_dataset("c_pair", data=model.c_pair.numpy())
         # Optional descriptor-mixing layer, stored only when trained with
         # cfg.descriptor_mixing=True. Dataset "U_pair" holds the residual
@@ -412,7 +412,7 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
                   U_pair=None, W_pre_angular=None, c_pair=None) -> None:
-    if getattr(model, "_neighbor_readout", False):
+    if model._neighbor_readout:
         # Clean break: the multi-channel readout changed the tail layout
         # (W1 [T, H, C]; c_pair when dipole_species_pairs). Old neighbor-mode
         # saves cannot be mapped — fail loudly. tnep-mode saves unaffected.

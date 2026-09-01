@@ -353,7 +353,7 @@ def _print_param_breakdown(model) -> None:
     _b1_label = ("ANN  b1  (unused: neighbor readout)"
                  if model._neighbor_readout else "ANN  b1")
     rows.append((_b1_label,          int(opt._n_b1)))
-    if int(getattr(opt, "n_c", 0)) > 0:
+    if opt.n_c > 0:
         rows.append(("c_pair  [C·T(T+1)/2]", int(opt.n_c)))
 
     # Polarisability ANN — same per-layer shape, mirrored doubling.
