@@ -1310,7 +1310,7 @@ class SNES:
                     _sub = _cache_top.setdefault(_vd_id, {})
                     W_atom_v = _sub.get(chunk_idx)
                 if W_atom_v is None:
-                    if getattr(self.model, "_neighbor_readout", False):
+                    if self.model._neighbor_readout:
                         # Neighbor readout: V [B,A,3] geometry kernel,
                         # precomputed in data.py — same slot as W_atom.
                         W_atom_v = chunk["V_atom"]
@@ -1773,7 +1773,7 @@ class SNES:
                 if _W_atom_cached is not None:
                     chunk["_W_atom"] = _W_atom_cached
             if self.cfg.target_mode == 1 and "_W_atom" not in chunk:
-                if getattr(self.model, "_neighbor_readout", False):
+                if self.model._neighbor_readout:
                     # Neighbor readout: V [B,A,3] geometry kernel from
                     # data.py rides the batch — same slot as W_atom.
                     chunk["_W_atom"] = chunk["V_atom"]
@@ -1947,7 +1947,7 @@ class SNES:
             # loop reuses it; inline fallback for other callers (score, etc.).
             W_atom = batch_data.get("_W_atom")
             if W_atom is None and self.cfg.target_mode == 1:
-                if getattr(self.model, "_neighbor_readout", False):
+                if self.model._neighbor_readout:
                     # Neighbor readout: V [B,A,3] geometry kernel from
                     # data.py — same slot as W_atom.
                     W_atom = batch_data["V_atom"]

@@ -6,6 +6,7 @@ from TNEPconfig import TNEPconfig
 from DescriptorBuilder import make_descriptor_builder
 from ase.io import read
 from ase import Atoms
+from ase.neighborlist import neighbor_list
 
 
 BOHR_TO_ANGSTROM = 0.529177210903
@@ -341,6 +342,11 @@ def assemble_data_dict(
         factor = _dipole_conversion_factor(cfg.dipole_units)
         if factor != 1.0:
             targets = [t * factor for t in targets]
+    # Guards read TOTAL-cell dipoles (branch-gap quantum e·L), so run them
+    # before any per-atom scaling.
+    if (cfg.target_mode == 1
+            and getattr(cfg, "dipole_readout", "tnep") == "neighbor"):
+        _neighbor_dipole_guards(dataset, targets, cfg)
     if cfg.scale_targets and cfg.target_mode == 1:
         targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
     data = {
@@ -357,7 +363,6 @@ def assemble_data_dict(
     # kernel V (data-static; delivered to the forwards via the W_atom slot).
     if (cfg.target_mode == 1
             and getattr(cfg, "dipole_readout", "tnep") == "neighbor"):
-        _neighbor_dipole_guards(dataset, targets, cfg)
         data["V_atom"] = [_neighbor_dipole_V(s, float(cfg.dipole_rc))
                           for s in dataset]
 
@@ -388,7 +393,6 @@ def _neighbor_dipole_V(atoms: Atoms, rc: float) -> np.ndarray:
     """Per-atom geometry vector of the neighbor-basis dipole readout:
     v_i = Σ_{j≠i, |d|<rc} f_c(|d|)·d, d = r_i − r_j (image pairs),
     f_c(r) = ((1+cos(πr/rc))/2)². float64 accumulate → float32 [N, 3]."""
-    from ase.neighborlist import neighbor_list
     i, j, D = neighbor_list("ijD", atoms, rc)
     keep = i != j                                  # drop self-image pairs
     i, d = i[keep], -D[keep].astype(np.float64)    # ase D = r_j − r_i

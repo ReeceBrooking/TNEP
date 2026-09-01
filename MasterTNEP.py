@@ -349,7 +349,7 @@ def _print_param_breakdown(model) -> None:
     # b1 stays in the SNES tail for layout stability but cancels identically
     # in the neighbor-basis dipole readout (Σ_i v_i ≡ 0).
     _b1_label = ("ANN  b1  (unused: neighbor readout)"
-                 if getattr(model, "_neighbor_readout", False) else "ANN  b1")
+                 if model._neighbor_readout else "ANN  b1")
     rows.append((_b1_label,          int(opt._n_b1)))
 
     # Polarisability ANN — same per-layer shape, mirrored doubling.
@@ -475,7 +475,7 @@ def _train_model_inner(cfg: TNEPconfig,
         print(f"Preprocess contraction ({cfg.descriptor_preprocess_contract}): "
               f"Q_raw={q_raw} → Q_new={q_new}  "
               f"(×{ratio:.2f} compression, {reduce:.1f}% reduction)")
-    if getattr(model, "_neighbor_readout", False):
+    if model._neighbor_readout:
         print(f"Dipole readout: neighbor basis — μ = Σ_i s_i·v_i, "
               f"v_i = Σ_j f_c(|d_ij|)·d_ij, f_c = ((1+cos(πr/r_c))/2)², "
               f"r_c = {cfg.dipole_rc} Å")

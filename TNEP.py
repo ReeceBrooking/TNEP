@@ -660,7 +660,7 @@ class TNEP(layers.Layer):
             center = tf.range(tf.shape(grad_index)[0],
                               dtype=grad_index.dtype)[:, tf.newaxis]
             keep = tf.logical_and(rij < rc, tf.not_equal(grad_index, center))
-            fc = tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * rij)))
+            fc = self._fc2(rij)
             w = fc * tf.cast(keep, rij.dtype) * neighbor_mask         # [A, M]
             V = tf.reduce_sum(                       # float64 accumulate
                 tf.cast(w[:, :, tf.newaxis] * -dr, tf.float64), axis=1)
@@ -1536,6 +1536,12 @@ class TNEP(layers.Layer):
         rij2 = tf.reduce_sum(tf.square(dr), axis=-1)         # [P]
         return dr, rij2
 
+    def _fc2(self, r: tf.Tensor) -> tf.Tensor:
+        """Squared-cosine dipole cutoff f_c(r) = ((1+cos(πr/r_c))/2)²;
+        callers mask r ≥ dipole_rc to zero."""
+        rc = float(self.cfg.dipole_rc)
+        return tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * r)))
+
     def _neighbor_V_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
                         box_inv: tf.Tensor, pair_struct: tf.Tensor,
                         pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
@@ -1554,7 +1560,7 @@ class TNEP(layers.Layer):
             positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
         rc = float(self.cfg.dipole_rc)
         r = tf.sqrt(rij2)
-        fc = tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * r)))
+        fc = self._fc2(r)
         keep = tf.logical_and(r < rc, tf.not_equal(pair_atom, pair_gidx))
         w = fc * tf.cast(keep, fc.dtype)                             # [P]
         contrib = tf.cast(w[:, tf.newaxis] * -dr, tf.float64)  # d = − (nbr−ctr)
