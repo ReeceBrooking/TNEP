@@ -283,9 +283,10 @@ _SCAN_H = 0.03
 
 
 def _rc_scan(cfg):
-    """μ(r) for an OH dimer scanned through r_c = 3.0 → (rs, mus [K, 3])."""
+    """μ(r) for an OH dimer scanned through cfg.dipole_rc → (rs, mus [K, 3])."""
     model = _model(cfg)
-    rs = np.arange(2.70, 3.30 + 1e-9, _SCAN_H)
+    rc = float(cfg.dipole_rc)
+    rs = np.arange(rc - 0.3, rc + 0.3 + 1e-9, _SCAN_H)
     mus = []
     for r in rs:
         at = Atoms("OH", positions=[[10.0, 10.0, 10.0], [10.0 + r, 10.0, 10.0]],

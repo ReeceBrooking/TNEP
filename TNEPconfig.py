@@ -75,8 +75,8 @@ class TNEPconfig:
     #                coefficients:
     #                  b_ij = Σ_n c_n[p(t_i,t_j)]·R_n(r_ij)·(s_i^n − s_j^n)
     #                  μ = Σ_{i<j} b_ij·(r_i − r_j)   (MIC displacements)
-    #                R_n(r) = T_n(2r/r_c − 1)·f_c(r) (Chebyshev, 1st kind),
-    #                f_c(r) = ((1+cos(πr/r_c))/2)²
+    #                R_n(r) = T_n(2r/r_c − 1)·f_c(r) (Chebyshev, 1st kind;
+    #                f_c per dipole_cutoff)
     dipole_readout: str = "neighbor"
     # Number of Chebyshev radial channels C of the neighbor readout (n =
     # 0..C−1). C=1 with c≡1 reduces to the plain f_c single-channel form.
