@@ -45,6 +45,9 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     # Pre-existence: only the Chebyshev radial existed; ζ unused there.
     "dipole_radial": "chebyshev",
     "dipole_zeta": -2.0,
+    # Pre-existence: cutoff hard-wired per radial family; None resolves to
+    # exactly that (resolved_dipole_cutoff).
+    "dipole_cutoff": None,
     # Pre-existence: no species-pair table (legacy bool False ≡ "off").
     "dipole_species_pairs": "off",
 }

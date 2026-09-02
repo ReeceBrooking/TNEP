@@ -7,7 +7,7 @@ from typing import Callable
 
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
-from TNEPconfig import TNEPconfig
+from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
 
 
 class TNEP(layers.Layer):
@@ -114,6 +114,7 @@ class TNEP(layers.Layer):
         self._dipole_channels = int(cfg.dipole_channels)
         self._dipole_radial = str(cfg.dipole_radial)
         self._dipole_zeta = float(cfg.dipole_zeta)
+        self._dipole_cutoff = resolved_dipole_cutoff(cfg)
         # Legacy bool → 3-value field: False→"off", True→"symmetric".
         _sp = cfg.dipole_species_pairs
         cfg.dipole_species_pairs = {False: "off", True: "symmetric"}.get(_sp, _sp)
@@ -129,6 +130,11 @@ class TNEP(layers.Layer):
                 raise ValueError(
                     f"cfg.dipole_radial must be 'chebyshev' or 'screened', "
                     f"got {self._dipole_radial!r}.")
+            if self._dipole_cutoff not in ("cosine2", "cubic"):
+                raise ValueError(
+                    f"cfg.dipole_cutoff must be 'cosine2', 'cubic' or None "
+                    f"(None = the radial family's traditional form), got "
+                    f"{cfg.dipole_cutoff!r}.")
             if self._dipole_radial == "screened" and self._dipole_channels != 1:
                 # RAISE, don't force: data assembly reads cfg.dipole_channels
                 # before the model exists (data.py V build), so silently
@@ -1633,35 +1639,38 @@ class TNEP(layers.Layer):
         rij2 = tf.reduce_sum(tf.square(dr), axis=-1)         # [P]
         return dr, rij2
 
-    def _fc2(self, r: tf.Tensor) -> tf.Tensor:
-        """Squared-cosine dipole cutoff f_c(r) = ((1+cos(πr/r_c))/2)²;
-        callers mask r ≥ dipole_rc to zero."""
+    def _fc(self, r: tf.Tensor) -> tf.Tensor:
+        """Dipole cutoff f_c(r) per the resolved cfg.dipole_cutoff:
+        "cosine2" ((1+cos(πr/r_c))/2)² — C³ contact at r_c; "cubic"
+        1 − 3x² + 2x³, x = r/r_c — C¹ contact. Polynomial/trig, safe on
+        raw r; callers mask r ≥ dipole_rc to zero."""
         rc = float(self.cfg.dipole_rc)
+        if self._dipole_cutoff == "cubic":
+            x = r / rc
+            return 1.0 - 3.0 * x * x + 2.0 * x * x * x
         return tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * r)))
 
     def _cheb_R(self, r: tf.Tensor) -> tf.Tensor:
         """Chebyshev radial channels R_n(r) = T_n(2r/r_c − 1)·f_c(r),
-        n = 0..C−1, stacked on a trailing channel axis → [..., C].
-        Recurrence (not cos∘arccos) so out-of-cutoff r stays finite until
-        the caller masks it."""
+        n = 0..C−1, stacked on a trailing channel axis → [..., C]; f_c per
+        cfg.dipole_cutoff (_fc). Recurrence (not cos∘arccos) so
+        out-of-cutoff r stays finite until the caller masks it."""
         C = self._dipole_channels
         x = 2.0 * r / float(self.cfg.dipole_rc) - 1.0
         Ts = [tf.ones_like(x), x]
         for _ in range(2, C):
             Ts.append(2.0 * x * Ts[-1] - Ts[-2])
-        return tf.stack(Ts[:C], axis=-1) * self._fc2(r)[..., tf.newaxis]
+        return tf.stack(Ts[:C], axis=-1) * self._fc(r)[..., tf.newaxis]
 
     def _radial(self, r: tf.Tensor) -> tf.Tensor:
         """Radial channel matrix [..., C] per cfg.dipole_radial. Screened:
-        R(r) = r^(ζ−1)·(1 − 3x² + 2x³), x = r/r_c, single channel. Both TF
-        call sites mask AFTER the radial and real r=0 self-image entries
-        exist in the pair streams, so guard the power's INPUT (at ζ < 1,
-        0**(ζ−1) = inf and inf·0 = nan downstream)."""
+        R(r) = r^(ζ−1)·f_c(r), single channel; f_c per cfg.dipole_cutoff
+        (_fc). Both TF call sites mask AFTER the radial and real r=0
+        self-image entries exist in the pair streams, so guard the power's
+        INPUT (at ζ < 1, 0**(ζ−1) = inf and inf·0 = nan downstream)."""
         if self._dipole_radial == "screened":
-            x = r / float(self.cfg.dipole_rc)
             r_safe = tf.where(r > 0, r, tf.ones_like(r))
-            R = (r_safe ** (self._dipole_zeta - 1.0)
-                 * (1.0 - 3.0 * x * x + 2.0 * x * x * x))
+            R = r_safe ** (self._dipole_zeta - 1.0) * self._fc(r)
             return R[..., tf.newaxis]
         return self._cheb_R(r)
 

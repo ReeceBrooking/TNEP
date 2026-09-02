@@ -279,38 +279,66 @@ def test_branch_inconsistency_warning(capsys):
 
 # ── 14: smoothness at r_c ───────────────────────────────────────────────────
 
-def test_smoothness_at_rc():
-    # dipole_rc strictly inside rcut so the descriptor is smooth at r_c.
-    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0)
+_SCAN_H = 0.03
+
+
+def _rc_scan(cfg):
+    """μ(r) for an OH dimer scanned through r_c = 3.0 → (rs, mus [K, 3])."""
     model = _model(cfg)
-    rc = float(cfg.dipole_rc)
-    h = 0.03
-    rs = np.arange(2.70, 3.30 + 1e-9, h)
+    rs = np.arange(2.70, 3.30 + 1e-9, _SCAN_H)
     mus = []
     for r in rs:
         at = Atoms("OH", positions=[[10.0, 10.0, 10.0], [10.0 + r, 10.0, 10.0]],
                    cell=20.0 * np.eye(3), pbc=True)
         at.info["dipole"] = np.zeros(3)
         mus.append(_mu(model, at, cfg))
-    mus = np.array(mus)                                   # [K, 3]
+    return rs, np.array(mus)
 
+
+def _assert_smooth_at_rc(cfg, cutoff):
+    """Continuity of μ at r_c, keyed on the CUTOFF (radial-agnostic):
+    "cosine2" is a C³ contact — value, μ′ AND μ″ vanish into the
+    identically-zero region; "cubic" is C¹ only — value + μ′ vanish, the
+    μ″ jump at r_c is EXPECTED (traded for the simpler polynomial), so d2
+    is deliberately unasserted there."""
+    rc, h = float(cfg.dipole_rc), _SCAN_H
+    rs, mus = _rc_scan(cfg)
     # Beyond r_c: exactly zero (V has no pairs).
     assert np.allclose(mus[rs >= rc], 0.0, atol=1e-12)
-
     d1 = (mus[2:] - mus[:-2]) / (2 * h)
-    d2 = (mus[2:] - 2 * mus[1:-1] + mus[:-2]) / h ** 2
     n_mu = np.linalg.norm(mus, axis=1)
     n_d1 = np.linalg.norm(d1, axis=1)
-    n_d2 = np.linalg.norm(d2, axis=1)
     r_mid = rs[1:-1]
-
-    # Squared cosine ⇒ μ ∝ (rc − r)^4 near rc: value, μ', μ'' all vanish
-    # continuously into the identically-zero region — no jump at r_c.
     k_last = np.max(np.where(rs < rc))                    # last point inside
-    assert n_mu[k_last] < 1e-3 * n_mu.max()
     near = np.abs(r_mid - rc) < 1.5 * h                   # FD points straddling rc
-    assert n_d1[near].max() < 0.05 * n_d1.max()
-    assert n_d2[near].max() < 0.10 * n_d2.max()
+    if cutoff == "cosine2":
+        # μ ∝ (rc − r)^4 near rc: value, μ', μ'' all continuous — no jump.
+        d2 = (mus[2:] - 2 * mus[1:-1] + mus[:-2]) / h ** 2
+        n_d2 = np.linalg.norm(d2, axis=1)
+        assert n_mu[k_last] < 1e-3 * n_mu.max()
+        assert n_d1[near].max() < 0.05 * n_d1.max()
+        assert n_d2[near].max() < 0.10 * n_d2.max()
+    else:
+        # μ ∝ (rc − r)² near rc: value ~h² and slope ~h at the last inside
+        # points relative to their scan maxima.
+        assert n_mu[k_last] < 0.02 * n_mu.max()
+        assert n_d1[near].max() < 0.15 * n_d1.max()
+
+
+def test_smoothness_at_rc():
+    # dipole_rc strictly inside rcut so the descriptor is smooth at r_c.
+    # Default (None) cutoff for chebyshev resolves to "cosine2".
+    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0)
+    _assert_smooth_at_rc(cfg, "cosine2")
+
+
+@pytest.mark.parametrize("radial,cutoff", [("chebyshev", "cubic"),
+                                           ("screened", "cosine2")])
+def test_cross_combo_smoothness_at_rc(radial, cutoff):
+    # The two NEW radial×cutoff crosses: smoothness class follows the CUTOFF.
+    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0,
+               dipole_cutoff=cutoff, **_MODE_KW[radial])
+    _assert_smooth_at_rc(cfg, cutoff)
 
 
 # ── 15: single H₂O sanity — μ nonzero, along the molecular bisector ─────────
@@ -456,33 +484,11 @@ def test_screened_identity_user_formula():
 
 def test_screened_smoothness_at_rc():
     # Screened cubic f_cub = (1−x)²(1+2x): f(r_c) = f′(r_c) = 0 but
-    # f″(r_c) = 6/r_c² ≠ 0 — C¹ contact only. Assert value + first FD
-    # derivative continuous; the second-derivative jump at r_c is EXPECTED
-    # (traded for the power-law screening), so d2 is deliberately unasserted.
+    # f″(r_c) = 6/r_c² ≠ 0 — C¹ contact only. Default (None) cutoff for
+    # screened resolves to "cubic".
     cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0,
                dipole_radial="screened", dipole_channels=1, dipole_zeta=-2.0)
-    model = _model(cfg)
-    rc = float(cfg.dipole_rc)
-    h = 0.03
-    rs = np.arange(2.70, 3.30 + 1e-9, h)
-    mus = []
-    for r in rs:
-        at = Atoms("OH", positions=[[10.0, 10.0, 10.0], [10.0 + r, 10.0, 10.0]],
-                   cell=20.0 * np.eye(3), pbc=True)
-        at.info["dipole"] = np.zeros(3)
-        mus.append(_mu(model, at, cfg))
-    mus = np.array(mus)
-    assert np.allclose(mus[rs >= rc], 0.0, atol=1e-12)   # beyond r_c: zero
-    d1 = (mus[2:] - mus[:-2]) / (2 * h)
-    n_mu = np.linalg.norm(mus, axis=1)
-    n_d1 = np.linalg.norm(d1, axis=1)
-    r_mid = rs[1:-1]
-    # μ ∝ (r_c − r)² near r_c ⇒ value ~h² and slope ~h at the last inside
-    # points relative to their scan maxima.
-    k_last = np.max(np.where(rs < rc))
-    assert n_mu[k_last] < 0.02 * n_mu.max()
-    near = np.abs(r_mid - rc) < 1.5 * h
-    assert n_d1[near].max() < 0.15 * n_d1.max()
+    _assert_smooth_at_rc(cfg, "cubic")
 
 
 def test_screened_no_nan_padded_batch():
@@ -616,3 +622,84 @@ def test_legacy_bool_normalizes_at_config_load():
     cfg_f = _cfg(dipole_species_pairs=False)
     _apply_legacy_field_defaults(cfg_f, ["dipole_species_pairs"])
     assert cfg_f.dipole_species_pairs == "off"
+
+
+# ── crossable cutoff function (dipole_cutoff) ───────────────────────────────
+
+def test_cheb_cubic_identity():
+    # NEW cross combo chebyshev+cubic: independent numpy ordered-pair sum
+    # μ = Σ_(i,j) s_i^n·T_n(2r/rc − 1)·f_cub(r)·d with chebvander (not the
+    # model's TF recurrence); c ≡ 1 ("off"), C = 4.
+    cfg = _cfg(dipole_cutoff="cubic")                       # chebyshev C=4
+    model = _model(cfg)
+    atoms = _bulk_frame()
+    data = prepare_eval_data([atoms], cfg)
+    s = _site_scalars_np(model, data)                       # [A, C]
+    mu_model = _mu(model, atoms, cfg)
+    rc = float(cfg.dipole_rc)
+    i, j, D = neighbor_list("ijD", atoms, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    Tn = np.polynomial.chebyshev.chebvander(
+        2.0 * r / rc - 1.0, int(cfg.dipole_channels) - 1)   # [P, C]
+    R = Tn * _fcub(r, rc)[:, None]
+    b = np.sum(R * s[i], axis=1)                            # [P]
+    mu_ref = np.sum(b[:, None] * d, axis=0)
+    assert np.allclose(mu_model, mu_ref,
+                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
+
+
+def test_screened_cosine2_identity():
+    # NEW cross combo screened+cosine2: reference is the user's ORIGINAL
+    # s·r̂·|r|^ζ·f form (unit vector times power) with f = cosine².
+    cfg = _cfg(dipole_cutoff="cosine2", **_MODE_KW["screened"])
+    model = _model(cfg)
+    atoms = _bulk_frame()
+    data = prepare_eval_data([atoms], cfg)
+    s = _site_scalars_np(model, data)[:, 0]                 # [A]
+    mu_model = _mu(model, atoms, cfg)
+    rc, zeta = float(cfg.dipole_rc), float(cfg.dipole_zeta)
+    i, j, D = neighbor_list("ijD", atoms, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    rhat = d / r[:, None]
+    mu_ref = np.sum(s[i, None] * rhat
+                    * (r ** zeta * _fc(r, rc))[:, None], axis=0)
+    assert np.allclose(mu_model, mu_ref,
+                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
+
+
+def test_dipole_cutoff_none_resolution():
+    # None resolves at model init to the radial family's traditional form —
+    # existing configs/saves keep identical behavior.
+    from TNEPconfig import resolved_dipole_cutoff
+    cfg_c = _cfg()                                          # chebyshev
+    assert _model(cfg_c)._dipole_cutoff == "cosine2"
+    assert resolved_dipole_cutoff(cfg_c) == "cosine2"
+    cfg_s = _cfg(**_MODE_KW["screened"])
+    assert _model(cfg_s)._dipole_cutoff == "cubic"
+    assert resolved_dipole_cutoff(cfg_s) == "cubic"
+
+
+def test_unknown_dipole_cutoff_raises_at_init():
+    cfg = _cfg(dipole_cutoff="gaussian")
+    with pytest.raises(ValueError, match="dipole_cutoff"):
+        _model(cfg)
+
+
+def test_save_load_roundtrip_explicit_cutoff(tmp_path):
+    # An explicit non-default cutoff must persist through the config JSON
+    # and leave μ unchanged after load.
+    import model_io
+    cfg = _cfg(dipole_cutoff="cubic")                       # chebyshev+cubic
+    model = _model(cfg)
+    atoms = _bulk_frame()
+    mu0 = _mu(model, atoms, cfg)
+    p = str(tmp_path / "cutoff.h5")
+    model_io.save_model(model, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.dipole_cutoff == "cubic"
+    assert loaded._dipole_cutoff == "cubic"
+    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
