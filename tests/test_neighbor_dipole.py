@@ -24,7 +24,7 @@ from TNEP import TNEP
 from DescriptorBuilder import make_descriptor_builder
 from DescriptorBuilderGPU import compute_dim_q
 from data import (prepare_eval_data, assign_type_indices, assemble_data_dict,
-                  pad_and_stack, _neighbor_dipole_guards)
+                  pad_and_stack, _neighbor_dipole_guards, _neighbor_dipole_V)
 
 WATER_XYZ = os.path.join(ROOT, "datasets", "train_waterbulk.xyz")
 
@@ -49,6 +49,8 @@ def _cfg(**kw):
     cfg.dipole_species_pairs = "off"
     cfg.dipole_radial = "chebyshev"
     cfg.dipole_zeta = -2.0
+    cfg.dipole_cutoff = None
+    cfg.dipole_gauss_sigma_scale = 1.0
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)
@@ -84,10 +86,13 @@ _MODE_KW = {
     "screened": dict(dipole_radial="screened", dipole_channels=1,
                      dipole_zeta=-2.0),
     "ordered": dict(dipole_species_pairs="ordered"),
+    "chebyshev_warped": dict(dipole_radial="chebyshev_warped"),
+    "gaussian": dict(dipole_radial="gaussian"),
+    "cheb_tanh3": dict(dipole_cutoff="tanh3"),
 }
 
 
-@functools.lru_cache(maxsize=4)
+@functools.lru_cache(maxsize=8)
 def _bulk_setup(mode="chebyshev"):
     """(cfg, model, atoms, padded-data) for the 96-atom water frame — shared.
     "ordered" gets a randomized ASYMMETRIC Ω (symmetric Ω would telescope
@@ -176,7 +181,8 @@ def test_pair_difference_sum_matches_model():
 
 # ── 11: invariance suite ────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered"])
+@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered",
+                                  "gaussian"])
 def test_rigid_translation_invariance(mode):
     cfg, model, atoms, _ = _bulk_setup(mode)
     mu0 = _mu(model, atoms, cfg)
@@ -186,7 +192,8 @@ def test_rigid_translation_invariance(mode):
     assert np.allclose(mu0, mu1, atol=2e-3)
 
 
-@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered"])
+@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered",
+                                  "gaussian"])
 def test_rotation_covariance(mode):
     cfg, model, atoms, _ = _bulk_setup(mode)
     mu0 = _mu(model, atoms, cfg)
@@ -202,7 +209,8 @@ def test_rotation_covariance(mode):
     assert np.allclose(mu_rot, R @ mu0, atol=2e-3)
 
 
-@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered"])
+@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered",
+                                  "gaussian"])
 def test_single_atom_lattice_translation_invariance(mode):
     cfg, model, atoms, _ = _bulk_setup(mode)
     mu0 = _mu(model, atoms, cfg)
@@ -214,11 +222,15 @@ def test_single_atom_lattice_translation_invariance(mode):
 
 # ── 13c: four-path forward consistency (the drift alarm) ────────────────────
 
-@pytest.mark.parametrize("mode", ["chebyshev", "screened"])
+@pytest.mark.parametrize("mode", ["chebyshev", "screened", "chebyshev_warped",
+                                  "gaussian", "cheb_tanh3"])
 def test_four_path_consistency(mode):
     # The only test cross-checking all three radial dispatch sites (numpy
     # twin, predict inline, _neighbor_V_coo) against each other — catches a
-    # ζ/radial mismatch between them.
+    # ζ/radial mismatch between them. The in-graph/predict legs are the ONLY
+    # automated execution of the TF _radial/_fc branches (every μ-comparing
+    # test consumes the numpy-built V via W_atom), so the new radials and
+    # the tanh3 cross MUST be parametrized here.
     cfg, model, atoms, _ = _bulk_setup(mode)
     # Full pair stream (self_pairs_only=False) so the in-graph V path has
     # the r_d COO list to build V from.
@@ -299,9 +311,9 @@ def _rc_scan(cfg):
 def _assert_smooth_at_rc(cfg, cutoff):
     """Continuity of μ at r_c, keyed on the CUTOFF (radial-agnostic):
     "cosine2" is a C³ contact — value, μ′ AND μ″ vanish into the
-    identically-zero region; "cubic" is C¹ only — value + μ′ vanish, the
-    μ″ jump at r_c is EXPECTED (traded for the simpler polynomial), so d2
-    is deliberately unasserted there."""
+    identically-zero region; "tanh3" is C² — value, μ′, μ″ vanish with
+    pinned looser gates; "cubic"/"cosine" are C¹ only — value + μ′ vanish,
+    the μ″ jump at r_c is EXPECTED, so d2 is deliberately unasserted."""
     rc, h = float(cfg.dipole_rc), _SCAN_H
     rs, mus = _rc_scan(cfg)
     # Beyond r_c: exactly zero (V has no pairs).
@@ -319,6 +331,17 @@ def _assert_smooth_at_rc(cfg, cutoff):
         assert n_mu[k_last] < 1e-3 * n_mu.max()
         assert n_d1[near].max() < 0.05 * n_d1.max()
         assert n_d2[near].max() < 0.10 * n_d2.max()
+    elif cutoff == "tanh3":
+        # C² contact: μ ~ A(r_c − r)³ near r_c, so the last inside point
+        # (s = h = 0.03 into a 0.3 window) has value ratio (h/0.3)³ = 1e-3
+        # and d2 ratio h/0.3 = 0.10 — exactly on the cosine2 gates. The
+        # pinned looser gates below pass cleanly while a C¹ bug fails by
+        # ~4×; float32 FD noise sits ~10³ below signal.
+        d2 = (mus[2:] - 2 * mus[1:-1] + mus[:-2]) / h ** 2
+        n_d2 = np.linalg.norm(d2, axis=1)
+        assert n_mu[k_last] < 5e-3 * n_mu.max()
+        assert n_d1[near].max() < 0.05 * n_d1.max()
+        assert n_d2[near].max() < 0.25 * n_d2.max()
     else:
         # μ ∝ (rc − r)² near rc: value ~h² and slope ~h at the last inside
         # points relative to their scan maxima.
@@ -339,6 +362,14 @@ def test_cross_combo_smoothness_at_rc(radial, cutoff):
     # The two NEW radial×cutoff crosses: smoothness class follows the CUTOFF.
     cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0,
                dipole_cutoff=cutoff, **_MODE_KW[radial])
+    _assert_smooth_at_rc(cfg, cutoff)
+
+
+@pytest.mark.parametrize("cutoff", ["cosine", "tanh3"])
+def test_new_cutoff_smoothness_at_rc(cutoff):
+    # "cosine" C¹ (value + d1 only); "tanh3" C² (value + d1 + d2, pinned).
+    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0,
+               dipole_cutoff=cutoff)
     _assert_smooth_at_rc(cfg, cutoff)
 
 
@@ -602,9 +633,20 @@ def test_screened_multichannel_raises_at_init():
 
 
 def test_unknown_radial_raises_at_init():
-    cfg = _cfg(dipole_radial="gaussian")
+    cfg = _cfg(dipole_radial="banana")
     with pytest.raises(ValueError, match="dipole_radial"):
         _model(cfg)
+
+
+def test_numpy_twin_unknown_names_raise():
+    # _neighbor_dipole_V runs at data assembly, BEFORE model-init validation
+    # — an else-fallthrough there would silently compute the wrong radial.
+    at = _bulk_frame()
+    t = np.zeros(len(at), dtype=int)
+    with pytest.raises(ValueError, match="dipole_radial"):
+        _neighbor_dipole_V(at, t, 3.0, 4, 2, radial="banana")
+    with pytest.raises(ValueError, match="dipole_cutoff"):
+        _neighbor_dipole_V(at, t, 3.0, 4, 2, cutoff="banana")
 
 
 def test_unknown_species_pairs_raises_at_init():
@@ -651,6 +693,56 @@ def test_cheb_cubic_identity():
                        atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
 
 
+def test_warped_identity():
+    # chebyshev_warped, default (None→cosine2) cutoff: independent numpy
+    # ordered-pair sum with chebvander at an INDEPENDENTLY-computed
+    # x_w = 2(r/rc − 1)² − 1 (not the model's TF recurrence); c ≡ 1, C = 4.
+    cfg = _cfg(dipole_radial="chebyshev_warped")
+    model = _model(cfg)
+    atoms = _bulk_frame()
+    data = prepare_eval_data([atoms], cfg)
+    s = _site_scalars_np(model, data)                       # [A, C]
+    mu_model = _mu(model, atoms, cfg)
+    rc = float(cfg.dipole_rc)
+    i, j, D = neighbor_list("ijD", atoms, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    xw = 2.0 * (r / rc - 1.0) ** 2 - 1.0
+    Tn = np.polynomial.chebyshev.chebvander(
+        xw, int(cfg.dipole_channels) - 1)                   # [P, C]
+    R = Tn * _fc(r, rc)[:, None]
+    b = np.sum(R * s[i], axis=1)                            # [P]
+    mu_ref = np.sum(b[:, None] * d, axis=0)
+    assert np.allclose(mu_model, mu_ref,
+                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
+
+
+def test_gaussian_identity():
+    # gaussian radial at σ-scale 0.5, default (None→cosine2) cutoff:
+    # explicit exp formula with μ_n/σ RE-DERIVED here (μ_n = rc·(n+1)/(C+1),
+    # σ = scale·rc/(C+1)) — NOT read from the model; c ≡ 1, C = 4.
+    cfg = _cfg(dipole_radial="gaussian", dipole_gauss_sigma_scale=0.5)
+    model = _model(cfg)
+    atoms = _bulk_frame()
+    data = prepare_eval_data([atoms], cfg)
+    s = _site_scalars_np(model, data)                       # [A, C]
+    mu_model = _mu(model, atoms, cfg)
+    rc, C = float(cfg.dipole_rc), int(cfg.dipole_channels)
+    mu_n = rc * (np.arange(C) + 1.0) / (C + 1)              # interior points
+    sigma = 0.5 * rc / (C + 1)                              # scale × spacing
+    i, j, D = neighbor_list("ijD", atoms, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    R = (np.exp(-(r[:, None] - mu_n) ** 2 / (2.0 * sigma ** 2))
+         * _fc(r, rc)[:, None])                             # [P, C]
+    b = np.sum(R * s[i], axis=1)                            # [P]
+    mu_ref = np.sum(b[:, None] * d, axis=0)
+    assert np.allclose(mu_model, mu_ref,
+                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
+
+
 def test_screened_cosine2_identity():
     # NEW cross combo screened+cosine2: reference is the user's ORIGINAL
     # s·r̂·|r|^ζ·f form (unit vector times power) with f = cosine².
@@ -682,6 +774,10 @@ def test_dipole_cutoff_none_resolution():
     cfg_s = _cfg(**_MODE_KW["screened"])
     assert _model(cfg_s)._dipole_cutoff == "cubic"
     assert resolved_dipole_cutoff(cfg_s) == "cubic"
+    for rad in ("chebyshev_warped", "gaussian"):        # new radials: cosine2
+        cfg_n = _cfg(dipole_radial=rad)
+        assert _model(cfg_n)._dipole_cutoff == "cosine2"
+        assert resolved_dipole_cutoff(cfg_n) == "cosine2"
 
 
 def test_unknown_dipole_cutoff_raises_at_init():
@@ -703,4 +799,22 @@ def test_save_load_roundtrip_explicit_cutoff(tmp_path):
     loaded = model_io.load_model(p)
     assert loaded.cfg.dipole_cutoff == "cubic"
     assert loaded._dipole_cutoff == "cubic"
+    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
+
+
+def test_save_load_roundtrip_gaussian_tanh3(tmp_path):
+    # New cross combo gaussian+tanh3 with a non-default σ-scale: all three
+    # fields must persist through the config JSON and leave μ unchanged.
+    import model_io
+    cfg = _cfg(dipole_radial="gaussian", dipole_cutoff="tanh3",
+               dipole_gauss_sigma_scale=0.5)
+    model = _model(cfg)
+    atoms = _bulk_frame()
+    mu0 = _mu(model, atoms, cfg)
+    p = str(tmp_path / "gauss_tanh3.h5")
+    model_io.save_model(model, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.dipole_radial == "gaussian"
+    assert loaded.cfg.dipole_cutoff == "tanh3"
+    assert float(loaded.cfg.dipole_gauss_sigma_scale) == 0.5
     assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)

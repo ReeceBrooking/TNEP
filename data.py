@@ -368,7 +368,8 @@ def assemble_data_dict(
                                int(cfg.dipole_channels), int(cfg.num_types),
                                str(cfg.dipole_radial),
                                float(cfg.dipole_zeta),
-                               resolved_dipole_cutoff(cfg))
+                               resolved_dipole_cutoff(cfg),
+                               float(cfg.dipole_gauss_sigma_scale))
             for s, t in zip(dataset, types_int)]
 
     # Auto-detect and include force/virial targets for PES mode
@@ -397,26 +398,46 @@ def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
                        C: int, T: int, radial: str = "chebyshev",
                        zeta: float = -2.0,
-                       cutoff: str = "cosine2") -> np.ndarray:
+                       cutoff: str = "cosine2",
+                       gauss_sigma_scale: float = 1.0) -> np.ndarray:
     """Per-atom geometry kernel of the neighbor-basis dipole readout:
     V_i[:,n,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·d, d = r_i − r_j (image
-    pairs). R: "chebyshev" R_n = T_n(2r/rc − 1)·f_c, or "screened"
-    R = r^(ζ−1)·f_c; f_c per `cutoff` — "cosine2" ((1+cos(πr/rc))/2)² or
-    "cubic" 1 − 3x² + 2x³, x = r/rc (numpy twin of TNEP._radial/_fc; pairs
-    are filtered before the power, so no r=0 guard).
-    float64 accumulate → float32 [N, 3, C, T]."""
+    pairs). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
+    "chebyshev_warped" T_n(2(r/rc − 1)² − 1)·f_c, "gaussian"
+    exp(−(r − μ_n)²/2σ²)·f_c (μ_n interior points of linspace(0, rc, C+2),
+    σ = gauss_sigma_scale·rc/(C+1)), or "screened" r^(ζ−1)·f_c. f_c per
+    `cutoff` — "cosine2" ((1+cos(πr/rc))/2)², "cosine" (1+cos(πr/rc))/2,
+    "cubic" 1 − 3x² + 2x³, x = r/rc, or "tanh3" tanh³(1 − r/rc)/tanh³(1)
+    (numpy twin of TNEP._radial/_fc; pairs are filtered before the power,
+    so no r=0 guard). float64 accumulate → float32 [N, 3, C, T]."""
     i, j, D = neighbor_list("ijD", atoms, rc)
     keep = i != j                                  # drop self-image pairs
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
     r = np.linalg.norm(d, axis=1)
     x = r / rc
-    fc = ((1.0 - 3.0 * x * x + 2.0 * x**3) if cutoff == "cubic"
-          else ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2)
+    if cutoff == "cosine2":
+        fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    elif cutoff == "cosine":
+        fc = (1.0 + np.cos(np.pi * r / rc)) / 2.0
+    elif cutoff == "cubic":
+        fc = 1.0 - 3.0 * x * x + 2.0 * x**3
+    elif cutoff == "tanh3":
+        fc = np.tanh(1.0 - r / rc) ** 3 / np.tanh(1.0) ** 3
+    else:
+        raise ValueError(f"unknown dipole_cutoff {cutoff!r}")
     if radial == "screened":
         Rw = (r ** (zeta - 1.0) * fc)[:, None]
-    else:
-        Tn = np.polynomial.chebyshev.chebvander(2.0 * r / rc - 1.0, C - 1)  # [P, C]
+    elif radial in ("chebyshev", "chebyshev_warped"):
+        xc = (2.0 * (r / rc - 1.0) ** 2 - 1.0 if radial == "chebyshev_warped"
+              else 2.0 * r / rc - 1.0)
+        Tn = np.polynomial.chebyshev.chebvander(xc, C - 1)          # [P, C]
         Rw = Tn * fc[:, None]
+    elif radial == "gaussian":
+        mu = np.linspace(0.0, rc, C + 2)[1:-1]
+        sigma = gauss_sigma_scale * rc / (C + 1)
+        Rw = np.exp(-(r[:, None] - mu) ** 2 / (2.0 * sigma ** 2)) * fc[:, None]
+    else:
+        raise ValueError(f"unknown dipole_radial {radial!r}")
     V = np.zeros((len(atoms), T, 3, C))
     np.add.at(V, (i, np.asarray(types_int)[j]),
               d[:, :, None] * Rw[:, None, :])

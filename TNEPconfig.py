@@ -84,9 +84,15 @@ class TNEPconfig:
     # Models must be re-trained if C changes.
     dipole_channels: int = 4
     # Radial family of the neighbor readout (f_c per dipole_cutoff):
-    #   "chebyshev" : R_n(r) = T_n(2r/r_c − 1)·f_c(r), C channels (default)
-    #   "screened"  : R(r) = r^(ζ−1)·f_c(r) — single channel (requires
-    #                 dipole_channels == 1).
+    #   "chebyshev"        : R_n(r) = T_n(2r/r_c − 1)·f_c(r), C channels
+    #   "chebyshev_warped" : R_n(r) = T_n(x_w)·f_c(r), NEP's squared warp
+    #                        x_w = 2(r/r_c − 1)² − 1 — resolution
+    #                        concentrated at short range, C channels
+    #   "gaussian"         : R_n(r) = exp(−(r − μ_n)²/2σ²)·f_c(r), μ_n the
+    #                        C interior points of linspace(0, r_c, C+2),
+    #                        σ = dipole_gauss_sigma_scale × spacing
+    #   "screened"         : R(r) = r^(ζ−1)·f_c(r) — single channel
+    #                        (requires dipole_channels == 1).
     dipole_radial: str = "chebyshev"
     # Screened-radial exponent ζ (dipole_radial="screened" only). Default −2
     # from the rigid-charge LSQ scan: floors 2.70 at ζ=−1, 2.72 at ζ=−2,
@@ -94,12 +100,20 @@ class TNEPconfig:
     # over the marginally-lower −1 deliberately: ~equal floor, stronger
     # H-bond suppression (Coulomb-like r^−2 screening).
     dipole_zeta: float = -2.0
-    # Cutoff function f_c of the neighbor readout, crossable with either
+    # Gaussian-window width scale σ/spacing (dipole_radial="gaussian" only):
+    # σ = scale × r_c/(C+1) (C=1 ⇒ scale·r_c/2). Step-0 rigid-charge LSQ
+    # evidence (diagnostics/diag_basis.py): scale 0.5 lowers the C=4 floor
+    # 22% (1.16 vs 1.49) while 1.0 edges it at C=10 — the knob matters.
+    dipole_gauss_sigma_scale: float = 1.0
+    # Cutoff function f_c of the neighbor readout, crossable with any
     # radial. Smoothness at r_c is a property of the CUTOFF, not the radial:
     #   "cosine2" : ((1+cos(πr/r_c))/2)² — C³ contact at r_c
+    #   "cosine"  : (1+cos(πr/r_c))/2 — C¹ contact (plain NEP cutoff)
     #   "cubic"   : 1 − 3x² + 2x³, x = r/r_c — C¹ contact (f″(r_c) ≠ 0)
-    # None = the radial family's traditional form: "cosine2" for chebyshev,
-    # "cubic" for screened (resolved_dipole_cutoff; validated at model init).
+    #   "tanh3"   : tanh³(1 − r/r_c)/tanh³(1) — C² contact (Behler cutoff,
+    #               normalized so f(0) = 1)
+    # None = the radial family's traditional form: "cubic" for screened,
+    # "cosine2" otherwise (resolved_dipole_cutoff; validated at model init).
     dipole_cutoff: str | None = None
     # Species-pair coefficient table of the neighbor readout:
     #   "off"       : c ≡ 1 frozen, no parameters.

@@ -126,15 +126,18 @@ class TNEP(layers.Layer):
                 raise ValueError(
                     f"cfg.dipole_channels must be ≥ 1, got "
                     f"{self._dipole_channels}.")
-            if self._dipole_radial not in ("chebyshev", "screened"):
+            if self._dipole_radial not in ("chebyshev", "chebyshev_warped",
+                                           "gaussian", "screened"):
                 raise ValueError(
-                    f"cfg.dipole_radial must be 'chebyshev' or 'screened', "
+                    f"cfg.dipole_radial must be 'chebyshev', "
+                    f"'chebyshev_warped', 'gaussian' or 'screened', "
                     f"got {self._dipole_radial!r}.")
-            if self._dipole_cutoff not in ("cosine2", "cubic"):
+            if self._dipole_cutoff not in ("cosine2", "cosine", "cubic",
+                                           "tanh3"):
                 raise ValueError(
-                    f"cfg.dipole_cutoff must be 'cosine2', 'cubic' or None "
-                    f"(None = the radial family's traditional form), got "
-                    f"{cfg.dipole_cutoff!r}.")
+                    f"cfg.dipole_cutoff must be 'cosine2', 'cosine', 'cubic', "
+                    f"'tanh3' or None (None = the radial family's traditional "
+                    f"form), got {cfg.dipole_cutoff!r}.")
             if self._dipole_radial == "screened" and self._dipole_channels != 1:
                 # RAISE, don't force: data assembly reads cfg.dipole_channels
                 # before the model exists (data.py V build), so silently
@@ -219,6 +222,14 @@ class TNEP(layers.Layer):
                         f"0 < dipole_rc ≤ rcut_hard={cfg.rcut_hard} so bonded "
                         f"pairs see each other in their descriptors (box-size "
                         f"gates are checked at data assembly).")
+                if self._dipole_radial == "gaussian":
+                    # Gaussian window constants, fixed at init: μ_n = the C
+                    # interior points of linspace(0, r_c, C+2); σ = σ-scale ×
+                    # spacing r_c/(C+1) (C=1 ⇒ σ-scale·r_c/2, same formula).
+                    _C = self._dipole_channels
+                    self._gauss_mu = np.linspace(0.0, _rc, _C + 2)[1:-1]
+                    self._gauss_sigma = (float(cfg.dipole_gauss_sigma_scale)
+                                         * _rc / (_C + 1))
                 if float(getattr(cfg, "charge_aux_weight", 0) or 0) > 0:
                     raise ValueError(
                         "charge_aux_weight > 0 is incompatible with "
@@ -1641,22 +1652,36 @@ class TNEP(layers.Layer):
 
     def _fc(self, r: tf.Tensor) -> tf.Tensor:
         """Dipole cutoff f_c(r) per the resolved cfg.dipole_cutoff:
-        "cosine2" ((1+cos(πr/r_c))/2)² — C³ contact at r_c; "cubic"
-        1 − 3x² + 2x³, x = r/r_c — C¹ contact. Polynomial/trig, safe on
-        raw r; callers mask r ≥ dipole_rc to zero."""
+        "cosine2" ((1+cos(πr/r_c))/2)² — C³ contact at r_c; "cosine"
+        (1+cos(πr/r_c))/2 — C¹; "cubic" 1 − 3x² + 2x³, x = r/r_c — C¹;
+        "tanh3" tanh³(1 − r/r_c)/tanh³(1) — C² (normalized so f(0) = 1).
+        All finite on raw r (tanh3 goes NEGATIVE beyond r_c before
+        masking); callers mask r ≥ dipole_rc to zero."""
         rc = float(self.cfg.dipole_rc)
-        if self._dipole_cutoff == "cubic":
+        fc = self._dipole_cutoff
+        if fc == "cosine2":
+            return tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * r)))
+        if fc == "cosine":
+            return 0.5 * (1.0 + tf.cos(np.pi / rc * r))
+        if fc == "cubic":
             x = r / rc
             return 1.0 - 3.0 * x * x + 2.0 * x * x * x
-        return tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * r)))
+        if fc == "tanh3":
+            return tf.tanh(1.0 - r / rc) ** 3 / np.tanh(1.0) ** 3
+        raise ValueError(f"unknown dipole_cutoff {fc!r}")
 
     def _cheb_R(self, r: tf.Tensor) -> tf.Tensor:
-        """Chebyshev radial channels R_n(r) = T_n(2r/r_c − 1)·f_c(r),
-        n = 0..C−1, stacked on a trailing channel axis → [..., C]; f_c per
-        cfg.dipole_cutoff (_fc). Recurrence (not cos∘arccos) so
-        out-of-cutoff r stays finite until the caller masks it."""
+        """Chebyshev radial channels R_n(r) = T_n(x)·f_c(r), n = 0..C−1,
+        stacked on a trailing channel axis → [..., C]; f_c per
+        cfg.dipole_cutoff (_fc). x = 2r/r_c − 1 ("chebyshev") or the NEP
+        warp x_w = 2(r/r_c − 1)² − 1 ("chebyshev_warped"). Recurrence
+        (not cos∘arccos) so out-of-cutoff r stays finite until the caller
+        masks it."""
         C = self._dipole_channels
-        x = 2.0 * r / float(self.cfg.dipole_rc) - 1.0
+        if self._dipole_radial == "chebyshev_warped":
+            x = 2.0 * tf.square(r / float(self.cfg.dipole_rc) - 1.0) - 1.0
+        else:
+            x = 2.0 * r / float(self.cfg.dipole_rc) - 1.0
         Ts = [tf.ones_like(x), x]
         for _ in range(2, C):
             Ts.append(2.0 * x * Ts[-1] - Ts[-2])
@@ -1668,11 +1693,19 @@ class TNEP(layers.Layer):
         (_fc). Both TF call sites mask AFTER the radial and real r=0
         self-image entries exist in the pair streams, so guard the power's
         INPUT (at ζ < 1, 0**(ζ−1) = inf and inf·0 = nan downstream)."""
-        if self._dipole_radial == "screened":
+        rad = self._dipole_radial
+        if rad == "screened":
             r_safe = tf.where(r > 0, r, tf.ones_like(r))
             R = r_safe ** (self._dipole_zeta - 1.0) * self._fc(r)
             return R[..., tf.newaxis]
-        return self._cheb_R(r)
+        if rad in ("chebyshev", "chebyshev_warped"):
+            return self._cheb_R(r)
+        if rad == "gaussian":
+            mu = tf.constant(self._gauss_mu, dtype=r.dtype)
+            g = tf.exp(-tf.square(r[..., tf.newaxis] - mu)
+                       / (2.0 * self._gauss_sigma ** 2))
+            return g * self._fc(r)[..., tf.newaxis]
+        raise ValueError(f"unknown dipole_radial {rad!r}")
 
     def _c_full(self, c_pair: tf.Tensor) -> tf.Tensor:
         """Packed c_pair [..., C, n_pairs] → [..., C, T, T] via _pair_idx

@@ -487,12 +487,19 @@ def _train_model_inner(cfg: TNEPconfig,
             "ordered": "learned ordered Ω[C, T²] (asymmetric — breaks gauge "
                        "invariance across species)",
         }[model._species_pairs]
-        _r_desc = (f"R = r^(ζ−1)·f_c (screened, ζ = {model._dipole_zeta})"
-                   if model._dipole_radial == "screened" else
-                   "R_n = T_n(2r/r_c − 1)·f_c (Chebyshev)")
+        _r_desc = {
+            "screened": f"R = r^(ζ−1)·f_c (screened, ζ = {model._dipole_zeta})",
+            "chebyshev": "R_n = T_n(2r/r_c − 1)·f_c (Chebyshev)",
+            "chebyshev_warped": "R_n = T_n(2(r/r_c − 1)² − 1)·f_c "
+                                "(warped Chebyshev)",
+            "gaussian": f"R_n = exp(−(r − μ_n)²/2σ²)·f_c (Gaussian, "
+                        f"σ-scale = {cfg.dipole_gauss_sigma_scale})",
+        }[model._dipole_radial]
         _fc_desc = {
             "cosine2": "f_c = ((1+cos(πr/r_c))/2)²",
+            "cosine": "f_c = (1+cos(πr/r_c))/2",
             "cubic": "f_c = 1 − 3x² + 2x³, x = r/r_c",
+            "tanh3": "f_c = tanh³(1 − r/r_c)/tanh³(1)",
         }[model._dipole_cutoff]
         print(f"Dipole readout: neighbor basis — "
               f"b_ij = Σ_n c_n[t_i,t_j]·R_n(r_ij)·s_i^n (+ mirrored j term), "
