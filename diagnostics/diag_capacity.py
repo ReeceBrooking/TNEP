@@ -17,7 +17,7 @@ BINS = [(0.0, 1.2), (1.2, 2.2), (2.2, 3.0), (3.0, RC)]
 def fc(r, rc=RC):
     return np.where(r < rc, (0.5 * (1 + np.cos(np.pi * r / rc))) ** 2, 0.0)
 
-frames = read("/home/reece/TNEP/datasets/train_waterbulk.xyz", index=":")
+frames = read("datasets/train_waterbulk.xyz", index=":")
 print(f"{len(frames)} frames, {len(frames[0])} atoms")
 
 mu = np.array([f.info.get("dipole", f.calc.results.get("dipole") if f.calc else None)

@@ -4,7 +4,7 @@ from ase.io import read
 from ase.neighborlist import neighbor_list
 
 RC = 4.0
-frames = read("/home/reece/TNEP/datasets/train_waterbulk.xyz", index=":")
+frames = read("datasets/train_waterbulk.xyz", index=":")
 mu = np.array([f.info.get("dipole", f.calc.results.get("dipole") if f.calc else None)
                for f in frames])
 

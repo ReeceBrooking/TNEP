@@ -414,12 +414,12 @@ def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
     keep = i != j                                  # drop self-image pairs
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
     r = np.linalg.norm(d, axis=1)
-    x = r / rc
     if cutoff == "cosine2":
         fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
     elif cutoff == "cosine":
         fc = (1.0 + np.cos(np.pi * r / rc)) / 2.0
     elif cutoff == "cubic":
+        x = r / rc
         fc = 1.0 - 3.0 * x * x + 2.0 * x**3
     elif cutoff == "tanh3":
         fc = np.tanh(1.0 - r / rc) ** 3 / np.tanh(1.0) ** 3

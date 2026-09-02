@@ -5,7 +5,7 @@ from ase.io import read
 from ase.neighborlist import neighbor_list
 
 RC = 4.0
-frames = read("/home/reece/TNEP/datasets/train_waterbulk.xyz", index=":")
+frames = read("datasets/train_waterbulk.xyz", index=":")
 mu = np.array([f.info.get("dipole", f.calc.results.get("dipole") if f.calc else None)
                for f in frames])
 F = len(frames)
@@ -30,7 +30,7 @@ def radial(name, r, C):
         return np.polynomial.chebyshev.chebvander(2 * (r / RC - 1) ** 2 - 1, C - 1)
     scale = float(name.split("x")[1])          # "gaussx0.5" etc.
     mus = np.linspace(0, RC, C + 2)[1:-1]
-    sig = scale * (mus[1] - mus[0]) if C > 1 else scale * RC / 2
+    sig = scale * RC / (C + 1)
     return np.exp(-((r[:, None] - mus[None, :]) ** 2) / (2 * sig ** 2))
 
 def floor(rname, cname, C):
