@@ -159,7 +159,11 @@ def _rmse_r2(pred: np.ndarray, mu: np.ndarray) -> tuple[float, float]:
 
 def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     """Fit the sparse-kernel dipole model on cfg.data_path; evaluate
-    cfg.test_data_path when set; write a run record JSON to GAP/."""
+    cfg.test_data_path when set; write a run record JSON to GAP/.
+
+    Dense augmented solve: A is [3F + n_columns, n_columns] float64 —
+    ~0.6 GB at 8000 columns, scaling as n_columns²; large M×C×T will OOM
+    silently before it gets slow."""
     _validate(cfg)
     t0 = time.time()
 
@@ -260,21 +264,19 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
 
 
 def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
-    """μ [F, 3] for a list of frames via the model's held cfg/builder."""
+    """μ [F, 3] for a list of frames via the model's held cfg/builder.
+
+    Routes through _phi_frame — the SAME design-matrix contraction the fit
+    uses (μ = Φα) — so fit and predict cannot drift."""
     cfg = model.cfg
     tis = tnep_data.assign_type_indices(frames, cfg.types)
     descs = _descriptors(model.builder, frames)
+    alpha_flat = np.concatenate(model.alpha)
     out = np.empty((len(frames), 3))
     for f, (atoms, ti, D) in enumerate(zip(frames, tis, descs)):
         ti = np.asarray(ti)
-        v = _v_atoms(atoms, ti, cfg)                    # [N, 3, K]
-        K = v.shape[-1]
-        mu = np.zeros(3)
-        for t, (Dm, a) in enumerate(zip(model.sparse_desc, model.alpha)):
-            sel = ti == t
-            w = ((D[sel] @ Dm.T) ** model.xi) @ a.reshape(len(Dm), K)
-            mu += np.einsum("nk,nxk->x", w, v[sel])
-        out[f] = mu
+        out[f] = _phi_frame(D, _v_atoms(atoms, ti, cfg), ti,
+                            model.sparse_desc, model.xi) @ alpha_flat
     return out
 
 
