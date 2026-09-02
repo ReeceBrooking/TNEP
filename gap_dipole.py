@@ -246,3 +246,30 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
             s[sel] = ((D[sel] @ Dm.T) ** model.xi) @ a
         out[f] = s @ v
     return out
+
+
+if __name__ == "__main__":
+    # IDE / CLI entry: fit on cfg.data_path, evaluate cfg.test_data_path,
+    # print metrics, write the GAP/ run record. The GAP-required readout
+    # fields are pinned HERE rather than read from TNEPconfig class defaults,
+    # so working-tree experiment values cannot leak into the fit.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))  # datasets/, GAP/
+
+    cfg = TNEPconfig()
+    cfg.target_mode = 1
+    cfg.scale_targets = False
+    cfg.dipole_readout = "neighbor"
+    cfg.dipole_radial = "screened"
+    cfg.dipole_cutoff = "cubic"
+    cfg.dipole_species_pairs = "off"
+    cfg.dipole_channels = 1
+    cfg.dipole_zeta = -2.0
+    cfg.dipole_rc = None                    # inherit rcut_hard
+    cfg.rcut_hard, cfg.rcut_soft = 3.5, 3.0
+
+    # GAP knobs — tweak freely:
+    cfg.gap_sparse_per_species = 500
+    cfg.gap_kernel_power = 2
+    cfg.gap_ridge_lambda = 1e-6
+
+    fit_gap_dipole(cfg)
