@@ -129,6 +129,15 @@ class TNEPconfig:
     # "cosine2" cutoff narrows effective support vs the plain cosine.
     dipole_rc: float | None = None
 
+    # --- GAP-mode dipole fit (gap_dipole.py; screened/cubic/off only) ----
+    # FPS-selected sparse environments per species for the kernel basis.
+    gap_sparse_per_species: int = 500
+    # Integer power ξ of the normalized SOAP dot-product kernel (D̂_i·D̂_m)^ξ.
+    gap_kernel_power: int = 2
+    # Ridge strength λ, applied RELATIVE to mean(diag(ΦᵀΦ)) — dimensionless
+    # (λ_eff = λ · mean_m ‖Φ[:,m]‖²), so its scale is data-independent.
+    gap_ridge_lambda: float = 1e-6
+
     # ═══════════════════════════════════════════════════════════════════
     # 2. DESCRIPTOR (SOAP-turbo)
     # ═══════════════════════════════════════════════════════════════════

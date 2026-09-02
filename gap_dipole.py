@@ -1,0 +1,236 @@
+"""GAP-mode dipole fit for the neighbor readout (screened/cubic/off).
+
+Sparse-kernel ridge alternative to the SNES-trained ANN, exploiting the
+readout's linearity in the site scalars (neighbor_dipole_gap_plan.md):
+
+    s_i = Σ_m α_m (D̂_i · D̂_m)^ξ      (m: sparse envs, same species as i)
+    μ   = Σ_i s_i v_i                 (v_i from data._neighbor_dipole_V)
+
+Fixed configuration, validated at fit: dipole_radial="screened",
+dipole_cutoff→"cubic", dipole_species_pairs="off" (c ≡ 1, C = 1).
+NO model persistence — fit writes a config+metrics run record JSON to GAP/.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+from dataclasses import dataclass
+
+import numpy as np
+from ase import Atoms
+from ase.io import read
+
+import data as tnep_data
+from DescriptorBuilder import make_descriptor_builder
+from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
+
+
+@dataclass
+class GapDipoleModel:
+    """In-memory GAP dipole model — never persisted (refits in seconds)."""
+    cfg: TNEPconfig
+    builder: object                   # descriptor builder from the fitting cfg
+    sparse_desc: list[np.ndarray]     # per type t: [M_t, Q] unit-norm rows
+    alpha: list[np.ndarray]           # per type t: [M_t]
+    xi: int
+
+
+def _validate(cfg: TNEPconfig) -> None:
+    """Raise unless cfg is the fixed GAP configuration. Runs FIRST in fit."""
+    sp = cfg.dipole_species_pairs
+    checks = [
+        (cfg.target_mode == 1,
+         f"target_mode must be 1, got {cfg.target_mode}"),
+        (cfg.dipole_readout == "neighbor",
+         f"dipole_readout must be 'neighbor', got {cfg.dipole_readout!r}"),
+        (cfg.dipole_radial == "screened",
+         f"dipole_radial must be 'screened', got {cfg.dipole_radial!r}"),
+        (resolved_dipole_cutoff(cfg) == "cubic",
+         f"dipole_cutoff must resolve to 'cubic', got "
+         f"{resolved_dipole_cutoff(cfg)!r}"),
+        # legacy bool False→"off" normalizes in TNEP.__init__, which GAP
+        # never runs — accept it here.
+        (sp == "off" or sp is False,
+         f"dipole_species_pairs must be 'off', got {sp!r}"),
+        (int(cfg.dipole_channels) == 1,
+         f"dipole_channels must be 1, got {cfg.dipole_channels}"),
+        (not cfg.scale_targets, "scale_targets must be False"),
+    ]
+    bad = [msg for ok, msg in checks if not ok]
+    if bad:
+        raise ValueError("fit_gap_dipole fixed-config violation: "
+                         + "; ".join(bad))
+
+
+def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
+    """SOAP descriptors, no gradients, float64. Asserts ‖D‖ ≈ 1 (both
+    builders already unit-normalize; we must NOT renormalize)."""
+    desc, _, _ = builder.build_descriptors(frames, calc_gradients=False)
+    out = []
+    for D in desc:
+        D = np.asarray(D, dtype=np.float64)
+        norms = np.linalg.norm(D, axis=1)
+        assert np.allclose(norms, 1.0, atol=1e-3), (
+            f"descriptors not unit-normalized "
+            f"(max |norm-1| = {np.abs(norms - 1.0).max():.3g})")
+        out.append(D)
+    return out
+
+
+def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: TNEPconfig) -> np.ndarray:
+    """Per-atom geometry vector v_i [N, 3]: V summed over neighbor types
+    (c ≡ 1, C = 1)."""
+    V = tnep_data._neighbor_dipole_V(
+        atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard), 1,
+        int(cfg.num_types), str(cfg.dipole_radial), float(cfg.dipole_zeta),
+        resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale))
+    return V[:, :, 0, :].sum(axis=-1).astype(np.float64)
+
+
+def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
+    """Greedy max-min FPS on unit-norm rows: d² = 2 − 2 D·D_m. Seeded start."""
+    M = min(M, len(D))
+    idx = np.empty(M, dtype=np.intp)
+    idx[0] = rng.integers(len(D))
+    d2 = 2.0 - 2.0 * (D @ D[idx[0]])
+    for m in range(1, M):
+        idx[m] = np.argmax(d2)
+        np.minimum(d2, 2.0 - 2.0 * (D @ D[idx[m]]), out=d2)
+    return idx
+
+
+def _phi_frame(D: np.ndarray, v: np.ndarray, ti: np.ndarray,
+               sparse_desc: list[np.ndarray], xi: int) -> np.ndarray:
+    """[3, M_tot] design block for one frame: Φ[:, m] = Σ_{i∈species(m)}
+    k(D̂_i, D̂_m) v_i. Species-blocked — no cross-species kernel terms."""
+    cols = []
+    for t, Dm in enumerate(sparse_desc):
+        sel = ti == t
+        K = (D[sel] @ Dm.T) ** xi                       # [n_t, M_t]
+        cols.append(v[sel].T @ K)                       # [3, M_t]
+    return np.concatenate(cols, axis=1)
+
+
+def _targets(frames: list[Atoms], cfg: TNEPconfig) -> np.ndarray:
+    """Dipole targets [F, 3], unit-converted per cfg (matches assemble)."""
+    key = tnep_data._resolve_target_key(cfg)
+    mu = np.stack([np.asarray(tnep_data._extract_target(s, key))
+                   for s in frames]).astype(np.float64)
+    if getattr(cfg, "convert_dipole_to_eangstrom", True):
+        mu = mu * tnep_data._dipole_conversion_factor(cfg.dipole_units)
+    return mu
+
+
+def _rmse_r2(pred: np.ndarray, mu: np.ndarray) -> tuple[float, float]:
+    """Total-vector RMSE √(mean(per-component²)·3) (diag_zeta convention), R²."""
+    res = pred - mu
+    rmse = float(np.sqrt(np.mean(res ** 2) * 3.0))
+    tot = float(np.sum((mu - mu.mean(0)) ** 2))
+    r2 = 1.0 - float(np.sum(res ** 2)) / tot if tot > 0.0 else float("nan")
+    return rmse, r2
+
+
+def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
+    """Fit the sparse-kernel dipole model on cfg.data_path; evaluate
+    cfg.test_data_path when set; write a run record JSON to GAP/."""
+    _validate(cfg)
+    t0 = time.time()
+
+    dataset, types_int = tnep_data.collect(cfg)
+    if cfg.total_N is not None:
+        cfg.randomise(dataset)
+        dataset = [dataset[k] for k in cfg.indices]
+        types_int = [types_int[k] for k in cfg.indices]
+    tis = [np.asarray(t) for t in types_int]
+
+    builder = make_descriptor_builder(cfg)
+    descs = _descriptors(builder, dataset)
+    # assemble_data_dict: unit-converted targets, box/label guards, V_atom —
+    # all built purely from cfg pre-model. Gradients not needed (empty).
+    d = tnep_data.assemble_data_dict(
+        dataset, types_int, descs, [[]] * len(dataset), [[]] * len(dataset),
+        cfg)
+    mu = np.stack([np.asarray(t, dtype=np.float64) for t in d["targets"]])
+    vs = [np.asarray(V, dtype=np.float64)[:, :, 0, :].sum(axis=-1)
+          for V in d["V_atom"]]
+
+    # Per-species FPS sparse points.
+    rng = np.random.default_rng(cfg.seed)
+    M_req = int(cfg.gap_sparse_per_species)
+    xi = int(cfg.gap_kernel_power)
+    sparse_desc = []
+    for t in range(cfg.num_types):
+        Dt = np.concatenate([D[ti == t] for D, ti in zip(descs, tis)])
+        sparse_desc.append(Dt[_fps(Dt, M_req, rng)].copy())
+    sizes = [len(s) for s in sparse_desc]
+    M_tot = sum(sizes)
+
+    # Φ frame-by-frame — the full N_envs × M kernel never exists.
+    F = len(dataset)
+    Phi = np.empty((F, 3, M_tot))
+    for f in range(F):
+        Phi[f] = _phi_frame(descs[f], vs[f], tis[f], sparse_desc, xi)
+    Phi_flat = Phi.reshape(3 * F, M_tot)
+
+    # Explicit ridge solve: augmented [Φ; √λ_eff·I], λ_eff relative to
+    # mean(diag(ΦᵀΦ)) so λ is dimensionless.
+    lam = float(cfg.gap_ridge_lambda)
+    lam_eff = lam * float(np.mean(np.sum(Phi_flat ** 2, axis=0)))
+    A = np.vstack([Phi_flat, np.sqrt(lam_eff) * np.eye(M_tot)])
+    b = np.concatenate([mu.reshape(-1), np.zeros(M_tot)])
+    alpha_flat = np.linalg.lstsq(A, b, rcond=None)[0]
+    alpha = np.split(alpha_flat, np.cumsum(sizes)[:-1])
+
+    model = GapDipoleModel(cfg=cfg, builder=builder,
+                           sparse_desc=sparse_desc, alpha=alpha, xi=xi)
+
+    train_rmse, train_r2 = _rmse_r2(
+        (Phi_flat @ alpha_flat).reshape(F, 3), mu)
+    metrics = {"train_rmse": train_rmse, "train_r2": train_r2,
+               "n_train_frames": F, "fit_seconds": time.time() - t0}
+    print(f"[gap_dipole] fit M={sizes} xi={xi} lambda={lam:g}: "
+          f"train RMSE {train_rmse:.4f}, R² {train_r2:.4f} "
+          f"({metrics['fit_seconds']:.1f} s)")
+
+    if cfg.test_data_path is not None:
+        test_frames = read(cfg.test_data_path, index=":")
+        test_rmse, test_r2 = _rmse_r2(predict(model, test_frames),
+                                      _targets(test_frames, cfg))
+        metrics.update(test_rmse=test_rmse, test_r2=test_r2,
+                       n_test_frames=len(test_frames))
+        print(f"[gap_dipole] test RMSE {test_rmse:.4f}, R² {test_r2:.4f}")
+
+    from model_io import _serialize_config
+    record = {
+        "config": _serialize_config(cfg),
+        "gap": {"sparse_per_species": M_req, "kernel_power": xi,
+                "ridge_lambda": lam, "lambda_eff": lam_eff,
+                "M_per_species": {str(z): n
+                                  for z, n in zip(cfg.types, sizes)}},
+        "metrics": metrics,
+    }
+    os.makedirs("GAP", exist_ok=True)
+    path = os.path.join(
+        "GAP", f"gap_M{M_req}_x{xi}_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    with open(path, "w") as fh:
+        json.dump(record, fh, indent=2)
+    print(f"[gap_dipole] run record → {path}")
+    return model
+
+
+def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
+    """μ [F, 3] for a list of frames via the model's held cfg/builder."""
+    cfg = model.cfg
+    tis = tnep_data.assign_type_indices(frames, cfg.types)
+    descs = _descriptors(model.builder, frames)
+    out = np.empty((len(frames), 3))
+    for f, (atoms, ti, D) in enumerate(zip(frames, tis, descs)):
+        ti = np.asarray(ti)
+        v = _v_atoms(atoms, ti, cfg)
+        s = np.zeros(len(atoms))
+        for t, (Dm, a) in enumerate(zip(model.sparse_desc, model.alpha)):
+            sel = ti == t
+            s[sel] = ((D[sel] @ Dm.T) ** model.xi) @ a
+        out[f] = s @ v
+    return out
