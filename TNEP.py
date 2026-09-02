@@ -108,14 +108,14 @@ class TNEP(layers.Layer):
 
         # Neighbor-basis dipole readout: decided before W1 so the site head
         # can carry its channel axis.
-        _readout = str(getattr(cfg, "dipole_readout", "tnep"))
+        _readout = str(cfg.dipole_readout)
         self._neighbor_readout = (cfg.target_mode == 1
                                   and _readout == "neighbor")
-        self._dipole_channels = int(getattr(cfg, "dipole_channels", 4))
-        self._dipole_radial = str(getattr(cfg, "dipole_radial", "chebyshev"))
-        self._dipole_zeta = float(getattr(cfg, "dipole_zeta", -2.0))
+        self._dipole_channels = int(cfg.dipole_channels)
+        self._dipole_radial = str(cfg.dipole_radial)
+        self._dipole_zeta = float(cfg.dipole_zeta)
         # Legacy bool → 3-value field: False→"off", True→"symmetric".
-        _sp = getattr(cfg, "dipole_species_pairs", "off")
+        _sp = cfg.dipole_species_pairs
         cfg.dipole_species_pairs = {False: "off", True: "symmetric"}.get(_sp, _sp)
         self._species_pairs = str(cfg.dipole_species_pairs)
         # THE learnability flag: every save/load/SNES-tail site keys on this.
@@ -190,7 +190,7 @@ class TNEP(layers.Layer):
 
         # Validate dipole contraction power (mode 1 only) at construction time.
         if cfg.target_mode == 1:
-            _N = int(getattr(cfg, "dipole_rij_power", 2))
+            _N = int(cfg.dipole_rij_power)
             if _N < 0:
                 raise ValueError(
                     f"cfg.dipole_rij_power must be an integer ≥ 0, got {_N}. "
@@ -204,7 +204,7 @@ class TNEP(layers.Layer):
                     f"cfg.dipole_readout must be 'tnep' or 'neighbor', "
                     f"got {_readout!r}.")
             if self._neighbor_readout:
-                if getattr(cfg, "dipole_rc", None) is None:
+                if cfg.dipole_rc is None:
                     cfg.dipole_rc = float(cfg.rcut_hard)  # inherit descriptor cutoff
                 _rc = float(cfg.dipole_rc)
                 if not 0.0 < _rc <= float(cfg.rcut_hard):

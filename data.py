@@ -345,7 +345,7 @@ def assemble_data_dict(
     # Guards read TOTAL-cell dipoles (branch-gap quantum e·L), so run them
     # before any per-atom scaling.
     if (cfg.target_mode == 1
-            and getattr(cfg, "dipole_readout", "tnep") == "neighbor"):
+            and cfg.dipole_readout == "neighbor"):
         _neighbor_dipole_guards(dataset, targets, cfg)
     if cfg.scale_targets and cfg.target_mode == 1:
         targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
@@ -362,12 +362,12 @@ def assemble_data_dict(
     # Neighbor-basis dipole readout: precompute the per-structure geometry
     # kernel V (data-static; delivered to the forwards via the W_atom slot).
     if (cfg.target_mode == 1
-            and getattr(cfg, "dipole_readout", "tnep") == "neighbor"):
+            and cfg.dipole_readout == "neighbor"):
         data["V_atom"] = [
             _neighbor_dipole_V(s, t, float(cfg.dipole_rc or cfg.rcut_hard),
                                int(cfg.dipole_channels), int(cfg.num_types),
-                               str(getattr(cfg, "dipole_radial", "chebyshev")),
-                               float(getattr(cfg, "dipole_zeta", -2.0)))
+                               str(cfg.dipole_radial),
+                               float(cfg.dipole_zeta))
             for s, t in zip(dataset, types_int)]
 
     # Auto-detect and include force/virial targets for PES mode
@@ -389,8 +389,8 @@ def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
     dipole_rij_power=0 (self-pair readout) or the neighbor readout (which
     reads no descriptor gradients at all)."""
     return cfg.target_mode == 1 and (
-        int(getattr(cfg, "dipole_rij_power", 2)) == 0
-        or getattr(cfg, "dipole_readout", "tnep") == "neighbor")
+        int(cfg.dipole_rij_power) == 0
+        or cfg.dipole_readout == "neighbor")
 
 
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,

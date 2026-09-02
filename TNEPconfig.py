@@ -90,7 +90,9 @@ class TNEPconfig:
     dipole_radial: str = "chebyshev"
     # Screened-radial exponent ζ (dipole_radial="screened" only). Default −2
     # from the rigid-charge LSQ scan: floors 2.70 at ζ=−1, 2.72 at ζ=−2,
-    # 11.0 at ζ=+1 (ζ>0 inverts the covalent/H-bond weighting).
+    # 11.0 at ζ=+1 (ζ>0 inverts the covalent/H-bond weighting). −2 chosen
+    # over the marginally-lower −1 deliberately: ~equal floor, stronger
+    # H-bond suppression (Coulomb-like r^−2 screening).
     dipole_zeta: float = -2.0
     # Species-pair coefficient table of the neighbor readout:
     #   "off"       : c ≡ 1 frozen, no parameters.
