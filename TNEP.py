@@ -112,10 +112,34 @@ class TNEP(layers.Layer):
         self._neighbor_readout = (cfg.target_mode == 1
                                   and _readout == "neighbor")
         self._dipole_channels = int(getattr(cfg, "dipole_channels", 4))
-        self._species_pairs = bool(getattr(cfg, "dipole_species_pairs", False))
-        if self._neighbor_readout and self._dipole_channels < 1:
-            raise ValueError(
-                f"cfg.dipole_channels must be ≥ 1, got {self._dipole_channels}.")
+        self._dipole_radial = str(getattr(cfg, "dipole_radial", "chebyshev"))
+        self._dipole_zeta = float(getattr(cfg, "dipole_zeta", -2.0))
+        # Legacy bool → 3-value field: False→"off", True→"symmetric".
+        _sp = getattr(cfg, "dipole_species_pairs", "off")
+        cfg.dipole_species_pairs = {False: "off", True: "symmetric"}.get(_sp, _sp)
+        self._species_pairs = str(cfg.dipole_species_pairs)
+        # THE learnability flag: every save/load/SNES-tail site keys on this.
+        self._c_learnable = self._species_pairs != "off"
+        if self._neighbor_readout:
+            if self._dipole_channels < 1:
+                raise ValueError(
+                    f"cfg.dipole_channels must be ≥ 1, got "
+                    f"{self._dipole_channels}.")
+            if self._dipole_radial not in ("chebyshev", "screened"):
+                raise ValueError(
+                    f"cfg.dipole_radial must be 'chebyshev' or 'screened', "
+                    f"got {self._dipole_radial!r}.")
+            if self._dipole_radial == "screened" and self._dipole_channels != 1:
+                # RAISE, don't force: data assembly reads cfg.dipole_channels
+                # before the model exists (data.py V build), so silently
+                # forcing C=1 here would ship a shape-mismatched V.
+                raise ValueError(
+                    f"cfg.dipole_radial='screened' is single-channel — set "
+                    f"dipole_channels=1 (got {self._dipole_channels}).")
+            if self._species_pairs not in ("off", "symmetric", "ordered"):
+                raise ValueError(
+                    f"cfg.dipole_species_pairs must be 'off', 'symmetric' or "
+                    f"'ordered' (legacy bool accepted), got {_sp!r}.")
 
         # W1 : hidden-to-scalar weights per type — [T, H_final], with an extra
         # radial-channel axis [T, H_final, C] under the neighbor readout.
@@ -136,22 +160,28 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        # c_pair : [C, T(T+1)/2] — per-(channel, unordered species pair)
-        # coefficients of the neighbor readout. Learnable (init 1.0, in the
-        # SNES tail) when cfg.dipole_species_pairs; frozen c ≡ 1 otherwise —
-        # the forward always contracts through it either way. _pair_idx maps
-        # (t, t') to the unordered-pair slot (symmetric by construction).
+        # c_pair : packed per-(channel, species pair) coefficients of the
+        # neighbor readout — [C, T(T+1)/2] unordered ("off"/"symmetric") or
+        # [C, T²] ordered. Learnable (init 1.0, in the SNES tail) when
+        # _c_learnable; frozen c ≡ 1 for "off" — the forward always contracts
+        # through it either way. _pair_idx maps (t_center, t_neighbor) to the
+        # packed slot; _c_full gathers it back to [C, T, T].
         if self._neighbor_readout:
             T_ = cfg.num_types
-            pair_idx = np.zeros((T_, T_), dtype=np.int32)
-            p = 0
-            for t in range(T_):
-                for t2 in range(t, T_):
-                    pair_idx[t, t2] = pair_idx[t2, t] = p
-                    p += 1
+            if self._species_pairs == "ordered":
+                # Ordered index t·T + t' — an asymmetric Ω breaks the
+                # (s_i − s_j) difference-form antisymmetry across species.
+                pair_idx = np.arange(T_ * T_, dtype=np.int32).reshape(T_, T_)
+            else:
+                pair_idx = np.zeros((T_, T_), dtype=np.int32)
+                p = 0
+                for t in range(T_):
+                    for t2 in range(t, T_):
+                        pair_idx[t, t2] = pair_idx[t2, t] = p
+                        p += 1
             self._pair_idx = tf.constant(pair_idx)
-            c_shape = (self._dipole_channels, T_ * (T_ + 1) // 2)
-            if self._species_pairs:
+            c_shape = (self._dipole_channels, int(pair_idx.max()) + 1)
+            if self._c_learnable:
                 self.c_pair = self.add_weight(
                     name="c_pair", shape=c_shape,
                     initializer="ones", trainable=True)
@@ -688,8 +718,10 @@ class TNEP(layers.Layer):
             #   μ = Σ_i Σ_n s_i^n Σ_t' c[t_i,t',n]·V_i[:,n,t'],
             #   V_i[:,n,t'] = Σ_{j∈t'} R_n(|d|)·d,  d = r_i − r_j (MIC).
             # No de_dq backward chain here — the readout reads no descriptor
-            # gradients; don't re-add it. b1 stays excluded from s (the
-            # per-channel uniform shift of s^n is exact gauge).
+            # gradients; don't re-add it. b1 stays excluded from s: with c
+            # symmetric a per-channel uniform shift of s^n is exact gauge;
+            # under dipole_species_pairs="ordered" that identity breaks and
+            # the exclusion is a modeling choice — keep it, don't "fix" it.
             s = tf.einsum('ah,ahn->an', h, W1_t)                      # [A, C]
             dr, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)          # dr = neighbor − center
@@ -698,7 +730,7 @@ class TNEP(layers.Layer):
                               dtype=grad_index.dtype)[:, tf.newaxis]
             keep = tf.logical_and(rij < rc, tf.not_equal(grad_index, center))
             w = tf.cast(keep, rij.dtype) * neighbor_mask              # [A, M]
-            Rw = self._cheb_R(rij) * w[:, :, tf.newaxis]           # [A, M, C]
+            Rw = self._radial(rij) * w[:, :, tf.newaxis]           # [A, M, C]
             tp = tf.one_hot(tf.gather(Z, grad_index), self.num_types,
                             dtype=tf.float64)                      # [A, M, T]
             V = tf.einsum('amn,amd,amt->adnt',                # float64 accum.
@@ -1245,7 +1277,8 @@ class TNEP(layers.Layer):
             #   μ[b] = Σ_{a,n,t'} s[b,a,n]·c[t_a,t',n]·V[b,a,:,n,t'].
             # The de_dq backward chain is skipped entirely — the readout
             # reads no descriptor gradients; don't re-add it. b1 stays
-            # excluded from s (per-channel uniform shift is exact gauge).
+            # excluded from s: exact gauge with c symmetric; a modeling
+            # choice (kept deliberately) under "ordered" Ω.
             if c_pair is None:
                 c_pair = self.c_pair  # model-weight callers (score, spectro)
             s = tf.einsum('bah,bahn->ban', h1, W1_t)               # [B, A, C]
@@ -1395,7 +1428,8 @@ class TNEP(layers.Layer):
         if self._neighbor_readout:
             # W_atom slot carries V [B, A, 3, Ch, T] (SNES threads it); no
             # backward matmul — the readout reads no descriptor gradients.
-            # b1 stays excluded (per-channel uniform shift is exact gauge).
+            # b1 stays excluded: exact gauge with c symmetric; a modeling
+            # choice (kept deliberately) under "ordered" Ω.
             s = tf.einsum('cbah,cbahn->cban', h1, W1_t_all)     # [C, B, A, Ch]
             if c_pair is None:
                 # Candidate-independent c (frozen c ≡ 1, or model weights).
@@ -1617,9 +1651,23 @@ class TNEP(layers.Layer):
             Ts.append(2.0 * x * Ts[-1] - Ts[-2])
         return tf.stack(Ts[:C], axis=-1) * self._fc2(r)[..., tf.newaxis]
 
+    def _radial(self, r: tf.Tensor) -> tf.Tensor:
+        """Radial channel matrix [..., C] per cfg.dipole_radial. Screened:
+        R(r) = r^(ζ−1)·(1 − 3x² + 2x³), x = r/r_c, single channel. Both TF
+        call sites mask AFTER the radial and real r=0 self-image entries
+        exist in the pair streams, so guard the power's INPUT (at ζ < 1,
+        0**(ζ−1) = inf and inf·0 = nan downstream)."""
+        if self._dipole_radial == "screened":
+            x = r / float(self.cfg.dipole_rc)
+            r_safe = tf.where(r > 0, r, tf.ones_like(r))
+            R = (r_safe ** (self._dipole_zeta - 1.0)
+                 * (1.0 - 3.0 * x * x + 2.0 * x * x * x))
+            return R[..., tf.newaxis]
+        return self._cheb_R(r)
+
     def _c_full(self, c_pair: tf.Tensor) -> tf.Tensor:
-        """c_pair [..., C, T(T+1)/2] → symmetric [..., C, T, T] via the
-        unordered-pair index table."""
+        """Packed c_pair [..., C, n_pairs] → [..., C, T, T] via _pair_idx
+        (symmetric table for "off"/"symmetric", ordered for "ordered")."""
         return tf.gather(c_pair, self._pair_idx, axis=-1)
 
     def _neighbor_V_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
@@ -1628,7 +1676,7 @@ class TNEP(layers.Layer):
                         Z: tf.Tensor, B: tf.Tensor, A: tf.Tensor) -> tf.Tensor:
         """Geometry kernel of the neighbor-basis dipole readout:
             V[b,a,:,n,t'] = Σ_{pairs (a,j), |d|<r_c, t_j=t'} R_n(|d|)·d,
-            d = r_a − r_j (MIC), R_n(r) = T_n(2r/r_c − 1)·f_c(r).
+            d = r_a − r_j (MIC), R_n per cfg.dipole_radial (_radial).
         Pairs come from the r_d descriptor list (r_c ≤ rcut_hard guarantees
         coverage); j==a self-image entries are excluded. Accumulated in
         float64, cast back to the pipeline dtype.
@@ -1643,7 +1691,7 @@ class TNEP(layers.Layer):
         T = self.num_types
         r = tf.sqrt(rij2)
         keep = tf.logical_and(r < rc, tf.not_equal(pair_atom, pair_gidx))
-        Rw = self._cheb_R(r) * tf.cast(keep, r.dtype)[:, tf.newaxis]  # [P, C]
+        Rw = self._radial(r) * tf.cast(keep, r.dtype)[:, tf.newaxis]  # [P, C]
         # contrib[p, d, n] = R_n·d, d = −(neighbor − center).
         contrib = tf.cast((-dr)[:, :, tf.newaxis]
                           * Rw[:, tf.newaxis, :], tf.float64)      # [P, 3, C]

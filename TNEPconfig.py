@@ -83,11 +83,23 @@ class TNEPconfig:
     # Widens the site head W1 to [T, H, C]. Validated ≥ 1 at model init.
     # Models must be re-trained if C changes.
     dipole_channels: int = 4
-    # Learn the species-pair coefficient table c [C, T(T+1)/2] (init 1.0,
-    # unordered-pair indexed, in the SNES tail + regularization). False =
-    # c frozen at 1 with no learnable parameters; the forward contracts
-    # through the same table either way.
-    dipole_species_pairs: bool = False
+    # Radial family of the neighbor readout:
+    #   "chebyshev" : R_n(r) = T_n(2r/r_c − 1)·f_c(r), C channels (default)
+    #   "screened"  : R(r) = r^(ζ−1)·(1 − 3x² + 2x³), x = r/r_c — single
+    #                 channel (requires dipole_channels == 1).
+    dipole_radial: str = "chebyshev"
+    # Screened-radial exponent ζ (dipole_radial="screened" only). Default −2
+    # from the rigid-charge LSQ scan: floors 2.70 at ζ=−1, 2.72 at ζ=−2,
+    # 11.0 at ζ=+1 (ζ>0 inverts the covalent/H-bond weighting).
+    dipole_zeta: float = -2.0
+    # Species-pair coefficient table of the neighbor readout:
+    #   "off"       : c ≡ 1 frozen, no parameters.
+    #   "symmetric" : learnable c [C, T(T+1)/2], unordered-pair indexed.
+    #   "ordered"   : learnable Ω [C, T²], ordered (t_center, t_neighbor)
+    #                 indexed — breaks the difference-form antisymmetry (and
+    #                 gauge invariance) across species.
+    # Legacy bool: False→"off", True→"symmetric" (normalized at model init).
+    dipole_species_pairs: str = "off"
     # Neighbor-readout cutoff r_c (Å). None = inherit rcut_hard (resolved at
     # model init). Must be ≤ rcut_hard and satisfy dipole_rc + rcut_hard ≤
     # L_min for every training box (checked at data assembly). Note the

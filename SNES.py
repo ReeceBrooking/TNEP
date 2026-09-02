@@ -31,7 +31,7 @@ def _format_duration(seconds: float) -> str:
 def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight tensors from reconstruct_params_tf into the model's Variables.
 
-    Tail order: W0,b0,W1,b1 | +c_pair (neighbor readout, species pairs on)
+    Tail order: W0,b0,W1,b1 | +c_pair (neighbor readout, _c_learnable)
     | +pol ANN (mode 2) | +U_pair (mixing)
     | +W_pre_angular (preprocess_contract != "off").
     """
@@ -41,7 +41,7 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     model.b0.assign(params[idx]); idx += 1
     model.W1.assign(params[idx]); idx += 1
     model.b1.assign(params[idx]); idx += 1
-    if model._neighbor_readout and model._species_pairs:
+    if model._neighbor_readout and model._c_learnable:
         model.c_pair.assign(params[idx]); idx += 1
     if model.cfg.target_mode == 2:
         model.W0_pol.assign(params[idx]); idx += 1
@@ -88,13 +88,16 @@ class SNES:
         # Total number of trainable parameters
         self.H = int(self.cfg.num_neurons)
         # Neighbor dipole readout: W1 gains a radial-channel axis [T, H, Ch];
-        # with dipole_species_pairs a learnable c_pair table [Ch, T(T+1)/2]
-        # follows b1 in the tail (else c ≡ 1 frozen: Ch = 1 / n_c = 0
-        # in every other mode).
+        # a learnable packed c_pair table follows b1 in the tail —
+        # [Ch, T(T+1)/2] for dipole_species_pairs="symmetric", [Ch, T²] for
+        # "ordered", none for "off" (c ≡ 1 frozen; Ch = 1 / n_c = 0 in every
+        # other mode).
         self._Ch = (int(model._dipole_channels)
                     if model._neighbor_readout else 1)
-        self.n_c = (self._Ch * self.cfg.num_types * (self.cfg.num_types + 1) // 2
-                    if model._neighbor_readout and model._species_pairs else 0)
+        _T = self.cfg.num_types
+        self.n_c = (self._Ch * (_T * _T if model._species_pairs == "ordered"
+                                else _T * (_T + 1) // 2)
+                    if model._neighbor_readout and model._c_learnable else 0)
         n_W0 = self.cfg.num_types * self.cfg.dim_q * self.H
         n_b0 = self.cfg.num_types * self.H
         n_W1 = self.cfg.num_types * self.H * self._Ch
@@ -1398,7 +1401,7 @@ class SNES:
     def _split_reconstructed(self, params: tuple) -> dict:
         """Parse the reconstruct_params_tf tuple into a named dict.
 
-        Tail order: W0,b0,W1,b1 | c_pair (neighbor readout, species pairs on)
+        Tail order: W0,b0,W1,b1 | c_pair (neighbor readout, _c_learnable)
         | W0_pol.. (mode 2) | U_pair (mixing) | W_pre_angular (preprocess !=
         "off").
         """

@@ -43,6 +43,12 @@ def _cfg(**kw):
     cfg.types = [8, 1]
     cfg.num_types = 2
     cfg.type_map = {8: 0, 1: 1}
+    # Pin readout fields so working-tree experiment defaults in TNEPconfig
+    # never leak into the suite (kwargs still override).
+    cfg.dipole_channels = 4
+    cfg.dipole_species_pairs = "off"
+    cfg.dipole_radial = "chebyshev"
+    cfg.dipole_zeta = -2.0
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)
@@ -71,11 +77,27 @@ def _mu(model, atoms, cfg):
         W_atom=data.get("V_atom"))[0].numpy()
 
 
-@functools.lru_cache(maxsize=1)
-def _bulk_setup():
-    """(cfg, model, atoms, padded-data) for the 96-atom water frame — shared."""
-    cfg = _cfg()
+# Readout variants shared across the parametrized suites. "screened" is the
+# user-mandated BASIC form: single channel, c ≡ 1 frozen, ζ = −2.
+_MODE_KW = {
+    "chebyshev": {},
+    "screened": dict(dipole_radial="screened", dipole_channels=1,
+                     dipole_zeta=-2.0),
+    "ordered": dict(dipole_species_pairs="ordered"),
+}
+
+
+@functools.lru_cache(maxsize=4)
+def _bulk_setup(mode="chebyshev"):
+    """(cfg, model, atoms, padded-data) for the 96-atom water frame — shared.
+    "ordered" gets a randomized ASYMMETRIC Ω (symmetric Ω would telescope
+    back to the difference form and hide ordered-path bugs)."""
+    cfg = _cfg(**_MODE_KW[mode])
     model = _model(cfg)
+    if mode == "ordered":
+        rng = np.random.default_rng(11)
+        model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape)
+                            .astype(np.float32))
     atoms = _bulk_frame()
     data = prepare_eval_data([atoms], cfg)
     return cfg, model, atoms, data
@@ -154,8 +176,9 @@ def test_pair_difference_sum_matches_model():
 
 # ── 11: invariance suite ────────────────────────────────────────────────────
 
-def test_rigid_translation_invariance():
-    cfg, model, atoms, _ = _bulk_setup()
+@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered"])
+def test_rigid_translation_invariance(mode):
+    cfg, model, atoms, _ = _bulk_setup(mode)
     mu0 = _mu(model, atoms, cfg)
     at2 = atoms.copy()
     at2.positions = at2.positions + np.array([1.234, -2.517, 0.771])
@@ -163,8 +186,9 @@ def test_rigid_translation_invariance():
     assert np.allclose(mu0, mu1, atol=2e-3)
 
 
-def test_rotation_covariance():
-    cfg, model, atoms, _ = _bulk_setup()
+@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered"])
+def test_rotation_covariance(mode):
+    cfg, model, atoms, _ = _bulk_setup(mode)
     mu0 = _mu(model, atoms, cfg)
     a, b, c = 0.7, -0.4, 1.1
     Rz = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
@@ -178,8 +202,9 @@ def test_rotation_covariance():
     assert np.allclose(mu_rot, R @ mu0, atol=2e-3)
 
 
-def test_single_atom_lattice_translation_invariance():
-    cfg, model, atoms, _ = _bulk_setup()
+@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered"])
+def test_single_atom_lattice_translation_invariance(mode):
+    cfg, model, atoms, _ = _bulk_setup(mode)
     mu0 = _mu(model, atoms, cfg)
     at2 = atoms.copy()
     at2.positions[5] += atoms.cell[:][0]         # +one cell vector, atom 5
@@ -189,8 +214,12 @@ def test_single_atom_lattice_translation_invariance():
 
 # ── 13c: four-path forward consistency (the drift alarm) ────────────────────
 
-def test_four_path_consistency():
-    cfg, model, atoms, _ = _bulk_setup()
+@pytest.mark.parametrize("mode", ["chebyshev", "screened"])
+def test_four_path_consistency(mode):
+    # The only test cross-checking all three radial dispatch sites (numpy
+    # twin, predict inline, _neighbor_V_coo) against each other — catches a
+    # ζ/radial mismatch between them.
+    cfg, model, atoms, _ = _bulk_setup(mode)
     # Full pair stream (self_pairs_only=False) so the in-graph V path has
     # the r_d COO list to build V from.
     types_int = assign_type_indices([atoms], cfg.types)
@@ -304,8 +333,12 @@ def test_water_monomer_bisector():
 
 # ── 16t: gauge — s → s + c shifts μ by c·Σ_i v_i ≡ 0 ────────────────────────
 
-def test_gauge_shift_cancels():
-    cfg, model, atoms, data = _bulk_setup()
+@pytest.mark.parametrize("mode", ["chebyshev", "screened"])
+def test_gauge_shift_cancels(mode):
+    # "off"/"symmetric" only: with an asymmetric ordered Ω the s → s + g
+    # residual Σ g·R·d·(Ω[t,t'] − Ω[t',t]) is nonzero BY DESIGN (gauge
+    # invariance is deliberately traded away), so no "ordered" case here.
+    cfg, model, atoms, data = _bulk_setup(mode)
     V = data["V_atom"][0].numpy()               # [A, 3, C, T], model's own V
     # Per channel n: shifting s^n uniformly across ALL atoms moves μ by
     # g_n·Σ_{a,t'} V[a,:,n,t'] ≡ 0 (ordered-pair cancellation, c symmetric).
@@ -337,15 +370,17 @@ def test_same_species_coefficient_zeroes_contribution():
 
 
 def test_species_pairs_off_is_frozen_ones():
-    # Default dipole_species_pairs=False: no c parameters in the SNES tail,
-    # and the forward equals the learnable model at its c=1 init.
+    # "off": no c parameters in the SNES tail, and the forward equals the
+    # learnable model at its c=1 init. Legacy bools (old configs/saves)
+    # normalize at model init: False→"off", True→"symmetric".
     from SNES import SNES
-    cfg_off = _cfg()
-    assert cfg_off.dipole_species_pairs is False           # class default
+    cfg_off = _cfg(dipole_species_pairs=False)             # legacy bool
     model_off = _model(cfg_off)
+    assert cfg_off.dipole_species_pairs == "off"           # normalized
     assert not isinstance(model_off.c_pair, tf.Variable)
-    cfg_on = _cfg(dipole_species_pairs=True)
+    cfg_on = _cfg(dipole_species_pairs=True)               # legacy bool
     model_on = _model(cfg_on)                              # same seed → same W
+    assert cfg_on.dipole_species_pairs == "symmetric"      # normalized
     atoms = _bulk_frame()
     assert np.allclose(_mu(model_off, atoms, cfg_off),
                        _mu(model_on, atoms, cfg_on), atol=1e-6)
@@ -390,3 +425,194 @@ def test_small_box_raises_at_data_assembly():
                cell=6.0 * np.eye(3), pbc=True)           # L = 6.0 < 6.5
     with pytest.raises(ValueError, match="box height"):
         _neighbor_dipole_guards([at], [np.zeros(3)], cfg)
+
+
+# ── screened power-law radial ───────────────────────────────────────────────
+
+def _fcub(r, rc):
+    x = r / rc
+    return 1.0 - 3.0 * x ** 2 + 2.0 * x ** 3
+
+
+def test_screened_identity_user_formula():
+    # Independent reference implements the USER'S ORIGINAL formula
+    # s·r̂·|r|^ζ·f_cub (unit vector times power) — NOT the code's
+    # r^(ζ−1)·d rearrangement — so a rearrangement bug cannot self-verify.
+    # Basic form: C = 1, c ≡ 1 frozen, ζ = −2.
+    cfg, model, atoms, data = _bulk_setup("screened")
+    s = _site_scalars_np(model, data)[:, 0]                    # [A]
+    mu_model = _mu(model, atoms, cfg)
+    rc, zeta = float(cfg.dipole_rc), float(cfg.dipole_zeta)
+    i, j, D = neighbor_list("ijD", atoms, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # d = r_i − r_j
+    r = np.linalg.norm(d, axis=1)
+    rhat = d / r[:, None]
+    mu_ref = np.sum(s[i, None] * rhat
+                    * (r ** zeta * _fcub(r, rc))[:, None], axis=0)
+    assert np.allclose(mu_model, mu_ref,
+                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
+
+
+def test_screened_smoothness_at_rc():
+    # Screened cubic f_cub = (1−x)²(1+2x): f(r_c) = f′(r_c) = 0 but
+    # f″(r_c) = 6/r_c² ≠ 0 — C¹ contact only. Assert value + first FD
+    # derivative continuous; the second-derivative jump at r_c is EXPECTED
+    # (traded for the power-law screening), so d2 is deliberately unasserted.
+    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0,
+               dipole_radial="screened", dipole_channels=1, dipole_zeta=-2.0)
+    model = _model(cfg)
+    rc = float(cfg.dipole_rc)
+    h = 0.03
+    rs = np.arange(2.70, 3.30 + 1e-9, h)
+    mus = []
+    for r in rs:
+        at = Atoms("OH", positions=[[10.0, 10.0, 10.0], [10.0 + r, 10.0, 10.0]],
+                   cell=20.0 * np.eye(3), pbc=True)
+        at.info["dipole"] = np.zeros(3)
+        mus.append(_mu(model, at, cfg))
+    mus = np.array(mus)
+    assert np.allclose(mus[rs >= rc], 0.0, atol=1e-12)   # beyond r_c: zero
+    d1 = (mus[2:] - mus[:-2]) / (2 * h)
+    n_mu = np.linalg.norm(mus, axis=1)
+    n_d1 = np.linalg.norm(d1, axis=1)
+    r_mid = rs[1:-1]
+    # μ ∝ (r_c − r)² near r_c ⇒ value ~h² and slope ~h at the last inside
+    # points relative to their scan maxima.
+    k_last = np.max(np.where(rs < rc))
+    assert n_mu[k_last] < 0.02 * n_mu.max()
+    near = np.abs(r_mid - rc) < 1.5 * h
+    assert n_d1[near].max() < 0.15 * n_d1.max()
+
+
+def test_screened_no_nan_padded_batch():
+    # Padded batch at ζ = −2: the self-pairs-only pair stream feeds the
+    # in-graph V builder real r = 0 entries, and padding adds more — the
+    # input guard in _radial must keep μ finite (0**(ζ−1) = inf without it).
+    cfg, model, _, _ = _bulk_setup("screened")
+    small = Atoms("OHH",
+                  positions=[[10.0, 10.0, 10.0], [10.96, 10.0, 10.0],
+                             [9.76, 10.59, 10.0]],
+                  cell=20.0 * np.eye(3), pbc=True)
+    small.info["dipole"] = np.zeros(3)
+    data = prepare_eval_data([_bulk_frame(), small], cfg)   # padded to 96
+    args = (data["descriptors"], data["grad_values"],
+            data["pair_atom"], data["pair_gidx"], data["pair_struct"],
+            data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
+            model.W0, model.b0, model.W1, model.b1)
+    assert np.all(np.isfinite(
+        model.predict_batch(*args, W_atom=data["V_atom"]).numpy()))
+    assert np.all(np.isfinite(
+        model.predict_batch(*args, W_atom=None).numpy()))
+
+
+# ── ordered species-weight table Ω ──────────────────────────────────────────
+
+def test_ordered_identity_asymmetric_omega():
+    # Independent numpy ordered-pair sum: μ = Σ_(i,j) s_i·Ω[t_i,t_j]·R·d —
+    # only the CENTER's scalar and the ORDERED index, no (s_i − s_j) form.
+    cfg, model, atoms, data = _bulk_setup("ordered")
+    T = cfg.num_types
+    Om = model.c_pair.numpy().astype(np.float64)               # [C, T²]
+    Om_sq = Om.reshape(-1, T, T)
+    assert not np.allclose(Om_sq, np.swapaxes(Om_sq, 1, 2))    # asymmetric
+    s = _site_scalars_np(model, data)                          # [A, C]
+    mu_model = _mu(model, atoms, cfg)
+    Zt = data["Z_int"][0].numpy()
+    i, j, D = neighbor_list("ijD", atoms, float(cfg.dipole_rc))
+    keep = i != j
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    R = _R_np(r, float(cfg.dipole_rc), int(cfg.dipole_channels))  # [P, C]
+    cn = Om[:, Zt[i] * T + Zt[j]].T                               # [P, C]
+    b = np.sum(cn * R * s[i], axis=1)
+    mu_ref = np.sum(b[:, None] * d, axis=0)
+    assert np.allclose(mu_model, mu_ref,
+                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
+
+
+def test_ordered_omega_one_collapses_to_off():
+    # Ω ≡ 1 gathers to the same all-ones [C, T, T] table as "off" — the two
+    # forwards are the SAME graph, so the collapse is bit-tight.
+    cfg_off = _cfg()
+    cfg_ord = _cfg(dipole_species_pairs="ordered")
+    model_off = _model(cfg_off)
+    model_ord = _model(cfg_ord)                     # same seed → same W; Ω = 1
+    atoms = _bulk_frame()
+    np.testing.assert_array_equal(_mu(model_off, atoms, cfg_off),
+                                  _mu(model_ord, atoms, cfg_ord))
+
+
+def test_ordered_snes_tail_size():
+    from SNES import SNES
+    cfg = _cfg(dipole_species_pairs="ordered")
+    opt = SNES(_model(cfg))
+    assert opt.n_c == int(cfg.dipole_channels) * cfg.num_types ** 2
+
+
+def test_save_load_roundtrip_ordered_omega(tmp_path):
+    # The silent-failure path from the gate inventory: a miskeyed save or
+    # load-assign would drop the asymmetric Ω and μ would change silently.
+    import model_io
+    cfg = _cfg(dipole_species_pairs="ordered")
+    model = _model(cfg)
+    rng = np.random.default_rng(5)
+    model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape)
+                        .astype(np.float32))
+    atoms = _bulk_frame()
+    mu0 = _mu(model, atoms, cfg)
+    p = str(tmp_path / "ordered.h5")
+    model_io.save_model(model, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.dipole_species_pairs == "ordered"
+    np.testing.assert_array_equal(loaded.c_pair.numpy(), model.c_pair.numpy())
+    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
+
+
+def test_save_load_roundtrip_screened_basic(tmp_path):
+    # Basic screened form (C=1, "off"): saves/loads with no Ω machinery,
+    # and dipole_radial/dipole_zeta persist through the config JSON.
+    import model_io
+    cfg, model, atoms, _ = _bulk_setup("screened")
+    mu0 = _mu(model, atoms, cfg)
+    p = str(tmp_path / "screened.h5")
+    model_io.save_model(model, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.dipole_radial == "screened"
+    assert float(loaded.cfg.dipole_zeta) == -2.0
+    assert not isinstance(loaded.c_pair, tf.Variable)
+    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
+
+
+# ── config gates (screened / 3-value field) ─────────────────────────────────
+
+def test_screened_multichannel_raises_at_init():
+    # RAISE, not force: data assembly reads cfg.dipole_channels before the
+    # model exists, so forcing C=1 here would desync the precomputed V.
+    cfg = _cfg(dipole_radial="screened", dipole_channels=4)
+    with pytest.raises(ValueError, match="single-channel"):
+        _model(cfg)
+
+
+def test_unknown_radial_raises_at_init():
+    cfg = _cfg(dipole_radial="gaussian")
+    with pytest.raises(ValueError, match="dipole_radial"):
+        _model(cfg)
+
+
+def test_unknown_species_pairs_raises_at_init():
+    cfg = _cfg(dipole_species_pairs="banana")
+    with pytest.raises(ValueError, match="dipole_species_pairs"):
+        _model(cfg)
+
+
+def test_legacy_bool_normalizes_at_config_load():
+    # model_io leg of the normalization: an old saved JSON carrying a bool
+    # must come out of the load path as the 3-value string.
+    from model_io import _apply_legacy_field_defaults
+    cfg_t = _cfg(dipole_species_pairs=True)
+    _apply_legacy_field_defaults(cfg_t, ["dipole_species_pairs"])
+    assert cfg_t.dipole_species_pairs == "symmetric"
+    cfg_f = _cfg(dipole_species_pairs=False)
+    _apply_legacy_field_defaults(cfg_f, ["dipole_species_pairs"])
+    assert cfg_f.dipole_species_pairs == "off"

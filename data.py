@@ -365,7 +365,9 @@ def assemble_data_dict(
             and getattr(cfg, "dipole_readout", "tnep") == "neighbor"):
         data["V_atom"] = [
             _neighbor_dipole_V(s, t, float(cfg.dipole_rc or cfg.rcut_hard),
-                               int(cfg.dipole_channels), int(cfg.num_types))
+                               int(cfg.dipole_channels), int(cfg.num_types),
+                               str(getattr(cfg, "dipole_radial", "chebyshev")),
+                               float(getattr(cfg, "dipole_zeta", -2.0)))
             for s, t in zip(dataset, types_int)]
 
     # Auto-detect and include force/virial targets for PES mode
@@ -392,17 +394,24 @@ def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
 
 
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
-                       C: int, T: int) -> np.ndarray:
+                       C: int, T: int, radial: str = "chebyshev",
+                       zeta: float = -2.0) -> np.ndarray:
     """Per-atom geometry kernel of the neighbor-basis dipole readout:
     V_i[:,n,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·d, d = r_i − r_j (image
-    pairs), R_n(r) = T_n(2r/rc − 1)·f_c(r), f_c = ((1+cos(πr/rc))/2)².
+    pairs). R: "chebyshev" R_n = T_n(2r/rc − 1)·((1+cos(πr/rc))/2)², or
+    "screened" R = r^(ζ−1)·(1 − 3x² + 2x³), x = r/rc (numpy twin of
+    TNEP._radial; pairs are filtered before the power, so no r=0 guard).
     float64 accumulate → float32 [N, 3, C, T]."""
     i, j, D = neighbor_list("ijD", atoms, rc)
     keep = i != j                                  # drop self-image pairs
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
     r = np.linalg.norm(d, axis=1)
-    Tn = np.polynomial.chebyshev.chebvander(2.0 * r / rc - 1.0, C - 1)  # [P, C]
-    Rw = Tn * (((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2)[:, None]
+    if radial == "screened":
+        x = r / rc
+        Rw = (r ** (zeta - 1.0) * (1.0 - 3.0 * x * x + 2.0 * x**3))[:, None]
+    else:
+        Tn = np.polynomial.chebyshev.chebvander(2.0 * r / rc - 1.0, C - 1)  # [P, C]
+        Rw = Tn * (((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2)[:, None]
     V = np.zeros((len(atoms), T, 3, C))
     np.add.at(V, (i, np.asarray(types_int)[j]),
               d[:, :, None] * Rw[:, None, :])

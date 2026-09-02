@@ -354,7 +354,8 @@ def _print_param_breakdown(model) -> None:
                  if model._neighbor_readout else "ANN  b1")
     rows.append((_b1_label,          int(opt._n_b1)))
     if opt.n_c > 0:
-        rows.append(("c_pair  [C·T(T+1)/2]", int(opt.n_c)))
+        rows.append(("c_pair  [C·T²]" if model._species_pairs == "ordered"
+                     else "c_pair  [C·T(T+1)/2]", int(opt.n_c)))
 
     # Polarisability ANN — same per-layer shape, mirrored doubling.
     if cfg.target_mode == 2:
@@ -480,13 +481,20 @@ def _train_model_inner(cfg: TNEPconfig,
               f"Q_raw={q_raw} → Q_new={q_new}  "
               f"(×{ratio:.2f} compression, {reduce:.1f}% reduction)")
     if model._neighbor_readout:
-        _c_desc = ("learned species-pair coefficients c[C, T(T+1)/2]"
-                   if model._species_pairs else "c ≡ 1")
+        _c_desc = {
+            "off": "c ≡ 1",
+            "symmetric": "learned symmetric c[C, T(T+1)/2] (unordered pairs)",
+            "ordered": "learned ordered Ω[C, T²] (asymmetric — breaks gauge "
+                       "invariance across species)",
+        }[model._species_pairs]
+        _r_desc = (f"R = r^(ζ−1)·(1 − 3x² + 2x³), x = r/r_c (screened, "
+                   f"ζ = {model._dipole_zeta})"
+                   if model._dipole_radial == "screened" else
+                   "R_n = T_n(2r/r_c − 1)·f_c (Chebyshev), "
+                   "f_c = ((1+cos(πr/r_c))/2)²")
         print(f"Dipole readout: neighbor basis — "
-              f"b_ij = Σ_n c_n[p(t_i,t_j)]·R_n(r_ij)·(s_i^n − s_j^n), "
-              f"μ = Σ_(i<j) b_ij·(r_i − r_j); "
-              f"R_n = T_n(2r/r_c − 1)·f_c (Chebyshev), "
-              f"f_c = ((1+cos(πr/r_c))/2)², "
+              f"b_ij = Σ_n c_n[t_i,t_j]·R_n(r_ij)·s_i^n (+ mirrored j term), "
+              f"μ = Σ_pairs b_ij·(r_i − r_j); {_r_desc}, "
               f"C = {model._dipole_channels} channels, {_c_desc}, "
               f"r_c = {cfg.dipole_rc} Å")
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")

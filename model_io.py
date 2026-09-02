@@ -42,6 +42,11 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "preprocess_sigma_scale": 1.0,
     # Pre-existence: not present; None preserves Q_raw (nep4_radial mode only).
     "descriptor_nep4_n_max_out": None,
+    # Pre-existence: only the Chebyshev radial existed; ζ unused there.
+    "dipole_radial": "chebyshev",
+    "dipole_zeta": -2.0,
+    # Pre-existence: no species-pair table (legacy bool False ≡ "off").
+    "dipole_species_pairs": "off",
 }
 
 
@@ -54,6 +59,11 @@ def _apply_legacy_field_defaults(cfg: TNEPconfig,
     for field, legacy in _LEGACY_FIELD_DEFAULTS.items():
         if field not in saved:
             setattr(cfg, field, legacy)
+    # Legacy bool dipole_species_pairs (pre-3-value saves): False→"off",
+    # True→"symmetric" (model init normalizes too; this keeps cfg clean for
+    # re-saves and validation before a model exists).
+    sp = getattr(cfg, "dipole_species_pairs", "off")
+    cfg.dipole_species_pairs = {False: "off", True: "symmetric"}.get(sp, sp)
 
 
 def setup_run_directory(cfg: TNEPconfig) -> str:
@@ -207,8 +217,8 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             wg.create_dataset("W1_pol", data=model.W1_pol.numpy())
             wg.create_dataset("b1_pol", data=model.b1_pol.numpy())
         # Neighbor readout: learned species-pair coefficient table (only when
-        # dipole_species_pairs; frozen c ≡ 1 is rebuilt at load, not stored).
-        if model._neighbor_readout and model._species_pairs:
+        # learnable; frozen c ≡ 1 is rebuilt at load, not stored).
+        if model._neighbor_readout and model._c_learnable:
             wg.create_dataset("c_pair", data=model.c_pair.numpy())
         # Optional descriptor-mixing layer, stored only when trained with
         # cfg.descriptor_mixing=True. Dataset "U_pair" holds the residual
@@ -417,15 +427,15 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
         # (W1 [T, H, C]; c_pair when dipole_species_pairs). Old neighbor-mode
         # saves cannot be mapped — fail loudly. tnep-mode saves unaffected.
         if tuple(np.shape(W1)) != tuple(model.W1.shape) or (
-                model._species_pairs and c_pair is None):
+                model._c_learnable and c_pair is None):
             raise ValueError(
                 f"neighbor-readout save predates the multi-channel Chebyshev "
                 f"readout (saved W1 shape {tuple(np.shape(W1))}, model needs "
                 f"{tuple(model.W1.shape)}"
-                + (", c_pair missing" if model._species_pairs and c_pair is None
+                + (", c_pair missing" if model._c_learnable and c_pair is None
                    else "")
                 + "). Old neighbor-mode saves are unsupported — re-train.")
-        if model._species_pairs:
+        if model._c_learnable:
             model.c_pair.assign(c_pair)
     model.W0.assign(W0)
     model.b0.assign(b0)
