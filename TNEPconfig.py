@@ -137,6 +137,12 @@ class TNEPconfig:
     # Ridge strength λ, applied RELATIVE to mean(diag(ΦᵀΦ)) — dimensionless
     # (λ_eff = λ · mean_m ‖Φ[:,m]‖²), so its scale is data-independent.
     gap_ridge_lambda: float = 1e-6
+    # Ridge solver — mathematically identical routes:
+    #   "primal" : augmented [Φ; √λ_eff·I] lstsq; peak memory ~n_columns².
+    #   "dual"   : α = Φᵀ(ΦΦᵀ + λ_eff·I)⁻¹μ; Gram is [3F, 3F] regardless of
+    #              n_columns — memory linear in columns, far faster when
+    #              columns ≫ 3F (large M·C·T).
+    gap_solver: str = "primal"
 
     # ═══════════════════════════════════════════════════════════════════
     # 2. DESCRIPTOR (SOAP-turbo)

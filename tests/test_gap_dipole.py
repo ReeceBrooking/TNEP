@@ -97,6 +97,9 @@ def test_predict_identity(fitted):
 
 CHEB_PAIRS = dict(dipole_radial="chebyshev", dipole_cutoff="cosine2",
                   dipole_channels=3, dipole_species_pairs="ordered")
+GAUSS_PAIRS = dict(dipole_radial="gaussian", dipole_cutoff="cosine2",
+                   dipole_channels=3, dipole_species_pairs="ordered",
+                   dipole_gauss_sigma_scale=0.5)
 
 
 def test_chebyshev_pair_identity(tmp_path):
@@ -133,8 +136,9 @@ def test_chebyshev_pair_identity(tmp_path):
 
 # ── exactness from a KNOWN α: μ = Φα* recovered at λ → 0 ───────────────────
 
-@pytest.mark.parametrize("overrides", [{}, CHEB_PAIRS],
-                         ids=["screened_off", "chebyshev_pairs"])
+@pytest.mark.parametrize("overrides", [{}, CHEB_PAIRS, GAUSS_PAIRS],
+                         ids=["screened_off", "chebyshev_pairs",
+                              "gaussian_pairs"])
 def test_exact_recovery_known_alpha(tmp_path, overrides):
     frames = read(WATER_XYZ, index="0:6")
     for f in frames:
@@ -296,3 +300,18 @@ def test_run_record(tmp_path):
     assert rec["gap"]["n_columns"] == sum(rec["gap"]["M_per_species"].values())
     for key in ("train_rmse", "train_r2", "fit_seconds"):
         assert key in rec["metrics"]
+
+
+def test_dual_solver_matches_primal(tmp_path):
+    """The dual ridge α = Φᵀ(ΦΦᵀ+λI)⁻¹μ is a matrix identity with the primal
+    augmented lstsq — predictions must agree to numerical precision."""
+    frames = read(WATER_XYZ, index="0:4")
+    with _chdir(tmp_path):
+        models = []
+        for solver in ("primal", "dual"):
+            cfg = _cfg(**CHEB_PAIRS)
+            cfg.gap_solver = solver
+            models.append(gap_dipole.fit_gap_dipole(cfg))
+    p = gap_dipole.predict(models[0], frames)
+    d = gap_dipole.predict(models[1], frames)
+    assert np.allclose(p, d, rtol=1e-8, atol=1e-10 * np.abs(p).max())
