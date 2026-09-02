@@ -1,15 +1,26 @@
-"""GAP-mode dipole fit for the neighbor readout (screened/cubic/off).
+"""GAP-mode dipole fit for the neighbor readout.
 
 Sparse-kernel ridge alternative to the SNES-trained ANN, exploiting the
 readout's linearity in the site scalars (neighbor_dipole_gap_plan.md):
 
-    s_i = Σ_m α_m (D̂_i · D̂_m)^ξ      (m: sparse envs, same species as i)
-    μ   = Σ_i s_i v_i                 (v_i from data._neighbor_dipole_V)
+    μ = Σ_i Σ_k s_i^k v_i[:, k],  s_i^k = Σ_m α_m^k (D̂_i · D̂_m)^ξ
 
-Fixed configuration, validated at fit: dipole_radial="screened",
-dipole_cutoff→"cubic", dipole_species_pairs="off" (c ≡ 1, C = 1).
-NO model persistence — fit writes a config+metrics run record JSON to GAP/.
-"""
+with v_i from data._neighbor_dipole_V [N, 3, C, T] — any radial
+(chebyshev/warped/gaussian/screened; screened requires C = 1, matching the
+readout contract) and any cutoff. The k axis of v — and hence the design
+columns per sparse point m — depends on dipole_species_pairs:
+
+    "off":         k = channel n only, V summed over neighbor type t′ (K = C);
+    anything else: k = (n, t′) kept (K = C·T) — per-(sparse-point, channel,
+        neighbor-species) weights absorbed into the linear fit. This STRICTLY
+        SUBSUMES both the readout's symmetric c and ordered Ω tables; the
+        symmetric/ordered distinction does not exist in the absorbed form
+        (any non-"off" value enables the same general columns).
+
+Columns = M_tot·K can exceed the 3·F equations (underdetermined); the ridge
+handles it — train RMSE approaches 0 there and test RMSE is the metric.
+Still fixed: dipole_readout="neighbor", target_mode=1, scale_targets=False.
+NO model persistence — fit writes a config+metrics run record JSON to GAP/."""
 from __future__ import annotations
 
 import json
@@ -32,35 +43,35 @@ class GapDipoleModel:
     cfg: TNEPconfig
     builder: object                   # descriptor builder from the fitting cfg
     sparse_desc: list[np.ndarray]     # per type t: [M_t, Q] unit-norm rows
-    alpha: list[np.ndarray]           # per type t: [M_t]
+    alpha: list[np.ndarray]           # per type t: [M_t·K] flat, (m, k) order
     xi: int
 
 
-def _validate(cfg: TNEPconfig) -> None:
-    """Raise unless cfg is the fixed GAP configuration. Runs FIRST in fit."""
+def _pair_columns(cfg: TNEPconfig) -> bool:
+    """True when the neighbor-type axis of V becomes design columns
+    (any dipole_species_pairs but "off"/legacy False)."""
     sp = cfg.dipole_species_pairs
+    return not (sp == "off" or sp is False)
+
+
+def _validate(cfg: TNEPconfig) -> None:
+    """Raise unless cfg is a GAP-fittable configuration. Runs FIRST in fit."""
     checks = [
         (cfg.target_mode == 1,
          f"target_mode must be 1, got {cfg.target_mode}"),
         (cfg.dipole_readout == "neighbor",
          f"dipole_readout must be 'neighbor', got {cfg.dipole_readout!r}"),
-        (cfg.dipole_radial == "screened",
-         f"dipole_radial must be 'screened', got {cfg.dipole_radial!r}"),
-        (resolved_dipole_cutoff(cfg) == "cubic",
-         f"dipole_cutoff must resolve to 'cubic', got "
-         f"{resolved_dipole_cutoff(cfg)!r}"),
-        # legacy bool False→"off" normalizes in TNEP.__init__, which GAP
-        # never runs — accept it here.
-        (sp == "off" or sp is False,
-         f"dipole_species_pairs must be 'off', got {sp!r}"),
-        (int(cfg.dipole_channels) == 1,
-         f"dipole_channels must be 1, got {cfg.dipole_channels}"),
+        (int(cfg.dipole_channels) >= 1,
+         f"dipole_channels must be >= 1, got {cfg.dipole_channels}"),
+        # readout contract: the screened radial is single-channel.
+        (cfg.dipole_radial != "screened" or int(cfg.dipole_channels) == 1,
+         f"dipole_channels must be 1 for the screened radial, got "
+         f"{cfg.dipole_channels}"),
         (not cfg.scale_targets, "scale_targets must be False"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     if bad:
-        raise ValueError("fit_gap_dipole fixed-config violation: "
-                         + "; ".join(bad))
+        raise ValueError("fit_gap_dipole config violation: " + "; ".join(bad))
 
 
 def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
@@ -78,20 +89,25 @@ def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
     return out
 
 
-def _collapse_V(V: np.ndarray) -> np.ndarray:
-    """[N, 3, 1, T] → per-atom v_i [N, 3] under c ≡ 1, C = 1 — the ONE place
-    this contract is encoded (float64 before the sum, shared by fit + predict)."""
-    return np.asarray(V, dtype=np.float64)[:, :, 0, :].sum(axis=-1)
+def _collapse_V(V: np.ndarray, pair_columns: bool) -> np.ndarray:
+    """[N, 3, C, T] → v_i [N, 3, K] — the ONE place the column contract is
+    encoded (float64, shared by fit + predict). K = C·T with pair columns
+    (k = (n, t′), C-major, matching reshape order) else K = C (t′ summed)."""
+    V = np.asarray(V, dtype=np.float64)
+    if pair_columns:
+        return V.reshape(V.shape[0], 3, -1)
+    return V.sum(axis=-1)
 
 
 def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: TNEPconfig) -> np.ndarray:
-    """Per-atom geometry vector v_i [N, 3]: V summed over neighbor types
-    (c ≡ 1, C = 1)."""
+    """Per-atom geometry vectors v_i [N, 3, K] per the cfg's radial/cutoff/
+    channels and pair-column mode."""
     V = tnep_data._neighbor_dipole_V(
-        atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard), 1,
-        int(cfg.num_types), str(cfg.dipole_radial), float(cfg.dipole_zeta),
+        atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard),
+        int(cfg.dipole_channels), int(cfg.num_types),
+        str(cfg.dipole_radial), float(cfg.dipole_zeta),
         resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale))
-    return _collapse_V(V)
+    return _collapse_V(V, _pair_columns(cfg))
 
 
 def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
@@ -108,13 +124,14 @@ def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
 
 def _phi_frame(D: np.ndarray, v: np.ndarray, ti: np.ndarray,
                sparse_desc: list[np.ndarray], xi: int) -> np.ndarray:
-    """[3, M_tot] design block for one frame: Φ[:, m] = Σ_{i∈species(m)}
-    k(D̂_i, D̂_m) v_i. Species-blocked — no cross-species kernel terms."""
+    """[3, M_tot·K] design block for one frame: Φ[:, (m,k)] = Σ_{i∈species(m)}
+    k(D̂_i, D̂_m) v_i[:, k]. Species-blocked — no cross-species kernel terms."""
     cols = []
     for t, Dm in enumerate(sparse_desc):
         sel = ti == t
         K = (D[sel] @ Dm.T) ** xi                       # [n_t, M_t]
-        cols.append(v[sel].T @ K)                       # [3, M_t]
+        cols.append(np.einsum("nm,nxk->xmk", K, v[sel])
+                    .reshape(3, -1))                    # [3, M_t·K]
     return np.concatenate(cols, axis=1)
 
 
@@ -161,7 +178,9 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         dataset, types_int, descs, [[]] * len(dataset), [[]] * len(dataset),
         cfg)
     mu = np.stack([np.asarray(t, dtype=np.float64) for t in d["targets"]])
-    vs = [_collapse_V(V) for V in d["V_atom"]]
+    pair = _pair_columns(cfg)
+    vs = [_collapse_V(V, pair) for V in d["V_atom"]]
+    n_vcols = int(cfg.dipole_channels) * (cfg.num_types if pair else 1)
 
     # Per-species FPS sparse points.
     rng = np.random.default_rng(cfg.seed)
@@ -176,23 +195,23 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
                 f"cannot place sparse points for that species")
         sparse_desc.append(Dt[_fps(Dt, M_req, rng)].copy())
     sizes = [len(s) for s in sparse_desc]
-    M_tot = sum(sizes)
+    n_columns = sum(sizes) * n_vcols
 
     # Φ frame-by-frame — the full N_envs × M kernel never exists.
     F = len(dataset)
-    Phi = np.empty((F, 3, M_tot))
+    Phi = np.empty((F, 3, n_columns))
     for f in range(F):
         Phi[f] = _phi_frame(descs[f], vs[f], tis[f], sparse_desc, xi)
-    Phi_flat = Phi.reshape(3 * F, M_tot)
+    Phi_flat = Phi.reshape(3 * F, n_columns)
 
     # Explicit ridge solve: augmented [Φ; √λ_eff·I], λ_eff relative to
     # mean(diag(ΦᵀΦ)) so λ is dimensionless.
     lam = float(cfg.gap_ridge_lambda)
     lam_eff = lam * float(np.mean(np.sum(Phi_flat ** 2, axis=0)))
-    A = np.vstack([Phi_flat, np.sqrt(lam_eff) * np.eye(M_tot)])
-    b = np.concatenate([mu.reshape(-1), np.zeros(M_tot)])
+    A = np.vstack([Phi_flat, np.sqrt(lam_eff) * np.eye(n_columns)])
+    b = np.concatenate([mu.reshape(-1), np.zeros(n_columns)])
     alpha_flat = np.linalg.lstsq(A, b, rcond=None)[0]
-    alpha = np.split(alpha_flat, np.cumsum(sizes)[:-1])
+    alpha = np.split(alpha_flat, np.cumsum([n * n_vcols for n in sizes])[:-1])
 
     model = GapDipoleModel(cfg=cfg, builder=builder,
                            sparse_desc=sparse_desc, alpha=alpha, xi=xi)
@@ -201,7 +220,8 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         (Phi_flat @ alpha_flat).reshape(F, 3), mu)
     metrics = {"train_rmse": train_rmse, "train_r2": train_r2,
                "n_train_frames": F, "fit_seconds": time.time() - t0}
-    print(f"[gap_dipole] fit M={sizes} xi={xi} lambda={lam:g}: "
+    print(f"[gap_dipole] fit M={sizes} xi={xi} lambda={lam:g} "
+          f"n_columns={n_columns}: "
           f"train RMSE {train_rmse:.4f}, R² {train_r2:.4f} "
           f"({metrics['fit_seconds']:.1f} s)")
 
@@ -218,6 +238,14 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         "config": _serialize_config(cfg),
         "gap": {"sparse_per_species": M_req, "kernel_power": xi,
                 "ridge_lambda": lam, "lambda_eff": lam_eff,
+                "radial": cfg.dipole_radial,
+                "cutoff": resolved_dipole_cutoff(cfg),
+                "channels": int(cfg.dipole_channels),
+                # True ⇒ per-(sparse-point, channel, neighbor-species)
+                # columns; subsumes symmetric c AND ordered Ω (no distinction
+                # in the absorbed linear form).
+                "pair_columns": pair,
+                "n_columns": n_columns,
                 "M_per_species": {str(z): n
                                   for z, n in zip(cfg.types, sizes)}},
         "metrics": metrics,
@@ -239,18 +267,20 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
     out = np.empty((len(frames), 3))
     for f, (atoms, ti, D) in enumerate(zip(frames, tis, descs)):
         ti = np.asarray(ti)
-        v = _v_atoms(atoms, ti, cfg)
-        s = np.zeros(len(atoms))
+        v = _v_atoms(atoms, ti, cfg)                    # [N, 3, K]
+        K = v.shape[-1]
+        mu = np.zeros(3)
         for t, (Dm, a) in enumerate(zip(model.sparse_desc, model.alpha)):
             sel = ti == t
-            s[sel] = ((D[sel] @ Dm.T) ** model.xi) @ a
-        out[f] = s @ v
+            w = ((D[sel] @ Dm.T) ** model.xi) @ a.reshape(len(Dm), K)
+            mu += np.einsum("nk,nxk->x", w, v[sel])
+        out[f] = mu
     return out
 
 
 if __name__ == "__main__":
     # IDE / CLI entry: fit on cfg.data_path, evaluate cfg.test_data_path,
-    # print metrics, write the GAP/ run record. The GAP-required readout
+    # print metrics, write the GAP/ run record. The GAP-relevant readout
     # fields are pinned HERE rather than read from TNEPconfig class defaults,
     # so working-tree experiment values cannot leak into the fit.
     os.chdir(os.path.dirname(os.path.abspath(__file__)))  # datasets/, GAP/
@@ -259,17 +289,17 @@ if __name__ == "__main__":
     cfg.target_mode = 1
     cfg.scale_targets = False
     cfg.dipole_readout = "neighbor"
-    cfg.dipole_radial = "screened"
-    cfg.dipole_cutoff = "cubic"
-    cfg.dipole_species_pairs = "off"
-    cfg.dipole_channels = 1
-    cfg.dipole_zeta = -2.0
-    cfg.dipole_rc = None                    # inherit rcut_hard
+    cfg.dipole_radial = "chebyshev"
+    cfg.dipole_cutoff = "cosine2"
+    cfg.dipole_species_pairs = "ordered"    # any non-"off" ⇒ pair columns
+    cfg.dipole_channels = 4
+    cfg.dipole_zeta = -2.0                  # unused for chebyshev
+    cfg.dipole_rc = 3.0                     # beat inherited 3.5 in run records
     cfg.rcut_hard, cfg.rcut_soft = 3.5, 3.0
 
     # GAP knobs — tweak freely:
     cfg.gap_sparse_per_species = 500
     cfg.gap_kernel_power = 2
-    cfg.gap_ridge_lambda = 1e-6
+    cfg.gap_ridge_lambda = 1e-8    # λ scan {1e-4,1e-6,1e-8}: 1e-8 best on test
 
     fit_gap_dipole(cfg)

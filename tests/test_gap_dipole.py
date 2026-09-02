@@ -1,4 +1,4 @@
-"""Tests for the GAP-mode dipole fit (gap_dipole.py, screened/cubic/off)."""
+"""Tests for the GAP-mode dipole fit (gap_dipole.py)."""
 import os
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
@@ -93,9 +93,49 @@ def test_predict_identity(fitted):
     assert np.allclose(mu, mu_ref, atol=1e-6 * max(np.linalg.norm(mu), 1.0))
 
 
+# ── chebyshev multi-channel + pair columns: predict() vs hand-rolled ───────
+
+CHEB_PAIRS = dict(dipole_radial="chebyshev", dipole_cutoff="cosine2",
+                  dipole_channels=3, dipole_species_pairs="ordered")
+
+
+def test_chebyshev_pair_identity(tmp_path):
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(_cfg(**CHEB_PAIRS))
+    at = read(WATER_XYZ, index="10")
+    mu = gap_dipole.predict(m, [at])[0]
+    ti = np.array([m.cfg.types.index(int(z)) for z in at.numbers])
+    D = np.asarray(m.builder.build_descriptors(
+        [at], calc_gradients=False)[0][0], dtype=np.float64)
+    C, T, rc = 3, len(m.cfg.types), float(m.cfg.dipole_rc)
+    i, j, Dv = neighbor_list("ijD", at, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)  # d = r_i − r_j
+    r = np.linalg.norm(d, axis=1)
+    fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    # own Chebyshev: T_n(x) = cos(n·arccos x), x = 2r/rc − 1 ∈ [−1, 1)
+    Tn = np.cos(np.arange(C)[None, :] * np.arccos(2.0 * r / rc - 1.0)[:, None])
+    v = np.zeros((len(at), 3, C, T))                 # per-(n, t′) accumulation
+    for p in range(len(i)):
+        for n in range(C):
+            v[i[p], :, n, ti[j[p]]] += Tn[p, n] * fc[p] * d[p]
+    mu_ref = np.zeros(3)
+    for a in range(len(at)):
+        t = ti[a]
+        beta = m.alpha[t].reshape(-1, C * T)         # [M_t, K], k = n·T + t′
+        for mm in range(beta.shape[0]):
+            ker = float(D[a] @ m.sparse_desc[t][mm]) ** m.xi
+            for n in range(C):
+                for tp in range(T):
+                    mu_ref += ker * beta[mm, n * T + tp] * v[a, :, n, tp]
+    assert np.allclose(mu, mu_ref, atol=1e-6 * max(np.linalg.norm(mu), 1.0))
+
+
 # ── exactness from a KNOWN α: μ = Φα* recovered at λ → 0 ───────────────────
 
-def test_exact_recovery_known_alpha(tmp_path):
+@pytest.mark.parametrize("overrides", [{}, CHEB_PAIRS],
+                         ids=["screened_off", "chebyshev_pairs"])
+def test_exact_recovery_known_alpha(tmp_path, overrides):
     frames = read(WATER_XYZ, index="0:6")
     for f in frames:
         f.calc = None                # else write() collides with info key
@@ -103,7 +143,7 @@ def test_exact_recovery_known_alpha(tmp_path):
     p0 = str(tmp_path / "zeros.xyz")
     write(p0, frames)
     kw = dict(total_N=None, gap_sparse_per_species=8,
-              gap_ridge_lambda=1e-12)
+              gap_ridge_lambda=1e-12, **overrides)
     with _chdir(tmp_path):
         base = gap_dipole.fit_gap_dipole(_cfg(data_path=p0, **kw))
     rng = np.random.default_rng(0)
@@ -181,14 +221,41 @@ def test_determinism(tmp_path):
         assert np.array_equal(a1, a2)
 
 
+# ── pair columns strictly subsume "off": ON fit recovers an OFF model ──────
+
+def test_pair_columns_subsume_off(tmp_path):
+    frames = read(WATER_XYZ, index="0:6")
+    for f in frames:
+        f.calc = None                # else write() collides with info key
+        f.info["dipole"] = np.zeros(3)   # OFF-fit targets are irrelevant
+    p0 = str(tmp_path / "zeros.xyz")
+    write(p0, frames)
+    kw = dict(total_N=None, gap_sparse_per_species=8, gap_ridge_lambda=1e-12,
+              dipole_radial="chebyshev", dipole_cutoff="cosine2",
+              dipole_channels=2)
+    with _chdir(tmp_path):
+        off = gap_dipole.fit_gap_dipole(
+            _cfg(data_path=p0, dipole_species_pairs="off", **kw))
+    rng = np.random.default_rng(1)
+    off = replace(off, alpha=[rng.normal(size=len(a)) for a in off.alpha])
+    mu_off = gap_dipole.predict(off, frames)
+    for f, mu in zip(frames, mu_off):
+        f.info["dipole"] = mu
+    p1 = str(tmp_path / "off_targets.xyz")
+    write(p1, frames)
+    with _chdir(tmp_path):
+        on = gap_dipole.fit_gap_dipole(
+            _cfg(data_path=p1, dipole_species_pairs="ordered", **kw))
+    assert np.allclose(gap_dipole.predict(on, frames), mu_off,
+                       atol=1e-8 * max(np.abs(mu_off).max(), 1.0))
+
+
 # ── config validation ──────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("kw,msg", [
-    (dict(dipole_radial="chebyshev"), "dipole_radial"),
-    (dict(dipole_cutoff="cosine2"), "dipole_cutoff"),
-    (dict(dipole_species_pairs="symmetric"), "dipole_species_pairs"),
     (dict(scale_targets=True), "scale_targets"),
-    (dict(dipole_channels=4), "dipole_channels"),
+    (dict(dipole_channels=4), "dipole_channels"),   # screened ⇒ C == 1
+    (dict(dipole_channels=0), "dipole_channels"),
     (dict(dipole_readout="tnep"), "dipole_readout"),
     (dict(target_mode=0), "target_mode"),
 ])
@@ -198,8 +265,15 @@ def test_validation_raises(kw, msg):
         gap_dipole.fit_gap_dipole(cfg)
 
 
-def test_legacy_false_species_pairs_accepted():
-    gap_dipole._validate(_cfg(dipole_species_pairs=False))  # no raise
+@pytest.mark.parametrize("kw", [
+    dict(dipole_species_pairs=False),               # legacy bool "off"
+    dict(dipole_radial="chebyshev", dipole_channels=4),
+    dict(dipole_cutoff="cosine2"),
+    dict(dipole_species_pairs="ordered"),
+    dict(dipole_species_pairs="symmetric"),
+])
+def test_validation_accepts(kw):
+    gap_dipole._validate(_cfg(**kw))                # no raise
 
 
 # ── run record ─────────────────────────────────────────────────────────────
@@ -215,5 +289,10 @@ def test_run_record(tmp_path):
     assert rec["config"]["gap_ridge_lambda"] == 1e-6
     assert rec["gap"]["sparse_per_species"] == 10
     assert set(rec["gap"]["M_per_species"]) == {"8", "1"}
+    assert rec["gap"]["radial"] == "screened"
+    assert rec["gap"]["cutoff"] == "cubic"
+    assert rec["gap"]["channels"] == 1
+    assert rec["gap"]["pair_columns"] is False
+    assert rec["gap"]["n_columns"] == sum(rec["gap"]["M_per_species"].values())
     for key in ("train_rmse", "train_r2", "fit_seconds"):
         assert key in rec["metrics"]
