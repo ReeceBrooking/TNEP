@@ -78,6 +78,12 @@ def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
     return out
 
 
+def _collapse_V(V: np.ndarray) -> np.ndarray:
+    """[N, 3, 1, T] → per-atom v_i [N, 3] under c ≡ 1, C = 1 — the ONE place
+    this contract is encoded (float64 before the sum, shared by fit + predict)."""
+    return np.asarray(V, dtype=np.float64)[:, :, 0, :].sum(axis=-1)
+
+
 def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: TNEPconfig) -> np.ndarray:
     """Per-atom geometry vector v_i [N, 3]: V summed over neighbor types
     (c ≡ 1, C = 1)."""
@@ -85,7 +91,7 @@ def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: TNEPconfig) -> np.ndarray:
         atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard), 1,
         int(cfg.num_types), str(cfg.dipole_radial), float(cfg.dipole_zeta),
         resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale))
-    return V[:, :, 0, :].sum(axis=-1).astype(np.float64)
+    return _collapse_V(V)
 
 
 def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
@@ -113,7 +119,10 @@ def _phi_frame(D: np.ndarray, v: np.ndarray, ti: np.ndarray,
 
 
 def _targets(frames: list[Atoms], cfg: TNEPconfig) -> np.ndarray:
-    """Dipole targets [F, 3], unit-converted per cfg (matches assemble)."""
+    """Dipole targets [F, 3], unit-converted per cfg (matches assemble).
+
+    NOTE: unlike the training path (assemble_data_dict), this applies NO
+    box/label guards — a pathological test file scores silently."""
     key = tnep_data._resolve_target_key(cfg)
     mu = np.stack([np.asarray(tnep_data._extract_target(s, key))
                    for s in frames]).astype(np.float64)
@@ -152,8 +161,7 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         dataset, types_int, descs, [[]] * len(dataset), [[]] * len(dataset),
         cfg)
     mu = np.stack([np.asarray(t, dtype=np.float64) for t in d["targets"]])
-    vs = [np.asarray(V, dtype=np.float64)[:, :, 0, :].sum(axis=-1)
-          for V in d["V_atom"]]
+    vs = [_collapse_V(V) for V in d["V_atom"]]
 
     # Per-species FPS sparse points.
     rng = np.random.default_rng(cfg.seed)
@@ -162,6 +170,10 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     sparse_desc = []
     for t in range(cfg.num_types):
         Dt = np.concatenate([D[ti == t] for D, ti in zip(descs, tis)])
+        if not len(Dt):
+            raise ValueError(
+                f"no atoms of type Z={cfg.types[t]} in the training data — "
+                f"cannot place sparse points for that species")
         sparse_desc.append(Dt[_fps(Dt, M_req, rng)].copy())
     sizes = [len(s) for s in sparse_desc]
     M_tot = sum(sizes)
