@@ -87,7 +87,7 @@ def test_predict_identity(fitted):
     mu_ref = np.zeros(3)
     for a in range(len(at)):
         s = sum(m.alpha[ti[a]][k]
-                * float(D[a] @ m.sparse_desc[ti[a]][k]) ** m.xi
+                * float(D[a] @ m.sparse_desc[ti[a]][k]) ** m.xi[0]
                 for k in range(len(m.alpha[ti[a]])))
         mu_ref += s * v[a]
     assert np.allclose(mu, mu_ref, atol=1e-6 * max(np.linalg.norm(mu), 1.0))
@@ -127,7 +127,7 @@ def test_chebyshev_pair_identity(tmp_path):
         t = ti[a]
         beta = m.alpha[t].reshape(-1, C * T)         # [M_t, K], k = n·T + t′
         for mm in range(beta.shape[0]):
-            ker = float(D[a] @ m.sparse_desc[t][mm]) ** m.xi
+            ker = float(D[a] @ m.sparse_desc[t][mm]) ** m.xi[0]
             for n in range(C):
                 for tp in range(T):
                     mu_ref += ker * beta[mm, n * T + tp] * v[a, :, n, tp]
@@ -254,6 +254,100 @@ def test_pair_columns_subsume_off(tmp_path):
                        atol=1e-8 * max(np.abs(mu_off).max(), 1.0))
 
 
+# ── sum-of-kernels: ξ list column blocks ───────────────────────────────────
+
+def test_sum_kernel_identity(tmp_path):
+    """predict() with ξ=[1,3] vs hand-rolled numpy: own kernel powers, own
+    block order (species → ξ → (m, k))."""
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(
+            _cfg(**CHEB_PAIRS, gap_kernel_power=[1, 3],
+                 gap_sparse_per_species=8))
+    at = read(WATER_XYZ, index="10")
+    mu = gap_dipole.predict(m, [at])[0]
+    ti = np.array([m.cfg.types.index(int(z)) for z in at.numbers])
+    D = np.asarray(m.builder.build_descriptors(
+        [at], calc_gradients=False)[0][0], dtype=np.float64)
+    C, T, rc = 3, len(m.cfg.types), float(m.cfg.dipole_rc)
+    i, j, Dv = neighbor_list("ijD", at, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    Tn = np.cos(np.arange(C)[None, :] * np.arccos(2.0 * r / rc - 1.0)[:, None])
+    v = np.zeros((len(at), 3, C, T))
+    for p in range(len(i)):
+        for n in range(C):
+            v[i[p], :, n, ti[j[p]]] += Tn[p, n] * fc[p] * d[p]
+    K = C * T
+    mu_ref = np.zeros(3)
+    for a in range(len(at)):
+        t = ti[a]
+        M_t = len(m.sparse_desc[t])
+        beta = m.alpha[t].reshape(2, M_t, K)         # ξ-major, then (m, k)
+        for x, xi in enumerate((1, 3)):              # own powers
+            for mm in range(M_t):
+                ker = float(D[a] @ m.sparse_desc[t][mm]) ** xi
+                for n in range(C):
+                    for tp in range(T):
+                        mu_ref += (ker * beta[x, mm, n * T + tp]
+                                   * v[a, :, n, tp])
+    assert np.allclose(mu, mu_ref, atol=1e-6 * max(np.linalg.norm(mu), 1.0))
+
+
+def test_sum_kernel_singleton_list_equals_int(tmp_path):
+    """Falsifier for the normalization path: ξ=[2] must equal ξ=2 EXACTLY."""
+    with _chdir(tmp_path):
+        m_int = gap_dipole.fit_gap_dipole(_cfg(gap_kernel_power=2))
+        m_list = gap_dipole.fit_gap_dipole(_cfg(gap_kernel_power=[2]))
+    assert m_list.xi == m_int.xi == (2,)
+    for a1, a2 in zip(m_int.alpha, m_list.alpha):
+        assert np.array_equal(a1, a2)
+
+
+# ── multi-scale second cutoff ──────────────────────────────────────────────
+
+def test_multiscale_exact_recovery_known_alpha(tmp_path):
+    """Pins the two-scale Φ assembly: a known α (both scale blocks) is
+    recovered exactly at λ → 0."""
+    frames = read(WATER_XYZ, index="0:6")
+    for f in frames:
+        f.calc = None
+        f.info["dipole"] = np.zeros(3)
+    p0 = str(tmp_path / "zeros.xyz")
+    write(p0, frames)
+    kw = dict(total_N=None, gap_sparse_per_species=8, gap_ridge_lambda=1e-12,
+              gap_extra_rcut=4.5, gap_kernel_power=[1, 2], **CHEB_PAIRS)
+    with _chdir(tmp_path):
+        base = gap_dipole.fit_gap_dipole(_cfg(data_path=p0, **kw))
+    assert base.builder2 is not None and base.alpha2 is not None
+    rng = np.random.default_rng(0)
+    star = replace(base,
+                   alpha=[rng.normal(size=len(a)) for a in base.alpha],
+                   alpha2=[rng.normal(size=len(a)) for a in base.alpha2])
+    mu_star = gap_dipole.predict(star, frames)      # μ = Φα* by construction
+    for f, mu in zip(frames, mu_star):
+        f.info["dipole"] = mu
+    p1 = str(tmp_path / "synth.xyz")
+    write(p1, frames)
+    with _chdir(tmp_path):                          # same seed → same FPS/Φ
+        refit = gap_dipole.fit_gap_dipole(_cfg(data_path=p1, **kw))
+    assert np.allclose(gap_dipole.predict(refit, frames), mu_star,
+                       atol=1e-8 * max(np.abs(mu_star).max(), 1.0))
+
+
+def test_multiscale_off_default_bitcompat(tmp_path):
+    """gap_extra_rcut=None + single-int ξ bit-matches the pre-feature fit
+    on the small fixture (α hash captured before the feature landed)."""
+    import hashlib
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(_cfg())
+    assert m.builder2 is None and m.sparse_desc2 is None and m.alpha2 is None
+    h = hashlib.sha256(np.concatenate(m.alpha).tobytes()).hexdigest()
+    assert h == ("cb73b443bbdfa65f7abf151af7363c1e"
+                 "92e44a3de3aa1d5fe1d4ee2dc0a51917")
+
+
 # ── config validation ──────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("kw,msg", [
@@ -262,11 +356,19 @@ def test_pair_columns_subsume_off(tmp_path):
     (dict(dipole_channels=0), "dipole_channels"),
     (dict(dipole_readout="tnep"), "dipole_readout"),
     (dict(target_mode=0), "target_mode"),
+    (dict(gap_kernel_power=[0]), "gap_kernel_power"),
+    (dict(gap_kernel_power=[]), "gap_kernel_power"),
+    (dict(gap_extra_rcut=-1.0), "gap_extra_rcut"),
 ])
 def test_validation_raises(kw, msg):
     cfg = _cfg(data_path="/nonexistent.xyz", **kw)  # raise happens FIRST
     with pytest.raises(ValueError, match=msg):
         gap_dipole.fit_gap_dipole(cfg)
+
+
+def test_extra_rcut_below_rcut_hard_warns():
+    with pytest.warns(UserWarning, match="gap_extra_rcut"):
+        gap_dipole._validate(_cfg(gap_extra_rcut=3.0))  # ≤ rcut_hard=3.5
 
 
 @pytest.mark.parametrize("kw", [

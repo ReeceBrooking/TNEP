@@ -132,8 +132,19 @@ class TNEPconfig:
     # --- GAP-mode dipole fit (gap_dipole.py; screened/cubic/off only) ----
     # FPS-selected sparse environments per species for the kernel basis.
     gap_sparse_per_species: int = 500
-    # Integer power ξ of the normalized SOAP dot-product kernel (D̂_i·D̂_m)^ξ.
-    gap_kernel_power: int = 2
+    # Power(s) ξ of the normalized SOAP dot-product kernel (D̂_i·D̂_m)^ξ.
+    # An int is a single kernel; a list (e.g. [1, 2, 4]) is a sum-of-kernels
+    # fit — each sparse point contributes one column block PER ξ and the
+    # ridge learns the implicit kernel mixture. Entries must be ints ≥ 1.
+    gap_kernel_power: int | list[int] = 2
+    # Second SOAP length scale for the KERNEL only (gap_dipole.py): a second
+    # descriptor builder with rcut_hard = gap_extra_rcut and rcut_soft =
+    # gap_extra_rcut − (rcut_hard − rcut_soft) (same buffer width), its own
+    # FPS sparse sets, and additional Φ column blocks (scales never cross,
+    # like species; the geometry vectors v are unchanged). Typically LARGER
+    # than rcut_hard — adds long-sighted environment resolution (multi-scale
+    # SOAP ~25%: Willatt/Musil/Ceriotti PCCP 2018). None = single scale.
+    gap_extra_rcut: float | None = None
     # Ridge strength λ, applied RELATIVE to mean(diag(ΦᵀΦ)) — dimensionless
     # (λ_eff = λ · mean_m ‖Φ[:,m]‖²), so its scale is data-independent.
     gap_ridge_lambda: float = 1e-6
