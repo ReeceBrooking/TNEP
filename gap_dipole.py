@@ -79,7 +79,8 @@ def _xi_tuple(cfg: TNEPconfig) -> tuple[int, ...]:
     the ridge learns the implicit mixture of (D̂·D̂_m)^ξ kernels)."""
     xi = cfg.gap_kernel_power
     xis = (xi,) if not hasattr(xi, "__iter__") else tuple(xi)
-    if not xis or any(x != int(x) or int(x) < 1 for x in xis):
+    if not xis or any(isinstance(x, bool) or x != int(x) or int(x) < 1
+                      for x in xis):
         raise ValueError(
             f"gap_kernel_power entries must be ints >= 1, got {xi!r}")
     return tuple(int(x) for x in xis)
@@ -177,8 +178,9 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
         for t, Dm in enumerate(sparse_desc):
             sel = ti == t
             G = D[sel] @ Dm.T                           # [n_t, M_t] base Gram
+            vt = v[sel]
             for xi in xis:
-                cols.append(np.einsum("nm,nxk->xmk", G ** xi, v[sel])
+                cols.append(np.einsum("nm,nxk->xmk", G ** xi, vt)
                             .reshape(3, -1))            # [3, M_t·K]
     return np.concatenate(cols, axis=1)
 
@@ -210,9 +212,12 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     cfg.test_data_path when set; write a run record JSON to GAP/.
 
     Solver memory (cfg.gap_solver): "primal" builds the dense augmented
-    [3F + n_columns, n_columns] — ~0.6 GB at 8000 columns, n_columns²
-    scaling, OOM before slow at large M·C·T; "dual" solves the [3F, 3F]
-    Gram instead — memory linear in columns, same α to numerical precision."""
+    [3F + n_columns, n_columns] — ~0.6 GB at 8k columns, n_columns² scaling,
+    ~18 GB (OOM) at the 48k columns a 2-scale × 3-ξ config reaches; "dual"
+    solves the [3F, 3F] Gram instead — Φ itself then dominates (~1.7 GB at
+    F=1500, 48k columns), memory linear in columns, same α to numerical
+    precision. Multi-scale (gap_extra_rcut) ≈ 2× descriptor build time,
+    fit and predict."""
     _validate(cfg)
     t0 = time.time()
 
@@ -389,20 +394,23 @@ if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))  # datasets/, GAP/
 
     cfg = TNEPconfig()
+    cfg.gap_solver = "dual"
     cfg.target_mode = 1
     cfg.scale_targets = False
     cfg.dipole_readout = "neighbor"
-    cfg.dipole_radial = "chebyshev"
+    cfg.dipole_radial = "gaussian"
     cfg.dipole_cutoff = "cosine2"
     cfg.dipole_species_pairs = "off"    # any non-"off" ⇒ pair columns
-    cfg.dipole_channels = 8
+    cfg.dipole_channels = 20
     cfg.dipole_zeta = -2.0                  # unused for chebyshev
     cfg.dipole_rc = 3.5                     # beat inherited 3.5 in run records
+    cfg.l_max = 7
+    cfg.alpha_max = 7
     cfg.rcut_hard, cfg.rcut_soft = 3.5, 3.0
 
     # GAP knobs — tweak freely:
-    cfg.gap_sparse_per_species = 500
-    cfg.gap_kernel_power = 2
+    cfg.gap_sparse_per_species = 250
+    cfg.gap_kernel_power = 1
     cfg.gap_ridge_lambda = 1e-8    # λ scan {1e-4,1e-6,1e-8}: 1e-8 best on test
 
     fit_gap_dipole(cfg)
