@@ -109,6 +109,11 @@ def _validate(cfg: TNEPconfig) -> None:
          f"dipole_channels must be 1 for the screened radial, got "
          f"{cfg.dipole_channels}"),
         (not cfg.scale_targets, "scale_targets must be False"),
+        # mirror the model-init r_c contract (no TNEP is ever constructed
+        # on the GAP path, so it must be enforced here too).
+        (0.0 < float(cfg.dipole_rc or cfg.rcut_hard) <= float(cfg.rcut_hard),
+         f"dipole_rc must satisfy 0 < rc <= rcut_hard="
+         f"{cfg.rcut_hard}, got {cfg.dipole_rc}"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     if bad:
@@ -337,6 +342,10 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         "gap": {"sparse_per_species": M_req, "kernel_power": list(xis),
                 "ridge_lambda": lam, "lambda_eff": lam_eff,
                 "solver": solver,
+                # zeta only where it is live — config.dipole_zeta is present
+                # in every record but decorative for non-screened radials.
+                **({"zeta": float(cfg.dipole_zeta)}
+                   if cfg.dipole_radial == "screened" else {}),
                 "radial": cfg.dipole_radial,
                 "cutoff": resolved_dipole_cutoff(cfg),
                 "channels": int(cfg.dipole_channels),
@@ -356,8 +365,12 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     }
     os.makedirs("GAP", exist_ok=True)
     xtag = "-".join(map(str, xis))
-    path = os.path.join(
-        "GAP", f"gap_M{M_req}_x{xtag}_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    # Uniquify: same-second fits (λ/ξ scan loops) must not clobber records.
+    stem = os.path.join(
+        "GAP", f"gap_M{M_req}_x{xtag}_{time.strftime('%Y%m%d_%H%M%S')}")
+    path, k = stem + ".json", 1
+    while os.path.exists(path):
+        path, k = f"{stem}_{k}.json", k + 1
     with open(path, "w") as fh:
         json.dump(record, fh, indent=2)
     print(f"[gap_dipole] run record → {path}")
