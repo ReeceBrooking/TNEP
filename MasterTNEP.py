@@ -1009,9 +1009,9 @@ def dump_dipole_predictions(model_path: str,
 
 
 if __name__ == '__main__':
-    #model = train_model()
-    model = load_model("models/n30_q216_pop100_20260711_193535_waterbulk_dipole_0.9998/train_waterbulk_O_H_dipole_best_val.h5")
-    dipoles = process_trajectory(model, "datasets/turbogap_waterbulk_trajectory.xyz", dt_fs = 1.0, batch_size=40, descriptor_mode=1, descriptor_batch_frames=40, pin_to_cpu=False, descriptor_precision="float32", descriptor_pair_tile_size=2000)
+    model = train_model()
+    #model = load_model("models/n30_q216_pop100_20260711_193535_waterbulk_dipole_0.9998/train_waterbulk_O_H_dipole_best_val.h5")
+    #dipoles = process_trajectory(model, "datasets/turbogap_waterbulk_trajectory.xyz", dt_fs = 1.0, batch_size=40, descriptor_mode=1, descriptor_batch_frames=40, pin_to_cpu=False, descriptor_precision="float32", descriptor_pair_tile_size=2000)
     #dump_dipole_predictions(model_path="models/n50_q165_pop100_20260513_161930_CHO_best_r2/train_C_O_H_dipole_best_val.h5", test_xyz="datasets/test.xyz", out_path="datasets/dipole_test_tnep.out")
     #filter_dataset_by_species(input_xyz="datasets/test.xyz", output_xyz="datasets/cho_filter_test.xyz", allowed_species=[6, 1, 8])
     #ir_spectrum_from_file(dipole_path="plots/nve_dipoles.txt", dt_fs = 1, save_dir=None, acf_ratio=0.1, smooth_k=10, quantum_correction="quadratic")

@@ -411,19 +411,20 @@ if __name__ == "__main__":
     cfg.target_mode = 1
     cfg.scale_targets = False
     cfg.dipole_readout = "neighbor"
-    cfg.dipole_radial = "gaussian"
-    cfg.dipole_cutoff = "cosine2"
-    cfg.dipole_species_pairs = "off"    # any non-"off" ⇒ pair columns
+    cfg.dipole_radial = "chebyshev"
+    cfg.dipole_cutoff = "cosine"
+    cfg.dipole_species_pairs = "symmetric"    # any non-"off" ⇒ pair columns
     cfg.dipole_channels = 20
     cfg.dipole_zeta = -2.0                  # unused for chebyshev
     cfg.dipole_rc = 3.5                     # beat inherited 3.5 in run records
     cfg.l_max = 7
     cfg.alpha_max = 7
     cfg.rcut_hard, cfg.rcut_soft = 3.5, 3.0
+    #cfg.gap_extra_rcut = 5.5
 
     # GAP knobs — tweak freely:
     cfg.gap_sparse_per_species = 250
-    cfg.gap_kernel_power = 1
+    cfg.gap_kernel_power = 2
     cfg.gap_ridge_lambda = 1e-8    # λ scan {1e-4,1e-6,1e-8}: 1e-8 best on test
 
     fit_gap_dipole(cfg)

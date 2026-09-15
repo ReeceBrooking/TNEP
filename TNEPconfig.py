@@ -49,7 +49,7 @@ class TNEPconfig:
     # Set to a custom string to support non-standard dataset labels (e.g. "mu", "alpha").
     target_key: str | None = None
     # Scale dipole targets by atom count (per-atom dipole training)
-    scale_targets: bool = False
+    scale_targets: bool = True
     # Native units of dipole targets in the dataset: "e*angstrom" (e·Å),
     # "e*bohr" (e·a₀, × 0.5292 → e·Å), "debye" (× 0.2082 → e·Å). Sets the
     # e·Å conversion factor and the plot/stats unit label.
@@ -82,7 +82,7 @@ class TNEPconfig:
     # 0..C−1). C=1 with c≡1 reduces to the plain f_c single-channel form.
     # Widens the site head W1 to [T, H, C]. Validated ≥ 1 at model init.
     # Models must be re-trained if C changes.
-    dipole_channels: int = 4
+    dipole_channels: int = 20
     # Radial family of the neighbor readout (f_c per dipole_cutoff):
     #   "chebyshev"        : R_n(r) = T_n(2r/r_c − 1)·f_c(r), C channels
     #   "chebyshev_warped" : R_n(r) = T_n(x_w)·f_c(r), NEP's squared warp
@@ -93,13 +93,13 @@ class TNEPconfig:
     #                        σ = dipole_gauss_sigma_scale × spacing
     #   "screened"         : R(r) = r^(ζ−1)·f_c(r) — single channel
     #                        (requires dipole_channels == 1).
-    dipole_radial: str = "chebyshev"
+    dipole_radial: str = "gaussian"
     # Screened-radial exponent ζ (dipole_radial="screened" only). Default −2
     # from the rigid-charge LSQ scan: floors 2.70 at ζ=−1, 2.72 at ζ=−2,
     # 11.0 at ζ=+1 (ζ>0 inverts the covalent/H-bond weighting). −2 chosen
     # over the marginally-lower −1 deliberately: ~equal floor, stronger
     # H-bond suppression (Coulomb-like r^−2 screening).
-    dipole_zeta: float = -2.0
+    dipole_zeta: float = -3.0
     # Gaussian-window width scale σ/spacing (dipole_radial="gaussian" only):
     # σ = scale × r_c/(C+1) (C=1 ⇒ scale·r_c/2). Step-0 rigid-charge LSQ
     # evidence (diagnostics/diag_basis.py): scale 0.5 lowers the C=4 floor
@@ -114,7 +114,7 @@ class TNEPconfig:
     #               normalized so f(0) = 1)
     # None = the radial family's traditional form: "cubic" for screened,
     # "cosine2" otherwise (resolved_dipole_cutoff; validated at model init).
-    dipole_cutoff: str | None = None
+    dipole_cutoff: str | None = "cosine"
     # Species-pair coefficient table of the neighbor readout:
     #   "off"       : c ≡ 1 frozen, no parameters.
     #   "symmetric" : learnable c [C, T(T+1)/2], unordered-pair indexed.
@@ -122,7 +122,7 @@ class TNEPconfig:
     #                 indexed — breaks the difference-form antisymmetry (and
     #                 gauge invariance) across species.
     # Legacy bool: False→"off", True→"symmetric" (normalized at model init).
-    dipole_species_pairs: str = "off"
+    dipole_species_pairs: str = "symmetric"
     # Neighbor-readout cutoff r_c (Å). None = inherit rcut_hard (resolved at
     # model init). Must be ≤ rcut_hard and satisfy dipole_rc + rcut_hard ≤
     # L_min for every training box (checked at data assembly). Note the
@@ -162,8 +162,8 @@ class TNEPconfig:
     # --- geometric parameters ------------------------------------------
     l_max: int = 4
     alpha_max: int = 4
-    rcut_hard: float = 6.0
-    rcut_soft: float = 5.5
+    rcut_hard: float = 4.0
+    rcut_soft: float = 3.5
     basis: str = "poly3"
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 0
@@ -204,7 +204,7 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # Hidden-layer width of the per-type ANN.
-    num_neurons: int = 30
+    num_neurons: int = 70
     # Hidden-layer activation (any tf.keras.activations name for the forward
     # pass). Dipole/polarisability training (target_mode 1/2) has a hand-coded
     # backward — only "tanh" and "swish" (alias "silu") supported there;
@@ -267,8 +267,8 @@ class TNEPconfig:
     # L1/L2 strengths: None = auto sqrt(dim*1e-6/num_types), -1.0 = dynamic
     # (adapt every lambda_adapt_interval gens toward lambda_target_ratio of
     # data RMSE), float = fixed.
-    lambda_1: float | None = 0.01
-    lambda_2: float | None = 0.01
+    lambda_1: float | None = 0.0005
+    lambda_2: float | None = 0.0005
     # Dynamic-λ controls (only when lambda_1 or lambda_2 == -1):
     #   target_ratio : target reg-penalty / data-RMSE ratio
     #   damping      : step exponent, λ_new = λ·(target/r)^d (smaller = gentler)
@@ -291,7 +291,7 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 100
     # Number of training generations (number of updates to the model)
-    num_generations: int = 60000
+    num_generations: int = 20000
     # Number of structures used in each train step (None = full batch)
     batch_size: int | None = None
     # Learning rate for sigma (None = auto from canonical SNES heuristic)
