@@ -1211,6 +1211,47 @@ def _compute_soap_inner_tf(
     )
 
 
+@tf.function(reduce_retracing=True)
+def _compute_cnk_inner_tf(
+    rjs, thetas, phis, pair_atom, pair_neighbour_species,
+    pair_is_central, pair_active, W_K, preflm,
+    *,
+    n_atoms, n_species, n_basis, l_max, rcut_hard, rcut_soft,
+    atom_sigma_r, atom_sigma_r_scaling, atom_sigma_t, atom_sigma_t_scaling,
+    amplitude_scaling, central_weight, radial_enhancement, nf, do_central,
+):
+    """Learned-radial-basis forward: raw centre coefficients over the n_basis
+    orthonormal poly3 functions, stopping before the power spectrum (which
+    TNEP.soap_from_raw forms per candidate). Returns float32
+    [n_atoms, S·K·k_max·2] laid out (species, κ, k=(l,m), re/im)."""
+    is_fp32 = rjs.dtype == tf.float32
+    rjs_r = tf.cast(rjs, tf.float64) if is_fp32 else rjs
+    W_r = tf.cast(W_K, tf.float64) if is_fp32 else W_K
+    R = radial_expansion_coeff_poly3_tf(
+        rjs_r, pair_neighbour_species, pair_is_central,
+        n_species=n_species, alpha_max=n_basis,
+        rcut_hard=rcut_hard, rcut_soft=rcut_soft,
+        atom_sigma_r=atom_sigma_r, atom_sigma_r_scaling=atom_sigma_r_scaling,
+        amplitude_scaling=amplitude_scaling, central_weight=central_weight,
+        radial_enhancement=radial_enhancement, nf=nf, do_central=do_central,
+        W_single=W_r,
+    )
+    if is_fp32:
+        R = tf.cast(R, rjs.dtype)
+    A = angular_expansion_coeff_tf(
+        rjs, thetas, phis, pair_active,
+        l_max=l_max, atom_sigma_t=atom_sigma_t,
+        atom_sigma_t_scaling=atom_sigma_t_scaling,
+        rcut=rcut_hard, preflm=preflm,
+    )
+    cnk = aggregate_cnk_tf(R, A, pair_atom, n_atoms)          # [k_max, S·K, N]
+    cnk = tf.transpose(cnk, [2, 1, 0])                        # [N, S·K, k_max]
+    out = tf.stack([tf.math.real(cnk), tf.math.imag(cnk)], axis=-1)
+    k_max = (l_max + 1) * (l_max + 2) // 2
+    return tf.reshape(tf.cast(out, tf.float32),
+                      [-1, n_species * n_basis * k_max * 2])
+
+
 def _build_cfg_cache(species_Z: list[int], soap_params: dict) -> dict:
     """Cfg-only constants (depend only on species_Z, alpha_max, l_max), cacheable
     across frames and consumed identically by forward and forward+grad paths."""
@@ -1229,6 +1270,10 @@ def _build_cfg_cache(species_Z: list[int], soap_params: dict) -> dict:
         multiplicity_np=build_multiplicity_array(n_max, l_max, mask_info["skip_mask"]),
         preflm_np=_get_preflm(l_max),
         kept_triples=_build_kept_triples(mask_info["skip_mask"], n_max, l_max),
+        n_basis=(int(soap_params["radial_basis_size"])
+                 if soap_params.get("radial_basis_size") is not None else None),
+        W_K_np=(build_orthonormalization_matrix_poly3(int(soap_params["radial_basis_size"]))
+                if soap_params.get("radial_basis_size") is not None else None),
     )
 
 
@@ -1676,7 +1721,9 @@ class DescriptorBuilderGPUTF:
             amplitude_scaling=float(cfg.amplitude_scaling),
             central_weight=float(cfg.central_weight),
             radial_enhancement=int(cfg.radial_enhancement),
+            radial_basis_size=getattr(cfg, "radial_basis_size", None),
         )
+        self._learn_radial = self._soap_params["radial_basis_size"] is not None
         # Precision: float64 (quippy/Fortran) or float32 (~2x faster, ~half VRAM).
         # Compute fns are cached by (dtype, jit_compile).
         self._real_dtype = (tf.float32
@@ -1838,6 +1885,52 @@ class DescriptorBuilderGPUTF:
                 W_t, mult_t, comp_idx_t, coeffs_t, preflm_t,
                 n_atoms=n_atoms, **fwd_static,
             )
+
+        if self._learn_radial:
+            # Learned radial basis: the forward emits raw centre coefficients
+            # (TNEP.soap_from_raw finishes the descriptor); gradients through
+            # the learned basis are not implemented yet (spec §5).
+            with tf.device(device):
+                W_K_t = tf.constant(cache["W_K_np"], dtype=dtype)
+            self._W_K_t = W_K_t
+            cnk_static = dict(
+                n_species=n_species, n_basis=int(cache["n_basis"]),
+                l_max=int(sp["l_max"]), rcut_hard=float(sp["rcut_hard"]),
+                rcut_soft=float(sp["rcut_soft"]),
+                atom_sigma_r=float(sp["atom_sigma_r"]),
+                atom_sigma_r_scaling=float(sp["atom_sigma_r_scaling"]),
+                atom_sigma_t=float(sp["atom_sigma_t"]),
+                atom_sigma_t_scaling=float(sp["atom_sigma_t_scaling"]),
+                amplitude_scaling=float(sp["amplitude_scaling"]),
+                central_weight=float(sp["central_weight"]),
+                radial_enhancement=int(sp["radial_enhancement"]),
+                nf=4.0, do_central=(float(sp["central_weight"]) != 0.0),
+            )
+
+            @tf.function(input_signature=sig_fwd, jit_compile=jit_compile)
+            def fwd_only_fn(rjs, thetas, phis, pair_atom, pair_neigh,
+                            pair_central, pair_active, n_atoms):
+                return _compute_cnk_inner_tf(
+                    rjs, thetas, phis, pair_atom, pair_neigh,
+                    pair_central, pair_active, W_K_t, preflm_t,
+                    n_atoms=n_atoms, **cnk_static)
+
+            from data import descriptor_gradients_needed
+            _grads_needed = descriptor_gradients_needed(self.cfg)
+
+            def with_grad_fn(rjs, thetas, phis, pair_atom, pair_gidx,
+                             pair_neigh, pair_central, pair_active, n_atoms):
+                if _grads_needed:
+                    raise NotImplementedError(
+                        "cfg.radial_basis_size: descriptor gradients through "
+                        "the learned radial basis are not implemented (PES / "
+                        "tnep readout / polarizability). Use the neighbor "
+                        "dipole readout, or set radial_basis_size=None.")
+                # Neighbor readout on the trajectory path: it needs the pair
+                # index stream (V is built in-graph) but no gradient values.
+                soap = fwd_only_fn(rjs, thetas, phis, pair_atom, pair_neigh,
+                                   pair_central, pair_active, n_atoms)
+                return soap, tf.zeros([tf.shape(rjs)[0], 3, 0], soap.dtype)
 
         self._compute_fns[(dtype, bool(jit_compile))] = (with_grad_fn, fwd_only_fn)
         # Backwards-compat aliases for the most-recently-built pair.

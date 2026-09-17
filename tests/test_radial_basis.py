@@ -156,3 +156,45 @@ def test_descriptor_input_width():
     assert descriptor_input_width(cfg) == cfg.dim_q
     cfg = _cfg(radial_basis_size=8)
     assert descriptor_input_width(cfg) == 3 * 8 * 15 * 2
+
+
+def _soap_from_raw_np(raw, Z, M, alpha, l_max, S):
+    """Independent NumPy reference of TNEP.soap_from_raw (one structure).
+    raw [A, S·K·k_max·2]; Z [A]; M [T, S, alpha, K]."""
+    from DescriptorBuilderGPU import radial_basis_channel_map
+    L = l_max + 1; k_max = L * (L + 1) // 2; K = M.shape[-1]
+    A = raw.shape[0]
+    r = raw.reshape(A, S, K, k_max, 2).astype(np.float64)
+    c_raw = r[..., 0] + 1j * r[..., 1]                                   # [A, S, K, k]
+    cc = np.einsum('asnk,askm->asnm', M[Z].astype(np.float64), c_raw)   # [A, S, alpha, k]
+    cc = cc.reshape(A, S * alpha, k_max)
+    cm = radial_basis_channel_map(alpha, l_max, S)
+    G = np.einsum('apk,ank,kl->apnl', cc[:, cm["pivot_rows"]], np.conj(cc), cm["Wm"]).real
+    q = G.reshape(A, -1)[:, cm["gather_idx"]] * cm["scale"]
+    n = np.linalg.norm(q, axis=1, keepdims=True)
+    return q / np.where(n < 1e-5, 1.0, n)
+
+
+@pytest.mark.parametrize("K", [4, 8])
+def test_builder_raw_coefficients_reproduce_fixed_descriptor(K):
+    from DescriptorBuilder import make_descriptor_builder
+    from DescriptorBuilderGPU import radial_basis_init, descriptor_input_width
+    frames = _cho_frames(3)
+    fixed = make_descriptor_builder(_cfg()).build_descriptors_flat(frames, calc_gradients=False)
+    cfg = _cfg(radial_basis_size=K)
+    b = make_descriptor_builder(cfg)
+    raw = b.build_descriptors_flat(frames, calc_gradients=False)
+    assert raw[0][0].shape[1] == descriptor_input_width(cfg)
+    M0 = np.broadcast_to(radial_basis_init(4, K), (3, 3, 4, K))
+    for fr, (desc, _, _, _), (r, _, _, _) in zip(frames, fixed, raw):
+        Z = np.array([cfg.type_map[int(z)] for z in fr.numbers])
+        q = _soap_from_raw_np(r, Z, M0, 4, 4, 3)
+        np.testing.assert_allclose(q, desc, atol=2e-5)
+    # Neighbor readout + gradients requested (trajectory path): real pair
+    # stream, zero-width gradient values.
+    out = b.build_descriptors_flat(frames, calc_gradients=True)
+    assert out[0][1].shape == (out[0][2].shape[0], 3, 0) and out[0][2].shape[0] > 0
+    # Gradient-consuming readout: not implemented under the knob.
+    b2 = make_descriptor_builder(_cfg(radial_basis_size=K, dipole_readout="tnep"))
+    with pytest.raises(NotImplementedError):
+        b2.build_descriptors_flat(frames, calc_gradients=True)
