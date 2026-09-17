@@ -317,3 +317,20 @@ def test_snes_gen0_fitness_matches_fixed_basis():
         out[K] = (fit, snes.validate(data, snes.mu))
     np.testing.assert_allclose(out[8][0], out[None][0], rtol=1e-4)
     assert abs(out[8][1] - out[None][1]) < 1e-5 * max(1.0, out[None][1])
+
+
+def test_save_load_roundtrip_preserves_M_radial_and_predictions(tmp_path):
+    from model_io import save_model, load_model
+    cfg = _cfg(radial_basis_size=6)
+    model = _model(cfg)
+    rng = np.random.default_rng(9)
+    model.M_radial.assign((model.M_radial.numpy()
+                           + 0.2 * rng.normal(size=model.M_radial.shape)).astype(np.float32))
+    data = _eval_data(cfg, _cho_frames(2))
+    before = _predict(model, data)
+    path = str(tmp_path / "m.h5")
+    save_model(model, cfg, path)
+    loaded = load_model(path)
+    assert loaded.cfg.radial_basis_size == 6
+    np.testing.assert_allclose(loaded.M_radial.numpy(), model.M_radial.numpy())
+    np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)

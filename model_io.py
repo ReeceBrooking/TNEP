@@ -52,6 +52,8 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "dipole_cutoff": None,
     # Pre-existence: no species-pair table (legacy bool False ≡ "off").
     "dipole_species_pairs": "off",
+    # Pre-existence: fixed radial basis.
+    "radial_basis_size": None,
 }
 
 
@@ -240,6 +242,9 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
                 "W_pre_angular", data=model.W_pre_angular.numpy())
             wg.attrs["preprocess_contract"] = str(
                 model.descriptor_preprocess_contract)
+        # Learned radial basis coefficients (cfg.radial_basis_size).
+        if getattr(model, "M_radial", None) is not None:
+            wg.create_dataset("M_radial", data=model.M_radial.numpy())
 
         # Descriptor metadata
         dg = f.create_group("descriptor")
@@ -426,7 +431,8 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
-                  U_pair=None, W_pre_angular=None, c_pair=None) -> None:
+                  U_pair=None, W_pre_angular=None, c_pair=None,
+                  M_radial=None) -> None:
     if model._neighbor_readout:
         # Clean break: the multi-channel readout changed the tail layout
         # (W1 [T, H, C]; c_pair when dipole_species_pairs). Old neighbor-mode
@@ -480,6 +486,18 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                 f"descriptor_preprocess_contract mode or alpha_max likely "
                 f"changed between save and load.")
         model.W_pre_angular.assign(W_pre_angular)
+    if getattr(model, "M_radial", None) is not None:
+        if M_radial is None:
+            raise ValueError(
+                "cfg.radial_basis_size is set but the save has no M_radial "
+                "dataset — the learned radial basis would silently reset to "
+                "its init. Re-train, or set radial_basis_size=None.")
+        if tuple(M_radial.shape) != tuple(model.M_radial.shape):
+            raise ValueError(
+                f"saved M_radial shape {tuple(M_radial.shape)} != model "
+                f"{tuple(model.M_radial.shape)} (alpha_max / "
+                f"radial_basis_size / num_types changed).")
+        model.M_radial.assign(M_radial)
 
 
 def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
@@ -518,6 +536,7 @@ def _load_model_h5(path: str) -> TNEP:
             "c_pair": wg["c_pair"][:] if "c_pair" in wg else None,
             "W_pre_angular": (wg["W_pre_angular"][:]
                               if "W_pre_angular" in wg else None),
+            "M_radial": wg["M_radial"][:] if "M_radial" in wg else None,
         }
 
     for k, v in config_dict.items():
@@ -597,6 +616,7 @@ def _load_model_npz(path: str) -> TNEP:
         data.get("W1_pol"), data.get("b1_pol"),
         U_pair=(data["U_pair"] if has_U_pair else None),
         W_pre_angular=data.get("W_pre_angular"),
+        M_radial=data.get("M_radial"),
     )
 
     _print_load_summary(path, cfg)
