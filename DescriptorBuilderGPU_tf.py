@@ -1824,6 +1824,10 @@ class DescriptorBuilderGPUTF:
             )
 
         sig_fwd = [s for s in sig if s.name != "pair_gidx"]
+        # Forward-only kernel does not tile pairs (no per-pair derivative
+        # tensors to bound), so it takes no pair_tile_size.
+        fwd_static = {k: v for k, v in common_static.items()
+                      if k != "pair_tile_size"}
 
         @tf.function(input_signature=sig_fwd, jit_compile=jit_compile)
         def fwd_only_fn(rjs, thetas, phis, pair_atom, pair_neigh,
@@ -1832,7 +1836,7 @@ class DescriptorBuilderGPUTF:
                 rjs, thetas, phis, pair_atom, pair_neigh,
                 pair_central, pair_active,
                 W_t, mult_t, comp_idx_t, coeffs_t, preflm_t,
-                n_atoms=n_atoms, **common_static,
+                n_atoms=n_atoms, **fwd_static,
             )
 
         self._compute_fns[(dtype, bool(jit_compile))] = (with_grad_fn, fwd_only_fn)
@@ -2232,6 +2236,21 @@ class DescriptorBuilderGPUTF:
         # Drop source arrays so they GC before pad_and_stack (avoid double copy).
         del flat
         return dataset_descriptors, dataset_gradients, dataset_grad_index
+
+    def build_descriptors_self_only(self, dataset: list, batch_size=None,
+                                    **build_kwargs):
+        """Same triple as `build_descriptors`, reduced to what mode-1 self-only
+        callers read: nothing for the neighbor readout (no descriptor
+        gradients at all), the self-pair row ∂q_i/∂r_i otherwise.
+        `batch_size` is accepted for API parity with the quippy builder (this
+        backend already batches by cfg.descriptor_batch_frames)."""
+        from data import descriptor_gradients_needed
+        if not descriptor_gradients_needed(self.cfg):
+            return self.build_descriptors(dataset, calc_gradients=False,
+                                          **build_kwargs)
+        from DescriptorBuilder import _filter_to_self_pairs
+        return _filter_to_self_pairs(
+            *self.build_descriptors(dataset, **build_kwargs))
 
 
 # =========================================================================

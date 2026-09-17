@@ -395,6 +395,15 @@ def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
         or cfg.dipole_readout == "neighbor")
 
 
+def descriptor_gradients_needed(cfg: TNEPconfig) -> bool:
+    """False only for the neighbor dipole readout, which reads no descriptor
+    gradients — every other mode contracts ∂q/∂r. NOTE: the neighbor readout
+    still needs the PAIR INDEX stream (pair_atom/pair_gidx) on the trajectory
+    path, where V is built in-graph — that path keeps calc_gradients=True and
+    only the gradient VALUES are skipped (zero-width under the learned basis)."""
+    return not (cfg.target_mode == 1 and cfg.dipole_readout == "neighbor")
+
+
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
                        C: int, T: int, radial: str = "chebyshev",
                        zeta: float = -2.0,
@@ -495,7 +504,8 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     """
     types_int = assign_type_indices(dataset, cfg.types)
     builder = make_descriptor_builder(cfg)
-    descriptors, gradients, grad_index = builder.build_descriptors(dataset)
+    descriptors, gradients, grad_index = builder.build_descriptors(
+        dataset, calc_gradients=descriptor_gradients_needed(cfg))
     data = assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
     return pad_and_stack(
         data,
@@ -653,7 +663,7 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     builder = make_descriptor_builder(cfg)
     _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
     test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(
-        test_dataset, **_kw)
+        test_dataset, calc_gradients=descriptor_gradients_needed(cfg), **_kw)
 
     test_data = assemble_data_dict(
         test_dataset, test_types_int,
