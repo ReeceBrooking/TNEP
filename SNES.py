@@ -1453,7 +1453,8 @@ class SNES:
         Args:
             param_vectors : [P, dim] or [dim] float32
         Returns:
-            tuple (W0,b0,W1,b1) + optional (pol ANN, U_pair, W_pre); each
+            tuple (W0,b0,W1,b1) + optional (pol ANN, U_pair, W_pre,
+            M_radial); each
             [P, ...] for batched input or [...] for single.
         """
         T = self.cfg.num_types

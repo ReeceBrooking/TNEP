@@ -423,7 +423,7 @@ def _train_model_inner(cfg: TNEPconfig,
     train_data, test_pending, val_data = split(dataset, dataset_types_int, cfg)
 
     # Resolve dim_q before any consumer needs it; cross-checked below.
-    from DescriptorBuilderGPU import compute_dim_q
+    from DescriptorBuilderGPU import compute_dim_q, descriptor_input_width
     cfg.dim_q = compute_dim_q(cfg)
 
     # Pad to dense tensors for GPU-batched eval (test_data padded lazily).
@@ -454,7 +454,6 @@ def _train_model_inner(cfg: TNEPconfig,
                                      pin_to_cpu=cfg.pin_data_to_cpu)
 
     # Cross-check built descriptor width vs cfg (catches cfg/builder drift).
-    from DescriptorBuilderGPU import descriptor_input_width
     built_width = int(train_data["descriptors"][0].shape[-1])
     if built_width != descriptor_input_width(cfg):
         raise RuntimeError(

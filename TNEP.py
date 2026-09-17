@@ -134,7 +134,7 @@ class TNEP(layers.Layer):
             M0 = radial_basis_init(alpha, K)
             self.M_radial = tf.Variable(
                 np.broadcast_to(M0, (cfg.num_types, cfg.num_types, alpha, K))
-                .astype(np.float32).copy(),
+                .astype(np.float32),
                 trainable=False, name="M_radial")
         else:
             self.M_radial = None
@@ -798,6 +798,8 @@ class TNEP(layers.Layer):
 
         Args:
             descriptors    : [A, dim_q]     padded per-atom SOAP descriptors
+                             ([A, W_in] raw centre coefficients under
+                             cfg.radial_basis_size; see soap_from_raw)
             gradients      : [A, M, 3, dim_q]  padded descriptor gradients
             grad_index     : [A, M]         padded neighbor indices
             positions      : [A, 3]         padded atom positions
@@ -1532,7 +1534,10 @@ class TNEP(layers.Layer):
         if self._learn_radial:
             # Learned radial basis: descriptors are per candidate [C, B, A, Q],
             # so the input→hidden product is a batched GEMM over C per type.
-            assert M_radial is not None, "candidates need per-candidate M_radial [C, T, S, α, K]"
+            if M_radial is None:
+                raise ValueError(
+                    "predict_batch_candidates needs per-candidate M_radial "
+                    "[C, T, S, α, K] under cfg.radial_basis_size.")
             desc_c = tf.reshape(
                 self.soap_from_raw(descriptors, Z, M_radial), [C, B * A, Q])   # [C, B*A, Q]
             for t in range(T):

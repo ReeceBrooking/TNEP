@@ -508,6 +508,9 @@ def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
     print(f"  target_mode={cfg.target_mode}, dim_q={cfg.dim_q}, "
           f"num_types={cfg.num_types}")
     print(f"  Type mapping: {type_str}")
+    if getattr(cfg, "radial_basis_size", None) is not None:
+        print(f"  Learned radial basis: K={cfg.radial_basis_size} "
+              f"(alpha_max={cfg.alpha_max})")
     if getattr(cfg, "descriptor_mixing", False):
         print(f"  Descriptor mixing: arch=l_aware, "
               f"per_type={getattr(cfg, 'descriptor_mixing_per_type', False)}")

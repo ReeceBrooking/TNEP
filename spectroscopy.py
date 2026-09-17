@@ -635,9 +635,12 @@ def _get_fused_predict(model: 'TNEP'):
     # grad_concat's last dim is dim_q for the fixed basis and 0 under the
     # learned basis (neighbor readout needs the pair stream, not gradients).
     dim_q = descriptor_input_width(cfg)
+    # Gradient VALUES are zero-width under the learned basis (pair indices
+    # still flow; V is built in-graph), raw-width otherwise.
+    grad_q = 0 if cfg.radial_basis_size is not None else dim_q
     sig = [
         tf.TensorSpec(shape=[None, dim_q],     dtype=tf.float32),  # soap_concat
-        tf.TensorSpec(shape=[None, 3, None],   dtype=tf.float32),  # grad_concat
+        tf.TensorSpec(shape=[None, 3, grad_q], dtype=tf.float32),  # grad_concat
         tf.TensorSpec(shape=[None],            dtype=tf.int32),    # pa_concat
         tf.TensorSpec(shape=[None],            dtype=tf.int32),    # pg_concat
         tf.TensorSpec(shape=[None],            dtype=tf.int64),    # atom_counts (Ragged)
@@ -748,11 +751,13 @@ def _build_fused_inputs(
         soap_concat = tf.concat([r[0] for r in frame_results], axis=0)
     else:
         soap_concat = tf.zeros((0, dim_q), dtype=tf.float32)
-    if N_pairs > 0:
+    if S:
         grad_concat = tf.concat([r[1] for r in frame_results], axis=0)
         pa_concat   = tf.concat([r[2] for r in frame_results], axis=0)
         pg_concat   = tf.concat([r[3] for r in frame_results], axis=0)
     else:
+        # No frames at all: width only matters for the trace, which never
+        # sees an empty batch (process_trajectory batches are non-empty).
         grad_concat = tf.zeros((0, 3, dim_q), dtype=tf.float32)
         pa_concat   = tf.zeros((0,), dtype=tf.int32)
         pg_concat   = tf.zeros((0,), dtype=tf.int32)
