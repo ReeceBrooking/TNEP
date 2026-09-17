@@ -369,6 +369,8 @@ def _print_param_breakdown(model) -> None:
         rows.append(("input-side mixing  U_pair", int(opt.n_U_pair)))
     if int(opt.n_preprocess) > 0:
         rows.append(("preprocess  W_pre (summed only)", int(opt.n_preprocess)))
+    if int(getattr(opt, "n_radial", 0)) > 0:
+        rows.append(("radial basis  M_radial [T·S·α·K]", int(opt.n_radial)))
 
     accounted = sum(n for _, n in rows)
     if accounted != total:

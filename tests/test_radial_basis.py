@@ -279,3 +279,41 @@ def test_learned_radial_rejects_gradient_modes_and_cpu_builder():
         _model(_cfg(radial_basis_size=3))
     with pytest.raises(ValueError):
         _model(_cfg(radial_basis_size=11))
+
+
+def test_snes_tail_holds_M0_and_roundtrips():
+    from SNES import _set_model_params
+    cfg = _cfg(radial_basis_size=8)
+    model = _model(cfg)
+    snes = model.optimizer
+    T, S, a, K = 3, 3, 4, 8
+    assert snes.n_radial == T * S * a * K
+    assert snes.dim == snes.n_anns_total + snes.n_U_pair + snes.n_preprocess + snes.n_radial
+    named = snes._split_reconstructed(snes.reconstruct_params_tf(snes.mu))
+    np.testing.assert_allclose(named["M_radial"].numpy(), model.M_radial.numpy(), atol=1e-7)
+    tov = snes._build_type_of_variable()
+    assert tov.shape == (snes.dim,)
+    np.testing.assert_array_equal(tov[-snes.n_radial:], np.repeat(np.arange(T), S * a * K))
+    # batched reconstruct + assign into a fresh model
+    pv = tf.stack([snes.mu, snes.mu + 0.01])
+    named_b = snes._split_reconstructed(snes.reconstruct_params_tf(pv))
+    assert named_b["M_radial"].shape == (2, T, S, a, K)
+    m2 = _model(cfg)
+    _set_model_params(m2, *snes.reconstruct_params_tf(snes.mu + 0.01))
+    np.testing.assert_allclose(m2.M_radial.numpy(), named_b["M_radial"][1].numpy(), atol=1e-7)
+
+
+def test_snes_gen0_fitness_matches_fixed_basis():
+    """Same seed ⇒ identical ANN μ; learned tail at M0 ⇒ identical fitness."""
+    frames = _cho_frames(6)
+    out = {}
+    for K in (None, 8):
+        cfg = _cfg(radial_basis_size=K, pop_size=2)
+        model = _model(cfg)
+        data = _eval_data(cfg, frames)
+        data["types_contained"] = tf.ones((len(frames), 3))
+        snes = model.optimizer
+        fit = snes.evaluate_population(tf.stack([snes.mu, snes.mu]), data).numpy()
+        out[K] = (fit, snes.validate(data, snes.mu))
+    np.testing.assert_allclose(out[8][0], out[None][0], rtol=1e-4)
+    assert abs(out[8][1] - out[None][1]) < 1e-5 * max(1.0, out[None][1])

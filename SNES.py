@@ -33,7 +33,8 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
 
     Tail order: W0,b0,W1,b1 | +c_pair (neighbor readout, _c_learnable)
     | +pol ANN (mode 2) | +U_pair (mixing)
-    | +W_pre_angular (preprocess_contract != "off").
+    | +W_pre_angular (preprocess_contract != "off") | +M_radial (learned
+    radial basis).
     """
     params = list(params)
     idx = 0
@@ -56,6 +57,9 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
             and getattr(model, "descriptor_preprocess_contract", "off") != "off"
             and getattr(model, "W_pre_angular", None) is not None):
         model.W_pre_angular.assign(params[idx]); idx += 1
+    if (idx < len(params)
+            and getattr(model, "M_radial", None) is not None):
+        model.M_radial.assign(params[idx]); idx += 1
 
 class SNES:
     """Separable NES optimizer for TNEP.
@@ -312,7 +316,11 @@ class SNES:
             self._preprocess_init_scheme = "mean"
             self._preprocess_init_per_q_raw = None
 
-        self.dim = self.n_anns_total + self.n_U_pair + self.n_preprocess
+        # Learned radial basis tail: M_radial [T, S, α, K], centre-type-major.
+        self.n_radial = (int(np.prod(model.M_radial.shape))
+                         if getattr(model, "M_radial", None) is not None else 0)
+        self.dim = (self.n_anns_total + self.n_U_pair + self.n_preprocess
+                    + self.n_radial)
 
         # Search distribution params as tf.Variables (stay on GPU). μ init
         # is Glorot (W0/W1 scaled by sqrt(6/(fan_in+fan_out)), biases zero);
@@ -510,6 +518,9 @@ class SNES:
                 summed_init = rng.uniform(
                     -limit, limit, size=summed_init.size).astype(np.float32)
             mu[pre_start:pre_start + self.n_preprocess] = summed_init
+        # Learned radial basis: M0 (reproduces the fixed descriptor at gen 0).
+        if self.n_radial > 0:
+            mu[self.dim - self.n_radial:] = self.model.M_radial.numpy().reshape(-1)
         return mu
 
     def _maybe_adapt_lambda(self, gen: int, data_loss: float,
@@ -681,6 +692,11 @@ class SNES:
             else:
                 pre_labels = np.full(self.n_preprocess, T, dtype=np.int32)
             tail_labels_parts.append(pre_labels)
+        # M_radial [T, S, α, K] is T-major: each centre type's radial functions
+        # are ranked by that type's fitness.
+        if self.n_radial > 0:
+            tail_labels_parts.append(
+                np.repeat(np.arange(T, dtype=np.int32), self.n_radial // T))
         if tail_labels_parts:
             tail_labels = np.concatenate(tail_labels_parts)
             return np.concatenate([ann_tov, tail_labels])
@@ -1277,6 +1293,7 @@ class SNES:
             U_pair_val = named.get("U_pair")
             W_pre_angular_val = named.get("W_pre_angular")
             c_pair_val = named.get("c_pair")
+            M_val = named.get("M_radial")
             # Absorb U_pair^T into W0 (and W0_pol).
             if U_pair_val is not None:
                 W0 = self.model._W0_eff(W0, U_pair_val)
@@ -1293,13 +1310,14 @@ class SNES:
             # Stash folded tensors for the next validate() call this gen.
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
-                "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val),
+                "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val),
             }
         elif _cache_hit:
-            (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val) = _cache["fold"]
+            (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val) = _cache["fold"]
         else:
             W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
             c_pair_val = None  # predict_batch falls back to model.c_pair
+            M_val = None       # predict_batch falls back to model.M_radial
             W0p = getattr(self.model, 'W0_pol', None)
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
@@ -1362,7 +1380,7 @@ class SNES:
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
-                W_atom=W_atom_v, c_pair=c_pair_val,
+                W_atom=W_atom_v, c_pair=c_pair_val, M_radial=M_val,
             )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
                 num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
@@ -1403,9 +1421,10 @@ class SNES:
 
         Tail order: W0,b0,W1,b1 | c_pair (neighbor readout, _c_learnable)
         | W0_pol.. (mode 2) | U_pair (mixing) | W_pre_angular (preprocess !=
-        "off").
+        "off") | M_radial (learned radial basis).
         """
-        out: dict = {"U_pair": None, "W_pre_angular": None, "c_pair": None}
+        out: dict = {"U_pair": None, "W_pre_angular": None, "c_pair": None,
+                     "M_radial": None}
         idx = 0
         out["W0"] = params[idx]; idx += 1
         out["b0"] = params[idx]; idx += 1
@@ -1422,6 +1441,8 @@ class SNES:
             out["U_pair"] = params[idx]; idx += 1
         if self.n_preprocess > 0 and idx < len(params):
             out["W_pre_angular"] = params[idx]; idx += 1
+        if self.n_radial > 0 and idx < len(params):
+            out["M_radial"] = params[idx]; idx += 1
         return out
 
     def reconstruct_params_tf(self, param_vectors: tf.Tensor) -> tuple:
@@ -1519,6 +1540,14 @@ class SNES:
                 full_flat = base_flat + summed_contrib
                 W_pre = tf.reshape(full_flat, base_static_shape)
             tail = tail + (W_pre,)
+
+        # Learned radial basis tail: M_radial [T, S, α, K] (+ leading C).
+        if self.n_radial > 0:
+            shape = list(self.model.M_radial.shape)
+            M = tf.reshape(param_vectors[..., offset:offset + self.n_radial],
+                           ([-1] + shape) if is_batched else shape)
+            offset += self.n_radial
+            tail = tail + (M,)
 
         return tail
 
@@ -2011,7 +2040,8 @@ class SNES:
                 desc, W_atom, Z, amask, W0, b0, W1, b1,
                 U_pair=U_pair_cand,
                 W_pre_angular=W_pre_angular_cand,
-                c_pair=named.get("c_pair"))  # [C, B, T_dim]
+                c_pair=named.get("c_pair"),
+                M_radial=named.get("M_radial"))  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]
