@@ -198,6 +198,16 @@ class TNEPconfig:
     # GPU memory budget (bytes) for the auto-sizer when
     # descriptor_batch_frames is None. None = builder default (6 GiB).
     descriptor_memory_budget_bytes: int | None = None
+    # Learnable radial basis (GPU builder only, descriptor_mode=1):
+    #   None : fixed SOAP-turbo basis (current behaviour)
+    #   K    : int ≥ alpha_max. The builder emits raw centre coefficients over
+    #          the K orthonormal poly3 functions; the alpha_max radial
+    #          functions per (centre type, neighbour species) become learned
+    #          combinations M_radial[T, S, alpha_max, K] in the SNES vector
+    #          (NEP's c_nk analogue; init reproduces the fixed basis exactly).
+    #          Supported with the neighbor dipole readout (no descriptor
+    #          gradients); gradient-consuming modes raise NotImplementedError.
+    radial_basis_size: int | None = None
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE

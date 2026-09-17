@@ -337,6 +337,74 @@ def compute_dim_q(cfg) -> int:
     return int(mask_info["n_compressed"])
 
 
+def radial_basis_init(alpha_max: int, n_basis: int) -> np.ndarray:
+    """M0 [alpha_max, n_basis]: the alpha_max Löwdin-orthonormal poly3
+    functions written in the n_basis-orthonormal set, M0 = [W_α | 0] · W_K⁻¹,
+    so M0 @ φ_K == φ_α exactly (both sets span I_1..I_α). Rows are
+    orthonormal; n_basis == alpha_max gives the identity. W_K⁻¹ = S_K^{1/2} is
+    formed from the SVD of the overlap (cond(W_K) ~ 1e6 at K = 8)."""
+    if not alpha_max <= n_basis <= 10:
+        raise ValueError(
+            f"radial_basis_size={n_basis} must satisfy alpha_max={alpha_max} "
+            f"<= K <= 10 (poly3 overlap is SPD only up to ~10).")
+    W_a = build_orthonormalization_matrix_poly3(alpha_max)
+    U, svd, Vt = np.linalg.svd(build_overlap_matrix_poly3(n_basis))
+    W_K_inv = U @ np.diag(np.sqrt(svd)) @ Vt
+    pad = np.zeros((alpha_max, n_basis - alpha_max), dtype=np.float64)
+    return np.concatenate([W_a, pad], axis=1) @ W_K_inv
+
+
+def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int) -> dict:
+    """Index map from the pivot-row Gram G[s_piv, n', l] to the compressed
+    channel order of make_compress_mask_trivial (Fortran (n, n', l) order,
+    kept when n or n' is a species' first radial index).
+
+    Returns dict: pivot_rows [S] int32 (0-based global n of each species'
+    first function), gather_idx [dim_q] int32 into G flattened as
+    (S, n_max, L), scale [dim_q] float32 (√2 for n != n', SOAP-turbo's
+    multiplicity), Wm [k_max, L] float32 (2 for m > 0 else 1, block-diagonal
+    in l; k = l(l+1)/2 + m)."""
+    n_max = alpha_max * n_species
+    L = l_max + 1
+    k_max = L * (L + 1) // 2
+    pivots = [s * alpha_max for s in range(n_species)]
+    piv_of = {n: s for s, n in enumerate(pivots)}
+    gather: list[int] = []
+    scale: list[float] = []
+    for n in range(n_max):
+        for nprime in range(n, n_max):
+            if n not in piv_of and nprime not in piv_of:
+                continue
+            s, other = ((piv_of[n], nprime) if n in piv_of
+                        else (piv_of[nprime], n))
+            for l in range(L):
+                gather.append((s * n_max + other) * L + l)
+                scale.append(np.sqrt(2.0) if n != nprime else 1.0)
+    Wm = np.zeros((k_max, L), dtype=np.float32)
+    k = 0
+    for l in range(L):
+        for m in range(l + 1):
+            Wm[k, l] = 2.0 if m > 0 else 1.0
+            k += 1
+    return dict(
+        pivot_rows=np.asarray(pivots, dtype=np.int32),
+        gather_idx=np.asarray(gather, dtype=np.int32),
+        scale=np.asarray(scale, dtype=np.float32),
+        Wm=Wm,
+    )
+
+
+def descriptor_input_width(cfg) -> int:
+    """Width of the per-atom vector the builder emits in the `descriptors`
+    slot: the raw compressed SOAP dim, or under cfg.radial_basis_size the
+    flattened raw centre coefficients S·K·k_max·2 (species, κ, (l,m), re/im)."""
+    K = getattr(cfg, "radial_basis_size", None)
+    if K is None:
+        return compute_dim_q(cfg)
+    L = int(cfg.l_max) + 1
+    return int(cfg.num_types) * int(K) * (L * (L + 1) // 2) * 2
+
+
 def descriptor_block_layout(cfg) -> dict:
     """Group the flat dim_q axis by unordered species pair (s_a, s_b).
 
