@@ -453,13 +453,20 @@ def _train_model_inner(cfg: TNEPconfig,
                                      num_types=cfg.num_types,
                                      pin_to_cpu=cfg.pin_data_to_cpu)
 
-    # Cross-check built descriptor shape vs cfg.dim_q (catches cfg/builder drift).
-    built_dim_q = int(train_data["descriptors"][0].shape[-1])
-    if built_dim_q != cfg.dim_q:
+    # Cross-check built descriptor width vs cfg (catches cfg/builder drift).
+    from DescriptorBuilderGPU import descriptor_input_width
+    built_width = int(train_data["descriptors"][0].shape[-1])
+    if built_width != descriptor_input_width(cfg):
         raise RuntimeError(
-            f"compute_dim_q={cfg.dim_q} disagrees with built descriptor "
-            f"shape {built_dim_q}; cfg / builder mismatch.")
+            f"descriptor_input_width={descriptor_input_width(cfg)} disagrees "
+            f"with built descriptor width {built_width}; cfg / builder mismatch.")
     print("Dimension of q: " + str(cfg.dim_q))
+    if cfg.radial_basis_size is not None:
+        print(f"Learned radial basis: {cfg.alpha_max} functions per (centre "
+              f"type, neighbour species) as combinations of K="
+              f"{cfg.radial_basis_size} orthonormal poly3 functions "
+              f"(M_radial [{cfg.num_types}, {cfg.num_types}, {cfg.alpha_max}, "
+              f"{cfg.radial_basis_size}] in the SNES vector; init = fixed basis)")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
     # On resume, reuse the checkpoint's existing run dir.

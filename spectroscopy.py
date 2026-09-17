@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 
 from TNEPconfig import TNEPconfig
 from DescriptorBuilder import DescriptorBuilder
+from DescriptorBuilderGPU import descriptor_input_width
 from data import cell_to_box
 
 if TYPE_CHECKING:
@@ -629,15 +630,14 @@ def _get_fused_predict(model: 'TNEP'):
         return cached
 
     cfg = model.cfg
-    # Builder emits RAW-width descriptors. With preprocess on, cfg.dim_q is the
-    # contracted Q_new, so pack at dim_q_raw (matches the raw-dim einsum score()
-    # feeds predict_batch after _W0_preprocess_eff expands W0 back to Q_raw).
-    dim_q = (int(cfg.dim_q_raw)
-             if model.descriptor_preprocess_contract != "off"
-             else int(cfg.dim_q))
+    # Builder emits RAW-width descriptors (raw SOAP dim, or S·K·k_max·2 under
+    # the learned radial basis); predict_batch takes raw width in both cases.
+    # grad_concat's last dim is dim_q for the fixed basis and 0 under the
+    # learned basis (neighbor readout needs the pair stream, not gradients).
+    dim_q = descriptor_input_width(cfg)
     sig = [
         tf.TensorSpec(shape=[None, dim_q],     dtype=tf.float32),  # soap_concat
-        tf.TensorSpec(shape=[None, 3, dim_q],  dtype=tf.float32),  # grad_concat
+        tf.TensorSpec(shape=[None, 3, None],   dtype=tf.float32),  # grad_concat
         tf.TensorSpec(shape=[None],            dtype=tf.int32),    # pa_concat
         tf.TensorSpec(shape=[None],            dtype=tf.int32),    # pg_concat
         tf.TensorSpec(shape=[None],            dtype=tf.int64),    # atom_counts (Ragged)
@@ -924,7 +924,7 @@ def predict_trajectory_batch(
             jit_compile=use_xla,
         )
         fused_inputs = _build_fused_inputs(
-            frame_results, batch_frames, batch_types, cfg.dim_q,
+            frame_results, batch_frames, batch_types, descriptor_input_width(cfg),
             pin_to_cpu=pin_to_cpu,
         )
         # _build_fused_inputs cleared frame_results; drop the empty handle.
@@ -944,13 +944,9 @@ def predict_trajectory_batch(
             batch_frames=descriptor_batch_frames,
             memory_budget_bytes=descriptor_memory_budget_bytes,
         )
-        # Builder emits raw-width descriptors; pack at dim_q_raw when preprocess
-        # is on (cfg.dim_q is the contracted Q_new there).
-        _dim_q_pack = (int(cfg.dim_q_raw)
-                       if model.descriptor_preprocess_contract != "off"
-                       else int(cfg.dim_q))
         batch = _pack_traj_batch_from_flat(frame_results, batch_frames, batch_types,
-                                           _dim_q_pack, pin_to_cpu=pin_to_cpu)
+                                           descriptor_input_width(cfg),
+                                           pin_to_cpu=pin_to_cpu)
         del frame_results
 
         # Apply mixing absorption in the same order as the fused path so both
