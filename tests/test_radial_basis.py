@@ -147,7 +147,7 @@ def test_radial_basis_channel_map_reproduces_power_spectrum():
     G = np.einsum('ipk,ink,kl->ipnl', piv, np.conj(c), cm["Wm"]).real
     q = G.reshape(5, -1)[:, cm["gather_idx"]] * cm["scale"]
     q = q / np.linalg.norm(q, axis=1, keepdims=True)
-    np.testing.assert_allclose(q, ref, atol=1e-10)
+    np.testing.assert_allclose(q, ref, atol=1e-8, rtol=0)
 
 
 def test_descriptor_input_width():
@@ -175,13 +175,13 @@ def _soap_from_raw_np(raw, Z, M, alpha, l_max, S):
     return q / np.where(n < 1e-5, 1.0, n)
 
 
-@pytest.mark.parametrize("K", [4, 8])
-def test_builder_raw_coefficients_reproduce_fixed_descriptor(K):
+@pytest.mark.parametrize("K,precision", [(4, "float64"), (8, "float64"), (8, "float32")])
+def test_builder_raw_coefficients_reproduce_fixed_descriptor(K, precision):
     from DescriptorBuilder import make_descriptor_builder
     from DescriptorBuilderGPU import radial_basis_init, descriptor_input_width
     frames = _cho_frames(3)
     fixed = make_descriptor_builder(_cfg()).build_descriptors_flat(frames, calc_gradients=False)
-    cfg = _cfg(radial_basis_size=K)
+    cfg = _cfg(radial_basis_size=K, descriptor_precision=precision)
     b = make_descriptor_builder(cfg)
     raw = b.build_descriptors_flat(frames, calc_gradients=False)
     assert raw[0][0].shape[1] == descriptor_input_width(cfg)

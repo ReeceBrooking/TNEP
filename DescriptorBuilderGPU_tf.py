@@ -1226,7 +1226,7 @@ def _compute_cnk_inner_tf(
     [n_atoms, S·K·k_max·2] laid out (species, κ, k=(l,m), re/im)."""
     is_fp32 = rjs.dtype == tf.float32
     rjs_r = tf.cast(rjs, tf.float64) if is_fp32 else rjs
-    W_r = tf.cast(W_K, tf.float64) if is_fp32 else W_K
+    # W_K is always fp64 (cond(W_K) ~ 1e6 at K = 8; fp32 rounding costs ~1e-3).
     R = radial_expansion_coeff_poly3_tf(
         rjs_r, pair_neighbour_species, pair_is_central,
         n_species=n_species, alpha_max=n_basis,
@@ -1234,7 +1234,7 @@ def _compute_cnk_inner_tf(
         atom_sigma_r=atom_sigma_r, atom_sigma_r_scaling=atom_sigma_r_scaling,
         amplitude_scaling=amplitude_scaling, central_weight=central_weight,
         radial_enhancement=radial_enhancement, nf=nf, do_central=do_central,
-        W_single=W_r,
+        W_single=W_K,
     )
     if is_fp32:
         R = tf.cast(R, rjs.dtype)
@@ -1891,8 +1891,7 @@ class DescriptorBuilderGPUTF:
             # (TNEP.soap_from_raw finishes the descriptor); gradients through
             # the learned basis are not implemented yet (spec §5).
             with tf.device(device):
-                W_K_t = tf.constant(cache["W_K_np"], dtype=dtype)
-            self._W_K_t = W_K_t
+                W_K_t = tf.constant(cache["W_K_np"], dtype=tf.float64)
             cnk_static = dict(
                 n_species=n_species, n_basis=int(cache["n_basis"]),
                 l_max=int(sp["l_max"]), rcut_hard=float(sp["rcut_hard"]),
@@ -2031,6 +2030,10 @@ class DescriptorBuilderGPUTF:
         k_max = (l_max + 1) * (l_max + 2) // 2
         n_max = cache["n_max"]
         n_compressed = int(cache["mask_info"]["n_compressed"])
+        if self._learn_radial:
+            # Raw centre coefficients over the K basis, no derivative tensors.
+            n_basis = int(cache["n_basis"]) * cache["n_species"]
+            return 16 * k_max * n_basis * n_atoms + 4 * 2 * k_max * n_basis * n_atoms
         # Forward (always present): cnk + soap output
         fwd = 16 * k_max * n_max * n_atoms + 8 * n_compressed * n_atoms
         if not calc_gradients:
@@ -2267,7 +2270,8 @@ class DescriptorBuilderGPUTF:
     ):
         """Bucketised-by-atom format used by the training pipeline.
 
-        calc_gradients=False yields empty per-atom gradient/index lists (only
+        calc_gradients=False yields empty per-atom gradient/index lists (PES
+        and the neighbor dipole readout; only
         target_mode=0/PES is meaningful then).
         Returns (dataset_descriptors, dataset_gradients, dataset_grad_index).
         """
@@ -2342,6 +2346,8 @@ class DescriptorBuilderGPUTF:
             return self.build_descriptors(dataset, calc_gradients=False,
                                           **build_kwargs)
         from DescriptorBuilder import _filter_to_self_pairs
+        # ponytail: full-COO peak for the whole dataset on this branch; chunk
+        # over the dataset like the quippy builder if it OOMs.
         return _filter_to_self_pairs(
             *self.build_descriptors(dataset, **build_kwargs))
 
