@@ -229,6 +229,35 @@ catches a K mismatch.
 13. **K < α** is rejected (basis must contain the α learned functions at init).
 14. **Existing saved models** are unaffected (knob absent → `None`).
 
+## 4b. Second option — species compression (`radial_basis_species_sum`)
+
+`radial_basis_species_sum: bool = False` selects how the learned radial
+channels treat neighbour species (only meaningful with `radial_basis_size`):
+
+- **False (default) — keep SOAP-turbo's dimensions.** Species-blocked as in
+  §2: `c[i,(s,n),k] = Σ_κ M[t_i,s,n,κ] c_raw[i,s,κ,k]`, n_max = S·α, trivial
+  compression, `dim_q` unchanged (165 for S=3, α=4, l_max=4).
+- **True — NEP-style species compression.** The neighbour-species axis is
+  summed into α shared channels, exactly as NEP's `g_n = Σ_j Σ_k c_nk^{(t_i,t_j)} f_k(r_ij)`:
+  `c[i,n,k] = Σ_s Σ_κ M[t_i,s,n,κ] c_raw[i,s,κ,k]`, n_max = α. The power
+  spectrum is the full upper triangle over the α channels (no compression
+  needed — it is already small): `dim_q = α(α+1)/2 · (l_max+1)` (50 for α=4,
+  l_max=4), Fortran (n, n', l) order with the √2 rule for n ≠ n', per-atom
+  L2 norm. Species information enters only through `M`, so `dim_q` no longer
+  grows with the number of species. Init: `M0` tiled over `s` (every species
+  contributes the same α functions at gen 0 — a species-agnostic SOAP;
+  SNES noise breaks the symmetry). There is no fixed-basis descriptor with
+  these dimensions, so gen-0 equivalence is not defined for this mode; its
+  reference test is an independent NumPy power spectrum over the summed
+  channels.
+
+The raw builder output is identical in both modes; only `soap_from_raw`'s
+contraction, `compute_dim_q`, `radial_basis_channel_map` (rows = all α
+channels, keep all n ≤ n') and `descriptor_block_layout` (one block
+`(0,0)` with α(α+1)/2 channels per l, so `descriptor_mixing` still works)
+change. `descriptor_preprocess_contract != "off"` is rejected in this mode
+(its layouts assume species-pair blocks).
+
 ## 5. Phase 2 — descriptor gradients through the learned basis (designed, deferred)
 
 Every gradient consumer contracts `de_dq[i, q] · ∂q̂_i/∂r_p` into a per-pair
