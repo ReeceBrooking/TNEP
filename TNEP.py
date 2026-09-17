@@ -88,6 +88,56 @@ class TNEP(layers.Layer):
         self._activation_name = str(cfg.activation).lower().strip()
         self._glorot_gain = 1.0
         self.activation = tf.keras.activations.get(cfg.activation)
+
+        # Learned radial basis (cfg.radial_basis_size = K): the builder emits
+        # raw centre coefficients [.., A, S·K·k_max·2] in the descriptors slot
+        # and soap_from_raw finishes the SOAP-turbo descriptor with M_radial.
+        _K = getattr(cfg, "radial_basis_size", None)
+        self._learn_radial = _K is not None
+        if self._learn_radial:
+            from DescriptorBuilderGPU import (radial_basis_init,
+                                              radial_basis_channel_map)
+            K = int(_K)
+            alpha = int(cfg.alpha_max)
+            if int(cfg.descriptor_mode) != 1:
+                raise ValueError(
+                    "cfg.radial_basis_size requires descriptor_mode=1 (the "
+                    "TF/GPU builder); the quippy backend cannot emit raw "
+                    "centre coefficients.")
+            if not alpha <= K <= 10:
+                raise ValueError(
+                    f"cfg.radial_basis_size={K} must satisfy alpha_max="
+                    f"{alpha} <= K <= 10 (the poly3 overlap matrix is SPD "
+                    f"only up to ~10).")
+            if not (cfg.target_mode == 1
+                    and str(cfg.dipole_readout) == "neighbor"):
+                raise NotImplementedError(
+                    "cfg.radial_basis_size: descriptor gradients through the "
+                    "learned radial basis are not implemented — only the "
+                    "neighbor dipole readout (target_mode=1) is supported.")
+            cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types)
+            if int(cm["gather_idx"].size) != int(self.dim_q_forward):
+                raise RuntimeError(
+                    f"radial_basis_channel_map gives {cm['gather_idx'].size} "
+                    f"channels, dim_q={self.dim_q_forward}.")
+            L = int(cfg.l_max) + 1
+            self._rb_alpha, self._rb_K = alpha, K
+            self._rb_L, self._rb_kmax = L, L * (L + 1) // 2
+            self._rb_pivots = tf.constant(cm["pivot_rows"])
+            self._rb_gather = tf.constant(cm["gather_idx"])
+            self._rb_scale = tf.constant(cm["scale"])
+            # m-multiplicity per k within each l block (2 for m > 0, else 1).
+            self._rb_mw = [tf.constant(cm["Wm"][l * (l + 1) // 2:
+                                              l * (l + 1) // 2 + l + 1, l]
+                                       [:, tf.newaxis])
+                           for l in range(L)]
+            M0 = radial_basis_init(alpha, K)
+            self.M_radial = tf.Variable(
+                np.broadcast_to(M0, (cfg.num_types, cfg.num_types, alpha, K))
+                .astype(np.float32).copy(),
+                trainable=False, name="M_radial")
+        else:
+            self.M_radial = None
         self.builder = make_descriptor_builder(cfg)
 
         # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type
@@ -683,9 +733,67 @@ class TNEP(layers.Layer):
         W0_eff = tf.einsum('...tqN,...tNqh->...tqh', AB, W0_at_q)
         return W0_eff
 
+    # ---- learned radial basis ---------------------------------------------
+
+    @property
+    def descriptor_input_width(self) -> int:
+        """Width of the per-atom vector in the `descriptors` slot (see
+        DescriptorBuilderGPU.descriptor_input_width). Distinct from
+        dim_q_forward, the width of the W0 matmul after the preprocess fold."""
+        from DescriptorBuilderGPU import descriptor_input_width
+        return descriptor_input_width(self.cfg)
+
+    def soap_from_raw(self, raw: tf.Tensor, Z: tf.Tensor,
+                      M: tf.Tensor | None = None) -> tf.Tensor:
+        """SOAP-turbo descriptor from raw centre coefficients with the learned
+        radial basis (cfg.radial_basis_size):
+            c[a, (s,n), k] = Σ_κ M[t_a, s, n, κ] · c_raw[a, s, κ, k]
+            q[a, (n,n',l)] = Σ_m mult · Re(c_{n l m} conj c_{n' l m})   (trivial
+            compression: n or n' a species pivot), then L2-normalised per atom
+            with SOAP-turbo's ‖q‖ < 1e-5 guard (padded atoms stay 0).
+        Args:
+            raw : [..., A, S·K·k_max·2]  builder output (species, κ, k, re/im)
+            Z   : [..., A]               type indices
+            M   : [T, S, α, K] (None → self.M_radial) or per-candidate
+                  [C, T, S, α, K]
+        Returns [..., A, Q], or [C, ..., A, Q] for per-candidate M.
+        """
+        M = self.M_radial if M is None else M
+        S, K, kmax, alpha, L = (self.num_types, self._rb_K, self._rb_kmax,
+                                self._rb_alpha, self._rb_L)
+        per_cand = len(M.shape) == 5
+        lead = tf.shape(raw)[:-1]
+        N = tf.reduce_prod(lead)
+        r = tf.reshape(raw, [N, S, K, kmax * 2])                 # [N, S, K, 2k]
+        Zf = tf.reshape(Z, [N])
+        M_at = tf.gather(M, Zf, axis=-4)                          # [(C,) N, S, α, K]
+        if per_cand:
+            cc = tf.einsum('cnsak,nskj->cnsaj', M_at, r)          # [C, N, S, α, 2k]
+            cc = tf.reshape(cc, [-1, N, S * alpha, kmax, 2])
+        else:
+            cc = tf.einsum('nsak,nskj->nsaj', M_at, r)
+            cc = tf.reshape(cc, [1, N, S * alpha, kmax, 2])
+        piv = tf.gather(cc, self._rb_pivots, axis=2)              # [C, N, S, k, 2]
+        G_l = []
+        for l in range(L):
+            k0 = l * (l + 1) // 2
+            p_l = piv[:, :, :, k0:k0 + l + 1, :] * self._rb_mw[l]
+            c_l = cc[:, :, :, k0:k0 + l + 1, :]
+            G_l.append(tf.einsum('cnpkr,cnmkr->cnpm', p_l, c_l))   # [C, N, S, S·α]
+        G = tf.stack(G_l, axis=-1)                                # [C, N, S, S·α, L]
+        G = tf.reshape(G, [-1, N, S * S * alpha * L])
+        q = tf.gather(G, self._rb_gather, axis=-1) * self._rb_scale
+        norm = tf.norm(q, axis=-1, keepdims=True)
+        q = q / tf.where(norm < 1e-5, tf.ones_like(norm), norm)
+        out_shape = tf.concat([lead, [self.dim_q_forward]], axis=0)
+        if per_cand:
+            return tf.reshape(q, tf.concat([[-1], out_shape], axis=0))
+        return tf.reshape(q[0], out_shape)
+
     def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,
                 positions: tf.Tensor, Z: tf.Tensor, box: tf.Tensor,
-                atom_mask: tf.Tensor, neighbor_mask: tf.Tensor) -> tf.Tensor:
+                atom_mask: tf.Tensor, neighbor_mask: tf.Tensor,
+                M_radial: tf.Tensor | None = None) -> tf.Tensor:
         """Run the forward pass for a single structure using padded tensors.
 
         Args:
@@ -703,6 +811,8 @@ class TNEP(layers.Layer):
             target_mode 1: [3]  dipole vector
             target_mode 2: [6]  polarizability tensor
         """
+        if self._learn_radial:
+            descriptors = self.soap_from_raw(descriptors, Z, M_radial)
         # Absorb U_pairᵀ into W0 once so forward and calc_forces share the
         # folded weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
@@ -1230,7 +1340,8 @@ class TNEP(layers.Layer):
                       W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
                       W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
                       W_atom: tf.Tensor | None = None,
-                      c_pair: tf.Tensor | None = None) -> tf.Tensor:
+                      c_pair: tf.Tensor | None = None,
+                      M_radial: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
         Weights are passed explicitly (not read from self) so this method can
@@ -1255,10 +1366,13 @@ class TNEP(layers.Layer):
                           [B, A, 3, C, T] instead (built in-graph when None)
             c_pair      : [C, T(T+1)/2] species-pair coefficients (neighbor
                           readout; None → self.c_pair)
+            M_radial    : [T, S, α, K] learned radial basis (None → self.M_radial)
 
         Returns:
             predictions : [B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
+        if self._learn_radial:
+            descriptors = self.soap_from_raw(descriptors, Z, M_radial)
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
         # Pure forward primitive: caller decides whether W0/W0_pol are raw or
@@ -1354,7 +1468,8 @@ class TNEP(layers.Layer):
                                   W1: tf.Tensor, b1: tf.Tensor,
                                   U_pair: tf.Tensor | None = None,
                                   W_pre_angular: tf.Tensor | None = None,
-                                  c_pair: tf.Tensor | None = None) -> tf.Tensor:
+                                  c_pair: tf.Tensor | None = None,
+                                  M_radial: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
         Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
@@ -1378,6 +1493,9 @@ class TNEP(layers.Layer):
             b1          : [C]
             c_pair      : [C, Ch, T(T+1)/2] per-candidate species-pair
                           coefficients (neighbor readout only)
+            M_radial    : [C, T, S, α, K] per-candidate learned radial basis
+                          (required under cfg.radial_basis_size; descriptors
+                          are then raw centre coefficients [B, A, W_in])
 
         Returns:
             predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
@@ -1410,15 +1528,25 @@ class TNEP(layers.Layer):
             W0 = self._W0_preprocess_eff(W0, W_pre_override=W_pre_angular)
 
         # ── Forward: input→hidden ─────────────────────────────────────────────
-        # Per type: [B*A, Q] @ [Q, C*H] → [C, B, A, H]. One GEMM/type, not C.
-        desc_flat = tf.reshape(descriptors, [B * A, Q])
         pre_h_terms = []
-        for t in range(T):
-            W0_t     = W0[:, t, :, :]                                              # [C, Q, H]
-            W0_t_mat = tf.reshape(tf.transpose(W0_t, [1, 0, 2]), [Q, C * H])      # [Q, C*H]
-            ph_flat  = tf.matmul(desc_flat, W0_t_mat)                             # [B*A, C*H]
-            ph       = tf.transpose(tf.reshape(ph_flat, [B, A, C, H]), [2, 0, 1, 3])  # [C,B,A,H]
-            pre_h_terms.append(ph * type_masks[t][tf.newaxis])
+        if self._learn_radial:
+            # Learned radial basis: descriptors are per candidate [C, B, A, Q],
+            # so the input→hidden product is a batched GEMM over C per type.
+            assert M_radial is not None, "candidates need per-candidate M_radial [C, T, S, α, K]"
+            desc_c = tf.reshape(
+                self.soap_from_raw(descriptors, Z, M_radial), [C, B * A, Q])   # [C, B*A, Q]
+            for t in range(T):
+                ph = tf.reshape(tf.matmul(desc_c, W0[:, t, :, :]), [C, B, A, H])  # [C,B,A,H]
+                pre_h_terms.append(ph * type_masks[t][tf.newaxis])
+        else:
+            # Per type: [B*A, Q] @ [Q, C*H] → [C, B, A, H]. One GEMM/type, not C.
+            desc_flat = tf.reshape(descriptors, [B * A, Q])
+            for t in range(T):
+                W0_t     = W0[:, t, :, :]                                              # [C, Q, H]
+                W0_t_mat = tf.reshape(tf.transpose(W0_t, [1, 0, 2]), [Q, C * H])      # [Q, C*H]
+                ph_flat  = tf.matmul(desc_flat, W0_t_mat)                             # [B*A, C*H]
+                ph       = tf.transpose(tf.reshape(ph_flat, [B, A, C, H]), [2, 0, 1, 3])  # [C,B,A,H]
+                pre_h_terms.append(ph * type_masks[t][tf.newaxis])
         pre_h = tf.add_n(pre_h_terms)  # [C, B, A, H]
 
         # ── Bias / output-weight gathers ──────────────────────────────────────

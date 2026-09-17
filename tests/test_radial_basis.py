@@ -198,3 +198,84 @@ def test_builder_raw_coefficients_reproduce_fixed_descriptor(K):
     b2 = make_descriptor_builder(_cfg(radial_basis_size=K, dipole_readout="tnep"))
     with pytest.raises(NotImplementedError):
         b2.build_descriptors_flat(frames, calc_gradients=True)
+
+
+def _model(cfg):
+    from TNEP import TNEP
+    tf.keras.utils.set_random_seed(0)
+    return TNEP(cfg)
+
+
+def _eval_data(cfg, frames):
+    from data import prepare_eval_data
+    return prepare_eval_data(frames, cfg)
+
+
+def _predict(model, data, M=None):
+    return model.predict_batch(
+        data["descriptors"], data["grad_values"],
+        data["pair_atom"], data["pair_gidx"], data["pair_struct"],
+        data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
+        model.W0, model.b0, model.W1, model.b1,
+        W_atom=data.get("V_atom"), M_radial=M).numpy()
+
+
+@pytest.mark.parametrize("K", [4, 8])
+def test_model_soap_from_raw_matches_numpy_reference(K):
+    cfg = _cfg(radial_basis_size=K)
+    model = _model(cfg)
+    frames = _cho_frames(2)
+    data = _eval_data(cfg, frames)
+    rng = np.random.default_rng(3)
+    M = (model.M_radial.numpy() + 0.1 * rng.normal(size=model.M_radial.shape)).astype(np.float32)
+    q_tf = model.soap_from_raw(data["descriptors"], data["Z_int"], tf.constant(M)).numpy()
+    for s, fr in enumerate(frames):
+        A = len(fr)
+        Z = data["Z_int"][s].numpy()[:A]
+        ref = _soap_from_raw_np(data["descriptors"][s].numpy()[:A], Z, M, 4, 4, 3)
+        np.testing.assert_allclose(q_tf[s, :A], ref, atol=1e-5)
+    # padded atoms must be exactly zero (norm guard on an empty row)
+    A_max = data["descriptors"].shape[1]
+    for s, fr in enumerate(frames):
+        assert np.all(q_tf[s, len(fr):] == 0.0)
+
+
+def test_learned_model_at_init_equals_fixed_model():
+    """Same ANN weights, fixed vs learned(K=8) at M0 → identical dipoles."""
+    frames = _cho_frames(3)
+    cfg_f = _cfg(); m_f = _model(cfg_f); d_f = _eval_data(cfg_f, frames)
+    cfg_l = _cfg(radial_basis_size=8); m_l = _model(cfg_l); d_l = _eval_data(cfg_l, frames)
+    for w in ("W0", "b0", "W1", "b1"):
+        getattr(m_l, w).assign(getattr(m_f, w))
+    np.testing.assert_allclose(_predict(m_l, d_l), _predict(m_f, d_f), rtol=1e-4, atol=1e-6)
+
+
+def test_candidates_match_single_candidate_predictions():
+    cfg = _cfg(radial_basis_size=6, dipole_species_pairs="symmetric")
+    model = _model(cfg)
+    data = _eval_data(cfg, _cho_frames(3))
+    rng = np.random.default_rng(5)
+    C = 3
+    M0 = model.M_radial.numpy()
+    Ms = np.stack([M0 + 0.05 * c * rng.normal(size=M0.shape) for c in range(C)]).astype(np.float32)
+    W0 = np.stack([model.W0.numpy()] * C); b0 = np.stack([model.b0.numpy()] * C)
+    W1 = np.stack([model.W1.numpy()] * C); b1 = np.zeros(C, np.float32)
+    cp = np.stack([model.c_pair.numpy()] * C)
+    preds = model.predict_batch_candidates(
+        data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
+        tf.constant(W0), tf.constant(b0), tf.constant(W1), tf.constant(b1),
+        c_pair=tf.constant(cp), M_radial=tf.constant(Ms)).numpy()         # [C, B, 3]
+    for c in range(C):
+        np.testing.assert_allclose(preds[c], _predict(model, data, tf.constant(Ms[c])),
+                                   rtol=1e-4, atol=1e-6)
+
+
+def test_learned_radial_rejects_gradient_modes_and_cpu_builder():
+    with pytest.raises(NotImplementedError):
+        _model(_cfg(radial_basis_size=8, dipole_readout="tnep"))
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_size=8, descriptor_mode=0))
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_size=3))
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_size=11))
