@@ -465,7 +465,9 @@ def _train_model_inner(cfg: TNEPconfig,
               f"type, neighbour species) as combinations of K="
               f"{cfg.radial_basis_size} orthonormal poly3 functions "
               f"(M_radial [{cfg.num_types}, {cfg.num_types}, {cfg.alpha_max}, "
-              f"{cfg.radial_basis_size}] in the SNES vector; init = fixed basis)")
+              f"{cfg.radial_basis_size}] in the SNES vector; init = fixed basis; "
+              + ("species-summed, dim_q = α(α+1)/2·L" if cfg.radial_basis_species_sum
+                 else "species-blocked, SOAP-turbo dimensions") + ")")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
     # On resume, reuse the checkpoint's existing run dir.

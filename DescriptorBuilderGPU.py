@@ -328,6 +328,9 @@ def compute_dim_q(cfg) -> int:
     alpha_max = int(cfg.alpha_max)
     l_max = int(cfg.l_max)
     n_species = int(cfg.num_types)
+    if _radial_species_sum(cfg):
+        # Species-summed learned basis: full (n <= n') spectrum over alpha channels.
+        return alpha_max * (alpha_max + 1) // 2 * (l_max + 1)
     compress_mode = getattr(cfg, "compress_mode", "trivial")
     if compress_mode == "linear":
         # quippy linear default = 2 × n_species pivots × (l_max+1) features
@@ -354,31 +357,45 @@ def radial_basis_init(alpha_max: int, n_basis: int) -> np.ndarray:
     return np.concatenate([W_a, pad], axis=1) @ W_K_inv
 
 
-def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int) -> dict:
-    """Index map from the pivot-row Gram G[s_piv, n', l] to the compressed
-    channel order of make_compress_mask_trivial (Fortran (n, n', l) order,
-    kept when n or n' is a species' first radial index).
+def _radial_species_sum(cfg) -> bool:
+    """True for the species-summed learned radial basis (spec §4b)."""
+    return (getattr(cfg, "radial_basis_size", None) is not None
+            and bool(getattr(cfg, "radial_basis_species_sum", False)))
 
-    Returns dict: pivot_rows [S] int32 (0-based global n of each species'
-    first function), gather_idx [dim_q] int32 into G flattened as
-    (S, n_max, L), scale [dim_q] float32 (√2 for n != n', SOAP-turbo's
-    multiplicity), Wm [k_max, L] float32 (2 for m > 0 else 1, block-diagonal
-    in l; k = l(l+1)/2 + m)."""
-    n_max = alpha_max * n_species
+
+def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int,
+                             species_sum: bool = False) -> dict:
+    """Index map from the row Gram G[row, n', l] to the descriptor channel
+    order, Fortran (n, n', l) with l innermost.
+
+    species_sum=False: rows = the S species pivots (each species' first
+    radial index of n_max = S·alpha_max), channels kept when n or n' is a
+    pivot — make_compress_mask_trivial's order. species_sum=True: n_max =
+    alpha_max shared channels, rows = all of them, every n <= n' kept.
+
+    Returns dict: rows [R] int32, n_max, gather_idx [dim_q] int32 into G
+    flattened as (R, n_max, L), scale [dim_q] float32 (√2 for n != n',
+    SOAP-turbo's multiplicity), Wm [k_max, L] float32 (2 for m > 0 else 1,
+    block-diagonal in l; k = l(l+1)/2 + m)."""
     L = l_max + 1
     k_max = L * (L + 1) // 2
-    pivots = [s * alpha_max for s in range(n_species)]
-    piv_of = {n: s for s, n in enumerate(pivots)}
+    if species_sum:
+        n_max = alpha_max
+        rows = list(range(alpha_max))
+    else:
+        n_max = alpha_max * n_species
+        rows = [s * alpha_max for s in range(n_species)]
+    row_of = {n: i for i, n in enumerate(rows)}
     gather: list[int] = []
     scale: list[float] = []
     for n in range(n_max):
         for nprime in range(n, n_max):
-            if n not in piv_of and nprime not in piv_of:
+            if n not in row_of and nprime not in row_of:
                 continue
-            s, other = ((piv_of[n], nprime) if n in piv_of
-                        else (piv_of[nprime], n))
+            i, other = ((row_of[n], nprime) if n in row_of
+                        else (row_of[nprime], n))
             for l in range(L):
-                gather.append((s * n_max + other) * L + l)
+                gather.append((i * n_max + other) * L + l)
                 scale.append(np.sqrt(2.0) if n != nprime else 1.0)
     Wm = np.zeros((k_max, L), dtype=np.float32)
     k = 0
@@ -387,7 +404,8 @@ def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int) -> dict
             Wm[k, l] = 2.0 if m > 0 else 1.0
             k += 1
     return dict(
-        pivot_rows=np.asarray(pivots, dtype=np.int32),
+        rows=np.asarray(rows, dtype=np.int32),
+        n_max=int(n_max),
         gather_idx=np.asarray(gather, dtype=np.int32),
         scale=np.asarray(scale, dtype=np.float32),
         Wm=Wm,
@@ -427,6 +445,26 @@ def descriptor_block_layout(cfg) -> dict:
     alpha_max = int(cfg.alpha_max)
     l_max = int(cfg.l_max)
     n_species = int(cfg.num_types)
+    if _radial_species_sum(cfg):
+        # Species-summed learned basis: no species pairs — one block over the
+        # alpha channels, per-l sub-blocks of alpha(alpha+1)/2 channels
+        # ((n, n') outer, l inner in the channel order).
+        L = l_max + 1
+        per_l = alpha_max * (alpha_max + 1) // 2
+        q = np.arange(per_l * L, dtype=np.int32).reshape(per_l, L)
+        ln = {l: q[:, l].copy() for l in range(L)}
+        return dict(
+            pair_keys=[(0, 0)],
+            pair_q_index={(0, 0): q.reshape(-1).copy()},
+            pair_ln_index={(0, 0): ln},
+            l_index={l: v.copy() for l, v in ln.items()},
+            block_sizes={(0, 0): int(per_l * L)},
+            max_block_size=int(per_l * L),
+            alpha_eff_per_pair={(0, 0): per_l},
+            max_alpha_eff=per_l,
+            N_per_l=per_l,
+            dim_q=int(per_l * L),
+        )
     alpha_per_species = [alpha_max] * n_species
 
     # 1-based species ownership of each global radial index.

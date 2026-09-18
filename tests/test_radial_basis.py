@@ -143,7 +143,7 @@ def test_radial_basis_channel_map_reproduces_power_spectrum():
         mi["coeffs"], mi["n_compressed"], n_max, l_max)          # [5, Q] normalised
     # Candidate: G[i, p, n', l] = Σ_k Wm[k,l]·Re(c[piv_p,k]·conj c[n',k])
     c = np.transpose(cnk, (2, 1, 0))                             # [N, n_max, k_max]
-    piv = c[:, cm["pivot_rows"], :]                              # [N, S, k_max]
+    piv = c[:, cm["rows"], :]                                    # [N, S, k_max]
     G = np.einsum('ipk,ink,kl->ipnl', piv, np.conj(c), cm["Wm"]).real
     q = G.reshape(5, -1)[:, cm["gather_idx"]] * cm["scale"]
     q = q / np.linalg.norm(q, axis=1, keepdims=True)
@@ -169,7 +169,7 @@ def _soap_from_raw_np(raw, Z, M, alpha, l_max, S):
     cc = np.einsum('asnk,askm->asnm', M[Z].astype(np.float64), c_raw)   # [A, S, alpha, k]
     cc = cc.reshape(A, S * alpha, k_max)
     cm = radial_basis_channel_map(alpha, l_max, S)
-    G = np.einsum('apk,ank,kl->apnl', cc[:, cm["pivot_rows"]], np.conj(cc), cm["Wm"]).real
+    G = np.einsum('apk,ank,kl->apnl', cc[:, cm["rows"]], np.conj(cc), cm["Wm"]).real
     q = G.reshape(A, -1)[:, cm["gather_idx"]] * cm["scale"]
     n = np.linalg.norm(q, axis=1, keepdims=True)
     return q / np.where(n < 1e-5, 1.0, n)
@@ -333,4 +333,110 @@ def test_save_load_roundtrip_preserves_M_radial_and_predictions(tmp_path):
     loaded = load_model(path)
     assert loaded.cfg.radial_basis_size == 6
     np.testing.assert_allclose(loaded.M_radial.numpy(), model.M_radial.numpy())
+    np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)
+
+
+def _soap_from_raw_summed_np(raw, Z, M, alpha, l_max, S):
+    """Independent NumPy reference for the species-summed mode (one structure):
+    channels summed over s, full (n <= n') power spectrum in Fortran order."""
+    L = l_max + 1; k_max = L * (L + 1) // 2; K = M.shape[-1]
+    A = raw.shape[0]
+    r = raw.reshape(A, S, K, k_max, 2).astype(np.float64)
+    c_raw = r[..., 0] + 1j * r[..., 1]                                    # [A, S, K, k]
+    cc = np.einsum('asnk,askm->anm', M[Z].astype(np.float64), c_raw)     # [A, alpha, k]
+    out = []
+    for n in range(alpha):
+        for nprime in range(n, alpha):
+            for l in range(L):
+                k0 = l * (l + 1) // 2
+                prod = (cc[:, n, k0:k0 + l + 1] * np.conj(cc[:, nprime, k0:k0 + l + 1])).real
+                mult = np.array([1.0] + [2.0] * l) * (np.sqrt(2.0) if n != nprime else 1.0)
+                out.append(prod @ mult)
+    q = np.stack(out, axis=1)                                             # [A, dim_q]
+    nrm = np.linalg.norm(q, axis=1, keepdims=True)
+    return q / np.where(nrm < 1e-5, 1.0, nrm)
+
+
+def test_species_sum_dim_q_and_channel_map():
+    from DescriptorBuilderGPU import (radial_basis_channel_map, compute_dim_q,
+                                      power_spectrum_numpy)
+    cfg = _cfg(radial_basis_size=8, radial_basis_species_sum=True)
+    assert compute_dim_q(cfg) == 4 * 5 // 2 * 5 == 50 and cfg.dim_q == 50
+    assert compute_dim_q(_cfg(radial_basis_size=8)) == 165
+    cm = radial_basis_channel_map(4, 4, 3, species_sum=True)
+    assert cm["gather_idx"].shape == (50,) and cm["n_max"] == 4
+    np.testing.assert_array_equal(cm["rows"], np.arange(4))
+    # Against power_spectrum_numpy with NO compression over a single alpha block.
+    L, k_max, n_max = 5, 15, 4
+    n_unc = n_max * (n_max + 1) // 2 * L
+    rng = np.random.default_rng(1)
+    cnk = rng.normal(size=(k_max, n_max, 5)) + 1j * rng.normal(size=(k_max, n_max, 5))
+    from DescriptorBuilderGPU import build_multiplicity_array
+    ref = power_spectrum_numpy(
+        cnk, build_multiplicity_array(n_max, 4, None), np.zeros(n_unc, bool),
+        np.arange(n_unc), np.arange(n_unc), np.ones(n_unc), n_unc, n_max, 4)
+    c = np.transpose(cnk, (2, 1, 0))
+    G = np.einsum('ipk,ink,kl->ipnl', c[:, cm["rows"], :], np.conj(c), cm["Wm"]).real
+    q = G.reshape(5, -1)[:, cm["gather_idx"]] * cm["scale"]
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    np.testing.assert_allclose(q, ref, atol=1e-8, rtol=0)
+
+
+def test_species_sum_block_layout_is_one_block():
+    from DescriptorBuilderGPU import descriptor_block_layout
+    lay = descriptor_block_layout(_cfg(radial_basis_size=8, radial_basis_species_sum=True))
+    assert lay["pair_keys"] == [(0, 0)] and lay["dim_q"] == 50
+    assert lay["alpha_eff_per_pair"][(0, 0)] == 10 and lay["N_per_l"] == 10
+    assert sorted(np.concatenate([lay["pair_ln_index"][(0, 0)][l] for l in range(5)])) == list(range(50))
+
+
+@pytest.mark.parametrize("mixing", [False, True])
+def test_species_sum_model_matches_numpy_reference(mixing):
+    cfg = _cfg(radial_basis_size=8, radial_basis_species_sum=True,
+               descriptor_mixing=mixing, descriptor_mixing_regularizer="expm")
+    model = _model(cfg)
+    assert model.W0.shape[1] == 50
+    frames = _cho_frames(2)
+    data = _eval_data(cfg, frames)
+    rng = np.random.default_rng(4)
+    M = (model.M_radial.numpy() + 0.1 * rng.normal(size=model.M_radial.shape)).astype(np.float32)
+    q_tf = model.soap_from_raw(data["descriptors"], data["Z_int"], tf.constant(M)).numpy()
+    for s, fr in enumerate(frames):
+        A = len(fr)
+        Z = data["Z_int"][s].numpy()[:A]
+        ref = _soap_from_raw_summed_np(data["descriptors"][s].numpy()[:A], Z, M, 4, 4, 3)
+        np.testing.assert_allclose(q_tf[s, :A], ref, atol=1e-5)
+        assert np.all(q_tf[s, A:] == 0.0)
+    # Candidate path (with mixing tail when enabled) agrees with single-candidate predict_batch.
+    snes = model.optimizer
+    pv = tf.stack([snes.mu, snes.mu + 0.02])
+    named = snes._split_reconstructed(snes.reconstruct_params_tf(pv))
+    preds = model.predict_batch_candidates(
+        data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
+        named["W0"], named["b0"], named["W1"], named["b1"],
+        U_pair=named["U_pair"], c_pair=named["c_pair"], M_radial=named["M_radial"]).numpy()
+    for c in range(2):
+        one = snes._split_reconstructed(snes.reconstruct_params_tf(pv[c]))
+        W0 = model._W0_eff(one["W0"], one["U_pair"]) if mixing else one["W0"]
+        single = model.predict_batch(
+            data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"],
+            data["pair_struct"], data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
+            W0, one["b0"], one["W1"], one["b1"], W_atom=data["V_atom"],
+            c_pair=one["c_pair"], M_radial=one["M_radial"]).numpy()
+        np.testing.assert_allclose(preds[c], single, rtol=1e-4, atol=1e-6)
+
+
+def test_species_sum_rejects_preprocess_and_roundtrips(tmp_path):
+    from model_io import save_model, load_model
+    with pytest.raises(NotImplementedError):
+        _model(_cfg(radial_basis_size=8, radial_basis_species_sum=True,
+                    descriptor_preprocess_contract="angular"))
+    cfg = _cfg(radial_basis_size=6, radial_basis_species_sum=True)
+    model = _model(cfg)
+    data = _eval_data(cfg, _cho_frames(2))
+    before = _predict(model, data)
+    path = str(tmp_path / "m.h5")
+    save_model(model, cfg, path)
+    loaded = load_model(path)
+    assert loaded.cfg.radial_basis_species_sum is True and loaded.cfg.dim_q == 50
     np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)

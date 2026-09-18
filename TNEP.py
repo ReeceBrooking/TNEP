@@ -115,7 +115,15 @@ class TNEP(layers.Layer):
                     "cfg.radial_basis_size: descriptor gradients through the "
                     "learned radial basis are not implemented — only the "
                     "neighbor dipole readout (target_mode=1) is supported.")
-            cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types)
+            self._rb_species_sum = bool(cfg.radial_basis_species_sum)
+            if (self._rb_species_sum
+                    and self.descriptor_preprocess_contract != "off"):
+                raise NotImplementedError(
+                    "cfg.radial_basis_species_sum=True has no species-pair "
+                    "blocks, which descriptor_preprocess_contract layouts "
+                    "assume; set descriptor_preprocess_contract='off'.")
+            cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types,
+                                          species_sum=self._rb_species_sum)
             if int(cm["gather_idx"].size) != int(self.dim_q_forward):
                 raise RuntimeError(
                     f"radial_basis_channel_map gives {cm['gather_idx'].size} "
@@ -123,7 +131,9 @@ class TNEP(layers.Layer):
             L = int(cfg.l_max) + 1
             self._rb_alpha, self._rb_K = alpha, K
             self._rb_L, self._rb_kmax = L, L * (L + 1) // 2
-            self._rb_pivots = tf.constant(cm["pivot_rows"])
+            self._rb_rows = tf.constant(cm["rows"])
+            self._rb_n_rows = int(cm["rows"].size)
+            self._rb_n_max = int(cm["n_max"])
             self._rb_gather = tf.constant(cm["gather_idx"])
             self._rb_scale = tf.constant(cm["scale"])
             # m-multiplicity per k within each l block (2 for m > 0, else 1).
@@ -751,6 +761,9 @@ class TNEP(layers.Layer):
             q[a, (n,n',l)] = Σ_m mult · Re(c_{n l m} conj c_{n' l m})   (trivial
             compression: n or n' a species pivot), then L2-normalised per atom
             with SOAP-turbo's ‖q‖ < 1e-5 guard (padded atoms stay 0).
+        cfg.radial_basis_species_sum sums the species axis into α shared
+        channels, c[a, n, k] = Σ_s Σ_κ M[t_a, s, n, κ] · c_raw[a, s, κ, k],
+        and keeps every (n ≤ n', l) channel (dim_q = α(α+1)/2·L).
         Args:
             raw : [..., A, S·K·k_max·2]  builder output (species, κ, k, re/im)
             Z   : [..., A]               type indices
@@ -767,21 +780,23 @@ class TNEP(layers.Layer):
         r = tf.reshape(raw, [N, S, K, kmax * 2])                 # [N, S, K, 2k]
         Zf = tf.reshape(Z, [N])
         M_at = tf.gather(M, Zf, axis=-4)                          # [(C,) N, S, α, K]
-        if per_cand:
-            cc = tf.einsum('cnsak,nskj->cnsaj', M_at, r)          # [C, N, S, α, 2k]
-            cc = tf.reshape(cc, [-1, N, S * alpha, kmax, 2])
+        if self._rb_species_sum:
+            # NEP-style: sum over neighbour species into α shared channels.
+            cc = (tf.einsum('cnsak,nskj->cnaj', M_at, r) if per_cand
+                  else tf.einsum('nsak,nskj->naj', M_at, r))      # [(C,) N, α, 2k]
         else:
-            cc = tf.einsum('nsak,nskj->nsaj', M_at, r)
-            cc = tf.reshape(cc, [1, N, S * alpha, kmax, 2])
-        piv = tf.gather(cc, self._rb_pivots, axis=2)              # [C, N, S, k, 2]
+            cc = (tf.einsum('cnsak,nskj->cnsaj', M_at, r) if per_cand
+                  else tf.einsum('nsak,nskj->nsaj', M_at, r))     # [(C,) N, S, α, 2k]
+        cc = tf.reshape(cc, [-1, N, self._rb_n_max, kmax, 2])    # [C, N, n_max, k, 2]
+        piv = tf.gather(cc, self._rb_rows, axis=2)                # [C, N, R, k, 2]
         G_l = []
         for l in range(L):
             k0 = l * (l + 1) // 2
             p_l = piv[:, :, :, k0:k0 + l + 1, :] * self._rb_mw[l]
             c_l = cc[:, :, :, k0:k0 + l + 1, :]
-            G_l.append(tf.einsum('cnpkr,cnmkr->cnpm', p_l, c_l))   # [C, N, S, S·α]
-        G = tf.stack(G_l, axis=-1)                                # [C, N, S, S·α, L]
-        G = tf.reshape(G, [-1, N, S * S * alpha * L])
+            G_l.append(tf.einsum('cnpkr,cnmkr->cnpm', p_l, c_l))   # [C, N, R, n_max]
+        G = tf.stack(G_l, axis=-1)                                # [C, N, R, n_max, L]
+        G = tf.reshape(G, [-1, N, self._rb_n_rows * self._rb_n_max * L])
         q = tf.gather(G, self._rb_gather, axis=-1) * self._rb_scale
         norm = tf.norm(q, axis=-1, keepdims=True)
         q = q / tf.where(norm < 1e-5, tf.ones_like(norm), norm)

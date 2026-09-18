@@ -208,6 +208,16 @@ class TNEPconfig:
     #          Supported with the neighbor dipole readout (no descriptor
     #          gradients); gradient-consuming modes raise NotImplementedError.
     radial_basis_size: int | None = None
+    # Species handling of the learned radial channels (radial_basis_size only):
+    #   False : keep SOAP-turbo's species-blocked layout and dimensions —
+    #           n_max = S·alpha_max, trivial compression, dim_q unchanged.
+    #   True  : NEP-style species compression — the neighbour-species axis is
+    #           summed into alpha_max shared channels
+    #           (c_n = Σ_s Σ_κ M[t,s,n,κ]·c_raw[s,κ]), full (n ≤ n') power
+    #           spectrum, dim_q = alpha_max(alpha_max+1)/2·(l_max+1); species
+    #           information enters only through M. Not combinable with
+    #           descriptor_preprocess_contract.
+    radial_basis_species_sum: bool = False
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE

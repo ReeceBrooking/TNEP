@@ -54,6 +54,7 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "dipole_species_pairs": "off",
     # Pre-existence: fixed radial basis.
     "radial_basis_size": None,
+    "radial_basis_species_sum": False,
 }
 
 
