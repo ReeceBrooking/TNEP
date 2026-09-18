@@ -789,29 +789,46 @@ class TNEP(layers.Layer):
         N = tf.reduce_prod(lead)
         r = tf.reshape(raw, [N, S, K, kmax * 2])                 # [N, S, K, 2k]
         Zf = tf.reshape(Z, [N])
-        M_at = tf.gather(M, Zf, axis=1 if per_cand else 0)       # [(C,) N, S, α, K(, L)]
+        # Partition atoms by centre type once and contract each type's atoms
+        # with its own M[t] (a small GEMM). Never gather M per atom: that
+        # [N, S, α, K(, L)] copy is hundreds of MB per candidate at 6 species
+        # and its backward makes one copy per l block.
+        T = self.num_types
+        order = tf.argsort(Zf)
+        inv = tf.math.invert_permutation(order)
+        counts = tf.math.bincount(tf.gather(Zf, order), minlength=T, maxlength=T)
+        parts = tf.split(tf.gather(r, order), counts, num=T, axis=0)
+        atom_axis = 1 if per_cand else 0
 
-        def _contract(M_l, r_k):
-            """c[(C,) N, n_max, k_len, 2] = Σ_κ M_l[t_a, s, n, κ] · r_k[a, s, κ, ·]
-            (Σ_s too under species_sum)."""
-            if self._rb_species_sum:
-                # NEP-style: sum over neighbour species into α shared channels.
-                c = (tf.einsum('cnsak,nskj->cnaj', M_l, r_k) if per_cand
-                     else tf.einsum('nsak,nskj->naj', M_l, r_k))
-            else:
-                c = (tf.einsum('cnsak,nskj->cnsaj', M_l, r_k) if per_cand
-                     else tf.einsum('nsak,nskj->nsaj', M_l, r_k))
-            return tf.reshape(c, [-1, N, self._rb_n_max, tf.shape(r_k)[-1] // 2, 2])
+        def _contract(M_of_t, k_slice):
+            """c[(C,) N, n_max, k_len, 2] = Σ_κ M[t_a, s, n, κ] · r[a, s, κ, k_slice]
+            (Σ_s too under species_sum), atoms back in input order."""
+            outs = []
+            for t in range(T):
+                M_t = M_of_t(t)                                   # [(C,) S, α, K]
+                r_t = parts[t][..., k_slice]                      # [N_t, S, K, kk]
+                if self._rb_species_sum:
+                    # NEP-style: sum over neighbour species into α shared channels.
+                    outs.append(tf.einsum('csak,nskj->cnaj', M_t, r_t) if per_cand
+                                else tf.einsum('sak,nskj->naj', M_t, r_t))
+                else:
+                    outs.append(tf.einsum('csak,nskj->cnsaj', M_t, r_t) if per_cand
+                                else tf.einsum('sak,nskj->nsaj', M_t, r_t))
+            c = tf.gather(tf.concat(outs, axis=atom_axis), inv, axis=atom_axis)
+            return tf.reshape(c, [-1, N, self._rb_n_max, tf.shape(r_t)[-1] // 2, 2])
 
         if not self._rb_per_l:
-            cc = _contract(M_at, r)                               # [C, N, n_max, k, 2]
+            cc = _contract(lambda t: M[:, t] if per_cand else M[t],
+                           slice(None))                           # [C, N, n_max, k, 2]
             piv = tf.gather(cc, self._rb_rows, axis=2)            # [C, N, R, k, 2]
         G_l = []
         for l in range(L):
             k0 = l * (l + 1) // 2
             if self._rb_per_l:
                 # This l block's own radial functions M[..., l] on its k slice.
-                c_l = _contract(M_at[..., l], r[..., 2 * k0:2 * (k0 + l + 1)])
+                c_l = _contract(lambda t, l=l: (M[:, t, ..., l] if per_cand
+                                                else M[t, ..., l]),
+                                slice(2 * k0, 2 * (k0 + l + 1)))
                 p_l = tf.gather(c_l, self._rb_rows, axis=2) * self._rb_mw[l]
             else:
                 p_l = piv[:, :, :, k0:k0 + l + 1, :] * self._rb_mw[l]
