@@ -824,3 +824,25 @@ def test_save_load_roundtrip_gaussian_tanh3(tmp_path):
     assert loaded.cfg.dipole_cutoff == "tanh3"
     assert float(loaded.cfg.dipole_gauss_sigma_scale) == 0.5
     assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
+
+
+
+def test_neighbor_pairs_fast_path_matches_ase():
+    """Direct MIC search == ASE neighbor_list on the bulk water frame (periodic,
+    L > 2rc) and on a vacuum-boxed CHO molecule (100 Å, pbc True)."""
+    from data import _neighbor_pairs
+    from ase.io import read as _read
+    frames = [_bulk_frame()]
+    cho = [a for a in _read(os.path.join(ROOT, "datasets", "train.xyz"), index=":10")
+           if set(a.numbers) <= {1, 6, 8}][0]
+    frames.append(cho)
+    for at in frames:
+        rc = 3.0
+        i, j, D = _neighbor_pairs(at, rc)
+        i2, j2, D2 = neighbor_list("ijD", at, rc)
+        assert len(i) == len(i2) > 0
+        key = lambda i_, j_, D_: sorted(zip(i_.tolist(), j_.tolist(), np.round(D_, 6).tolist()))
+        assert key(i, j, D) == key(i2, j2, D2)
+        # the fast path really was taken
+        L = np.diag(at.cell.array)
+        assert np.all(L[at.pbc] >= 2 * rc)

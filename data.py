@@ -363,6 +363,7 @@ def assemble_data_dict(
     # kernel V (data-static; delivered to the forwards via the W_atom slot).
     if (cfg.target_mode == 1
             and cfg.dipole_readout == "neighbor"):
+        from tqdm import tqdm
         data["V_atom"] = [
             _neighbor_dipole_V(s, t, float(cfg.dipole_rc or cfg.rcut_hard),
                                int(cfg.dipole_channels), int(cfg.num_types),
@@ -370,7 +371,9 @@ def assemble_data_dict(
                                float(cfg.dipole_zeta),
                                resolved_dipole_cutoff(cfg),
                                float(cfg.dipole_gauss_sigma_scale))
-            for s, t in zip(dataset, types_int)]
+            for s, t in tqdm(list(zip(dataset, types_int)),
+                             desc="Building neighbor-readout V", unit="struct",
+                             disable=len(dataset) < 50)]
 
     # Auto-detect and include force/virial targets for PES mode
     if cfg.target_mode == 0:
@@ -404,6 +407,29 @@ def descriptor_gradients_needed(cfg: TNEPconfig) -> bool:
     return not (cfg.target_mode == 1 and cfg.dipole_readout == "neighbor")
 
 
+def _neighbor_pairs(atoms: Atoms, rc: float):
+    """(i, j, D) with D = r_j − r_i for every pair within rc, ASE's
+    neighbor_list("ijD") contract. Fast path for orthorhombic cells whose
+    periodic lengths are all ≥ 2·rc (every molecular vacuum box and the bulk
+    cells the readout guards already require): direct N² minimum-image
+    search — ASE bins the whole cell at rc, ~100 ms per 16-atom molecule in
+    a 100 Å box. Anything else falls back to ASE."""
+    cell = np.asarray(atoms.cell.array, dtype=np.float64)
+    pbc = np.asarray(atoms.pbc, dtype=bool)
+    L = np.diag(cell)
+    orthorhombic = np.allclose(cell, np.diag(L)) and np.all(L > 0)
+    if not (orthorhombic and np.all(L[pbc] >= 2.0 * rc)):
+        return neighbor_list("ijD", atoms, rc)
+    pos = np.asarray(atoms.positions, dtype=np.float64)
+    D = pos[None, :, :] - pos[:, None, :]                       # [N, N, 3] r_j − r_i
+    for a in np.flatnonzero(pbc):
+        D[..., a] -= L[a] * np.round(D[..., a] / L[a])          # minimum image
+    r2 = np.einsum('ijk,ijk->ij', D, D)
+    np.fill_diagonal(r2, np.inf)                               # no self pair
+    i, j = np.nonzero(r2 < rc * rc)
+    return i, j, D[i, j]
+
+
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
                        C: int, T: int, radial: str = "chebyshev",
                        zeta: float = -2.0,
@@ -419,7 +445,7 @@ def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
     "cubic" 1 − 3x² + 2x³, x = r/rc, or "tanh3" tanh³(1 − r/rc)/tanh³(1)
     (numpy twin of TNEP._radial/_fc; pairs are filtered before the power,
     so no r=0 guard). float64 accumulate → float32 [N, 3, C, T]."""
-    i, j, D = neighbor_list("ijD", atoms, rc)
+    i, j, D = _neighbor_pairs(atoms, rc)
     keep = i != j                                  # drop self-image pairs
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
     r = np.linalg.norm(d, axis=1)
