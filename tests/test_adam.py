@@ -44,16 +44,28 @@ def test_adam_fit_runs_and_trains_every_tail(kw):
     assert len(history["generation"]) == 4 and np.all(np.isfinite(history["val_loss"]))
     assert np.all(np.isfinite(history["train_loss"]))
     after_final = [v.numpy() for v in _trainable(final_model).values()]
-    # Every watched variable moved, including M_radial / U_pair / c_pair.
+    # Every watched variable moved, including M_radial / c_pair.
     for b, a, name in zip(before, after_final, _trainable(model)):
         if name == "b1":
             continue   # no gradient under the neighbor readout (excluded from s by design)
         assert not np.allclose(a, b), f"{name} did not train"
+    if cfg.descriptor_mixing:
+        # The mixing tail trained through SNES's expm map: V != 0 and orthogonal.
+        V = final_model.U_pair.numpy()
+        assert np.abs(V).max() > 0
+        U = np.eye(V.shape[-1]) + V
+        np.testing.assert_allclose(U @ np.swapaxes(U, -1, -2), np.broadcast_to(np.eye(V.shape[-1]), U.shape), atol=1e-5)
     # The in-place model holds the best-val snapshot: its val RMSE is the best seen.
     assert abs(model.optimizer.validate(va) - min(history["val_loss"])) < 1e-6
-    # Predictions from a rebuilt fresh model with the same weights agree.
-    d = _eval_data(cfg, frames[:2])
-    np.testing.assert_allclose(_predict(final_model, d), _predict(final_model, d))
+    # A fresh model given the final weights (incl. U_pair / M_radial) reproduces final_model.
+    from TNEP import TNEP
+    m2 = TNEP(cfg)
+    for k, v in _trainable(final_model).items():
+        _trainable(m2)[k].assign(v)
+    if cfg.descriptor_mixing:
+        m2.U_pair.assign(final_model.U_pair)
+    assert abs(m2.optimizer.validate(va) - final_model.optimizer.validate(va)) < 1e-6
+    assert final_model.optimizer.validate(va) == pytest.approx(history["val_loss"][-1], abs=1e-6)
 
 
 def test_adam_rejects_preprocess_and_resume():
@@ -68,6 +80,8 @@ def test_adam_rejects_preprocess_and_resume():
         model.fit(tr, va, resume_state={"mu": None})
     with pytest.raises(ValueError):
         _model(_cfg(optimizer="sgd")).fit(tr, va)
+    with pytest.raises(NotImplementedError):
+        _model(_cfg(optimizer="adam", lambda_1=-1.0)).fit(tr, va)
 
 
 def test_adam_loss_decreases_on_tiny_set():

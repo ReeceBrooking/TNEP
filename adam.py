@@ -2,13 +2,16 @@
 
 Gradient-based alternative to SNES: tf.GradientTape through predict_batch,
 so every learnable tensor the forward reads — the ANN weights, c_pair, the
-descriptor-mixing residual U_pair (trained as a dense V; the cayley/expm
-skew parameterisations are SNES-only) and the learned radial basis
-M_radial — is trained by autodiff, including through soap_from_raw.
+descriptor-mixing tail (the same flat skew/dense parameters SNES searches,
+mapped to V by SNES._reconstruct_one_mixing_layer, so cayley/expm stay
+structural) and the learned radial basis M_radial — is trained by autodiff,
+including through soap_from_raw. Objective = RMSE + L1 + L2 on the ANN core,
+the same quantity SNES ranks on.
 
 Same (history, final_model, best_val_model) contract and history keys as
 SNES.fit so the driver, plots and save_history work unchanged (sigma
-columns are 0). Not supported: checkpoint/resume, descriptor_preprocess_contract.
+columns are 0). Not supported: checkpoint/resume, dynamic lambda (-1),
+descriptor_preprocess_contract.
 """
 from __future__ import annotations
 
@@ -38,16 +41,15 @@ def _trainable(model) -> dict:
     if model.cfg.target_mode == 2:
         vs.update(W0_pol=model.W0_pol, b0_pol=model.b0_pol,
                   W1_pol=model.W1_pol, b1_pol=model.b1_pol)
-    if model.descriptor_mixing and model.U_pair is not None:
-        vs["U_pair"] = model.U_pair
     if model.M_radial is not None:
         vs["M_radial"] = model.M_radial
     return {k: _tf_var(v) for k, v in vs.items()}
 
 
 def _ann_core(model) -> list:
-    """Weights the L1/L2 penalty covers — the ANN(s) only, matching SNES's
-    exclusion of the c_pair / U_pair / M_radial tails."""
+    """Weights the L1/L2 penalty covers — the ANN(s) only (b1 and the
+    c_pair / U_pair / M_radial tails excluded, as in SNES's multi-type
+    per-type penalty)."""
     core = [model.W0, model.b0, model.W1]
     if model.cfg.target_mode == 2:
         core += [model.W0_pol, model.b0_pol, model.W1_pol]
@@ -61,10 +63,32 @@ def fit_adam(model, train_data: dict, val_data: dict,
         raise NotImplementedError(
             "optimizer='adam' does not support descriptor_preprocess_contract "
             "(its summed-entry masking is SNES-specific); set it to 'off'.")
+    if cfg.lambda_1 == -1 or cfg.lambda_2 == -1:
+        raise NotImplementedError(
+            "optimizer='adam' does not support dynamic lambda (-1); give "
+            "lambda_1/lambda_2 a value or None (SNES auto value).")
     from data import prefetched_chunks, slice_and_complete_chunk
 
     snes = model.optimizer            # resolved lambdas, validate(), tf_rng
     named = _trainable(model)
+    # Descriptor mixing: train SNES's flat tail (skew upper triangles under
+    # cayley/expm, dense entries under "off") and map it to V exactly as
+    # SNES does, so the parameterisation stays structural. V = 0 at init.
+    mix_flat = None
+    if model.descriptor_mixing and model.U_pair is not None:
+        mix_flat = tf.Variable(tf.zeros([snes.n_U_pair], tf.float32),
+                               trainable=False, name="mix_flat")
+        named["mix_flat"] = mix_flat
+
+    def _mixing_V():
+        return snes._reconstruct_one_mixing_layer(
+            mix_flat, False, snes._mix_per_type, cfg.num_types)
+
+    def _sync_U_pair():
+        """Write the current V into model.U_pair (validate/score/save read it)."""
+        if mix_flat is not None:
+            _tf_var(model.U_pair).assign(_mixing_V())
+
     variables = list(named.values())
     core = _ann_core(model)
     n_core = float(sum(int(np.prod(v.shape)) for v in core))
@@ -78,7 +102,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
     def _forward(chunk):
         # Only tf.Variables / tensors go into the forward (Keras variables
         # are not valid tf.function arguments).
-        U = named.get("U_pair")
+        U = _mixing_V() if mix_flat is not None else None
         W0 = model._W0_eff(named["W0"], U) if U is not None else named["W0"]
         W0p = None
         if cfg.target_mode == 2:
@@ -110,7 +134,9 @@ def fit_adam(model, train_data: dict, val_data: dict,
                 flat = tf.concat([tf.reshape(v, [-1]) for v in core], axis=0)
                 l1 = snes.lambda_1 * tf.reduce_sum(tf.abs(flat)) / n_core
                 l2 = snes.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(flat)) / n_core)
-            loss = mse + l1 + l2
+            # SNES ranks on RMSE + penalty; use the same objective so the
+            # lambda scale means the same thing under both optimizers.
+            loss = tf.sqrt(mse + 1e-12) + l1 + l2
         grads = tape.gradient(loss, variables)
         # b1 has no gradient under the neighbor readout (excluded from s by
         # design); skip None grads instead of letting Keras warn every step.
@@ -142,6 +168,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
     best_val = float("inf")
     best_snapshot = [v.numpy() for v in variables]
     gens_without_improvement = 0
+    last_plot = 0
     print(f"Fitting model with Adam (lr={cfg.adam_lr}, "
           f"{sum(int(np.prod(v.shape)) for v in variables)} trainable params)...")
 
@@ -157,8 +184,14 @@ def fit_adam(model, train_data: dict, val_data: dict,
 
         do_val = (gen % cfg.val_interval == 0) or (gen == cfg.num_generations - 1)
         if do_val:
+            _sync_U_pair()
             val_rmse = snes.validate(val_data)
             t2 = time.perf_counter()
+            if not np.isfinite(val_rmse) or not np.isfinite(train_rmse):
+                print(f"Adam diverged at gen {gen} (train RMSE {train_rmse}, "
+                      f"val RMSE {val_rmse}); stopping — lower adam_lr. "
+                      f"Returning the best-val weights so far.")
+                break
             if val_rmse < best_val:
                 best_val = val_rmse
                 best_snapshot = [v.numpy() for v in variables]
@@ -166,7 +199,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
             else:
                 gens_without_improvement += 1
             history["generation"].append(gen)
-            history["train_loss"].append(train_rmse)
+            history["train_loss"].append(train_rmse + gen_l1 + gen_l2)  # objective, as SNES
             history["train_rmse"].append(train_rmse)
             history["val_loss"].append(val_rmse)
             history["L1"].append(gen_l1)
@@ -183,9 +216,12 @@ def fit_adam(model, train_data: dict, val_data: dict,
             print(f"gen {gen + 1}/{cfg.num_generations}  train RMSE: {train_rmse:.6f}"
                   f"  val RMSE: {val_rmse:.6f}  best val RMSE: {best_val:.6f}"
                   f"  L1: {gen_l1:.2e}  L2: {gen_l2:.2e}", flush=True)
-            if plot_callback is not None and cfg.plot_interval and gen > 0 \
-                    and gen % cfg.plot_interval == 0:
-                plot_callback(history, gen)
+            # Fires on the val tick at/after each plot_interval boundary
+            # (val_interval need not divide plot_interval).
+            if (plot_callback is not None and cfg.plot_interval
+                    and (gen + 1) // cfg.plot_interval > last_plot):
+                last_plot = (gen + 1) // cfg.plot_interval
+                plot_callback(history, gen + 1)
             if cfg.patience is not None and gens_without_improvement >= cfg.patience:
                 print(f"Early stopping at gen {gen} "
                       f"(no improvement for {cfg.patience} validation ticks)")
@@ -195,8 +231,12 @@ def fit_adam(model, train_data: dict, val_data: dict,
     # restored to best-val (same convention as SNES.fit).
     from TNEP import TNEP
     final_model = TNEP(cfg)
-    for dst, src in zip(_trainable(final_model).values(), variables):
-        dst.assign(src)
+    _sync_U_pair()
+    for k, dst in _trainable(final_model).items():
+        dst.assign(named[k])
+    if mix_flat is not None:
+        _tf_var(final_model.U_pair).assign(_tf_var(model.U_pair))
     for v, snap in zip(variables, best_snapshot):
         v.assign(snap)
+    _sync_U_pair()
     return history, final_model, model
