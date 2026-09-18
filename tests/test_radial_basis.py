@@ -52,6 +52,8 @@ def _cfg(**kw):
     cfg.num_types = 3
     cfg.type_map = {6: 0, 8: 1, 1: 2}
     cfg.radial_basis_size = None
+    cfg.radial_basis_species_sum = False
+    cfg.optimizer = "snes"
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)

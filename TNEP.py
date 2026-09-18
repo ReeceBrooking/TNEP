@@ -1019,6 +1019,16 @@ class TNEP(layers.Layer):
             final_model    : model at the last generation
             best_val_model : model at the best-validation generation
         """
+        if str(self.cfg.optimizer) == "adam":
+            if resume_state is not None:
+                raise NotImplementedError(
+                    "optimizer='adam' has no checkpoint/resume support.")
+            from adam import fit_adam
+            return fit_adam(self, train_data, val_data,
+                            plot_callback=plot_callback)
+        if str(self.cfg.optimizer) != "snes":
+            raise ValueError(
+                f"cfg.optimizer={self.cfg.optimizer!r}; expected 'snes' or 'adam'.")
         history, final_model, best_val_model = self.optimizer.fit(
             train_data, val_data, plot_callback=plot_callback,
             resume_state=resume_state)

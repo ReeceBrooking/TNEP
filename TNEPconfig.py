@@ -308,6 +308,16 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # --- core ----------------------------------------------------------
+    # Training algorithm: "snes" (evolution strategy, the NEP default) or
+    # "adam" (gradient descent by autodiff through the forward — trains the
+    # ANN, c_pair, the mixing residual U_pair as a dense V, and M_radial;
+    # one Adam step per structure chunk (batch_size=None) or per sampled
+    # batch; no checkpoint/resume; descriptor_preprocess_contract must be
+    # "off"). num_generations, batch_size, val_interval, patience and the
+    # L1/L2 settings apply to both.
+    optimizer: str = "snes"
+    # Adam learning rate (optimizer="adam" only).
+    adam_lr: float = 1e-3
     # Number of samples made in each train generation
     pop_size: int | None = 100
     # Number of training generations (number of updates to the model)
