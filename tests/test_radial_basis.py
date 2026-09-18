@@ -53,6 +53,7 @@ def _cfg(**kw):
     cfg.type_map = {6: 0, 8: 1, 1: 2}
     cfg.radial_basis_size = None
     cfg.radial_basis_species_sum = False
+    cfg.radial_basis_per_l = False
     cfg.optimizer = "snes"
     for k, v in kw.items():
         setattr(cfg, k, v)
@@ -283,6 +284,8 @@ def test_learned_radial_rejects_gradient_modes_and_cpu_builder():
         _model(_cfg(radial_basis_size=11))
     with pytest.raises(ValueError):
         _model(_cfg(radial_basis_species_sum=True))   # needs radial_basis_size
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_per_l=True))
 
 
 @pytest.mark.parametrize("species_sum", [False, True])
@@ -444,4 +447,85 @@ def test_species_sum_rejects_preprocess_and_roundtrips(tmp_path):
     save_model(model, cfg, path)
     loaded = load_model(path)
     assert loaded.cfg.radial_basis_species_sum is True and loaded.cfg.dim_q == 50
+    np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)
+
+
+def _soap_from_raw_per_l_np(raw, Z, M, alpha, l_max, S, species_sum):
+    """Independent NumPy reference for radial_basis_per_l: M [T,S,alpha,K,L],
+    each l block contracted with its own M[..., l]."""
+    L = l_max + 1; k_max = L * (L + 1) // 2; K = M.shape[3]
+    A = raw.shape[0]
+    r = raw.reshape(A, S, K, k_max, 2).astype(np.float64)
+    c_raw = r[..., 0] + 1j * r[..., 1]                                    # [A, S, K, k]
+    n_max = alpha if species_sum else S * alpha
+    cc = np.zeros((A, n_max, k_max), complex)
+    for l in range(L):
+        ks = slice(l * (l + 1) // 2, l * (l + 1) // 2 + l + 1)
+        Ml = M[Z][..., l].astype(np.float64)                              # [A, S, alpha, K]
+        if species_sum:
+            cc[:, :, ks] = np.einsum('asnk,askm->anm', Ml, c_raw[..., ks])
+        else:
+            cc[:, :, ks] = np.einsum('asnk,askm->asnm', Ml, c_raw[..., ks]).reshape(A, n_max, l + 1)
+    from DescriptorBuilderGPU import radial_basis_channel_map
+    cm = radial_basis_channel_map(alpha, l_max, S, species_sum=species_sum)
+    G = np.einsum('apk,ank,kl->apnl', cc[:, cm["rows"]], np.conj(cc), cm["Wm"]).real
+    q = G.reshape(A, -1)[:, cm["gather_idx"]] * cm["scale"]
+    n = np.linalg.norm(q, axis=1, keepdims=True)
+    return q / np.where(n < 1e-5, 1.0, n)
+
+
+@pytest.mark.parametrize("species_sum", [False, True])
+def test_per_l_radial_basis(species_sum, tmp_path):
+    from model_io import save_model, load_model
+    cfg = _cfg(radial_basis_size=8, radial_basis_per_l=True,
+               radial_basis_species_sum=species_sum, dipole_species_pairs="symmetric")
+    model = _model(cfg)
+    assert tuple(model.M_radial.shape) == (3, 3, 4, 8, 5)
+    frames = _cho_frames(3)
+    data = _eval_data(cfg, frames)
+    # Init reproduces the shared-M descriptor exactly (M0 tiled over l).
+    cfg_s = _cfg(radial_basis_size=8, radial_basis_species_sum=species_sum)
+    m_s = _model(cfg_s)
+    q_per_l = model.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
+    q_shared = m_s.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
+    np.testing.assert_allclose(q_per_l, q_shared, atol=1e-6)
+    # Random per-l M against the independent NumPy reference; padded atoms zero.
+    rng = np.random.default_rng(6)
+    M = (model.M_radial.numpy() + 0.1 * rng.normal(size=model.M_radial.shape)).astype(np.float32)
+    q = model.soap_from_raw(data["descriptors"], data["Z_int"], tf.constant(M)).numpy()
+    for s, fr in enumerate(frames):
+        A = len(fr); Z = data["Z_int"][s].numpy()[:A]
+        ref = _soap_from_raw_per_l_np(data["descriptors"][s].numpy()[:A], Z, M, 4, 4, 3, species_sum)
+        np.testing.assert_allclose(q[s, :A], ref, atol=1e-5)
+        assert np.all(q[s, A:] == 0.0)
+    # Different l blocks really use different M: perturb only l=3 -> only l=3 channels change.
+    M3 = model.M_radial.numpy().copy(); M3[..., 3] += 0.3 * rng.normal(size=M3[..., 3].shape)
+    q3 = model.soap_from_raw(data["descriptors"], data["Z_int"], tf.constant(M3.astype(np.float32))).numpy()
+    from DescriptorBuilderGPU import radial_basis_channel_map
+    l_of_q = np.array([g % 5 for g in radial_basis_channel_map(4, 4, 3, species_sum=species_sum)["gather_idx"]])
+    unnorm_same = np.abs(q3 - q_per_l)   # normalisation couples channels, so compare ratios per atom
+    A = len(frames[0])
+    assert np.abs(q3[0, :A][:, l_of_q == 3] - q_per_l[0, :A][:, l_of_q == 3]).max() > 1e-3
+    # SNES tail + candidates path + save/load.
+    snes = model.optimizer
+    assert snes.n_radial == 3 * 3 * 4 * 8 * 5
+    pv = tf.stack([snes.mu, snes.mu + 0.02])
+    named = snes._split_reconstructed(snes.reconstruct_params_tf(pv))
+    assert tuple(named["M_radial"].shape) == (2, 3, 3, 4, 8, 5)
+    preds = model.predict_batch_candidates(
+        data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
+        named["W0"], named["b0"], named["W1"], named["b1"],
+        c_pair=named["c_pair"], M_radial=named["M_radial"]).numpy()
+    for c in range(2):
+        one = snes._split_reconstructed(snes.reconstruct_params_tf(pv[c]))
+        single = model.predict_batch(
+            data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"],
+            data["pair_struct"], data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
+            one["W0"], one["b0"], one["W1"], one["b1"], W_atom=data["V_atom"],
+            c_pair=one["c_pair"], M_radial=one["M_radial"]).numpy()
+        np.testing.assert_allclose(preds[c], single, rtol=1e-4, atol=1e-6)
+    model.M_radial.assign(M)
+    before = _predict(model, data)
+    path = str(tmp_path / "m.h5"); save_model(model, cfg, path); loaded = load_model(path)
+    assert loaded.cfg.radial_basis_per_l is True
     np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)

@@ -465,11 +465,14 @@ def _train_model_inner(cfg: TNEPconfig,
                 "α(α+1)/2·L)" if cfg.radial_basis_species_sum
                 else "per (centre type, neighbour species) (species-blocked, "
                 "SOAP-turbo dimensions)")
+        _shape = [cfg.num_types, cfg.num_types, cfg.alpha_max, cfg.radial_basis_size]
+        if cfg.radial_basis_per_l:
+            _shape.append(cfg.l_max + 1)
         print(f"Learned radial basis: {cfg.alpha_max} functions {_per} as "
               f"combinations of K={cfg.radial_basis_size} orthonormal poly3 "
-              f"functions (M_radial [{cfg.num_types}, {cfg.num_types}, "
-              f"{cfg.alpha_max}, {cfg.radial_basis_size}] in the SNES vector; "
-              f"init = fixed basis)")
+              f"functions"
+              + (", separate per l block" if cfg.radial_basis_per_l else "")
+              + f" (M_radial {_shape} in the SNES vector; init = fixed basis)")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
     # On resume, reuse the checkpoint's existing run dir.

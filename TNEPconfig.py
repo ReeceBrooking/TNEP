@@ -218,6 +218,11 @@ class TNEPconfig:
     #           information enters only through M. Not combinable with
     #           descriptor_preprocess_contract.
     radial_basis_species_sum: bool = False
+    # l-dependent learned radial functions (radial_basis_size only): each
+    # angular block l = 0..l_max gets its own M[T, S, alpha_max, K, l] —
+    # NEP's separate angular c_nk. False shares one M across all l.
+    # L× the radial coefficients; init still reproduces the fixed basis.
+    radial_basis_per_l: bool = False
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE

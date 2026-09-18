@@ -51,8 +51,11 @@ def _cfg(**kw):
     cfg.dipole_zeta = -2.0
     cfg.dipole_cutoff = None
     cfg.dipole_gauss_sigma_scale = 1.0
+    cfg.l_max = 4
+    cfg.alpha_max = 4
     cfg.radial_basis_size = None
     cfg.radial_basis_species_sum = False
+    cfg.radial_basis_per_l = False
     cfg.optimizer = "snes"
     for k, v in kw.items():
         setattr(cfg, k, v)

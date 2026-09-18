@@ -55,6 +55,7 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     # Pre-existence: fixed radial basis.
     "radial_basis_size": None,
     "radial_basis_species_sum": False,
+    "radial_basis_per_l": False,
 }
 
 

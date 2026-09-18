@@ -116,6 +116,7 @@ class TNEP(layers.Layer):
                     "learned radial basis are not implemented — only the "
                     "neighbor dipole readout (target_mode=1) is supported.")
             self._rb_species_sum = bool(cfg.radial_basis_species_sum)
+            self._rb_per_l = bool(cfg.radial_basis_per_l)
             if (self._rb_species_sum
                     and self.descriptor_preprocess_contract != "off"):
                 raise NotImplementedError(
@@ -142,15 +143,19 @@ class TNEP(layers.Layer):
                                        [:, tf.newaxis])
                            for l in range(L)]
             M0 = radial_basis_init(alpha, K)
+            M0_shape = (cfg.num_types, cfg.num_types, alpha, K)
+            if self._rb_per_l:
+                M0 = M0[..., np.newaxis]
+                M0_shape = M0_shape + (L,)
             self.M_radial = tf.Variable(
-                np.broadcast_to(M0, (cfg.num_types, cfg.num_types, alpha, K))
-                .astype(np.float32),
+                np.broadcast_to(M0, M0_shape).astype(np.float32),
                 trainable=False, name="M_radial")
         else:
-            if bool(getattr(cfg, "radial_basis_species_sum", False)):
-                raise ValueError(
-                    "cfg.radial_basis_species_sum=True requires "
-                    "cfg.radial_basis_size (the learned radial basis).")
+            for f in ("radial_basis_species_sum", "radial_basis_per_l"):
+                if bool(getattr(cfg, f, False)):
+                    raise ValueError(
+                        f"cfg.{f}=True requires cfg.radial_basis_size (the "
+                        f"learned radial basis).")
             self.M_radial = None
         self.builder = make_descriptor_builder(cfg)
 
@@ -768,36 +773,49 @@ class TNEP(layers.Layer):
         cfg.radial_basis_species_sum sums the species axis into α shared
         channels, c[a, n, k] = Σ_s Σ_κ M[t_a, s, n, κ] · c_raw[a, s, κ, k],
         and keeps every (n ≤ n', l) channel (dim_q = α(α+1)/2·L).
+        cfg.radial_basis_per_l gives each l block its own M[..., l].
         Args:
             raw : [..., A, S·K·k_max·2]  builder output (species, κ, k, re/im)
             Z   : [..., A]               type indices
-            M   : [T, S, α, K] (None → self.M_radial) or per-candidate
-                  [C, T, S, α, K]
+            M   : [T, S, α, K(, L)] (None → self.M_radial) or per-candidate
+                  [C, T, S, α, K(, L)]
         Returns [..., A, Q], or [C, ..., A, Q] for per-candidate M.
         """
         M = self.M_radial if M is None else M
         S, K, kmax, alpha, L = (self.num_types, self._rb_K, self._rb_kmax,
                                 self._rb_alpha, self._rb_L)
-        per_cand = len(M.shape) == 5
+        per_cand = len(M.shape) == (6 if self._rb_per_l else 5)
         lead = tf.shape(raw)[:-1]
         N = tf.reduce_prod(lead)
         r = tf.reshape(raw, [N, S, K, kmax * 2])                 # [N, S, K, 2k]
         Zf = tf.reshape(Z, [N])
-        M_at = tf.gather(M, Zf, axis=-4)                          # [(C,) N, S, α, K]
-        if self._rb_species_sum:
-            # NEP-style: sum over neighbour species into α shared channels.
-            cc = (tf.einsum('cnsak,nskj->cnaj', M_at, r) if per_cand
-                  else tf.einsum('nsak,nskj->naj', M_at, r))      # [(C,) N, α, 2k]
-        else:
-            cc = (tf.einsum('cnsak,nskj->cnsaj', M_at, r) if per_cand
-                  else tf.einsum('nsak,nskj->nsaj', M_at, r))     # [(C,) N, S, α, 2k]
-        cc = tf.reshape(cc, [-1, N, self._rb_n_max, kmax, 2])    # [C, N, n_max, k, 2]
-        piv = tf.gather(cc, self._rb_rows, axis=2)                # [C, N, R, k, 2]
+        M_at = tf.gather(M, Zf, axis=1 if per_cand else 0)       # [(C,) N, S, α, K(, L)]
+
+        def _contract(M_l, r_k):
+            """c[(C,) N, n_max, k_len, 2] = Σ_κ M_l[t_a, s, n, κ] · r_k[a, s, κ, ·]
+            (Σ_s too under species_sum)."""
+            if self._rb_species_sum:
+                # NEP-style: sum over neighbour species into α shared channels.
+                c = (tf.einsum('cnsak,nskj->cnaj', M_l, r_k) if per_cand
+                     else tf.einsum('nsak,nskj->naj', M_l, r_k))
+            else:
+                c = (tf.einsum('cnsak,nskj->cnsaj', M_l, r_k) if per_cand
+                     else tf.einsum('nsak,nskj->nsaj', M_l, r_k))
+            return tf.reshape(c, [-1, N, self._rb_n_max, tf.shape(r_k)[-1] // 2, 2])
+
+        if not self._rb_per_l:
+            cc = _contract(M_at, r)                               # [C, N, n_max, k, 2]
+            piv = tf.gather(cc, self._rb_rows, axis=2)            # [C, N, R, k, 2]
         G_l = []
         for l in range(L):
             k0 = l * (l + 1) // 2
-            p_l = piv[:, :, :, k0:k0 + l + 1, :] * self._rb_mw[l]
-            c_l = cc[:, :, :, k0:k0 + l + 1, :]
+            if self._rb_per_l:
+                # This l block's own radial functions M[..., l] on its k slice.
+                c_l = _contract(M_at[..., l], r[..., 2 * k0:2 * (k0 + l + 1)])
+                p_l = tf.gather(c_l, self._rb_rows, axis=2) * self._rb_mw[l]
+            else:
+                p_l = piv[:, :, :, k0:k0 + l + 1, :] * self._rb_mw[l]
+                c_l = cc[:, :, :, k0:k0 + l + 1, :]
             G_l.append(tf.einsum('cnpkr,cnmkr->cnpm', p_l, c_l))   # [C, N, R, n_max]
         G = tf.stack(G_l, axis=-1)                                # [C, N, R, n_max, L]
         G = tf.reshape(G, [-1, N, self._rb_n_rows * self._rb_n_max * L])
