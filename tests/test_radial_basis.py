@@ -279,11 +279,14 @@ def test_learned_radial_rejects_gradient_modes_and_cpu_builder():
         _model(_cfg(radial_basis_size=3))
     with pytest.raises(ValueError):
         _model(_cfg(radial_basis_size=11))
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_species_sum=True))   # needs radial_basis_size
 
 
-def test_snes_tail_holds_M0_and_roundtrips():
+@pytest.mark.parametrize("species_sum", [False, True])
+def test_snes_tail_holds_M0_and_roundtrips(species_sum):
     from SNES import _set_model_params
-    cfg = _cfg(radial_basis_size=8)
+    cfg = _cfg(radial_basis_size=8, radial_basis_species_sum=species_sum)
     model = _model(cfg)
     snes = model.optimizer
     T, S, a, K = 3, 3, 4, 8

@@ -461,13 +461,15 @@ def _train_model_inner(cfg: TNEPconfig,
             f"with built descriptor width {built_width}; cfg / builder mismatch.")
     print("Dimension of q: " + str(cfg.dim_q))
     if cfg.radial_basis_size is not None:
-        print(f"Learned radial basis: {cfg.alpha_max} functions per (centre "
-              f"type, neighbour species) as combinations of K="
-              f"{cfg.radial_basis_size} orthonormal poly3 functions "
-              f"(M_radial [{cfg.num_types}, {cfg.num_types}, {cfg.alpha_max}, "
-              f"{cfg.radial_basis_size}] in the SNES vector; init = fixed basis; "
-              + ("species-summed, dim_q = α(α+1)/2·L" if cfg.radial_basis_species_sum
-                 else "species-blocked, SOAP-turbo dimensions") + ")")
+        _per = ("shared across neighbour species (species-summed, dim_q = "
+                "α(α+1)/2·L)" if cfg.radial_basis_species_sum
+                else "per (centre type, neighbour species) (species-blocked, "
+                "SOAP-turbo dimensions)")
+        print(f"Learned radial basis: {cfg.alpha_max} functions {_per} as "
+              f"combinations of K={cfg.radial_basis_size} orthonormal poly3 "
+              f"functions (M_radial [{cfg.num_types}, {cfg.num_types}, "
+              f"{cfg.alpha_max}, {cfg.radial_basis_size}] in the SNES vector; "
+              f"init = fixed basis)")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
     # On resume, reuse the checkpoint's existing run dir.

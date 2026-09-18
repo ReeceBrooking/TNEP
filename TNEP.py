@@ -99,11 +99,11 @@ class TNEP(layers.Layer):
                                               radial_basis_channel_map)
             K = int(_K)
             alpha = int(cfg.alpha_max)
-            if int(cfg.descriptor_mode) != 1:
+            if int(cfg.descriptor_mode) != 1 or str(cfg.compress_mode) != "trivial":
                 raise ValueError(
                     "cfg.radial_basis_size requires descriptor_mode=1 (the "
-                    "TF/GPU builder); the quippy backend cannot emit raw "
-                    "centre coefficients.")
+                    "TF/GPU builder; quippy cannot emit raw centre "
+                    "coefficients) and compress_mode='trivial'.")
             if not alpha <= K <= 10:
                 raise ValueError(
                     f"cfg.radial_basis_size={K} must satisfy alpha_max="
@@ -147,6 +147,10 @@ class TNEP(layers.Layer):
                 .astype(np.float32),
                 trainable=False, name="M_radial")
         else:
+            if bool(getattr(cfg, "radial_basis_species_sum", False)):
+                raise ValueError(
+                    "cfg.radial_basis_species_sum=True requires "
+                    "cfg.radial_basis_size (the learned radial basis).")
             self.M_radial = None
         self.builder = make_descriptor_builder(cfg)
 
