@@ -1121,53 +1121,14 @@ git commit -m "feat: learned radial basis through the training driver and trajec
 
 ---
 
-### Task 7: A/B validation on CHO (record verbatim)
+### Task 7: A/B validation on CHO — DROPPED (2026-09-17)
 
-**Files:**
-- Create: `scripts/ab_radial_basis.py`
-- Append results to: `docs/superpowers/specs/2026-09-17-learned-radial-basis-design.md` (new section "7. Results")
+Removed at the user's request: SNES runs are too slow to give a verdict in-session, and the deliverable is the option being implemented correctly, not a benchmark. Correctness is pinned by `tests/test_radial_basis.py` (gen-0 equivalence with the fixed builder, independent NumPy references for both modes, SNES round trips, save/load, candidate-vs-single agreement) plus 5-generation GPU smokes for both modes and a trajectory-inference smoke.
 
-- [ ] **Step 1: Write the script**
+Incidental timing (40 generations, 1320 CHO train structures, RTX 4070 SUPER): fixed basis 231.1 ms/gen evaluate, K=8 blocked 527.5 ms/gen. Not optimised, per the same instruction.
 
-```python
-"""A/B: fixed SOAP basis vs learned radial basis on the CHO dipole set.
-Usage: python scripts/ab_radial_basis.py <K or none> <num_generations> [total_N]
-Prints the run's own terminal output; nothing is post-processed."""
-import sys
-from MasterTNEP import train_model
-from TNEPconfig import TNEPconfig
+---
 
-K = None if sys.argv[1].lower() == "none" else int(sys.argv[1])
-cfg = TNEPconfig()
-cfg.data_path = "datasets/train.xyz"
-cfg.test_data_path = "datasets/test.xyz"
-cfg.allowed_species = [6, 1, 8]
-cfg.descriptor_mode = 1
-cfg.radial_basis_size = K
-cfg.num_generations = int(sys.argv[2])
-cfg.total_N = int(sys.argv[3]) if len(sys.argv) > 3 else None
-cfg.seed = 928375439201
-cfg.save_path = f"models/ab_radial_K{K}"
-cfg.checkpoint_interval = None
-cfg.plot_interval = None
-cfg.show_plots = False
-train_model(cfg)
-```
+### Task 8: species compression option (`radial_basis_species_sum`)
 
-- [ ] **Step 2: Run the three arms** (same seed, same budget; run sequentially on the GPU)
-
-```bash
-for K in none 4 8; do
-  python scripts/ab_radial_basis.py $K 2000 2>&1 | grep -v "^WARNING\|^I0000\|cuda\|oneDNN" \
-    | grep -E "Model Parameters|radial|Final-gen|Best-val|Cosine|evaluate|validate|best val RMSE: [0-9.]+\s+elapsed" \
-    > /tmp/claude-1000/-home-reece-TNEP/83293e9c-0843-4e42-a836-d0bcf984a77c/scratchpad/ab_K$K.log
-done
-```
-Then read each log and copy the printed lines (final progress line, Final-gen / Best-val test blocks, timing lines) into the spec's "7. Results" section verbatim. Do not compute or infer anything not printed.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add scripts/ab_radial_basis.py docs/superpowers/specs/2026-09-17-learned-radial-basis-design.md
-git commit -m "docs: learned radial basis A/B results on CHO"
-```
+Implemented directly (commit c323df2) from spec §4b: `radial_basis_species_sum: bool = False` — False keeps SOAP-turbo's species-blocked layout and `dim_q`; True sums the neighbour-species axis into α shared channels with the full n ≤ n' power spectrum (`dim_q = α(α+1)/2·(l_max+1)`), one-block `descriptor_block_layout` so mixing still works, preprocess contraction rejected. Tests: channel map vs uncompressed `power_spectrum_numpy`, block layout, model vs independent NumPy reference with and without mixing (candidates path vs single), preprocess rejection, save/load round trip.

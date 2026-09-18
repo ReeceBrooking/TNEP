@@ -302,7 +302,9 @@ contraction.
      `_set_model_params` then `score` matches the fixed-basis model's score
      on a small CHO subset at gen 0.
    - save → load → identical predictions.
-2. End-to-end A/B on CHO (`train.xyz` / `test.xyz`, `allowed_species=[6,1,8]`),
-   `descriptor_mode=1`, same seed, same generation budget, three runs:
-   fixed basis; K = α; K = 2α. Record the printed val/test RMSE and per-gen
-   timing verbatim.
+2. ~~End-to-end A/B on CHO~~ — dropped at the user's request (SNES is too
+   slow to give a verdict in-session; the deliverable is a correctly
+   implemented option). Both modes are instead smoke-tested end to end on
+   the GPU for 5 generations (`Run complete!`, `dim_q` 165 / 50) and the
+   learned basis through trajectory inference matches the scoring path to
+   6e-6.
