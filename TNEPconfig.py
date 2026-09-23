@@ -245,6 +245,14 @@ class TNEPconfig:
     # information, kept for NEP parity; the un-squared form keeps the SOAP
     # channels' scale). dim_q grows by n_max. Same exclusions as four_body.
     radial_basis_five_body: bool = False
+    # SOAP-turbo's per-atom L2 normalisation of the power spectrum
+    # (radial_basis_size only). True = as SOAP (q/‖q‖: shape only, magnitude
+    # discarded, channels coupled through the shared norm). False = NEP-like:
+    # the raw spectrum on a fixed O(1) footing (× scale², the same constant as
+    # the extra blocks), no per-atom projection — magnitude/coordination kept,
+    # channels independent. Meant to be paired with descriptor_scale, which
+    # then does the per-channel conditioning NEP's q_scaler does.
+    radial_basis_normalize: bool = True
     # Descriptor scale preconditioning (plan 2026-09-23). A per-channel scale
     # m is folded into the input weights, W0_eff = Uᵀ·diag(m)·W0, so the model
     # class is unchanged (any scaled model == an unscaled one with W0' = m∘W0)

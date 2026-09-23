@@ -475,6 +475,8 @@ def _train_model_inner(cfg: TNEPconfig,
               + (", + un-normalised 2-body block" if cfg.radial_basis_two_body else "")
               + (", + 4-body (l=2 bispectrum) block" if cfg.radial_basis_four_body else "")
               + (", + 5-body ((q^{l=1})²) block" if cfg.radial_basis_five_body else "")
+              + ("" if cfg.radial_basis_normalize else
+                 "; per-atom L2 normalisation OFF (raw spectrum × scale²)")
               + f" (M_radial {_shape} in the SNES vector; init = fixed basis)")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
@@ -487,6 +489,11 @@ def _train_model_inner(cfg: TNEPconfig,
         cfg.save_plots = os.path.join(run_dir, "plots")
         print(f"  resume: writing outputs to existing run dir {run_dir}")
 
+    if (cfg.radial_basis_size is not None and not cfg.radial_basis_normalize
+            and str(cfg.descriptor_scale) == "off"):
+        print("WARNING: radial_basis_normalize=False without descriptor_scale — "
+              "the raw spectrum's per-channel spread is uncorrected; set "
+              "descriptor_scale='block' or 'channel'.")
     # Descriptor scale preconditioning: m from the generation-0 descriptor
     # of the training set, computed once (a checkpoint's cfg already has it).
     if str(cfg.descriptor_scale) != "off" and cfg.q_scale is None:

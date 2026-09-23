@@ -117,6 +117,7 @@ class TNEP(layers.Layer):
                     "neighbor dipole readout (target_mode=1) is supported.")
             self._rb_species_sum = bool(cfg.radial_basis_species_sum)
             self._rb_per_l = bool(cfg.radial_basis_per_l)
+            self._rb_normalize = bool(cfg.radial_basis_normalize)
             self._rb_two_body = bool(cfg.radial_basis_two_body)
             self._rb_four_body = bool(cfg.radial_basis_four_body)
             self._rb_five_body = bool(cfg.radial_basis_five_body)
@@ -190,6 +191,10 @@ class TNEP(layers.Layer):
                     raise ValueError(
                         f"cfg.{f}=True requires cfg.radial_basis_size (the "
                         f"learned radial basis).")
+            if not bool(getattr(cfg, "radial_basis_normalize", True)):
+                raise ValueError(
+                    "cfg.radial_basis_normalize=False requires "
+                    "cfg.radial_basis_size (the fixed builder always normalises).")
             self.M_radial = None
         # Descriptor scale preconditioning: m folded into W0 (see _W0_eff);
         # the Keras W0 init is divided by m so the initial function is the
@@ -846,6 +851,8 @@ class TNEP(layers.Layer):
         channels, c[a, n, k] = Σ_s Σ_κ M[t_a, s, n, κ] · c_raw[a, s, κ, k],
         and keeps every (n ≤ n', l) channel (dim_q = α(α+1)/2·L).
         cfg.radial_basis_per_l gives each l block its own M[..., l].
+        cfg.radial_basis_normalize=False skips the per-atom L2 norm and
+        scales the raw spectrum by scale² instead (pair with descriptor_scale).
         Appended blocks (n_max channels each, in this order, on the
         O(1)-scaled coefficients ĉ = c × scale, never L2-normalised):
           radial_basis_two_body  : Re ĉ_{n00}                      (NEP 2-body)
@@ -921,9 +928,14 @@ class TNEP(layers.Layer):
         G = tf.stack(G_l, axis=-1)                                # [C, N, R, n_max, L]
         G = tf.reshape(G, [-1, N, self._rb_n_rows * self._rb_n_max * L])
         q = tf.gather(G, self._rb_gather, axis=-1) * self._rb_scale
-        norm = tf.norm(q, axis=-1, keepdims=True)
-        q = q / tf.where(norm < 1e-5, tf.ones_like(norm), norm)
         sc = self._rb_two_body_scale
+        if self._rb_normalize:
+            norm = tf.norm(q, axis=-1, keepdims=True)
+            q = q / tf.where(norm < 1e-5, tf.ones_like(norm), norm)
+        else:
+            # NEP-like: no per-atom projection; the spectrum is quadratic in
+            # the coefficients, so scale² puts it on the extras' O(1) footing.
+            q = q * (sc * sc)
         extras = []
         if self._rb_two_body:
             # NEP-style 2-body block, un-normalised (keeps density), O(1) scale.

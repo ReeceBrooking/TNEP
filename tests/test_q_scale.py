@@ -97,3 +97,29 @@ def _predict_eff(model, data):
         data["pair_struct"], data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
         model._W0_eff(model.W0), model.b0, model.W1, model.b1,
         W_atom=data["V_atom"]).numpy()
+
+
+def test_unnormalised_spectrum_option():
+    """normalize=False: same direction as the normalised descriptor per atom,
+    O(1) magnitudes carrying coordination, extras unchanged, scaler finite."""
+    frames = _cho_frames(6)
+    cfg_n = _cfg(**FULL)
+    cfg_u = _cfg(radial_basis_normalize=False, **FULL)
+    m_n, m_u = _model(cfg_n), _model(cfg_u)
+    data = _eval_data(cfg_n, frames)
+    qn = m_n.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
+    qu = m_u.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
+    n_extra = 3 * 12
+    mask = data["atom_mask"].numpy() > 0
+    soap_n, soap_u = qn[mask][:, :-n_extra], qu[mask][:, :-n_extra]
+    norms = np.linalg.norm(soap_u, axis=1, keepdims=True)
+    np.testing.assert_allclose(soap_u / norms, soap_n, rtol=1e-4, atol=1e-6)     # same shape
+    assert 1e-3 < np.median(norms) < 10.0 and norms.std() / norms.mean() > 0.05  # O(1), varies with environment
+    np.testing.assert_allclose(qu[..., -n_extra:], qn[..., -n_extra:], rtol=1e-6)  # extras untouched
+    assert np.all(qu[~mask] == 0.0)
+    m = compute_q_scale(qu, data["atom_mask"].numpy(), _cfg(descriptor_scale="channel",
+                                                             radial_basis_normalize=False, **FULL))
+    assert np.all(np.isfinite(m)) and m.shape == (cfg_u.dim_q,)
+    print("\nunnormalised SOAP norms: median %.3f  min %.3f  max %.3f" % (np.median(norms), norms.min(), norms.max()))
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_normalize=False))
