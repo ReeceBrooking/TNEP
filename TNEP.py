@@ -811,9 +811,9 @@ class TNEP(layers.Layer):
         Appended blocks (n_max channels each, in this order, on the
         O(1)-scaled coefficients ĉ = c × scale, never L2-normalised):
           radial_basis_two_body  : Re ĉ_{n00}                      (NEP 2-body)
-          radial_basis_four_body : Σ (2 2 2; m1 m2 m3) ĉ_{n2m1}ĉ_{n2m2}ĉ_{n2m3}
-                                   (l=2 bispectrum, NEP 4-body)
-          radial_basis_five_body : (Σ_m |ĉ_{n1m}|²)²              (NEP 5-body)
+          radial_basis_four_body : cbrt Σ (2 2 2; m1 m2 m3) ĉ_{n2m1}ĉ_{n2m2}ĉ_{n2m3}
+                                   (l=2 bispectrum, NEP 4-body; signed cube root)
+          radial_basis_five_body : Σ_m |ĉ_{n1m}|²   (NEP 5-body is its square)
         Args:
             raw : [..., A, S·K·k_max·2]  builder output (species, κ, k, re/im)
             Z   : [..., A]               type indices
@@ -900,11 +900,15 @@ class TNEP(layers.Layer):
             prod = (tf.gather(full, self._rb_3j_idx[0], axis=-1)
                     * tf.gather(full, self._rb_3j_idx[1], axis=-1)
                     * tf.gather(full, self._rb_3j_idx[2], axis=-1))
-            extras.append(tf.einsum('...t,t->...', tf.math.real(prod), self._rb_3j_w))
+            b4 = tf.einsum('...t,t->...', tf.math.real(prod), self._rb_3j_w)
+            # Signed cube root: degree 1 in ĉ like the other blocks (the raw
+            # cubic is ~100× below the SOAP channels). ε keeps the gradient finite.
+            extras.append(tf.math.sign(b4) * tf.pow(tf.abs(b4) + 1e-9, 1.0 / 3.0))
         if self._rb_five_body:
             sq = tf.reduce_sum(tf.square(c_1 * sc), axis=-1)       # |ĉ_{1m}|² for m = 0, 1
-            q1 = sq[..., 0] + 2.0 * sq[..., 1]                     # Σ_{m=-1..1}
-            extras.append(tf.square(q1))
+            # Σ_{m=-1..1} |ĉ_{n1m}|² — NEP's 5-body is its square; the
+            # degree-2 form keeps the block on the SOAP channels' scale.
+            extras.append(sq[..., 0] + 2.0 * sq[..., 1])
         if extras:
             q = tf.concat([q] + extras, axis=-1)
         out_shape = tf.concat([lead, [self.dim_q_forward]], axis=0)

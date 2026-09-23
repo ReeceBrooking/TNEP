@@ -638,8 +638,9 @@ def test_four_and_five_body_blocks(species_sum, per_l, tmp_path):
                 if abs(m3) > 2: continue
                 w = float(wigner_3j(2, 2, 2, m1, m2, m3))
                 q4 += w * (full[..., m1 + 2] * full[..., m2 + 2] * full[..., m3 + 2]).real
+        q4 = np.sign(q4) * np.cbrt(np.abs(q4) + 1e-9)
         c1 = cc_l(1)
-        q5 = (np.abs(c1[..., 0]) ** 2 + 2 * np.abs(c1[..., 1]) ** 2) ** 2
+        q5 = np.abs(c1[..., 0]) ** 2 + 2 * np.abs(c1[..., 1]) ** 2
         np.testing.assert_allclose(q[s, :A, -2 * n_max:-n_max], q4, rtol=1e-4, atol=1e-6)
         np.testing.assert_allclose(q[s, :A, -n_max:], q5, rtol=1e-4, atol=1e-6)
         assert np.abs(q4).max() > 1e-4 and np.abs(q5).max() > 1e-4
