@@ -425,6 +425,54 @@ def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int,
     )
 
 
+Q_SCALE_ALPHA = 0.5    # equalisation exponent (0 = no scaling, 1 = full)
+Q_SCALE_CLAMP = 10.0   # max boost / damping of any channel
+
+
+def q_scale_groups(cfg) -> list:
+    """Channel groups for descriptor_scale="block": each SOAP l group (union
+    over species pairs) then each learned-basis extra block (2-/4-/5-body),
+    covering every channel exactly once."""
+    lay = descriptor_block_layout(cfg)
+    groups = [np.asarray(v, dtype=np.int32) for _, v in sorted(lay["l_index"].items())]
+    n_soap = sum(len(g) for g in groups)
+    n_extra = radial_extra_count(cfg)
+    if n_extra:
+        n_on = sum(bool(getattr(cfg, f, False)) for f in (
+            "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
+        width = n_extra // n_on
+        for b in range(n_on):
+            groups.append(np.arange(n_soap + b * width, n_soap + (b + 1) * width, dtype=np.int32))
+    return groups
+
+
+def compute_q_scale(q: np.ndarray, atom_mask: np.ndarray, cfg) -> np.ndarray:
+    """Per-channel preconditioning scale m [Q] from the generation-0
+    descriptor q [.., Q] over real atoms (atom_mask > 0):
+        m_k = clip((s_ref / s_k)^ALPHA, 1/CLAMP, CLAMP),  s_ref = median std
+    dead channels (s_k = 0) keep m = 1. "block" mode uses one value per
+    q_scale_groups group (median std of the group)."""
+    Q = q.shape[-1]
+    x = np.asarray(q, dtype=np.float64).reshape(-1, Q)[np.asarray(atom_mask).reshape(-1) > 0]
+    s = x.std(axis=0)
+    live = s > 0
+    if not np.any(live):
+        return np.ones(Q, dtype=np.float32)
+    s_ref = float(np.median(s[live]))
+    def _m(std):
+        return float(np.clip((s_ref / std) ** Q_SCALE_ALPHA, 1.0 / Q_SCALE_CLAMP, Q_SCALE_CLAMP))
+    m = np.ones(Q, dtype=np.float64)
+    if str(cfg.descriptor_scale) == "block":
+        for idx in q_scale_groups(cfg):
+            sg = s[idx][live[idx]]
+            if sg.size:
+                m[idx] = _m(float(np.median(sg)))
+    else:
+        m[live] = [_m(v) for v in s[live]]
+    m[~live] = 1.0
+    return m.astype(np.float32)
+
+
 def descriptor_input_width(cfg) -> int:
     """Width of the per-atom vector the builder emits in the `descriptors`
     slot: the raw compressed SOAP dim, or under cfg.radial_basis_size the

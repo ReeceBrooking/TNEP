@@ -191,6 +191,30 @@ class TNEP(layers.Layer):
                         f"cfg.{f}=True requires cfg.radial_basis_size (the "
                         f"learned radial basis).")
             self.M_radial = None
+        # Descriptor scale preconditioning: m folded into W0 (see _W0_eff);
+        # the Keras W0 init is divided by m so the initial function is the
+        # unscaled one. SNES's μ init does the same in _build_mu_init.
+        self._q_scale = None
+        if str(getattr(cfg, "descriptor_scale", "off")) != "off":
+            if str(cfg.descriptor_scale) not in ("block", "channel"):
+                raise ValueError(
+                    f"cfg.descriptor_scale={cfg.descriptor_scale!r}; expected "
+                    f"'off', 'block' or 'channel'.")
+            if self.descriptor_preprocess_contract != "off":
+                raise NotImplementedError(
+                    "descriptor_scale is not combinable with "
+                    "descriptor_preprocess_contract (W0 is stored at Q_new there).")
+            if cfg.q_scale is None:
+                raise ValueError(
+                    "cfg.descriptor_scale is on but cfg.q_scale is None — the "
+                    "training driver computes it from the training set "
+                    "(compute_q_scale) before building the model.")
+            m = np.asarray(cfg.q_scale, dtype=np.float32)
+            if m.shape != (int(self.dim_q_forward),):
+                raise ValueError(
+                    f"cfg.q_scale has shape {m.shape}, expected "
+                    f"({self.dim_q_forward},) — recompute for this descriptor.")
+            self._q_scale = tf.constant(m)
         self.builder = make_descriptor_builder(cfg)
 
         # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type
@@ -642,6 +666,12 @@ class TNEP(layers.Layer):
             self._preprocess_q_to_q_new = None
             self._preprocess_scatter = None
 
+        if self._q_scale is not None:
+            inv = 1.0 / self._q_scale[:, tf.newaxis]
+            self.W0.assign(self.W0 * inv)
+            if cfg.target_mode == 2:
+                self.W0_pol.assign(self.W0_pol * inv)
+
         self.optimizer = SNES(self)
 
     # ---- descriptor mixing helpers ----------------------------------------
@@ -693,13 +723,21 @@ class TNEP(layers.Layer):
             per-type U_pair [(C,) T, num_pairs, bs, bs] + W0 [(C,) T, Q, H] → W0_eff [(C,) T, Q, H]
 
         V init = 0 ⇒ U_full = I ⇒ W0_eff == W0 at gen 0.
+        With cfg.descriptor_scale the per-channel m is folded here too, on
+        W0's own input (the mixed descriptor): W0_eff = U_fullᵀ·diag(m)·W0,
+        so a scaled model is exactly an unscaled one with W0' = m∘W0 for
+        any U. This is the ONLY fold site — every entry point must go
+        through _W0_eff unconditionally.
         """
-        if not self.descriptor_mixing:
-            return W0
-        U_full = self._U_full(U_pair)
-        if self.descriptor_mixing_per_type:
-            return tf.einsum('...tqp,...tqh->...tph', U_full, W0)
-        return tf.einsum('...qp,...tqh->...tph', U_full, W0)
+        if self._q_scale is not None:
+            W0 = W0 * self._q_scale[:, tf.newaxis]                # [..., Q, H]
+        if self.descriptor_mixing:
+            U_full = self._U_full(U_pair)
+            if self.descriptor_mixing_per_type:
+                W0 = tf.einsum('...tqp,...tqh->...tph', U_full, W0)
+            else:
+                W0 = tf.einsum('...qp,...tqh->...tph', U_full, W0)
+        return W0
 
     def _W0_preprocess_eff(self, W0: tf.Tensor,
                             W_pre_override: tf.Tensor | None = None) -> tf.Tensor:
@@ -1656,8 +1694,7 @@ class TNEP(layers.Layer):
 
         # Per-candidate mixing: absorb U_pairᵀ into W0 so forward/backward stay
         # in raw-desc space (de_dq combines with raw grad_values). See _W0_eff.
-        if self.descriptor_mixing and U_pair is not None:
-            W0 = self._W0_eff(W0, U_pair)
+        W0 = self._W0_eff(W0, U_pair)
 
         # Preprocess fold: W0 Q_new → Q_raw so the matmul below is uniform at
         # Q_raw and de_dq comes out at Q_raw for the raw-W_atom sum. Mutually

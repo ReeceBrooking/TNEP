@@ -477,13 +477,20 @@ class SNES:
         c_W0 = gain * float(np.sqrt(6.0 / (Q + H)))
         c_W1 = gain * float(np.sqrt(6.0 / (H + self._Ch)))
 
+        q_scale = (self.model._q_scale.numpy() if self.model._q_scale is not None
+                   else None)
+
         def _fill_ann(off: int) -> int:
             """Fill one ANN's worth of weights starting at ``off``.
             Layout: [W0(T,Q,H) | b0(T,H) | W1(T,H·Ch) | b1(1)].
             """
             n_W0 = T * Q * H
-            mu[off:off + n_W0] = rng.uniform(
-                -c_W0, c_W0, size=n_W0).astype(np.float32)
+            w0 = rng.uniform(-c_W0, c_W0, size=n_W0).astype(np.float32)
+            if q_scale is not None:
+                # Stored weights = effective / m so W0_eff at gen 0 is the
+                # unscaled Glorot init (descriptor_scale is a reparameterisation).
+                w0 = (w0.reshape(T, Q, H) / q_scale[None, :, None]).reshape(-1)
+            mu[off:off + n_W0] = w0
             off += n_W0
             # b0 zero
             off += T * H
@@ -1295,10 +1302,9 @@ class SNES:
             c_pair_val = named.get("c_pair")
             M_val = named.get("M_radial")
             # Absorb U_pair^T into W0 (and W0_pol).
-            if U_pair_val is not None:
-                W0 = self.model._W0_eff(W0, U_pair_val)
-                if W0p is not None:
-                    W0p = self.model._W0_eff(W0p, U_pair_val)
+            W0 = self.model._W0_eff(W0, U_pair_val)
+            if W0p is not None:
+                W0p = self.model._W0_eff(W0p, U_pair_val)
             # Preprocess fold (composes with mixing under l_aware).
             if (getattr(self.model, "descriptor_preprocess_contract", "off")
                     != "off"):
@@ -1322,10 +1328,9 @@ class SNES:
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
             b1p = getattr(self.model, 'b1_pol', None)
-            if getattr(self.model, "descriptor_mixing", False):
-                W0 = self.model._W0_eff(W0)
-                if W0p is not None:
-                    W0p = self.model._W0_eff(W0p)
+            W0 = self.model._W0_eff(W0)
+            if W0p is not None:
+                W0p = self.model._W0_eff(W0p)
             if (getattr(self.model, "descriptor_preprocess_contract", "off")
                     != "off"):
                 W0 = self.model._W0_preprocess_eff(W0)
@@ -1988,9 +1993,8 @@ class SNES:
             pol_weights = self._pol_weights  # [6] component weights
             # Pre-absorb U_pair^T into W0/W0_pol per candidate (linear _W0_eff
             # broadcasts over the candidate axis) so the loop uses raw descriptors.
-            if U_pair_cand is not None:
-                W0 = self.model._W0_eff(W0, U_pair_cand)
-                W0p = self.model._W0_eff(W0p, U_pair_cand)
+            W0 = self.model._W0_eff(W0, U_pair_cand)
+            W0p = self.model._W0_eff(W0p, U_pair_cand)
 
             fitness_comp_w = pol_weights[tf.newaxis]  # [1, 6]
             sq_comp_w = pol_weights[tf.newaxis]

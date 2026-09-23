@@ -245,6 +245,22 @@ class TNEPconfig:
     # information, kept for NEP parity; the un-squared form keeps the SOAP
     # channels' scale). dim_q grows by n_max. Same exclusions as four_body.
     radial_basis_five_body: bool = False
+    # Descriptor scale preconditioning (plan 2026-09-23). A per-channel scale
+    # m is folded into the input weights, W0_eff = Uᵀ·diag(m)·W0, so the model
+    # class is unchanged (any scaled model == an unscaled one with W0' = m∘W0)
+    # and q / ∂q/∂R are never touched; only the SNES/Adam search geometry
+    # changes (effective per-channel step σ·m). Both inits are divided by m,
+    # so generation 0 is identical to "off". m_k = clip((s_ref/s_k)^0.5,
+    # 1/10, 10) from the per-channel std s_k of the generation-0 descriptor
+    # over the training atoms (frozen; dead channels keep m = 1).
+    #   "off"     : no scaling (bit-identical to before)
+    #   "block"   : one scalar per SOAP l group and per extra block (≤ 9)
+    #   "channel" : one scalar per channel
+    # Not combinable with descriptor_preprocess_contract.
+    descriptor_scale: str = "off"
+    # Runtime: the scale vector [dim_q], computed by the driver from the
+    # training set and saved in the model's config (None = not yet computed).
+    q_scale: list[float] | None = None
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE

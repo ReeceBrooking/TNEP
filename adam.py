@@ -103,11 +103,8 @@ def fit_adam(model, train_data: dict, val_data: dict,
         # Only tf.Variables / tensors go into the forward (Keras variables
         # are not valid tf.function arguments).
         U = _mixing_V() if mix_flat is not None else None
-        W0 = model._W0_eff(named["W0"], U) if U is not None else named["W0"]
-        W0p = None
-        if cfg.target_mode == 2:
-            W0p = (model._W0_eff(named["W0_pol"], U) if U is not None
-                   else named["W0_pol"])
+        W0 = model._W0_eff(named["W0"], U)     # U fold (if mixing) + q-scale fold
+        W0p = model._W0_eff(named["W0_pol"], U) if cfg.target_mode == 2 else None
         preds = model.predict_batch(
             chunk["descriptors"], chunk["grad_values"],
             chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
