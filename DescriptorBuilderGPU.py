@@ -328,16 +328,17 @@ def compute_dim_q(cfg) -> int:
     alpha_max = int(cfg.alpha_max)
     l_max = int(cfg.l_max)
     n_species = int(cfg.num_types)
+    two_body = radial_two_body_count(cfg)
     if _radial_species_sum(cfg):
         # Species-summed learned basis: full (n <= n') spectrum over alpha channels.
-        return alpha_max * (alpha_max + 1) // 2 * (l_max + 1)
+        return alpha_max * (alpha_max + 1) // 2 * (l_max + 1) + two_body
     compress_mode = getattr(cfg, "compress_mode", "trivial")
     if compress_mode == "linear":
         # quippy linear default = 2 × n_species pivots × (l_max+1) features
         return int(2 * n_species * (l_max + 1))
     alpha_per_species = [alpha_max] * n_species
     mask_info = make_compress_mask_trivial(alpha_per_species, l_max)
-    return int(mask_info["n_compressed"])
+    return int(mask_info["n_compressed"]) + two_body
 
 
 def radial_basis_init(alpha_max: int, n_basis: int) -> np.ndarray:
@@ -361,6 +362,16 @@ def _radial_species_sum(cfg) -> bool:
     """True for the species-summed learned radial basis (spec §4b)."""
     return (getattr(cfg, "radial_basis_size", None) is not None
             and bool(getattr(cfg, "radial_basis_species_sum", False)))
+
+
+def radial_two_body_count(cfg) -> int:
+    """Channels appended by radial_basis_two_body: n_max (alpha_max
+    species-summed, S·alpha_max blocked), 0 when off."""
+    if (getattr(cfg, "radial_basis_size", None) is None
+            or not bool(getattr(cfg, "radial_basis_two_body", False))):
+        return 0
+    a = int(cfg.alpha_max)
+    return a if _radial_species_sum(cfg) else a * int(cfg.num_types)
 
 
 def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int,
@@ -463,7 +474,8 @@ def descriptor_block_layout(cfg) -> dict:
             alpha_eff_per_pair={(0, 0): per_l},
             max_alpha_eff=per_l,
             N_per_l=per_l,
-            dim_q=int(per_l * L),
+            # 2-body channels (if any) sit after the SOAP block, outside every pair.
+            dim_q=int(per_l * L) + radial_two_body_count(cfg),
         )
     alpha_per_species = [alpha_max] * n_species
 
@@ -545,7 +557,8 @@ def descriptor_block_layout(cfg) -> dict:
         alpha_eff_per_pair=alpha_eff_per_pair,
         max_alpha_eff=max(alpha_eff_per_pair.values()) if alpha_eff_per_pair else 0,
         N_per_l=N_per_l,
-        dim_q=int(q_counter),
+        # 2-body channels (if any) sit after the SOAP block, outside every pair.
+        dim_q=int(q_counter) + radial_two_body_count(cfg),
     )
 
 

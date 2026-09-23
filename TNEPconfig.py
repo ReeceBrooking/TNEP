@@ -223,6 +223,15 @@ class TNEPconfig:
     # NEP's separate angular c_nk. False shares one M across all l.
     # L× the radial coefficients; init still reproduces the fixed basis.
     radial_basis_per_l: bool = False
+    # Append NEP's 2-body radial descriptor (radial_basis_size only):
+    # q_n = Σ_j g_n(r_ij), i.e. the l = 0 centre coefficients of the learned
+    # radial functions, left UN-normalised (SOAP's per-atom L2 norm discards
+    # coordination/density; this block keeps it). Scaled by the fixed
+    # constant 1/(4π (rcut_hard/atom_sigma_t)²) (SOAP-turbo's angular
+    # amplitude) so the channels are O(1). dim_q grows by n_max (S·alpha_max
+    # blocked, alpha_max species-summed). Not combinable with
+    # descriptor_preprocess_contract; excluded from descriptor_mixing blocks.
+    radial_basis_two_body: bool = False
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE

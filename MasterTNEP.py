@@ -472,6 +472,7 @@ def _train_model_inner(cfg: TNEPconfig,
               f"combinations of K={cfg.radial_basis_size} orthonormal poly3 "
               f"functions"
               + (", separate per l block" if cfg.radial_basis_per_l else "")
+              + (", + un-normalised 2-body block" if cfg.radial_basis_two_body else "")
               + f" (M_radial {_shape} in the SNES vector; init = fixed basis)")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.

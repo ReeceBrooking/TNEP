@@ -117,18 +117,32 @@ class TNEP(layers.Layer):
                     "neighbor dipole readout (target_mode=1) is supported.")
             self._rb_species_sum = bool(cfg.radial_basis_species_sum)
             self._rb_per_l = bool(cfg.radial_basis_per_l)
+            self._rb_two_body = bool(cfg.radial_basis_two_body)
+            if self._rb_two_body and self.descriptor_preprocess_contract != "off":
+                raise NotImplementedError(
+                    "cfg.radial_basis_two_body=True appends channels outside "
+                    "the species-pair blocks descriptor_preprocess_contract "
+                    "layouts assume; set descriptor_preprocess_contract='off'.")
+            # Fixed O(1) scale for the 2-body block: undo SOAP-turbo's 4π and
+            # angular amplitude (rcut/σ_t)² carried by the raw coefficients.
+            self._rb_two_body_scale = float(
+                1.0 / (4.0 * np.pi * (float(cfg.rcut_hard) / float(cfg.atom_sigma_t)) ** 2))
             if (self._rb_species_sum
                     and self.descriptor_preprocess_contract != "off"):
                 raise NotImplementedError(
                     "cfg.radial_basis_species_sum=True has no species-pair "
                     "blocks, which descriptor_preprocess_contract layouts "
                     "assume; set descriptor_preprocess_contract='off'.")
+            from DescriptorBuilderGPU import radial_two_body_count
             cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types,
                                           species_sum=self._rb_species_sum)
-            if int(cm["gather_idx"].size) != int(self.dim_q_forward):
+            self._rb_n_two_body = int(radial_two_body_count(cfg))
+            if (int(cm["gather_idx"].size) + self._rb_n_two_body
+                    != int(self.dim_q_forward)):
                 raise RuntimeError(
                     f"radial_basis_channel_map gives {cm['gather_idx'].size} "
-                    f"channels, dim_q={self.dim_q_forward}.")
+                    f"(+{self._rb_n_two_body} two-body) channels, "
+                    f"dim_q={self.dim_q_forward}.")
             L = int(cfg.l_max) + 1
             self._rb_alpha, self._rb_K = alpha, K
             self._rb_L, self._rb_kmax = L, L * (L + 1) // 2
@@ -151,7 +165,8 @@ class TNEP(layers.Layer):
                 np.broadcast_to(M0, M0_shape).astype(np.float32),
                 trainable=False, name="M_radial")
         else:
-            for f in ("radial_basis_species_sum", "radial_basis_per_l"):
+            for f in ("radial_basis_species_sum", "radial_basis_per_l",
+                      "radial_basis_two_body"):
                 if bool(getattr(cfg, f, False)):
                     raise ValueError(
                         f"cfg.{f}=True requires cfg.radial_basis_size (the "
@@ -774,6 +789,8 @@ class TNEP(layers.Layer):
         channels, c[a, n, k] = Σ_s Σ_κ M[t_a, s, n, κ] · c_raw[a, s, κ, k],
         and keeps every (n ≤ n', l) channel (dim_q = α(α+1)/2·L).
         cfg.radial_basis_per_l gives each l block its own M[..., l].
+        cfg.radial_basis_two_body appends the n_max un-normalised l = 0
+        coefficients Re c[a, n, (0,0)] × scale (NEP's 2-body q_n = Σ_j g_n).
         Args:
             raw : [..., A, S·K·k_max·2]  builder output (species, κ, k, re/im)
             Z   : [..., A]               type indices
@@ -834,11 +851,16 @@ class TNEP(layers.Layer):
                 p_l = piv[:, :, :, k0:k0 + l + 1, :] * self._rb_mw[l]
                 c_l = cc[:, :, :, k0:k0 + l + 1, :]
             G_l.append(tf.einsum('cnpkr,cnmkr->cnpm', p_l, c_l))   # [C, N, R, n_max]
+            if l == 0:
+                c_00 = c_l[:, :, :, 0, 0]                         # [C, N, n_max] Re c_{n00}
         G = tf.stack(G_l, axis=-1)                                # [C, N, R, n_max, L]
         G = tf.reshape(G, [-1, N, self._rb_n_rows * self._rb_n_max * L])
         q = tf.gather(G, self._rb_gather, axis=-1) * self._rb_scale
         norm = tf.norm(q, axis=-1, keepdims=True)
         q = q / tf.where(norm < 1e-5, tf.ones_like(norm), norm)
+        if self._rb_two_body:
+            # NEP-style 2-body block, un-normalised (keeps density), O(1) scale.
+            q = tf.concat([q, c_00 * self._rb_two_body_scale], axis=-1)
         out_shape = tf.concat([lead, [self.dim_q_forward]], axis=0)
         if per_cand:
             return tf.reshape(q, tf.concat([[-1], out_shape], axis=0))

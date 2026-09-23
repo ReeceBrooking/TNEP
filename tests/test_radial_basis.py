@@ -54,6 +54,7 @@ def _cfg(**kw):
     cfg.radial_basis_size = None
     cfg.radial_basis_species_sum = False
     cfg.radial_basis_per_l = False
+    cfg.radial_basis_two_body = False
     cfg.optimizer = "snes"
     for k, v in kw.items():
         setattr(cfg, k, v)
@@ -529,3 +530,56 @@ def test_per_l_radial_basis(species_sum, tmp_path):
     path = str(tmp_path / "m.h5"); save_model(model, cfg, path); loaded = load_model(path)
     assert loaded.cfg.radial_basis_per_l is True
     np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("species_sum,per_l", [(False, False), (True, True)])
+def test_two_body_block(species_sum, per_l, tmp_path):
+    from model_io import save_model, load_model
+    from DescriptorBuilderGPU import compute_dim_q, descriptor_block_layout
+    base = dict(radial_basis_size=8, radial_basis_species_sum=species_sum, radial_basis_per_l=per_l)
+    cfg = _cfg(radial_basis_two_body=True, descriptor_mixing=True,
+               descriptor_mixing_regularizer="expm", **base)
+    n2 = 4 if species_sum else 12
+    assert cfg.dim_q == compute_dim_q(_cfg(**base)) + n2
+    assert descriptor_block_layout(cfg)["dim_q"] == cfg.dim_q
+    model = _model(cfg)
+    m0 = _model(_cfg(**base))
+    frames = _cho_frames(3)
+    data = _eval_data(cfg, frames)
+    q = model.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
+    q0 = m0.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
+    # SOAP part untouched; 2-body block = scaled Re c_{n00} of the learned functions.
+    np.testing.assert_allclose(q[..., :-n2], q0, atol=1e-6)
+    scale = 1.0 / (4 * np.pi * (cfg.rcut_hard / cfg.atom_sigma_t) ** 2)
+    for s, fr in enumerate(frames):
+        A = len(fr); Z = data["Z_int"][s].numpy()[:A]
+        r = data["descriptors"][s].numpy()[:A].reshape(A, 3, 8, 15, 2)
+        c00 = r[:, :, :, 0, 0]                                            # [A, S, K]
+        M = model.M_radial.numpy()[Z]
+        M = M[..., 0] if per_l else M                                     # l = 0 functions
+        two = np.einsum('asnk,ask->asn' if not species_sum else 'asnk,ask->an', M, c00)
+        np.testing.assert_allclose(q[s, :A, -n2:], two.reshape(A, -1) * scale, rtol=1e-5, atol=1e-6)
+        assert np.all(q[s, A:] == 0.0)
+        assert np.abs(q[s, :A, -n2:]).max() < 5.0            # O(1) scale
+    # Density is visible: doubling the neighbour count is not invisible to the block
+    # (unlike the L2-normalised SOAP part). Candidates path + save/load.
+    snes = model.optimizer
+    pv = tf.stack([snes.mu, snes.mu + 0.02])
+    named = snes._split_reconstructed(snes.reconstruct_params_tf(pv))
+    preds = model.predict_batch_candidates(
+        data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
+        named["W0"], named["b0"], named["W1"], named["b1"],
+        U_pair=named["U_pair"], c_pair=named["c_pair"], M_radial=named["M_radial"]).numpy()
+    one = snes._split_reconstructed(snes.reconstruct_params_tf(pv[1]))
+    single = model.predict_batch(
+        data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"],
+        data["pair_struct"], data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
+        model._W0_eff(one["W0"], one["U_pair"]), one["b0"], one["W1"], one["b1"],
+        W_atom=data["V_atom"], c_pair=one["c_pair"], M_radial=one["M_radial"]).numpy()
+    np.testing.assert_allclose(preds[1], single, rtol=1e-4, atol=1e-6)
+    before = _predict(model, data)
+    path = str(tmp_path / "m.h5"); save_model(model, cfg, path); loaded = load_model(path)
+    assert loaded.cfg.radial_basis_two_body is True and loaded.cfg.dim_q == cfg.dim_q
+    np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_two_body=True))
