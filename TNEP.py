@@ -117,7 +117,11 @@ class TNEP(layers.Layer):
                     "neighbor dipole readout (target_mode=1) is supported.")
             self._rb_species_sum = bool(cfg.radial_basis_species_sum)
             self._rb_per_l = bool(cfg.radial_basis_per_l)
-            self._rb_normalize = bool(cfg.radial_basis_normalize)
+            self._rb_norm = str(cfg.radial_basis_norm)
+            if self._rb_norm not in ("l2", "none", "sqrt"):
+                raise ValueError(
+                    f"cfg.radial_basis_norm={cfg.radial_basis_norm!r}; expected "
+                    f"'l2', 'none' or 'sqrt'.")
             self._rb_two_body = bool(cfg.radial_basis_two_body)
             self._rb_four_body = bool(cfg.radial_basis_four_body)
             self._rb_five_body = bool(cfg.radial_basis_five_body)
@@ -191,10 +195,10 @@ class TNEP(layers.Layer):
                     raise ValueError(
                         f"cfg.{f}=True requires cfg.radial_basis_size (the "
                         f"learned radial basis).")
-            if not bool(getattr(cfg, "radial_basis_normalize", True)):
+            if str(getattr(cfg, "radial_basis_norm", "l2")) != "l2":
                 raise ValueError(
-                    "cfg.radial_basis_normalize=False requires "
-                    "cfg.radial_basis_size (the fixed builder always normalises).")
+                    "cfg.radial_basis_norm != 'l2' requires cfg.radial_basis_size "
+                    "(the fixed builder always L2-normalises).")
             self.M_radial = None
         # Descriptor scale preconditioning: m folded into W0 (see _W0_eff);
         # the Keras W0 init is divided by m so the initial function is the
@@ -220,6 +224,13 @@ class TNEP(layers.Layer):
                     f"cfg.q_scale has shape {m.shape}, expected "
                     f"({self.dim_q_forward},) — recompute for this descriptor.")
             self._q_scale = tf.constant(m)
+            if cfg.q_shift is None:
+                raise ValueError("cfg.q_shift is None — computed with q_scale.")
+            mu = np.asarray(cfg.q_shift, dtype=np.float32)
+            if mu.shape != m.shape:
+                raise ValueError(f"cfg.q_shift has shape {mu.shape}, expected {m.shape}.")
+            # b0 fold uses (m∘μ); stored once.
+            self._q_shift_m = tf.constant(m * mu)
         self.builder = make_descriptor_builder(cfg)
 
         # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type
@@ -672,10 +683,14 @@ class TNEP(layers.Layer):
             self._preprocess_scatter = None
 
         if self._q_scale is not None:
+            # Stored W0 = Glorot / m and b0 = (m∘μ)·W0_stored, so W0_eff / b0_eff
+            # at init equal the unscaled Glorot / zero init exactly.
             inv = 1.0 / self._q_scale[:, tf.newaxis]
             self.W0.assign(self.W0 * inv)
+            self.b0.assign(tf.einsum('q,tqh->th', self._q_shift_m, self.W0))
             if cfg.target_mode == 2:
                 self.W0_pol.assign(self.W0_pol * inv)
+                self.b0_pol.assign(tf.einsum('q,tqh->th', self._q_shift_m, self.W0_pol))
 
         self.optimizer = SNES(self)
 
@@ -829,6 +844,15 @@ class TNEP(layers.Layer):
         W0_eff = tf.einsum('...tqN,...tNqh->...tqh', AB, W0_at_q)
         return W0_eff
 
+    def _b0_eff(self, b0: tf.Tensor, W0_stored: tf.Tensor) -> tf.Tensor:
+        """Centring fold of descriptor_scale: the ANN sees m∘(q − μ), so
+        b0_eff = b0 − (m∘μ)·W0_stored (W0 BEFORE _W0_eff; any leading
+        candidate dim broadcasts). Identity when scaling is off. Call it
+        wherever _W0_eff is called."""
+        if self._q_scale is None:
+            return b0
+        return b0 - tf.einsum('q,...tqh->...th', self._q_shift_m, W0_stored)
+
     # ---- learned radial basis ---------------------------------------------
 
     @property
@@ -851,8 +875,8 @@ class TNEP(layers.Layer):
         channels, c[a, n, k] = Σ_s Σ_κ M[t_a, s, n, κ] · c_raw[a, s, κ, k],
         and keeps every (n ≤ n', l) channel (dim_q = α(α+1)/2·L).
         cfg.radial_basis_per_l gives each l block its own M[..., l].
-        cfg.radial_basis_normalize=False skips the per-atom L2 norm and
-        scales the raw spectrum by scale² instead (pair with descriptor_scale).
+        cfg.radial_basis_norm: "l2" per-atom projection; "none" raw × scale²;
+        "sqrt" sign·√|q| × scale (degree 1). Pair the latter two with descriptor_scale.
         Appended blocks (n_max channels each, in this order, on the
         O(1)-scaled coefficients ĉ = c × scale, never L2-normalised):
           radial_basis_two_body  : Re ĉ_{n00}                      (NEP 2-body)
@@ -929,13 +953,17 @@ class TNEP(layers.Layer):
         G = tf.reshape(G, [-1, N, self._rb_n_rows * self._rb_n_max * L])
         q = tf.gather(G, self._rb_gather, axis=-1) * self._rb_scale
         sc = self._rb_two_body_scale
-        if self._rb_normalize:
+        if self._rb_norm == "l2":
             norm = tf.norm(q, axis=-1, keepdims=True)
             q = q / tf.where(norm < 1e-5, tf.ones_like(norm), norm)
-        else:
+        elif self._rb_norm == "none":
             # NEP-like: no per-atom projection; the spectrum is quadratic in
             # the coefficients, so scale² puts it on the extras' O(1) footing.
             q = q * (sc * sc)
+        else:
+            # "sqrt": degree 1 in the coefficients (like NEP's radial block and
+            # the extras): halves every log-spread of "none", keeps magnitude.
+            q = tf.math.sign(q) * tf.sqrt(tf.abs(q) + 1e-12) * sc
         extras = []
         if self._rb_two_body:
             # NEP-style 2-body block, un-normalised (keeps density), O(1) scale.
@@ -994,13 +1022,14 @@ class TNEP(layers.Layer):
         # Absorb U_pairᵀ into W0 once so forward and calc_forces share the
         # folded weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
+        b0_eff = self._b0_eff(self.b0, self.W0)
         # Expand W0 Q_new → Q_raw when preprocess is on (mirrors score()).
         if self.descriptor_preprocess_contract != "off":
             W0_eff = self._W0_preprocess_eff(W0_eff)
 
         # Gather per-type weights for each atom
         W0_t = tf.gather(W0_eff, Z)    # [A, dim_q, H]
-        b0_t = tf.gather(self.b0, Z)   # [A, H]
+        b0_t = tf.gather(b0_eff, Z)    # [A, H]
         W1_t = tf.gather(self.W1, Z)   # [A, H]
 
         # Hidden layer: h = activation(z), z = q @ W0[t] + b0[t]. Keep z for the
@@ -1214,10 +1243,13 @@ class TNEP(layers.Layer):
         # Pre-fold U_pairᵀ into W0 (and W0_pol) once so every chunk shares the
         # absorbed weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
+        b0_eff = self._b0_eff(self.b0, self.W0)
         W0_pol_eff = (self._W0_eff(self.W0_pol)
                       if (self.cfg.target_mode == 2
                           and getattr(self, "W0_pol", None) is not None)
                       else getattr(self, "W0_pol", None))
+        b0_pol_eff = (self._b0_eff(self.b0_pol, self.W0_pol)
+                      if self.cfg.target_mode == 2 else getattr(self, 'b0_pol', None))
         # Second fold: with preprocess on, expand W0 Q_new → Q_raw before
         # predict_batch's raw-dim einsum (mirrors validate()/_evaluate_chunk).
         if self.descriptor_preprocess_contract != "off":
@@ -1234,9 +1266,9 @@ class TNEP(layers.Layer):
                 chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],
-                W0_eff, self.b0, self.W1, self.b1,
+                W0_eff, b0_eff, self.W1, self.b1,
                 W0_pol_eff,
-                getattr(self, 'b0_pol', None),
+                b0_pol_eff,
                 getattr(self, 'W1_pol', None),
                 getattr(self, 'b1_pol', None),
                 W_atom=chunk.get("V_atom"),  # neighbor readout: [B,A,3] kernel
@@ -1706,6 +1738,7 @@ class TNEP(layers.Layer):
 
         # Per-candidate mixing: absorb U_pairᵀ into W0 so forward/backward stay
         # in raw-desc space (de_dq combines with raw grad_values). See _W0_eff.
+        b0 = self._b0_eff(b0, W0)          # centring fold needs the STORED W0
         W0 = self._W0_eff(W0, U_pair)
 
         # Preprocess fold: W0 Q_new → Q_raw so the matmul below is uniform at

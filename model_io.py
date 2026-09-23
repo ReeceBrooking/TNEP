@@ -59,7 +59,8 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "radial_basis_two_body": False,
     "radial_basis_four_body": False,
     "radial_basis_five_body": False,
-    "radial_basis_normalize": True,
+    "radial_basis_norm": "l2",
+    "q_shift": None,
     "descriptor_scale": "off",
     "q_scale": None,
 }
@@ -550,6 +551,8 @@ def _load_model_h5(path: str) -> TNEP:
             "M_radial": wg["M_radial"][:] if "M_radial" in wg else None,
         }
 
+    if "radial_basis_normalize" in config_dict:   # pre-2026-09-23 bool
+        config_dict["radial_basis_norm"] = "l2" if config_dict.pop("radial_basis_normalize") else "none"
     for k, v in config_dict.items():
         if k == "descriptor_mean":
             # Legacy field — descriptor scaling was removed; ignore.

@@ -479,6 +479,7 @@ class SNES:
 
         q_scale = (self.model._q_scale.numpy() if self.model._q_scale is not None
                    else None)
+        q_shift_m = (self.model._q_shift_m.numpy() if q_scale is not None else None)
 
         def _fill_ann(off: int) -> int:
             """Fill one ANN's worth of weights starting at ``off``.
@@ -492,7 +493,10 @@ class SNES:
                 w0 = (w0.reshape(T, Q, H) / q_scale[None, :, None]).reshape(-1)
             mu[off:off + n_W0] = w0
             off += n_W0
-            # b0 zero
+            # b0 zero — or (m∘μ)·W0_stored so b0_eff is zero under centring.
+            if q_shift_m is not None:
+                mu[off:off + T * H] = np.einsum(
+                    'q,tqh->th', q_shift_m, w0.reshape(T, Q, H)).reshape(-1)
             off += T * H
             n_W1 = T * H * self._Ch
             mu[off:off + n_W1] = rng.uniform(
@@ -1301,7 +1305,10 @@ class SNES:
             W_pre_angular_val = named.get("W_pre_angular")
             c_pair_val = named.get("c_pair")
             M_val = named.get("M_radial")
-            # Absorb U_pair^T into W0 (and W0_pol).
+            # Centring fold (needs the stored W0), then absorb U_pair^T.
+            b0 = self.model._b0_eff(b0, W0)
+            if W0p is not None:
+                b0p = self.model._b0_eff(b0p, W0p)
             W0 = self.model._W0_eff(W0, U_pair_val)
             if W0p is not None:
                 W0p = self.model._W0_eff(W0p, U_pair_val)
@@ -1328,6 +1335,9 @@ class SNES:
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
             b1p = getattr(self.model, 'b1_pol', None)
+            b0 = self.model._b0_eff(b0, W0)
+            if W0p is not None:
+                b0p = self.model._b0_eff(b0p, W0p)
             W0 = self.model._W0_eff(W0)
             if W0p is not None:
                 W0p = self.model._W0_eff(W0p)
@@ -1993,6 +2003,8 @@ class SNES:
             pol_weights = self._pol_weights  # [6] component weights
             # Pre-absorb U_pair^T into W0/W0_pol per candidate (linear _W0_eff
             # broadcasts over the candidate axis) so the loop uses raw descriptors.
+            b0 = self.model._b0_eff(b0, W0)
+            b0p = self.model._b0_eff(b0p, W0p)
             W0 = self.model._W0_eff(W0, U_pair_cand)
             W0p = self.model._W0_eff(W0p, U_pair_cand)
 

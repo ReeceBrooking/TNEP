@@ -475,8 +475,8 @@ def _train_model_inner(cfg: TNEPconfig,
               + (", + un-normalised 2-body block" if cfg.radial_basis_two_body else "")
               + (", + 4-body (l=2 bispectrum) block" if cfg.radial_basis_four_body else "")
               + (", + 5-body ((q^{l=1})²) block" if cfg.radial_basis_five_body else "")
-              + ("" if cfg.radial_basis_normalize else
-                 "; per-atom L2 normalisation OFF (raw spectrum × scale²)")
+              + {"l2": "", "none": "; per-atom L2 normalisation OFF (raw spectrum × scale²)",
+                 "sqrt": "; per-atom L2 normalisation OFF (sign·√|q| × scale, degree 1)"}[cfg.radial_basis_norm]
               + f" (M_radial {_shape} in the SNES vector; init = fixed basis)")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
@@ -489,9 +489,9 @@ def _train_model_inner(cfg: TNEPconfig,
         cfg.save_plots = os.path.join(run_dir, "plots")
         print(f"  resume: writing outputs to existing run dir {run_dir}")
 
-    if (cfg.radial_basis_size is not None and not cfg.radial_basis_normalize
+    if (cfg.radial_basis_size is not None and cfg.radial_basis_norm != "l2"
             and str(cfg.descriptor_scale) == "off"):
-        print("WARNING: radial_basis_normalize=False without descriptor_scale — "
+        print("WARNING: radial_basis_norm != 'l2' without descriptor_scale — "
               "the raw spectrum's per-channel spread is uncorrected; set "
               "descriptor_scale='block' or 'channel'.")
     # Descriptor scale preconditioning: m from the generation-0 descriptor
@@ -511,13 +511,16 @@ def _train_model_inner(cfg: TNEPconfig,
             q0 = tf.concat([_m0.soap_from_raw(q0[s:s + step], train_data["Z_int"][s:s + step])
                             for s in range(0, S_all, step)], axis=0)
             del _m0
-        m = compute_q_scale(q0.numpy() if hasattr(q0, "numpy") else np.asarray(q0),
-                            amask.numpy() if hasattr(amask, "numpy") else np.asarray(amask), cfg)
+        m, mu = compute_q_scale(q0.numpy() if hasattr(q0, "numpy") else np.asarray(q0),
+                                amask.numpy() if hasattr(amask, "numpy") else np.asarray(amask), cfg)
         cfg.q_scale = [float(v) for v in m]
+        cfg.q_shift = [float(v) for v in mu]
         print(f"Descriptor scale ({cfg.descriptor_scale}): m per group "
               f"[min / median / max] = "
               + ", ".join(f"{m[g].min():.2f}/{np.median(m[g]):.2f}/{m[g].max():.2f}"
-                          for g in q_scale_groups(cfg)))
+                          for g in q_scale_groups(cfg))
+              + "; centred (mean|μ| per group = "
+              + ", ".join(f"{np.abs(mu[g]).mean():.2e}" for g in q_scale_groups(cfg)) + ")")
         del q0
 
     model = TNEP(cfg)

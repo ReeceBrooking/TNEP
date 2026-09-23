@@ -57,7 +57,8 @@ def _cfg(**kw):
     cfg.radial_basis_two_body = False
     cfg.radial_basis_four_body = False
     cfg.radial_basis_five_body = False
-    cfg.radial_basis_normalize = True
+    cfg.radial_basis_norm = "l2"
+    cfg.q_shift = None
     cfg.descriptor_scale = "off"
     cfg.q_scale = None
     cfg.optimizer = "snes"

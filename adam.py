@@ -103,15 +103,17 @@ def fit_adam(model, train_data: dict, val_data: dict,
         # Only tf.Variables / tensors go into the forward (Keras variables
         # are not valid tf.function arguments).
         U = _mixing_V() if mix_flat is not None else None
+        b0 = model._b0_eff(named["b0"], named["W0"])    # centring fold (stored W0)
         W0 = model._W0_eff(named["W0"], U)     # U fold (if mixing) + q-scale fold
+        b0p = model._b0_eff(named["b0_pol"], named["W0_pol"]) if cfg.target_mode == 2 else None
         W0p = model._W0_eff(named["W0_pol"], U) if cfg.target_mode == 2 else None
         preds = model.predict_batch(
             chunk["descriptors"], chunk["grad_values"],
             chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
             chunk["positions"], chunk["Z_int"], chunk["boxes"],
             chunk["atom_mask"],
-            W0, named["b0"], named["W1"], named["b1"],
-            W0p, named.get("b0_pol"), named.get("W1_pol"), named.get("b1_pol"),
+            W0, b0, named["W1"], named["b1"],
+            W0p, b0p, named.get("W1_pol"), named.get("b1_pol"),
             W_atom=chunk.get("V_atom"),
             c_pair=named.get("c_pair"),
             M_radial=named.get("M_radial"))

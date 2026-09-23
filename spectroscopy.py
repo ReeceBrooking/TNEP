@@ -663,15 +663,14 @@ def _get_fused_predict(model: 'TNEP'):
 
     # Pre-absorb U_pairᵀ into W0 (and W0_pol) when descriptor mixing is active;
     # predict_batch trusts the caller to do this. Mirrors score() in TNEP.py.
-    if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
-        W0_eff_var = model._W0_eff(model.W0)
-        W0p_eff_var = (model._W0_eff(model.W0_pol)
-                        if (cfg.target_mode == 2
-                            and getattr(model, "W0_pol", None) is not None)
-                        else getattr(model, "W0_pol", None))
-    else:
-        W0_eff_var = model.W0
-        W0p_eff_var = getattr(model, "W0_pol", None)
+    W0_eff_var = model._W0_eff(model.W0)
+    b0_eff_var = model._b0_eff(model.b0, model.W0)
+    W0p_eff_var = (model._W0_eff(model.W0_pol)
+                    if (cfg.target_mode == 2
+                        and getattr(model, "W0_pol", None) is not None)
+                    else getattr(model, "W0_pol", None))
+    b0p_eff_var = (model._b0_eff(model.b0_pol, model.W0_pol)
+                    if cfg.target_mode == 2 else getattr(model, "b0_pol", None))
     # Second fold: expand W0 Q_new → Q_raw when preprocess is on, so the forward
     # matmul runs at raw descriptor width. Mirrors score() (TNEP.py:796-799);
     # without this, a preprocess-contracted model mis-predicts/crashes in
@@ -681,11 +680,11 @@ def _get_fused_predict(model: 'TNEP'):
         if W0p_eff_var is not None:
             W0p_eff_var = model._W0_preprocess_eff(W0p_eff_var)
     W0_t  = _to_tensor(W0_eff_var)
-    b0_t  = _to_tensor(model.b0)
+    b0_t  = _to_tensor(b0_eff_var)
     W1_t  = _to_tensor(model.W1)
     b1_t  = _to_tensor(model.b1)
     W0p_t = _to_tensor(W0p_eff_var)
-    b0p_t = _to_tensor(getattr(model, "b0_pol", None))
+    b0p_t = _to_tensor(b0p_eff_var)
     W1p_t = _to_tensor(getattr(model, "W1_pol", None))
     b1p_t = _to_tensor(getattr(model, "b1_pol", None))
 
@@ -956,15 +955,14 @@ def predict_trajectory_batch(
 
         # Apply mixing absorption in the same order as the fused path so both
         # backends produce identical predictions.
-        if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
-            W0_pred = model._W0_eff(model.W0)
-            W0p_pred = (model._W0_eff(model.W0_pol)
-                         if (cfg.target_mode == 2
-                             and getattr(model, "W0_pol", None) is not None)
-                         else getattr(model, "W0_pol", None))
-        else:
-            W0_pred = model.W0
-            W0p_pred = getattr(model, "W0_pol", None)
+        W0_pred = model._W0_eff(model.W0)
+        b0_pred = model._b0_eff(model.b0, model.W0)
+        W0p_pred = (model._W0_eff(model.W0_pol)
+                     if (cfg.target_mode == 2
+                         and getattr(model, "W0_pol", None) is not None)
+                     else getattr(model, "W0_pol", None))
+        b0p_pred = (model._b0_eff(model.b0_pol, model.W0_pol)
+                     if cfg.target_mode == 2 else getattr(model, 'b0_pol', None))
         # Preprocess fold (Q_new → Q_raw), mirroring score() and the fused path.
         if model.descriptor_preprocess_contract != "off":
             W0_pred = model._W0_preprocess_eff(W0_pred)
@@ -976,9 +974,9 @@ def predict_trajectory_batch(
             batch["pair_atom"], batch["pair_gidx"], batch["pair_struct"],
             batch["positions"], batch["Z_int"], batch["boxes"],
             batch["atom_mask"],
-            W0_pred, model.b0, model.W1, model.b1,
+            W0_pred, b0_pred, model.W1, model.b1,
             W0p_pred,
-            getattr(model, 'b0_pol', None),
+            b0p_pred,
             getattr(model, 'W1_pol', None),
             getattr(model, 'b1_pol', None),
         )

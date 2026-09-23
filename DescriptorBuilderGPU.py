@@ -446,31 +446,37 @@ def q_scale_groups(cfg) -> list:
     return groups
 
 
-def compute_q_scale(q: np.ndarray, atom_mask: np.ndarray, cfg) -> np.ndarray:
-    """Per-channel preconditioning scale m [Q] from the generation-0
-    descriptor q [.., Q] over real atoms (atom_mask > 0):
-        m_k = clip((s_ref / s_k)^ALPHA, 1/CLAMP, CLAMP),  s_ref = median std
-    dead channels (s_k = 0) keep m = 1. "block" mode uses one value per
-    q_scale_groups group (median std of the group)."""
+def compute_q_scale(q: np.ndarray, atom_mask: np.ndarray, cfg) -> tuple:
+    """Preconditioning (m [Q], μ [Q]) from the generation-0 descriptor
+    q [.., Q] over real atoms (atom_mask > 0). μ_k = channel mean. Scale in
+    two levels from the channel std s_k:
+        g_group = s_ref / median(s_group)                 (α = 1, unclamped)
+        r_k     = clip((s_ref' / (g·s_k))^ALPHA, 1/CLAMP, CLAMP)   ("channel")
+        m_k     = g_group · r_k   ("channel")  or  g_group   ("block")
+    s_ref = median live std, s_ref' the same after the group factor. Dead
+    channels (s_k = 0) keep m = 1."""
     Q = q.shape[-1]
     x = np.asarray(q, dtype=np.float64).reshape(-1, Q)[np.asarray(atom_mask).reshape(-1) > 0]
+    mu = x.mean(axis=0)
     s = x.std(axis=0)
     live = s > 0
     if not np.any(live):
-        return np.ones(Q, dtype=np.float32)
+        return np.ones(Q, dtype=np.float32), mu.astype(np.float32)
     s_ref = float(np.median(s[live]))
-    def _m(std):
-        return float(np.clip((s_ref / std) ** Q_SCALE_ALPHA, 1.0 / Q_SCALE_CLAMP, Q_SCALE_CLAMP))
-    m = np.ones(Q, dtype=np.float64)
-    if str(cfg.descriptor_scale) == "block":
-        for idx in q_scale_groups(cfg):
-            sg = s[idx][live[idx]]
-            if sg.size:
-                m[idx] = _m(float(np.median(sg)))
-    else:
-        m[live] = [_m(v) for v in s[live]]
+    g = np.ones(Q, dtype=np.float64)
+    for idx in q_scale_groups(cfg):
+        sg = s[idx][live[idx]]
+        if sg.size:
+            g[idx] = s_ref / float(np.median(sg))
+    m = g.copy()
+    if str(cfg.descriptor_scale) == "channel":
+        s1 = s * g
+        s_ref1 = float(np.median(s1[live]))
+        r = np.clip((s_ref1 / np.where(live, s1, s_ref1)) ** Q_SCALE_ALPHA,
+                    1.0 / Q_SCALE_CLAMP, Q_SCALE_CLAMP)
+        m = g * r
     m[~live] = 1.0
-    return m.astype(np.float32)
+    return m.astype(np.float32), mu.astype(np.float32)
 
 
 def descriptor_input_width(cfg) -> int:
