@@ -328,7 +328,7 @@ def compute_dim_q(cfg) -> int:
     alpha_max = int(cfg.alpha_max)
     l_max = int(cfg.l_max)
     n_species = int(cfg.num_types)
-    two_body = radial_two_body_count(cfg)
+    two_body = radial_extra_count(cfg)
     if _radial_species_sum(cfg):
         # Species-summed learned basis: full (n <= n') spectrum over alpha channels.
         return alpha_max * (alpha_max + 1) // 2 * (l_max + 1) + two_body
@@ -364,14 +364,16 @@ def _radial_species_sum(cfg) -> bool:
             and bool(getattr(cfg, "radial_basis_species_sum", False)))
 
 
-def radial_two_body_count(cfg) -> int:
-    """Channels appended by radial_basis_two_body: n_max (alpha_max
-    species-summed, S·alpha_max blocked), 0 when off."""
-    if (getattr(cfg, "radial_basis_size", None) is None
-            or not bool(getattr(cfg, "radial_basis_two_body", False))):
+def radial_extra_count(cfg) -> int:
+    """Channels appended after the SOAP block by the learned-basis extras
+    (radial_basis_two_body / four_body / five_body): n_max each (alpha_max
+    species-summed, S·alpha_max blocked), 0 when the knob is off."""
+    if getattr(cfg, "radial_basis_size", None) is None:
         return 0
+    n_on = sum(bool(getattr(cfg, f, False)) for f in (
+        "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
     a = int(cfg.alpha_max)
-    return a if _radial_species_sum(cfg) else a * int(cfg.num_types)
+    return n_on * (a if _radial_species_sum(cfg) else a * int(cfg.num_types))
 
 
 def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int,
@@ -475,7 +477,7 @@ def descriptor_block_layout(cfg) -> dict:
             max_alpha_eff=per_l,
             N_per_l=per_l,
             # 2-body channels (if any) sit after the SOAP block, outside every pair.
-            dim_q=int(per_l * L) + radial_two_body_count(cfg),
+            dim_q=int(per_l * L) + radial_extra_count(cfg),
         )
     alpha_per_species = [alpha_max] * n_species
 
@@ -558,7 +560,7 @@ def descriptor_block_layout(cfg) -> dict:
         max_alpha_eff=max(alpha_eff_per_pair.values()) if alpha_eff_per_pair else 0,
         N_per_l=N_per_l,
         # 2-body channels (if any) sit after the SOAP block, outside every pair.
-        dim_q=int(q_counter) + radial_two_body_count(cfg),
+        dim_q=int(q_counter) + radial_extra_count(cfg),
     )
 
 

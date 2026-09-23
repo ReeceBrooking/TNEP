@@ -57,6 +57,8 @@ def _cfg(**kw):
     cfg.radial_basis_species_sum = False
     cfg.radial_basis_per_l = False
     cfg.radial_basis_two_body = False
+    cfg.radial_basis_four_body = False
+    cfg.radial_basis_five_body = False
     cfg.optimizer = "snes"
     for k, v in kw.items():
         setattr(cfg, k, v)

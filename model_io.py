@@ -57,6 +57,8 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "radial_basis_species_sum": False,
     "radial_basis_per_l": False,
     "radial_basis_two_body": False,
+    "radial_basis_four_body": False,
+    "radial_basis_five_body": False,
 }
 
 

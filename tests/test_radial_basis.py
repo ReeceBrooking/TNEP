@@ -55,6 +55,8 @@ def _cfg(**kw):
     cfg.radial_basis_species_sum = False
     cfg.radial_basis_per_l = False
     cfg.radial_basis_two_body = False
+    cfg.radial_basis_four_body = False
+    cfg.radial_basis_five_body = False
     cfg.optimizer = "snes"
     for k, v in kw.items():
         setattr(cfg, k, v)
@@ -583,3 +585,90 @@ def test_two_body_block(species_sum, per_l, tmp_path):
     np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)
     with pytest.raises(ValueError):
         _model(_cfg(radial_basis_two_body=True))
+
+
+def _rotated(atoms, seed):
+    """Copy of atoms rigidly rotated about the cell centre (random rotation)."""
+    from scipy.spatial.transform import Rotation
+    at = atoms.copy()
+    R = Rotation.random(random_state=seed).as_matrix()
+    c = at.cell.lengths() / 2
+    at.positions = (at.positions - c) @ R.T + c
+    at.info["dipole"] = np.zeros(3)   # copy() drops the calculator that held the target
+    return at
+
+
+@pytest.mark.parametrize("species_sum,per_l", [(False, False), (True, True)])
+def test_four_and_five_body_blocks(species_sum, per_l, tmp_path):
+    from model_io import save_model, load_model
+    from DescriptorBuilderGPU import compute_dim_q, descriptor_block_layout
+    from DescriptorBuilder import make_descriptor_builder
+    from sympy.physics.wigner import wigner_3j
+    base = dict(radial_basis_size=8, radial_basis_species_sum=species_sum, radial_basis_per_l=per_l)
+    cfg = _cfg(radial_basis_two_body=True, radial_basis_four_body=True, radial_basis_five_body=True,
+               descriptor_mixing=True, descriptor_mixing_regularizer="expm", **base)
+    n_max = 4 if species_sum else 12
+    assert cfg.dim_q == compute_dim_q(_cfg(**base)) + 3 * n_max
+    assert descriptor_block_layout(cfg)["dim_q"] == cfg.dim_q
+    model = _model(cfg)
+    rng = np.random.default_rng(8)
+    M = (model.M_radial.numpy() + 0.1 * rng.normal(size=model.M_radial.shape)).astype(np.float32)
+    model.M_radial.assign(M)
+    frames = _cho_frames(3)
+    data = _eval_data(cfg, frames)
+    q = model.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
+    scale = 1.0 / (4 * np.pi * (cfg.rcut_hard / cfg.atom_sigma_t) ** 2)
+    # NumPy reference of the 4-/5-body blocks from the contracted coefficients.
+    for s, fr in enumerate(frames):
+        A = len(fr); Z = data["Z_int"][s].numpy()[:A]
+        r = data["descriptors"][s].numpy()[:A].reshape(A, 3, 8, 15, 2).astype(np.float64)
+        c_raw = r[..., 0] + 1j * r[..., 1]                                   # [A, S, K, k]
+        def cc_l(l):
+            Ml = M[Z][..., l] if per_l else M[Z]
+            ks = slice(l * (l + 1) // 2, l * (l + 1) // 2 + l + 1)
+            if species_sum:
+                return np.einsum('asnk,askm->anm', Ml, c_raw[..., ks]) * scale
+            return np.einsum('asnk,askm->asnm', Ml, c_raw[..., ks]).reshape(A, n_max, l + 1) * scale
+        c2 = cc_l(2)                                                          # [A, n_max, 3] m=0,1,2
+        full = np.stack([np.conj(c2[..., 2]), -np.conj(c2[..., 1]), c2[..., 0], c2[..., 1], c2[..., 2]], -1)
+        q4 = np.zeros((A, n_max))
+        for m1 in range(-2, 3):
+            for m2 in range(-2, 3):
+                m3 = -m1 - m2
+                if abs(m3) > 2: continue
+                w = float(wigner_3j(2, 2, 2, m1, m2, m3))
+                q4 += w * (full[..., m1 + 2] * full[..., m2 + 2] * full[..., m3 + 2]).real
+        c1 = cc_l(1)
+        q5 = (np.abs(c1[..., 0]) ** 2 + 2 * np.abs(c1[..., 1]) ** 2) ** 2
+        np.testing.assert_allclose(q[s, :A, -2 * n_max:-n_max], q4, rtol=1e-4, atol=1e-6)
+        np.testing.assert_allclose(q[s, :A, -n_max:], q5, rtol=1e-4, atol=1e-6)
+        assert np.abs(q4).max() > 1e-4 and np.abs(q5).max() > 1e-4
+        assert np.all(q[s, A:] == 0.0)
+    # Rotation invariance of EVERY channel (the real test of the 4-body contraction).
+    rot = [_rotated(fr, 11 + i) for i, fr in enumerate(frames)]
+    d_rot = _eval_data(cfg, rot)
+    q_rot = model.soap_from_raw(d_rot["descriptors"], d_rot["Z_int"]).numpy()
+    np.testing.assert_allclose(q_rot, q, rtol=1e-4, atol=1e-5)
+    # Save/load and the per-candidate path.
+    before = _predict(model, data)
+    path = str(tmp_path / "m.h5"); save_model(model, cfg, path); loaded = load_model(path)
+    assert loaded.cfg.radial_basis_four_body is True and loaded.cfg.dim_q == cfg.dim_q
+    np.testing.assert_allclose(_predict(loaded, data), before, rtol=1e-5, atol=1e-7)
+    snes = model.optimizer
+    pv = tf.stack([snes.mu, snes.mu + 0.02])
+    named = snes._split_reconstructed(snes.reconstruct_params_tf(pv))
+    preds = model.predict_batch_candidates(
+        data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
+        named["W0"], named["b0"], named["W1"], named["b1"],
+        U_pair=named["U_pair"], c_pair=named["c_pair"], M_radial=named["M_radial"]).numpy()
+    one = snes._split_reconstructed(snes.reconstruct_params_tf(pv[1]))
+    single = model.predict_batch(
+        data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"],
+        data["pair_struct"], data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
+        model._W0_eff(one["W0"], one["U_pair"]), one["b0"], one["W1"], one["b1"],
+        W_atom=data["V_atom"], c_pair=one["c_pair"], M_radial=one["M_radial"]).numpy()
+    np.testing.assert_allclose(preds[1], single, rtol=1e-4, atol=1e-6)
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_four_body=True))
+    with pytest.raises(ValueError):
+        _model(_cfg(radial_basis_size=8, radial_basis_four_body=True, l_max=1))

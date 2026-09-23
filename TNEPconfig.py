@@ -232,6 +232,17 @@ class TNEPconfig:
     # blocked, alpha_max species-summed). Not combinable with
     # descriptor_preprocess_contract; excluded from descriptor_mixing blocks.
     radial_basis_two_body: bool = False
+    # Append NEP's 4-body descriptor (radial_basis_size only, l_max ≥ 2):
+    # per radial channel n, the l1=l2=l3=2 bispectrum invariant
+    # Σ_{m1+m2+m3=0} (2 2 2; m1 m2 m3)·c_{n2m1}c_{n2m2}c_{n2m3} of the
+    # learned functions (cubic in the O(1)-scaled coefficients). dim_q grows
+    # by n_max. Excluded from mixing blocks; not with preprocess contraction.
+    radial_basis_four_body: bool = False
+    # Append NEP's 5-body descriptor (radial_basis_size only, l_max ≥ 1):
+    # per channel n, (Σ_m |c_{n1m}|²)² — NEP's C5B form, i.e. the SQUARE of
+    # the l = 1 three-body invariant (no new information, kept for NEP
+    # parity). dim_q grows by n_max. Same exclusions as four_body.
+    radial_basis_five_body: bool = False
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE
