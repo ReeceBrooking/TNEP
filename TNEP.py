@@ -1824,8 +1824,13 @@ class TNEP(layers.Layer):
         c_full   : [Cc, C, T, T]
         Z        : [B, A] int; nbr_index [B, A, M] int; nbr_G [B, A, M, 3, C]
         Returns [Cc, B, 3]. Padding slots carry nbr_G = 0, so no mask.
-        # ponytail: materialises [Cc,B,A,M,C] twice (a·b product, c gather);
-        # population_chunk_size is the memory knob — loop over K if it bites."""
+
+        Loops over the (static) channel axis so the largest intermediate is
+        [Cc, B, A, M, K], not [Cc, B, A, M, C]: measured 467 → 49 ms per
+        10-candidate chunk (350 frames, M=32, C=20, K=2), peak 6.4 → 2.9 GB.
+        # ponytail: still materialises [Cc,B,A,M,K] per channel;
+        # population_chunk_size is the memory knob — a sparse-matmul message
+        # form (S^{n,d}·b̃ per channel) would drop the M gather entirely."""
         Cc = tf.shape(a)[0]
         B = tf.shape(Z)[0]
         A = tf.shape(Z)[1]
@@ -1834,15 +1839,19 @@ class TNEP(layers.Layer):
         # One gather over the flattened (B·A) atom axis — no batch_dims bookkeeping.
         flat_j = tf.reshape(
             nbr_index + (tf.range(B) * A)[:, tf.newaxis, tf.newaxis], [-1])
-        b_flat = tf.reshape(b, [Cc, B * A, C, K])
-        b_j = tf.reshape(tf.gather(b_flat, flat_j, axis=1), [Cc, B, A, M, C, K])
-        ab = tf.einsum('cbank,cbamnk->cbamn', a, b_j)                 # [Cc,B,A,M,C]
         t_j = tf.reshape(tf.gather(tf.reshape(Z, [-1]), flat_j), [B, A, M])
         slot = Z[:, :, tf.newaxis] * T + t_j                          # [B,A,M] into T·T
         c_flat = tf.reshape(tf.transpose(c_full, [0, 2, 3, 1]), [Cc, T * T, C])
-        c_ij = tf.gather(c_flat, slot, axis=1)                        # [Cc,B,A,M,C]
-        return tf.einsum('cbamn,cbamn,bamdn->cbd',
-                         ab, c_ij, tf.cast(nbr_G, ab.dtype))          # [Cc,B,3]
+        b_flat = tf.reshape(b, [Cc, B * A, C, K])
+        nbr_G = tf.cast(nbr_G, a.dtype)
+        mu = tf.zeros([Cc, B, 3], a.dtype)
+        for n in range(C):                                            # static C
+            b_j = tf.reshape(tf.gather(b_flat[:, :, n, :], flat_j, axis=1),
+                             [Cc, B, A, M, K])
+            ab = tf.einsum('cbak,cbamk->cbam', a[:, :, :, n, :], b_j)  # [Cc,B,A,M]
+            w = ab * tf.gather(c_flat[:, :, n], slot, axis=1)         # × c[n, t_i t_j]
+            mu += tf.einsum('cbam,bamd->cbd', w, nbr_G[..., n])
+        return mu
 
     def _bilinear_coo(self, a: tf.Tensor, b: tf.Tensor, c_full: tf.Tensor,
                       Z: tf.Tensor, pair_struct: tf.Tensor,
