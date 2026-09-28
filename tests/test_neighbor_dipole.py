@@ -982,3 +982,23 @@ def test_pair_rank_snes_tail_and_gen0_identity():
         nbr_index=full["nbr_index"], nbr_G=full["nbr_G"])[0, 0].numpy()
     np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
     assert np.any(mu_cand != 0.0)
+
+
+def test_save_load_roundtrip_bilinear(tmp_path):
+    # Same pattern as test_save_load_roundtrip_ordered_omega: a miskeyed
+    # save/load of the widened W1 or the readout string would change μ silently.
+    import model_io
+    cfg = _cfg(dipole_channels=4, dipole_readout="bilinear", dipole_pair_rank=2,
+               dipole_species_pairs="symmetric")
+    model = _model(cfg)
+    model.W1.assign(tf.random.stateless_normal(model.W1.shape, [5, 6]))
+    atoms = _bulk_frame()
+    mu0 = _mu(model, atoms, cfg)
+    p = str(tmp_path / "bilinear.h5")
+    model_io.save_model(model, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.dipole_readout == "bilinear" and loaded._pair_rank == 2
+    assert tuple(loaded.W1.shape) == tuple(model.W1.shape)
+    np.testing.assert_array_equal(loaded.W1.numpy(), model.W1.numpy())
+    np.testing.assert_array_equal(loaded.c_pair.numpy(), model.c_pair.numpy())
+    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
