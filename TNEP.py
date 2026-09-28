@@ -971,6 +971,7 @@ class TNEP(layers.Layer):
                 getattr(self, 'W1_pol', None),
                 getattr(self, 'b1_pol', None),
                 W_atom=chunk.get("V_atom"),  # neighbor readout: [B,A,3] kernel
+                nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
             ))
             del chunk
         raw_preds = tf.concat(pred_parts, axis=0)

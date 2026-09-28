@@ -93,14 +93,17 @@ class SNES:
         # "ordered", none for "off" (c ≡ 1 frozen; Ch = 1 / n_c = 0 in every
         # other mode).
         self._Ch = (int(model._dipole_channels)
-                    if model._neighbor_readout else 1)
+                    if model._neighbor_readout else 1)      # channels → c_pair
+        # W1's last axis: C under "neighbor", C·(1+2K) under "bilinear".
+        self._Hw = (int(model._head_width)
+                    if model._neighbor_readout else 1)      # head width → W1
         _T = self.cfg.num_types
         self.n_c = (self._Ch * (_T * _T if model._species_pairs == "ordered"
                                 else _T * (_T + 1) // 2)
                     if model._neighbor_readout and model._c_learnable else 0)
         n_W0 = self.cfg.num_types * self.cfg.dim_q * self.H
         n_b0 = self.cfg.num_types * self.H
-        n_W1 = self.cfg.num_types * self.H * self._Ch
+        n_W1 = self.cfg.num_types * self.H * self._Hw
         n_b1 = 1
         self.n_typed = n_W0 + n_b0 + n_W1
         # Per-type param count (per type t): W0 Q·H + b0 H + W1 H·Ch.
@@ -108,7 +111,7 @@ class SNES:
         # whose type-t block is ALSO extracted for per-type regularization, so
         # the denominator doubles to match _extract_type_params.
         self._n_per_type = ((self.cfg.dim_q * self.H + self.H
-                             + self.H * self._Ch)
+                             + self.H * self._Hw)
                             * (2 if self.cfg.target_mode == 2 else 1))
         self.n_primary = self.n_typed + n_b1 + self.n_c
         self._n_W0 = n_W0
@@ -467,7 +470,7 @@ class SNES:
         # Activation-dependent Glorot gain (gain=1 → tanh init).
         gain = float(getattr(self.model, "_glorot_gain", 1.0))
         c_W0 = gain * float(np.sqrt(6.0 / (Q + H)))
-        c_W1 = gain * float(np.sqrt(6.0 / (H + self._Ch)))
+        c_W1 = gain * float(np.sqrt(6.0 / (H + self._Hw)))
 
         def _fill_ann(off: int) -> int:
             """Fill one ANN's worth of weights starting at ``off``.
@@ -479,9 +482,13 @@ class SNES:
             off += n_W0
             # b0 zero
             off += T * H
-            n_W1 = T * H * self._Ch
-            mu[off:off + n_W1] = rng.uniform(
-                -c_W1, c_W1, size=n_W1).astype(np.float32)
+            n_W1 = T * H * self._Hw
+            w1 = rng.uniform(-c_W1, c_W1, size=(T, H, self._Hw)).astype(np.float32)
+            if self.model._neighbor_readout and self.model._pair_rank > 0:
+                # Gen 0 == the difference model: b ≡ 0 kills the pair term.
+                C, K = self._Ch, self.model._pair_rank
+                w1[:, :, C + C * K:] = 0.0
+            mu[off:off + n_W1] = w1.reshape(-1)
             off += n_W1
             # b1 zero
             off += 1
@@ -604,8 +611,8 @@ class SNES:
 
         # W1 block: after all b0
         w1_offset = b0_offset + T * H
-        w1_start = w1_offset + t * H * self._Ch
-        w1_end = w1_start + H * self._Ch
+        w1_start = w1_offset + t * H * self._Hw
+        w1_end = w1_start + H * self._Hw
 
         blocks = [
             pv[w0_start:w0_end],
@@ -647,8 +654,8 @@ class SNES:
                 offset += H
             # W1: [T, H·Ch]
             for t in range(T):
-                tov[offset:offset + H * self._Ch] = t
-                offset += H * self._Ch
+                tov[offset:offset + H * self._Hw] = t
+                offset += H * self._Hw
             # b1 (and the c_pair table, when present): global (label = T)
             tov[offset:] = T
             return tov
@@ -956,8 +963,9 @@ class SNES:
                                "num_atoms", "targets", "atom_mask"]
                 if "types_contained" in train_data:
                     struct_keys.append("types_contained")
-                if "V_atom" in train_data:
-                    struct_keys.append("V_atom")
+                for _k in ("V_atom", "nbr_index", "nbr_G"):
+                    if _k in train_data:
+                        struct_keys.append(_k)
                 batch_data = {
                     key: tf.gather(train_data[key], batch_idx_tf)
                     for key in struct_keys
@@ -1363,6 +1371,7 @@ class SNES:
                 chunk["atom_mask"],
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
                 W_atom=W_atom_v, c_pair=c_pair_val,
+                nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
             )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
                 num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
@@ -1441,10 +1450,10 @@ class SNES:
 
         n_W0 = T * Q * H
         n_b0 = T * H
-        n_W1 = T * H * self._Ch
+        n_W1 = T * H * self._Hw
         n_b1 = 1
         # W1 shape: [T, H] except the neighbor readout's channel axis.
-        w1_shape = ([T, H, self._Ch] if self.model._neighbor_readout
+        w1_shape = ([T, H, self._Hw] if self.model._neighbor_readout
                     else [T, H])
 
         is_batched = len(param_vectors.shape) == 2
@@ -1718,8 +1727,8 @@ class SNES:
         b0_end = b0_start + H
 
         w1_offset = b0_offset + T * H
-        w1_start = w1_offset + t * H * self._Ch
-        w1_end = w1_start + H * self._Ch
+        w1_start = w1_offset + t * H * self._Hw
+        w1_end = w1_start + H * self._Hw
 
         blocks = [
             param_vectors[:, w0_start:w0_end],
@@ -2011,7 +2020,9 @@ class SNES:
                 desc, W_atom, Z, amask, W0, b0, W1, b1,
                 U_pair=U_pair_cand,
                 W_pre_angular=W_pre_angular_cand,
-                c_pair=named.get("c_pair"))  # [C, B, T_dim]
+                c_pair=named.get("c_pair"),
+                nbr_index=batch_data.get("nbr_index"),
+                nbr_G=batch_data.get("nbr_G"))  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]

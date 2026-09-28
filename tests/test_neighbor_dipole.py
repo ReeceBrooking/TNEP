@@ -943,3 +943,42 @@ def test_bilinear_matches_bruteforce_and_is_antisymmetric():
     W1_sw[:, :, C + C * K:] = model.W1.numpy()[:, :, C:C + C * K]
     mu_sw = model.predict_batch(*args, tf.constant(W1_sw), model.b1, **kw)[0].numpy()
     np.testing.assert_allclose(mu_sw - mu_s, -(mu_full - mu_s), rtol=1e-4, atol=1e-5)
+
+
+def test_pair_rank_snes_tail_and_gen0_identity():
+    """W1 block = T·H·C(1+2K); c_pair block unchanged (C·pairs); μ-init zeroes
+    the b-slice so gen 0 equals the difference model with the same s-slice."""
+    from SNES import SNES, _set_model_params
+    cfg = _cfg(dipole_channels=4, dipole_readout="bilinear", dipole_pair_rank=2,
+               dipole_species_pairs="symmetric")
+    model = _model(cfg); opt = SNES(model)
+    T, H, C, K = 2, 8, 4, 2
+    assert opt._n_W1 == T * H * C * (1 + 2 * K)
+    assert opt.n_c == C * (T * (T + 1) // 2)
+    named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
+    W1 = named["W1"].numpy()
+    assert tuple(W1.shape) == (T, H, C * (1 + 2 * K))
+    assert np.all(W1[:, :, C + C * K:] == 0.0)            # b-slice zero at gen 0
+    assert np.any(W1[:, :, C:C + C * K] != 0.0)           # a-slice Glorot
+    # Round trip: reconstruct → assign → predict_batch == predict_batch_candidates(mu).
+    atoms = _bulk_frame()
+    types_int = assign_type_indices([atoms], cfg.types)
+    builder = make_descriptor_builder(cfg)
+    desc, grads, gidx = builder.build_descriptors([atoms])
+    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
+    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
+    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
+    params = opt.reconstruct_params_tf(mu_vec)
+    _set_model_params(model, *params)
+    mu_model = model.predict_batch(
+        full["descriptors"], full["grad_values"], full["pair_atom"], full["pair_gidx"],
+        full["pair_struct"], full["positions"], full["Z_int"], full["boxes"],
+        full["atom_mask"], model.W0, model.b0, model.W1, model.b1,
+        W_atom=full["V_atom"], nbr_index=full["nbr_index"], nbr_G=full["nbr_G"])[0].numpy()
+    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
+    mu_cand = model.predict_batch_candidates(
+        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
+        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"],
+        nbr_index=full["nbr_index"], nbr_G=full["nbr_G"])[0, 0].numpy()
+    np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
+    assert np.any(mu_cand != 0.0)
