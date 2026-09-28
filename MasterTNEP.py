@@ -438,7 +438,7 @@ def _train_model_inner(cfg: TNEPconfig,
         n_train_pairs = int(train_data["grad_values"].shape[0])
         n_val_pairs   = int(val_data["grad_values"].shape[0])
         _reason = ("neighbor readout"
-                   if cfg.dipole_readout == "neighbor"
+                   if cfg.dipole_readout in ("neighbor", "bilinear")
                    else "dipole_rij_power=0")
         print(f"  {_reason}: COO restricted to self-pairs only "
               f"(train P={n_train_pairs}, val P={n_val_pairs})")

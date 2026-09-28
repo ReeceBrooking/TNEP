@@ -345,7 +345,7 @@ def assemble_data_dict(
     # Guards read TOTAL-cell dipoles (branch-gap quantum e·L), so run them
     # before any per-atom scaling.
     if (cfg.target_mode == 1
-            and cfg.dipole_readout == "neighbor"):
+            and cfg.dipole_readout in ("neighbor", "bilinear")):
         _neighbor_dipole_guards(dataset, targets, cfg)
     if cfg.scale_targets and cfg.target_mode == 1:
         targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
@@ -362,7 +362,7 @@ def assemble_data_dict(
     # Neighbor-basis dipole readout: precompute the per-structure geometry
     # kernel V (data-static; delivered to the forwards via the W_atom slot).
     if (cfg.target_mode == 1
-            and cfg.dipole_readout == "neighbor"):
+            and cfg.dipole_readout in ("neighbor", "bilinear")):
         data["V_atom"] = [
             _neighbor_dipole_V(s, t, float(cfg.dipole_rc or cfg.rcut_hard),
                                int(cfg.dipole_channels), int(cfg.num_types),
@@ -371,6 +371,17 @@ def assemble_data_dict(
                                resolved_dipole_cutoff(cfg),
                                float(cfg.dipole_gauss_sigma_scale))
             for s, t in zip(dataset, types_int)]
+        if cfg.dipole_readout == "bilinear":
+            # Bilinear pair head: padded per-centre pair table (same pairs
+            # and R_n as V; plan neighbor_dipole_bilinear_plan.md).
+            _nbr = [_neighbor_dipole_nbr(
+                        s, float(cfg.dipole_rc or cfg.rcut_hard),
+                        int(cfg.dipole_channels), str(cfg.dipole_radial),
+                        float(cfg.dipole_zeta), resolved_dipole_cutoff(cfg),
+                        float(cfg.dipole_gauss_sigma_scale))
+                    for s in dataset]
+            data["nbr_index"] = [n for n, _ in _nbr]
+            data["nbr_G"] = [g for _, g in _nbr]
 
     # Auto-detect and include force/virial targets for PES mode
     if cfg.target_mode == 0:
@@ -392,24 +403,21 @@ def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
     reads no descriptor gradients at all)."""
     return cfg.target_mode == 1 and (
         int(cfg.dipole_rij_power) == 0
-        or cfg.dipole_readout == "neighbor")
+        or cfg.dipole_readout in ("neighbor", "bilinear"))
 
 
-def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
-                       C: int, T: int, radial: str = "chebyshev",
-                       zeta: float = -2.0,
-                       cutoff: str = "cosine2",
-                       gauss_sigma_scale: float = 1.0) -> np.ndarray:
-    """Per-atom geometry kernel of the neighbor-basis dipole readout:
-    V_i[:,n,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·d, d = r_i − r_j (image
-    pairs). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
+def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
+                           zeta: float, cutoff: str, gauss_sigma_scale: float):
+    """Ordered neighbor pairs of the neighbor-basis readout: (i, j, G) with
+    G[p] = R_n(|d|)·d [P, 3, C], d = r_i − r_j (image pairs, self-images
+    dropped). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
     "chebyshev_warped" T_n(2(r/rc − 1)² − 1)·f_c, "gaussian"
     exp(−(r − μ_n)²/2σ²)·f_c (μ_n interior points of linspace(0, rc, C+2),
     σ = gauss_sigma_scale·rc/(C+1)), or "screened" r^(ζ−1)·f_c. f_c per
     `cutoff` — "cosine2" ((1+cos(πr/rc))/2)², "cosine" (1+cos(πr/rc))/2,
     "cubic" 1 − 3x² + 2x³, x = r/rc, or "tanh3" tanh³(1 − r/rc)/tanh³(1)
     (numpy twin of TNEP._radial/_fc; pairs are filtered before the power,
-    so no r=0 guard). float64 accumulate → float32 [N, 3, C, T]."""
+    so no r=0 guard). float64 throughout; callers cast."""
     i, j, D = neighbor_list("ijD", atoms, rc)
     keep = i != j                                  # drop self-image pairs
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
@@ -438,10 +446,43 @@ def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
         Rw = np.exp(-(r[:, None] - mu) ** 2 / (2.0 * sigma ** 2)) * fc[:, None]
     else:
         raise ValueError(f"unknown dipole_radial {radial!r}")
+    return i, j, d[:, :, None] * Rw[:, None, :]              # [P, 3, C]
+
+
+def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
+                       C: int, T: int, radial: str = "chebyshev",
+                       zeta: float = -2.0,
+                       cutoff: str = "cosine2",
+                       gauss_sigma_scale: float = 1.0) -> np.ndarray:
+    """Per-atom geometry kernel of the neighbor-basis dipole readout:
+    V_i[:,n,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·d (pairs and R_n from
+    _neighbor_dipole_pairs). float64 accumulate → float32 [N, 3, C, T]."""
+    i, j, G = _neighbor_dipole_pairs(atoms, rc, C, radial, zeta, cutoff,
+                                     gauss_sigma_scale)
     V = np.zeros((len(atoms), T, 3, C))
-    np.add.at(V, (i, np.asarray(types_int)[j]),
-              d[:, :, None] * Rw[:, None, :])
+    np.add.at(V, (i, np.asarray(types_int)[j]), G)
     return V.transpose(0, 2, 3, 1).astype(np.float32)      # [N, 3, C, T]
+
+
+def _neighbor_dipole_nbr(atoms: Atoms, rc: float, C: int, radial: str,
+                         zeta: float, cutoff: str, gauss_sigma_scale: float):
+    """Padded per-centre pair table for the bilinear pair head:
+    nbr_index [N, M] int32 (padding 0), nbr_G [N, M, 3, C] float32
+    (padding 0), M = max neighbors of any centre in THIS frame (re-padded
+    across frames in pad_and_stack)."""
+    i, j, G = _neighbor_dipole_pairs(atoms, rc, C, radial, zeta, cutoff,
+                                     gauss_sigma_scale)
+    N = len(atoms)
+    order = np.argsort(i, kind="stable")
+    i, j, G = i[order], j[order], G[order]
+    counts = np.bincount(i, minlength=N)
+    M = int(counts.max()) if len(i) else 0
+    slot = np.arange(len(i)) - np.repeat(np.cumsum(counts) - counts, counts)
+    nbr_index = np.zeros((N, M), dtype=np.int32)
+    nbr_G = np.zeros((N, M, 3, C), dtype=np.float32)
+    nbr_index[i, slot] = j
+    nbr_G[i, slot] = G
+    return nbr_index, nbr_G
 
 
 def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
@@ -763,6 +804,12 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     if has_V:
         V_np = np.zeros((S, max_atoms) + data["V_atom"][0].shape[1:],
                         dtype=np.float32)
+    has_nbr = "nbr_index" in data  # bilinear pair head: padded pair table
+    if has_nbr:
+        max_nbr = max(int(n.shape[1]) for n in data["nbr_index"])
+        nbr_idx_np = np.zeros((S, max_atoms, max_nbr), dtype=np.int32)
+        nbr_G_np = np.zeros((S, max_atoms, max_nbr)
+                            + data["nbr_G"][0].shape[2:], dtype=np.float32)
     if num_types is not None:
         types_contained_np = np.zeros((S, num_types), dtype=np.float32)
 
@@ -794,6 +841,10 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             virial_np[s, :] = data["virials"][s].numpy()
         if has_V:
             V_np[s, :N_s] = data["V_atom"][s]
+        if has_nbr:
+            M_s = int(data["nbr_index"][s].shape[1])
+            nbr_idx_np[s, :N_s, :M_s] = data["nbr_index"][s]
+            nbr_G_np[s, :N_s, :M_s] = data["nbr_G"][s]
 
         for i in range(N_s):
             gv_full = data["gradients"][s][i]
@@ -848,6 +899,9 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             result["virials"] = tf.constant(virial_np);      del virial_np
         if has_V:
             result["V_atom"]  = tf.constant(V_np);           del V_np
+        if has_nbr:
+            result["nbr_index"] = tf.constant(nbr_idx_np);   del nbr_idx_np
+            result["nbr_G"]     = tf.constant(nbr_G_np);     del nbr_G_np
         if num_types is not None:
             result["types_contained"] = tf.constant(types_contained_np); del types_contained_np
     return result
@@ -963,7 +1017,7 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom")
+                  "forces", "virials", "V_atom", "nbr_index", "nbr_G")
     for k in SMALL_KEYS:
         if k in data:
             chunk[k] = tf.gather(data[k], idx_tf)
@@ -1078,7 +1132,7 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     out: dict = {"_idx_np": idx_np, "_precomputed": precomputed}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom")
+                  "forces", "virials", "V_atom", "nbr_index", "nbr_G")
     for k in SMALL_KEYS:
         if k in data:
             v = data[k]
@@ -1104,7 +1158,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom")
+                  "forces", "virials", "V_atom", "nbr_index", "nbr_G")
     # pin_to_cpu=True ⇒ host RAM, upload each chunk to GPU if present.
     # False ⇒ already on-device, no device context needed.
     ctx = _gpu_device_ctx() if pin_to_cpu else _NullCtx()
@@ -1166,7 +1220,7 @@ def _gpu_device_ctx():
 
 _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                          "targets", "atom_mask", "types_contained",
-                         "forces", "virials", "V_atom")
+                         "forces", "virials", "V_atom", "nbr_index", "nbr_G")
 
 
 def move_data_to_gpu(data: dict) -> None:

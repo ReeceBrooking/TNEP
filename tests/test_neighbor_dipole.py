@@ -19,7 +19,8 @@ from ase import Atoms
 from ase.io import read
 from ase.neighborlist import neighbor_list
 
-from TNEPconfig import TNEPconfig
+import data as tnep_data
+from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
 from TNEP import TNEP
 from DescriptorBuilder import make_descriptor_builder
 from DescriptorBuilderGPU import compute_dim_q
@@ -51,7 +52,7 @@ def _cfg(**kw):
     cfg.dipole_zeta = -2.0
     cfg.dipole_cutoff = None
     cfg.dipole_gauss_sigma_scale = 1.0
-    cfg.dipole_pair_rank = 0
+    cfg.dipole_pair_rank = 2
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)
@@ -824,12 +825,13 @@ def test_save_load_roundtrip_gaussian_tanh3(tmp_path):
 # ── Bilinear pair head (neighbor_dipole_bilinear_plan.md) ─────────────────────
 
 def test_pair_rank_head_width():
-    # K=0: head width == C (today's W1 shape, bit-compatible genome).
-    cfg = _cfg(dipole_channels=4, dipole_pair_rank=0)
+    # "neighbor": head width == C whatever dipole_pair_rank says (K forced 0).
+    cfg = _cfg(dipole_channels=4, dipole_pair_rank=3)
     m = _model(cfg)
+    assert m._pair_rank == 0
     assert m._head_width == 4 and tuple(m.W1.shape) == (2, 8, 4)
-    # K=2: C·(1+2K) = 4·5 = 20.
-    cfg = _cfg(dipole_channels=4, dipole_pair_rank=2)
+    # "bilinear", K=2: C·(1+2K) = 4·5 = 20.
+    cfg = _cfg(dipole_channels=4, dipole_readout="bilinear", dipole_pair_rank=2)
     m = _model(cfg)
     assert m._head_width == 20 and tuple(m.W1.shape) == (2, 8, 20)
     # _split_head slices: s [.., C], a/b [.., C, K].
@@ -842,7 +844,42 @@ def test_pair_rank_head_width():
     np.testing.assert_array_equal(b.numpy()[0, 0], [12, 13])
 
 
-def test_pair_rank_rejected_outside_neighbor_readout():
-    cfg = _cfg(dipole_readout="tnep", dipole_pair_rank=1)
+def test_bilinear_readout_needs_rank():
+    cfg = _cfg(dipole_readout="bilinear", dipole_pair_rank=0)
     with pytest.raises(ValueError, match="dipole_pair_rank"):
         _model(cfg)
+    with pytest.raises(ValueError, match="dipole_readout"):
+        _model(_cfg(dipole_readout="bogus"))
+
+
+def test_nbr_table_matches_ase_pairs():
+    """nbr_index / nbr_G reproduce the ase pair list (padding zero, G = R_n·d)."""
+    cfg = _cfg(dipole_channels=4, dipole_readout="bilinear", dipole_pair_rank=1)
+    atoms = _bulk_frame()
+    types_int = assign_type_indices([atoms], cfg.types)
+    builder = make_descriptor_builder(cfg)
+    desc, grads, gidx = builder.build_descriptors([atoms])
+    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
+    assert "nbr_index" in d and "nbr_G" in d
+    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
+    idx, G = full["nbr_index"][0].numpy(), full["nbr_G"][0].numpy()   # [A,M], [A,M,3,C]
+    # Reference: V_i = Σ_j G_ij (V's definition) — ties the table to the V kernel.
+    V_ref = full["V_atom"][0].numpy().sum(-1)                           # [A,3,C]
+    np.testing.assert_allclose(G.sum(1), V_ref, rtol=1e-5, atol=1e-6)
+    # Padding rows carry zero G and index 0; real rows match the ase pair set.
+    i, j, D = neighbor_list("ijD", atoms, cfg.dipole_rc)
+    counts = np.bincount(i[i != j], minlength=len(atoms))
+    for a_ in range(len(atoms)):
+        assert np.all(G[a_, counts[a_]:] == 0.0)
+        assert np.all(idx[a_, counts[a_]:] == 0)
+        assert set(idx[a_, :counts[a_]]) == set(j[(i == a_) & (i != j)])
+
+
+def test_nbr_table_absent_for_neighbor_readout():
+    cfg = _cfg(dipole_channels=4, dipole_pair_rank=2)   # "neighbor": K ignored
+    atoms = _bulk_frame()
+    types_int = assign_type_indices([atoms], cfg.types)
+    builder = make_descriptor_builder(cfg)
+    desc, grads, gidx = builder.build_descriptors([atoms])
+    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
+    assert "nbr_index" not in d and "nbr_G" not in d

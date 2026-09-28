@@ -109,8 +109,9 @@ class TNEP(layers.Layer):
         # Neighbor-basis dipole readout: decided before W1 so the site head
         # can carry its channel axis.
         _readout = str(cfg.dipole_readout)
+        # "bilinear" is the neighbor readout plus the bilinear pair term.
         self._neighbor_readout = (cfg.target_mode == 1
-                                  and _readout == "neighbor")
+                                  and _readout in ("neighbor", "bilinear"))
         self._dipole_channels = int(cfg.dipole_channels)
         self._dipole_radial = str(cfg.dipole_radial)
         self._dipole_zeta = float(cfg.dipole_zeta)
@@ -121,16 +122,17 @@ class TNEP(layers.Layer):
         self._species_pairs = str(cfg.dipole_species_pairs)
         # THE learnability flag: every save/load/SNES-tail site keys on this.
         self._c_learnable = self._species_pairs != "off"
-        # Bilinear pair head rank K (neighbor_dipole_bilinear_plan.md).
-        self._pair_rank = int(cfg.dipole_pair_rank)
-        if self._pair_rank < 0:
+        # Bilinear pair head rank K (neighbor_dipole_bilinear_plan.md):
+        # active only under dipole_readout="bilinear"; 0 elsewhere so every
+        # K-keyed site reduces to the plain neighbor readout.
+        self._pair_rank = (int(cfg.dipole_pair_rank)
+                           if self._neighbor_readout and _readout == "bilinear"
+                           else 0)
+        if _readout == "bilinear" and self._pair_rank < 1:
             raise ValueError(
-                f"cfg.dipole_pair_rank must be ≥ 0, got {self._pair_rank}.")
-        if self._pair_rank > 0 and not self._neighbor_readout:
-            raise ValueError(
-                "cfg.dipole_pair_rank > 0 requires target_mode=1 and "
-                "dipole_readout='neighbor' (the bilinear pair term is a "
-                "neighbor-readout head).")
+                f"dipole_readout='bilinear' needs cfg.dipole_pair_rank ≥ 1 "
+                f"(got {cfg.dipole_pair_rank}); use dipole_readout='neighbor' "
+                f"for the pair-term-free model.")
         # Head width C·(1+2K): s [C] | a [C·K] | b [C·K]. THE single source for
         # W1's last axis; SNES/model_io read it back from here.
         self._head_width = (self._dipole_channels * (1 + 2 * self._pair_rank)
@@ -222,9 +224,10 @@ class TNEP(layers.Layer):
                     f"2 = |r|²·F (Xu et al. JCTC 2024 default), "
                     f"≥3 = higher radial moments."
                 )
-            if _readout not in ("tnep", "neighbor"):
+            if _readout not in ("tnep", "neighbor", "bilinear"):
                 raise ValueError(
-                    f"cfg.dipole_readout must be 'tnep' or 'neighbor', "
+                    f"cfg.dipole_readout must be 'tnep', 'neighbor' or "
+                    f"'bilinear', "
                     f"got {_readout!r}.")
             if self._neighbor_readout:
                 if cfg.dipole_rc is None:
