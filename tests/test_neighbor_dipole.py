@@ -78,7 +78,8 @@ def _mu(model, atoms, cfg):
         data["pair_atom"], data["pair_gidx"], data["pair_struct"],
         data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
         model.W0, model.b0, model.W1, model.b1,
-        W_atom=data.get("V_atom"))[0].numpy()
+        W_atom=data.get("V_atom"), nbr_index=data.get("nbr_index"),
+        nbr_G=data.get("nbr_G"))[0].numpy()
 
 
 # Readout variants shared across the parametrized suites. "screened" is the
@@ -95,11 +96,11 @@ _MODE_KW = {
 
 
 @functools.lru_cache(maxsize=8)
-def _bulk_setup(mode="chebyshev"):
+def _bulk_setup(mode="chebyshev", readout="neighbor"):
     """(cfg, model, atoms, padded-data) for the 96-atom water frame — shared.
     "ordered" gets a randomized ASYMMETRIC Ω (symmetric Ω would telescope
     back to the difference form and hide ordered-path bugs)."""
-    cfg = _cfg(**_MODE_KW[mode])
+    cfg = _cfg(dipole_readout=readout, **_MODE_KW[mode])
     model = _model(cfg)
     if mode == "ordered":
         rng = np.random.default_rng(11)
@@ -226,14 +227,15 @@ def test_single_atom_lattice_translation_invariance(mode):
 
 @pytest.mark.parametrize("mode", ["chebyshev", "screened", "chebyshev_warped",
                                   "gaussian", "cheb_tanh3"])
-def test_four_path_consistency(mode):
+@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
+def test_four_path_consistency(mode, readout):
     # The only test cross-checking all three radial dispatch sites (numpy
     # twin, predict inline, _neighbor_V_coo) against each other — catches a
     # ζ/radial mismatch between them. The in-graph/predict legs are the ONLY
     # automated execution of the TF _radial/_fc branches (every μ-comparing
     # test consumes the numpy-built V via W_atom), so the new radials and
     # the tanh3 cross MUST be parametrized here.
-    cfg, model, atoms, _ = _bulk_setup(mode)
+    cfg, model, atoms, _ = _bulk_setup(mode, readout)
     # Full pair stream (self_pairs_only=False) so the in-graph V path has
     # the r_d COO list to build V from.
     types_int = assign_type_indices([atoms], cfg.types)
@@ -246,13 +248,14 @@ def test_four_path_consistency(mode):
             full["pair_atom"], full["pair_gidx"], full["pair_struct"],
             full["positions"], full["Z_int"], full["boxes"], full["atom_mask"],
             model.W0, model.b0, model.W1, model.b1)
-    mu_slot = model.predict_batch(*args, W_atom=full["V_atom"])[0].numpy()
-    mu_ingraph = model.predict_batch(*args, W_atom=None)[0].numpy()
+    nbr = dict(nbr_index=full.get("nbr_index"), nbr_G=full.get("nbr_G"))
+    mu_slot = model.predict_batch(*args, W_atom=full["V_atom"], **nbr)[0].numpy()
+    mu_ingraph = model.predict_batch(*args, W_atom=None)[0].numpy()   # COO legs
 
     mu_cand = model.predict_batch_candidates(
         full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
         model.W0[tf.newaxis], model.b0[tf.newaxis],
-        model.W1[tf.newaxis], model.b1[tf.newaxis])[0, 0].numpy()
+        model.W1[tf.newaxis], model.b1[tf.newaxis], **nbr)[0, 0].numpy()
 
     # Single-structure predict(): dense [A, M] neighbor table from the builder.
     gi = gidx[0]
@@ -883,3 +886,60 @@ def test_nbr_table_absent_for_neighbor_readout():
     desc, grads, gidx = builder.build_descriptors([atoms])
     d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
     assert "nbr_index" not in d and "nbr_G" not in d
+
+
+def _bilinear_reference(model, atoms, cfg, h):
+    """Brute-force μ_bl from the ase pair list and the ANN head outputs h·W1[t]."""
+    types_int = np.asarray(assign_type_indices([atoms], cfg.types)[0])
+    out = np.einsum('ah,ahk->ak', h, model.W1.numpy()[types_int])
+    C, K = cfg.dipole_channels, cfg.dipole_pair_rank
+    a = out[:, C:C + C * K].reshape(-1, C, K)
+    b = out[:, C + C * K:].reshape(-1, C, K)
+    c_full = model._c_full(model.c_pair).numpy()            # [C, T, T]
+    i, j, G = tnep_data._neighbor_dipole_pairs(
+        atoms, cfg.dipole_rc, C, cfg.dipole_radial, cfg.dipole_zeta,
+        resolved_dipole_cutoff(cfg), cfg.dipole_gauss_sigma_scale)   # [P,3,C]
+    mu = np.zeros(3)
+    for p in range(len(i)):
+        ab = (a[i[p]] * b[j[p]]).sum(-1)                     # [C]
+        mu += G[p] @ (c_full[:, types_int[i[p]], types_int[j[p]]] * ab)
+    return mu
+
+
+def test_bilinear_matches_bruteforce_and_is_antisymmetric():
+    cfg = _cfg(dipole_channels=3, dipole_readout="bilinear", dipole_pair_rank=2,
+               dipole_species_pairs="symmetric")
+    model = _model(cfg)
+    # Randomise c so the species-pair coupling is actually exercised.
+    model.c_pair.assign(tf.random.stateless_uniform(model.c_pair.shape, [1, 2], 0.5, 1.5))
+    atoms = _bulk_frame()
+    types_int = assign_type_indices([atoms], cfg.types)
+    builder = make_descriptor_builder(cfg)
+    desc, grads, gidx = builder.build_descriptors([atoms])
+    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
+    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
+    args = (full["descriptors"], full["grad_values"], full["pair_atom"],
+            full["pair_gidx"], full["pair_struct"], full["positions"],
+            full["Z_int"], full["boxes"], full["atom_mask"],
+            model.W0, model.b0)
+    kw = dict(W_atom=full["V_atom"], nbr_index=full["nbr_index"], nbr_G=full["nbr_G"])
+    mu_full = model.predict_batch(*args, model.W1, model.b1, **kw)[0].numpy()
+    # s-term alone: zero the a/b slices of W1.
+    C, K = cfg.dipole_channels, cfg.dipole_pair_rank
+    W1_s = model.W1.numpy().copy(); W1_s[:, :, C:] = 0.0
+    mu_s = model.predict_batch(*args, tf.constant(W1_s), model.b1, **kw)[0].numpy()
+    # Hidden activations for the reference (same arithmetic as predict_batch;
+    # mixing is off in _cfg so raw W0 == W0_eff).
+    Zn = full["Z_int"][0].numpy()
+    z = (np.einsum('aq,aqh->ah', full["descriptors"][0].numpy(), model.W0.numpy()[Zn])
+         + model.b0.numpy()[Zn])
+    h = model.activation(tf.constant(z)).numpy()
+    mu_ref = _bilinear_reference(model, atoms, cfg, h)
+    assert np.linalg.norm(mu_ref) > 1e-3          # the term is not trivially zero
+    np.testing.assert_allclose(mu_full - mu_s, mu_ref, rtol=1e-4, atol=1e-5)
+    # Antisymmetry: swapping the a and b slices negates the pair term.
+    W1_sw = model.W1.numpy().copy()
+    W1_sw[:, :, C:C + C * K] = model.W1.numpy()[:, :, C + C * K:]
+    W1_sw[:, :, C + C * K:] = model.W1.numpy()[:, :, C:C + C * K]
+    mu_sw = model.predict_batch(*args, tf.constant(W1_sw), model.b1, **kw)[0].numpy()
+    np.testing.assert_allclose(mu_sw - mu_s, -(mu_full - mu_s), rtol=1e-4, atol=1e-5)

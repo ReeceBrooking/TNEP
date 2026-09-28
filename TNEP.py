@@ -756,7 +756,8 @@ class TNEP(layers.Layer):
             # symmetric a per-channel uniform shift of s^n is exact gauge;
             # under dipole_species_pairs="ordered" that identity breaks and
             # the exclusion is a modeling choice — keep it, don't "fix" it.
-            s = tf.einsum('ah,ahn->an', h, W1_t)                      # [A, C]
+            out = tf.einsum('ah,ahk->ak', h, W1_t)               # [A, C(1+2K)]
+            s, a, b = self._split_head(out)                          # [A, C], [A, C, K] ×2
             dr, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)          # dr = neighbor − center
             rc = float(self.cfg.dipole_rc)
@@ -770,9 +771,20 @@ class TNEP(layers.Layer):
             V = tf.einsum('amn,amd,amt->adnt',                # float64 accum.
                           tf.cast(Rw, tf.float64),
                           tf.cast(-dr, tf.float64), tp)      # [A, 3, C, T]
-            c_at = tf.gather(self._c_full(self.c_pair), Z, axis=1)  # [C, A, T]
-            return tf.einsum('an,nat,adnt->d',
-                             s, c_at, tf.cast(V, s.dtype))               # [3]
+            c_full = self._c_full(self.c_pair)                        # [C, T, T]
+            c_at = tf.gather(c_full, Z, axis=1)                       # [C, A, T]
+            mu = tf.einsum('an,nat,adnt->d',
+                           s, c_at, tf.cast(V, s.dtype))                 # [3]
+            if self._pair_rank > 0:
+                # Same [A, M] table as V: G = Rw·(−dr) per slot; padding and
+                # out-of-r_c slots are already zero through w.
+                G = tf.cast(Rw[:, :, tf.newaxis, :]
+                            * (-dr)[:, :, :, tf.newaxis], s.dtype)     # [A, M, 3, C]
+                mu += self._bilinear_padded(
+                    a[tf.newaxis, tf.newaxis], b[tf.newaxis, tf.newaxis],
+                    c_full[tf.newaxis], Z[tf.newaxis],
+                    grad_index[tf.newaxis], G[tf.newaxis])[0, 0]
+            return mu
 
         # Modes 1 and 2 need forces
         forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask,
@@ -1247,7 +1259,9 @@ class TNEP(layers.Layer):
                       W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
                       W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
                       W_atom: tf.Tensor | None = None,
-                      c_pair: tf.Tensor | None = None) -> tf.Tensor:
+                      c_pair: tf.Tensor | None = None,
+                      nbr_index: tf.Tensor | None = None,
+                      nbr_G: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
         Weights are passed explicitly (not read from self) so this method can
@@ -1272,6 +1286,9 @@ class TNEP(layers.Layer):
                           [B, A, 3, C, T] instead (built in-graph when None)
             c_pair      : [C, T(T+1)/2] species-pair coefficients (neighbor
                           readout; None → self.c_pair)
+            nbr_index   : [B, A, M] padded neighbor table (bilinear readout;
+                          None → build the pair term from the COO stream)
+            nbr_G       : [B, A, M, 3, C] per-slot R_n(r_ij)(r_i − r_j)
 
         Returns:
             predictions : [B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
@@ -1315,7 +1332,8 @@ class TNEP(layers.Layer):
             # choice (kept deliberately) under "ordered" Ω.
             if c_pair is None:
                 c_pair = self.c_pair  # model-weight callers (score, spectro)
-            s = tf.einsum('bah,bahn->ban', h1, W1_t)               # [B, A, C]
+            out = tf.einsum('bah,bahk->bak', h1, W1_t)          # [B, A, C(1+2K)]
+            s, a, b = self._split_head(out)
             V = W_atom  # [B, A, 3, C, T] geometry kernel via the W_atom slot
             if V is None:
                 # Full-pair callers (spectroscopy fused / legacy pack):
@@ -1324,8 +1342,21 @@ class TNEP(layers.Layer):
                     positions, boxes, box_inv, pair_struct, pair_atom,
                     pair_gidx, Z, tf.shape(descriptors)[0],
                     tf.shape(descriptors)[1])
-            c_at = tf.gather(self._c_full(c_pair), Z, axis=1)   # [C, B, A, T]
-            return tf.einsum('ban,nbat,badnt->bd', s, c_at, V)        # [B, 3]
+            c_full = self._c_full(c_pair)                         # [C, T, T]
+            c_at = tf.gather(c_full, Z, axis=1)                   # [C, B, A, T]
+            mu = tf.einsum('ban,nbat,badnt->bd', s, c_at, V)      # [B, 3]
+            if self._pair_rank > 0:
+                if nbr_index is not None:
+                    # Padded pair table from data.py (SNES validate / score).
+                    mu += self._bilinear_padded(
+                        a[tf.newaxis], b[tf.newaxis], c_full[tf.newaxis],
+                        Z, nbr_index, nbr_G)[0]
+                else:
+                    # Full r_d COO stream (in-graph, like V above).
+                    mu += self._bilinear_coo(
+                        a, b, c_full, Z, pair_struct, pair_atom, pair_gidx,
+                        positions, boxes, box_inv, tf.shape(descriptors)[0])
+            return mu
 
         # Single-hidden backward chain (∂U/∂q):
         #   ∂U/∂h1 = W1, ∂U/∂a1 = activation'(h1, z1)·W1, ∂U/∂q = ∂U/∂a1·W0^T
@@ -1371,7 +1402,9 @@ class TNEP(layers.Layer):
                                   W1: tf.Tensor, b1: tf.Tensor,
                                   U_pair: tf.Tensor | None = None,
                                   W_pre_angular: tf.Tensor | None = None,
-                                  c_pair: tf.Tensor | None = None) -> tf.Tensor:
+                                  c_pair: tf.Tensor | None = None,
+                                  nbr_index: tf.Tensor | None = None,
+                                  nbr_G: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
         Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
@@ -1395,6 +1428,8 @@ class TNEP(layers.Layer):
             b1          : [C]
             c_pair      : [C, Ch, T(T+1)/2] per-candidate species-pair
                           coefficients (neighbor readout only)
+            nbr_index   : [B, A, M], nbr_G [B, A, M, 3, Ch] — padded pair
+                          table of the bilinear readout (candidate-independent)
 
         Returns:
             predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
@@ -1442,7 +1477,7 @@ class TNEP(layers.Layer):
         # tf.gather along T axis: b0[C,T,H] gathered by Z_flat[B*A] → [C,B*A,H]
         Z_flat   = tf.reshape(Z, [B * A])
         b0_t_all = tf.reshape(tf.gather(b0, Z_flat, axis=1), [C, B, A, H])
-        _w1_shape = ([C, B, A, H_final, self._dipole_channels]
+        _w1_shape = ([C, B, A, H_final, self._head_width]
                      if self._neighbor_readout else [C, B, A, H_final])
         W1_t_all = tf.reshape(tf.gather(W1, Z_flat, axis=1), _w1_shape)
 
@@ -1464,15 +1499,21 @@ class TNEP(layers.Layer):
             # backward matmul — the readout reads no descriptor gradients.
             # b1 stays excluded: exact gauge with c symmetric; a modeling
             # choice (kept deliberately) under "ordered" Ω.
-            s = tf.einsum('cbah,cbahn->cban', h1, W1_t_all)     # [C, B, A, Ch]
+            out = tf.einsum('cbah,cbahk->cbak', h1, W1_t_all)   # [C, B, A, Ch(1+2K)]
+            s, a, b = self._split_head(out)
             if c_pair is None:
-                # Candidate-independent c (frozen c ≡ 1, or model weights).
-                c_at = tf.gather(self._c_full(self.c_pair), Z, axis=1)
-                return tf.einsum('cban,nbat,badnt->cbd',
-                                 s, c_at, W_atom)                  # [C, B, 3]
-            c_at = tf.gather(self._c_full(c_pair), Z, axis=2)  # [C, Ch, B, A, T]
-            return tf.einsum('cban,cnbat,badnt->cbd',
-                             s, c_at, W_atom)                      # [C, B, 3]
+                # Candidate-independent c (frozen c ≡ 1, or model weights):
+                # tile once so ONE einsum serves both cases. (Symbolic C —
+                # never `list + TensorShape`, it does not trace.)
+                c_full = tf.tile(self._c_full(self.c_pair)[tf.newaxis],
+                                 [C, 1, 1, 1])                     # [C, Ch, T, T]
+            else:
+                c_full = self._c_full(c_pair)                      # [C, Ch, T, T]
+            c_at = tf.gather(c_full, Z, axis=2)                    # [C, Ch, B, A, T]
+            mu = tf.einsum('cban,cnbat,badnt->cbd', s, c_at, W_atom)   # [C, B, 3]
+            if self._pair_rank > 0:
+                mu += self._bilinear_padded(a, b, c_full, Z, nbr_index, nbr_G)
+            return mu
 
         # ── Dipole: backward matmul ───────────────────────────────────────────
         # ∂U/∂a1 = activation'(h1, z1)·W1.
@@ -1771,6 +1812,62 @@ class TNEP(layers.Layer):
             tf.reshape(contrib, [-1, 3 * C]), seg, num_segments=B * A * T)
         V = tf.reshape(tf.cast(V, dr.dtype), [B, A, T, 3, C])
         return tf.transpose(V, [0, 1, 3, 4, 2])                  # [B,A,3,C,T]
+
+    def _bilinear_padded(self, a: tf.Tensor, b: tf.Tensor, c_full: tf.Tensor,
+                         Z: tf.Tensor, nbr_index: tf.Tensor,
+                         nbr_G: tf.Tensor) -> tf.Tensor:
+        """Bilinear pair term from the padded neighbor table (data.py
+        _neighbor_dipole_nbr):
+            μ_bl[c,b] = Σ_{a,m,n} c_full[c,n,t_a,t_j]·nbr_G[b,a,m,:,n]·(a[c,b,a,n,:]·b[c,b,j,n,:])
+        a, b     : [Cc, B, A, C, K]  (Cc candidates; predict_batch passes Cc=1)
+        c_full   : [Cc, C, T, T]
+        Z        : [B, A] int; nbr_index [B, A, M] int; nbr_G [B, A, M, 3, C]
+        Returns [Cc, B, 3]. Padding slots carry nbr_G = 0, so no mask.
+        # ponytail: materialises [Cc,B,A,M,C] twice (a·b product, c gather);
+        # population_chunk_size is the memory knob — loop over K if it bites."""
+        Cc = tf.shape(a)[0]
+        B = tf.shape(Z)[0]
+        A = tf.shape(Z)[1]
+        M = tf.shape(nbr_index)[2]
+        T, C, K = self.num_types, self._dipole_channels, self._pair_rank
+        # One gather over the flattened (B·A) atom axis — no batch_dims bookkeeping.
+        flat_j = tf.reshape(
+            nbr_index + (tf.range(B) * A)[:, tf.newaxis, tf.newaxis], [-1])
+        b_flat = tf.reshape(b, [Cc, B * A, C, K])
+        b_j = tf.reshape(tf.gather(b_flat, flat_j, axis=1), [Cc, B, A, M, C, K])
+        ab = tf.einsum('cbank,cbamnk->cbamn', a, b_j)                 # [Cc,B,A,M,C]
+        t_j = tf.reshape(tf.gather(tf.reshape(Z, [-1]), flat_j), [B, A, M])
+        slot = Z[:, :, tf.newaxis] * T + t_j                          # [B,A,M] into T·T
+        c_flat = tf.reshape(tf.transpose(c_full, [0, 2, 3, 1]), [Cc, T * T, C])
+        c_ij = tf.gather(c_flat, slot, axis=1)                        # [Cc,B,A,M,C]
+        return tf.einsum('cbamn,cbamn,bamdn->cbd',
+                         ab, c_ij, tf.cast(nbr_G, ab.dtype))          # [Cc,B,3]
+
+    def _bilinear_coo(self, a: tf.Tensor, b: tf.Tensor, c_full: tf.Tensor,
+                      Z: tf.Tensor, pair_struct: tf.Tensor,
+                      pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
+                      positions: tf.Tensor, boxes: tf.Tensor,
+                      box_inv: tf.Tensor, B: tf.Tensor) -> tf.Tensor:
+        """Bilinear pair term from the full r_d COO pair stream (single weight
+        set; legacy full-pair callers). a, b : [B, A, C, K]; c_full [C, T, T].
+        Returns [B, 3]. Mirrors _neighbor_V_coo's pair filtering and sign."""
+        dr, rij2 = self._neighbor_displacements_coo(
+            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
+        r = tf.sqrt(rij2)
+        keep = tf.logical_and(r < float(self.cfg.dipole_rc),
+                              tf.not_equal(pair_atom, pair_gidx))
+        Rw = self._radial(r) * tf.cast(keep, r.dtype)[:, tf.newaxis]   # [P, C]
+        G = (-dr)[:, :, tf.newaxis] * Rw[:, tf.newaxis, :]              # [P, 3, C]
+        ii = tf.stack([pair_struct, pair_atom], axis=1)
+        jj = tf.stack([pair_struct, pair_gidx], axis=1)
+        ab = tf.reduce_sum(tf.gather_nd(a, ii) * tf.gather_nd(b, jj), axis=-1)  # [P, C]
+        t_i = tf.gather_nd(Z, ii)
+        t_j = tf.gather_nd(Z, jj)
+        T = self.num_types
+        c_flat = tf.reshape(tf.transpose(c_full, [1, 2, 0]), [T * T, -1])   # [T·T, C]
+        c_ij = tf.gather(c_flat, t_i * T + t_j)                              # [P, C]
+        per_pair = tf.einsum('pn,pn,pdn->pd', ab, c_ij, tf.cast(G, ab.dtype))  # [P, 3]
+        return tf.math.unsorted_segment_sum(per_pair, pair_struct, num_segments=B)
 
     def _dipole_coo(self, forces_per_pair: tf.Tensor, pair_struct: tf.Tensor,
                     pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
