@@ -121,6 +121,20 @@ class TNEP(layers.Layer):
         self._species_pairs = str(cfg.dipole_species_pairs)
         # THE learnability flag: every save/load/SNES-tail site keys on this.
         self._c_learnable = self._species_pairs != "off"
+        # Bilinear pair head rank K (neighbor_dipole_bilinear_plan.md).
+        self._pair_rank = int(cfg.dipole_pair_rank)
+        if self._pair_rank < 0:
+            raise ValueError(
+                f"cfg.dipole_pair_rank must be ≥ 0, got {self._pair_rank}.")
+        if self._pair_rank > 0 and not self._neighbor_readout:
+            raise ValueError(
+                "cfg.dipole_pair_rank > 0 requires target_mode=1 and "
+                "dipole_readout='neighbor' (the bilinear pair term is a "
+                "neighbor-readout head).")
+        # Head width C·(1+2K): s [C] | a [C·K] | b [C·K]. THE single source for
+        # W1's last axis; SNES/model_io read it back from here.
+        self._head_width = (self._dipole_channels * (1 + 2 * self._pair_rank)
+                            if self._neighbor_readout else 1)
         if self._neighbor_readout:
             if self._dipole_channels < 1:
                 raise ValueError(
@@ -154,7 +168,7 @@ class TNEP(layers.Layer):
         # radial-channel axis [T, H_final, C] under the neighbor readout.
         self.W1 = self.add_weight(
             name="W1",
-            shape=((cfg.num_types, self._H_final, self._dipole_channels)
+            shape=((cfg.num_types, self._H_final, self._head_width)
                    if self._neighbor_readout
                    else (cfg.num_types, self._H_final)),
             initializer="glorot_uniform",
@@ -1706,6 +1720,17 @@ class TNEP(layers.Layer):
                        / (2.0 * self._gauss_sigma ** 2))
             return g * self._fc(r)[..., tf.newaxis]
         raise ValueError(f"unknown dipole_radial {rad!r}")
+
+    def _split_head(self, out: tf.Tensor):
+        """Split the head output [.., C·(1+2K)] → s [.., C], a [.., C, K],
+        b [.., C, K]. K = 0 ⇒ a, b have a zero-width last axis (never
+        contracted)."""
+        C, K = self._dipole_channels, self._pair_rank
+        lead = tf.shape(out)[:-1]
+        s = out[..., :C]
+        a = tf.reshape(out[..., C:C + C * K], tf.concat([lead, [C, K]], 0))
+        b = tf.reshape(out[..., C + C * K:], tf.concat([lead, [C, K]], 0))
+        return s, a, b
 
     def _c_full(self, c_pair: tf.Tensor) -> tf.Tensor:
         """Packed c_pair [..., C, n_pairs] → [..., C, T, T] via _pair_idx

@@ -51,6 +51,7 @@ def _cfg(**kw):
     cfg.dipole_zeta = -2.0
     cfg.dipole_cutoff = None
     cfg.dipole_gauss_sigma_scale = 1.0
+    cfg.dipole_pair_rank = 0
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)
@@ -818,3 +819,30 @@ def test_save_load_roundtrip_gaussian_tanh3(tmp_path):
     assert loaded.cfg.dipole_cutoff == "tanh3"
     assert float(loaded.cfg.dipole_gauss_sigma_scale) == 0.5
     assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
+
+
+# ── Bilinear pair head (neighbor_dipole_bilinear_plan.md) ─────────────────────
+
+def test_pair_rank_head_width():
+    # K=0: head width == C (today's W1 shape, bit-compatible genome).
+    cfg = _cfg(dipole_channels=4, dipole_pair_rank=0)
+    m = _model(cfg)
+    assert m._head_width == 4 and tuple(m.W1.shape) == (2, 8, 4)
+    # K=2: C·(1+2K) = 4·5 = 20.
+    cfg = _cfg(dipole_channels=4, dipole_pair_rank=2)
+    m = _model(cfg)
+    assert m._head_width == 20 and tuple(m.W1.shape) == (2, 8, 20)
+    # _split_head slices: s [.., C], a/b [.., C, K].
+    out = tf.reshape(tf.range(20, dtype=tf.float32), [1, 20])
+    s, a, b = m._split_head(out)
+    assert tuple(s.shape) == (1, 4)
+    assert tuple(a.shape) == (1, 4, 2) and tuple(b.shape) == (1, 4, 2)
+    np.testing.assert_array_equal(s.numpy()[0], [0, 1, 2, 3])
+    np.testing.assert_array_equal(a.numpy()[0, 0], [4, 5])
+    np.testing.assert_array_equal(b.numpy()[0, 0], [12, 13])
+
+
+def test_pair_rank_rejected_outside_neighbor_readout():
+    cfg = _cfg(dipole_readout="tnep", dipole_pair_rank=1)
+    with pytest.raises(ValueError, match="dipole_pair_rank"):
+        _model(cfg)
