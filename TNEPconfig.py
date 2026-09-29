@@ -288,6 +288,25 @@ class TNEPconfig:
     # descriptor over training atoms), folded into b0 (b0_eff = b0 − (m∘μ)·W0)
     # so the ANN sees m∘(q − μ); computed with q_scale.
     q_shift: list[float] | None = None
+    # GPUMD NEP descriptors (multi_descriptor_plan.md §0.3), computed
+    # exactly as GPUMD's nep.cu / nep_utilities.cuh from a raw per-atom
+    # basis (nep_descriptor.py) contracted in-model by learnable c tensors.
+    # Defaults = GPUMD's (parameters.cu:83-90, 118-119).
+    #   "off"     : bit-identical to before
+    #   "concat"  : q = [q_soap ‖ q_nep]
+    #   "replace" : q = q_nep (descriptor_mixing / preprocess_contract off)
+    #   "sum"     : summed experts (§0.4)
+    nep_descriptor: str = "off"
+    nep_n_max_radial: int = 6            # q_n, n = 0..n_max
+    nep_n_max_angular: int = 6
+    nep_basis_size_radial: int = 6       # Chebyshev k = 0..basis_size
+    nep_basis_size_angular: int = 6
+    nep_l_max: int = 4                   # GPUMD: the only supported value
+    nep_four_body: bool = True           # GPUMD L_max_4body = 2 → q_n222
+    nep_five_body: bool = False          # GPUMD L_max_5body = 1 → q_n1111; needs nep_four_body
+    nep_rc_radial: float = 8.0
+    nep_rc_angular: float = 4.0
+    nep_num_neurons: int = 30            # "sum" mode only: width of ANN_2b / ANN_3b
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE

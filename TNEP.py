@@ -8,6 +8,7 @@ from typing import Callable
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
+from nep_descriptor import validate_nep_cfg
 
 
 @tf.function(jit_compile=True)
@@ -59,6 +60,12 @@ class TNEP(layers.Layer):
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self.cfg = cfg
+
+        if str(getattr(cfg, "nep_descriptor", "off")) != "off":
+            validate_nep_cfg(cfg)
+            raise NotImplementedError(
+                f"cfg.nep_descriptor={cfg.nep_descriptor!r}: only 'off' is wired; "
+                "Task 4/5 of multi_descriptor_plan.md add concat/replace/sum.")
 
         # Preprocess contraction phase 1/2: run guards, then override cfg.dim_q
         # to the contracted dim BEFORE allocating W0. Phase 2 allocates W_pre_*.
