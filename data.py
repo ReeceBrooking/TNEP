@@ -1039,6 +1039,12 @@ def _is_contiguous_range(arr: np.ndarray) -> bool:
     return bool(np.all(np.diff(arr) == 1))
 
 
+# Structure-padded per-structure fields that ride every chunk.
+_RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
+                         "targets", "atom_mask", "types_contained",
+                         "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
+
+
 def slice_and_complete_chunk(data: dict, indices) -> dict:
     """Build a chunk dict by slicing per-structure fields from `data`.
 
@@ -1066,10 +1072,7 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
         idx_tf = tf.constant(np.asarray(indices, dtype=np.int32), dtype=tf.int32)
 
     chunk: dict = {}
-    SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
-                  "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
-    for k in SMALL_KEYS:
+    for k in _RESIDENT_SMALL_KEYS:
         if k in data:
             chunk[k] = tf.gather(data[k], idx_tf)
 
@@ -1181,10 +1184,7 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
 
     # Slice every CPU-resident structure-padded field into numpy.
     out: dict = {"_idx_np": idx_np, "_precomputed": precomputed}
-    SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
-                  "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
-    for k in SMALL_KEYS:
+    for k in _RESIDENT_SMALL_KEYS:
         if k in data:
             v = data[k]
             np_view = v.numpy() if hasattr(v, "numpy") else np.asarray(v)
@@ -1207,9 +1207,6 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
     tensors (tf.constant). Reuses pre-staged pair-index tensors from
     data["_pair_idx_gpu_cache"] for (s_start, s_end) when present."""
     chunk: dict = {}
-    SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
-                  "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
     # pin_to_cpu=True ⇒ host RAM, upload each chunk to GPU if present.
     # False ⇒ already on-device, no device context needed.
     ctx = _gpu_device_ctx() if pin_to_cpu else _NullCtx()
@@ -1218,7 +1215,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
     if pair_idx_cache is not None and s_start is not None and s_end is not None:
         pair_idx_entry = pair_idx_cache.get((int(s_start), int(s_end)))
     with ctx:
-        for k in SMALL_KEYS:
+        for k in _RESIDENT_SMALL_KEYS:
             np_key = "_np_" + k
             if np_key in raw:
                 chunk[k] = tf.constant(raw[np_key])
@@ -1268,10 +1265,6 @@ def _gpu_device_ctx():
         pass
     return _NullCtx()
 
-
-_RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
-                         "targets", "atom_mask", "types_contained",
-                         "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
 
 
 def move_data_to_gpu(data: dict) -> None:

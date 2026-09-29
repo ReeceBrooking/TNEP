@@ -891,7 +891,7 @@ def predict_trajectory_batch(
         [B, 3] for dipole models, [B, 6] for polarizability models.
     """
     cfg = model.cfg
-    if model._nep_mode != "off":
+    if cfg.nep_descriptor != "off":
         raise NotImplementedError(
             "NEP descriptors: trajectory inference not yet supported")
     # Lazy import to avoid an unconditional TF GPU builder import for callers
