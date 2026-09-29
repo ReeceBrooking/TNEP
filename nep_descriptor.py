@@ -287,12 +287,11 @@ def nep_slices(cfg):
 def nep_pair_list(atoms, cfg):
     """(i, j, D) from ONE ase call at max(rc_r, rc_a): D = r_j − r_i including the
     image offset (image-exact — NOT MIC: rc_r = 8 Å exceeds L/2 for the water box),
-    zero-length self entries dropped, sorted by centre i. Shared by nep_raw_numpy
-    and nep_pairs_numpy."""
+    zero-length self entries dropped, sorted by centre i (ase returns pairs sorted
+    by i; masking keeps that order). Shared by nep_raw_numpy and nep_pairs_numpy."""
     i, j, D = neighbor_list("ijD", atoms, max(float(cfg.nep_rc_radial), float(cfg.nep_rc_angular)))
     keep = np.linalg.norm(D, axis=1) > 0.0
-    order = np.argsort(i[keep], kind="stable")
-    return i[keep][order], j[keep][order], D[keep][order]
+    return i[keep], j[keep], D[keep]
 
 
 def nep_raw_numpy(atoms, types_int, cfg, pairs=None):
@@ -322,6 +321,8 @@ def nep_pairs_numpy(atoms, cfg, pairs=None):
     """Image-exact pair stream for the Phase B force contraction (plan §B.3), keyed as
     in the data dict: nep_pair_atom [P] int32, nep_pair_gidx [P] int32,
     nep_pair_D [P,3] float32 (r_j − r_i incl. image), nep_pair_ang [P] bool (r < rc_a).
+    nep_pair_ang is computed from the float64 D and is AUTHORITATIVE: the in-graph
+    basis must use it as the angular mask, never re-derive r < rc_a from the float32 D.
     No basis values stored — Task 11 computes fn/fnp/P/∇P in-graph from D."""
     i, j, D = nep_pair_list(atoms, cfg) if pairs is None else pairs
     return dict(nep_pair_atom=i.astype(np.int32), nep_pair_gidx=j.astype(np.int32),

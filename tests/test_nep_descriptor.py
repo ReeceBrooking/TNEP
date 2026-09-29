@@ -1042,7 +1042,8 @@ def test_sum_mode_adam_smoke():
 # ── Task 10 (Phase B): per-pair basis derivatives + image-exact pair stream ─
 
 def _fd(f, x, h=1e-6):
-    """Central FD of f: [P] → [P, ...] w.r.t. its single vector argument."""
+    """Central FD of f: [P] → [P, ...] w.r.t. its single vector argument.
+    h=1e-6 in float64: h² truncation ≈ 1e-12, eps/h roundoff ≈ 1e-10 → rtol 1e-6 is safe."""
     return (f(x + h) - f(x - h)) / (2.0 * h)
 
 
@@ -1104,7 +1105,9 @@ def test_nep_pairs_numpy_resums_to_raw_and_is_image_exact():
     r = np.linalg.norm(p["nep_pair_D"].astype(np.float64), axis=1)
     assert np.all(r > 0.0) and np.all(r < rc_r)                 # no self image, within rc_r
     L = float(atoms.cell[0, 0])
-    assert rc_r > L / 2 and np.any(r > L / 2)                   # MIC would be WRONG here
+    assert rc_r > L / 2                                         # MIC would be WRONG here:
+    # several images of one (i, j) are in the list — no MIC construction can produce that.
+    assert len(set(zip(p["nep_pair_atom"].tolist(), p["nep_pair_gidx"].tolist()))) < P
     assert int(p["nep_pair_ang"].sum()) == int(np.sum(np.linalg.norm(
         neighbor_list("D", atoms, rc_a), axis=1) > 0.0))        # ang = the rc_a list
     # Re-summing the stream reproduces nep_raw_numpy.
