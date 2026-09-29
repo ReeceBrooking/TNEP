@@ -236,10 +236,10 @@ class TNEP(layers.Layer):
         # unscaled one. SNES's μ init does the same in _build_mu_init.
         self._q_scale = None
         if str(getattr(cfg, "descriptor_scale", "off")) != "off":
-            if str(cfg.descriptor_scale) not in ("block", "channel"):
+            if str(cfg.descriptor_scale) not in ("block", "channel", "minmax"):
                 raise ValueError(
                     f"cfg.descriptor_scale={cfg.descriptor_scale!r}; expected "
-                    f"'off', 'block' or 'channel'.")
+                    f"'off', 'block', 'channel' or 'minmax'.")
             if self.descriptor_preprocess_contract != "off":
                 raise NotImplementedError(
                     "descriptor_scale is not combinable with "

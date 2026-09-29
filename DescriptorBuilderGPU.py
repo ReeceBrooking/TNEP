@@ -454,9 +454,16 @@ def compute_q_scale(q: np.ndarray, atom_mask: np.ndarray, cfg) -> tuple:
         r_k     = clip((s_ref' / (g·s_k))^ALPHA, 1/CLAMP, CLAMP)   ("channel")
         m_k     = g_group · r_k   ("channel")  or  g_group   ("block")
     s_ref = median live std, s_ref' the same after the group factor. Dead
-    channels (s_k = 0) keep m = 1."""
+    channels (s_k = 0) keep m = 1.
+    "minmax": GPUMD's q_scaler (nep.cu find_max_min) — m_k = 1/(max_k − min_k)
+    over all training atoms, no centring (μ = 0). Dead channels keep m = 1."""
     Q = q.shape[-1]
     x = np.asarray(q, dtype=np.float64).reshape(-1, Q)[np.asarray(atom_mask).reshape(-1) > 0]
+    if str(cfg.descriptor_scale) == "minmax":
+        rng = x.max(0) - x.min(0)
+        with np.errstate(divide="ignore"):
+            m = np.where(rng > 0, 1.0 / rng, 1.0)
+        return m.astype(np.float32), np.zeros(Q, np.float32)
     mu = x.mean(axis=0)
     s = x.std(axis=0)
     live = s > 0

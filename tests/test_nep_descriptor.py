@@ -97,3 +97,31 @@ def test_fixed_soap_rejects_sqrt():
     # The quippy builder (descriptor_mode=0) ignores radial_basis_norm.
     with pytest.raises(ValueError, match="radial_basis_norm"):
         _model(_cfg(radial_basis_norm="none", descriptor_mode=0))
+
+
+# ── Task 2: descriptor_scale="minmax" (GPUMD's q_scaler) ───────────────────
+
+def test_q_scale_minmax_is_gpumd_scaler():
+    from DescriptorBuilderGPU import compute_q_scale
+    q = np.random.default_rng(0).uniform(-3, 5, (50, 7)); mask = np.ones(50)
+    q[:, 6] = 2.0                                                       # dead channel
+    cfg = _cfg(descriptor_scale="minmax")
+    m, mu = compute_q_scale(q, mask, cfg)
+    np.testing.assert_allclose(m[:6], 1.0 / (q[:, :6].max(0) - q[:, :6].min(0)), rtol=1e-6)   # nep.cu:347
+    assert m[6] == 1.0
+    assert np.all(mu == 0.0)                                            # no centring
+    assert m.dtype == np.float32 and mu.dtype == np.float32
+
+
+def test_minmax_threads_into_model_fold():
+    from DescriptorBuilderGPU import compute_q_scale
+    cfg = _cfg(descriptor_scale="minmax")
+    atoms = _bulk_frame()
+    q_np = _descriptors(cfg, atoms)
+    mask_np = np.ones(q_np.shape[0])
+    m, mu = compute_q_scale(q_np, mask_np, cfg)
+    cfg.q_scale = [float(v) for v in m]
+    cfg.q_shift = [float(v) for v in mu]
+    model = _model(cfg)
+    np.testing.assert_allclose(model._q_scale.numpy(), m)
+    assert np.all(model._q_shift_m.numpy() == 0.0)

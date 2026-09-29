@@ -278,6 +278,7 @@ class TNEPconfig:
     #   "off"     : no scaling or centring (bit-identical to before)
     #   "block"   : group factor only (SOAP l groups + each extra block, ≤ 9)
     #   "channel" : group factor × per-channel residual
+    #   "minmax"  : GPUMD q_scaler — 1/(max−min) per channel, no centring
     # Not combinable with descriptor_preprocess_contract.
     descriptor_scale: str = "off"
     # Runtime: the scale vector [dim_q], computed by the driver from the
