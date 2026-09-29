@@ -23,7 +23,8 @@ sys.path.insert(0, ROOT)
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--readout", choices=["neighbor", "bilinear"], default="neighbor")
+    p.add_argument("--readout", choices=["neighbor", "bilinear", "tnep"], default="neighbor")
+    p.add_argument("--rij-power", type=int, default=2, help="tnep readout: |r_ij|^N weight")
     p.add_argument("--nep", choices=["off", "concat", "replace", "sum"], default="off")
     p.add_argument("--pair-rank", type=int, default=1)
     p.add_argument("--scale", choices=["off", "block", "channel", "minmax"], default="off")
@@ -32,6 +33,7 @@ def main(argv=None) -> None:
     p.add_argument("--generations", type=int, default=6)
     p.add_argument("--frames", type=int, default=12)
     p.add_argument("--pop", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=None, help="SNES mini-batch (None = full batch)")
     p.add_argument("--data", default=os.path.join(ROOT, "datasets", "train_waterbulk.xyz"))
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
@@ -40,6 +42,7 @@ def main(argv=None) -> None:
     from MasterTNEP import train_model
     from TNEPconfig import TNEPconfig
     from model_io import load_model
+    import nep_descriptor as nd
 
     os.makedirs(a.out, exist_ok=True)
     test_path = os.path.join(a.out, "test_slice.xyz")
@@ -58,6 +61,10 @@ def main(argv=None) -> None:
     cfg.optimizer = a.optimizer
     cfg.num_generations = a.generations     # adam.py: steps = num_generations
     cfg.pop_size = a.pop
+    cfg.batch_size = a.batch_size
+    if a.readout == "tnep":
+        cfg.dipole_rij_power = a.rij_power
+        cfg.activation = "tanh"              # GPUMD TNEP
     if a.nep == "replace":
         cfg.descriptor_mixing = False       # replace has no SOAP blocks to mix
     # CPU sizing.
@@ -83,6 +90,14 @@ def main(argv=None) -> None:
     metrics, _ = loaded.score_from_file(test_path, show_plots=False)
     assert "rmse" in metrics, metrics
 
+    if a.readout == "tnep" and a.nep in ("concat", "replace"):
+        # GPUMD's number_of_variables for the same header; under "replace"
+        # (no mixing / preprocess / scale-with-params / learned SOAP basis)
+        # our typed slab is exactly (dim+2)·H per type + b1 + c_r/c_a.
+        n_gpumd = nd.gpumd_num_params(cfg, soap_dim=cfg.dim_q - nd.nep_dim(cfg))
+        print(f"n_params={n_params} n_params_gpumd={n_gpumd}")
+        if a.nep == "replace":
+            assert n_params == n_gpumd, (n_params, n_gpumd)
     print(f"SMOKE OK {' '.join(sys.argv[1:] if argv is None else argv)} "
           f"W1={tuple(int(d) for d in loaded.W1.shape)} dim_q={cfg.dim_q} "
           f"n_params={n_params} wall={time.time() - t0:.1f}s")

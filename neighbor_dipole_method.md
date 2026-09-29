@@ -118,6 +118,21 @@ comparison between the modes has been run. Not done: descriptor gradients
 ∂q^NEP/∂r (so `dipole_readout="tnep"` with NEP inputs = Phase B), and
 trajectory inference for NEP-input models.
 
+Phase B (2026-09-29). `dipole_readout="tnep"` with NEP inputs now runs
+end to end for "concat" and "replace" (SNES full-batch and mini-batch,
+Adam; save/load/score): per-candidate NEP pair forces ∂q^NEP/∂r through the
+factorised radial α / angular Gs kernels (multi_descriptor_plan.md §B.2),
+with image-exact |r_ij|² weights from the stored displacements (never MIC).
+For the faithful GPUMD configuration — "replace", `descriptor_scale=
+"minmax"`, tanh, `dipole_rij_power=2`, mixing / preprocess / learned SOAP
+basis off — the SNES parameter count equals GPUMD's `number_of_variables`
+exactly (`nep_descriptor.gpumd_num_params`, asserted by
+`test_parameter_count_matches_gpumd_formula` and by scripts/smoke_train.py):
+typed slab (dim+2)·H per species + one shared b1 + c_r/c_a. Under "concat"
+the count differs by the mixing tail only. Still not done: trajectory
+inference, PES / polarisability (forces on both atoms, virials), and
+"sum"+tnep. No accuracy comparison has been run.
+
 ## 3. Exact properties (theory)
 
 1. **Translation invariance / acoustic sum rule.** Only displacements d

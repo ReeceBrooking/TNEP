@@ -1208,6 +1208,17 @@ def _mu_batch(m, d, W_atom=None, weights=None, c=None):
         W_atom=W_atom, c_r=c_r, c_a=c_a, **_tnep_kw(d)).numpy()
 
 
+def test_parameter_count_matches_gpumd_formula():
+    """SNES.dim for the faithful GPUMD TNEP configuration equals GPUMD's
+    number_of_variables (parameters.cu:203-235): typed slab (dim+2)·H per
+    type + shared b1 + c_r/c_a — no extra parameters anywhere."""
+    cfg = _tnep_cfg("replace", descriptor_mixing=False,
+                    descriptor_preprocess_contract="off", descriptor_scale="off")
+    m = _model(cfg)
+    assert int(m.optimizer.dim) == nd.gpumd_num_params(cfg)
+    assert nd.gpumd_num_params(cfg) == 2 * (42 + 2) * 8 + 1 + 4 * (49 + 49)   # header by hand
+
+
 @pytest.mark.parametrize("four_body", [True, False])
 def test_nep_pair_forces_match_fd(four_body):
     """F_p = ∂U_i/∂D_p (D = r_j − r_i) for U = Σ_{i,d} Fp[i,d] q_d with Fp frozen:
