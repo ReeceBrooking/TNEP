@@ -6,6 +6,7 @@ import os
 import h5py
 from TNEPconfig import TNEPconfig
 from TNEP import TNEP
+from nep_descriptor import EXPERT_WEIGHTS
 
 
 # Backward-compat: if a saved model predates a config field, the live
@@ -254,10 +255,14 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         # Learned radial basis coefficients (cfg.radial_basis_size).
         if getattr(model, "M_radial", None) is not None:
             wg.create_dataset("M_radial", data=model.M_radial.numpy())
-        # NEP contraction coefficients (cfg.nep_descriptor != "off").
+        # NEP contraction coefficients (cfg.nep_descriptor != "off") and the
+        # "sum"-mode expert ANNs.
         if getattr(model, "c_r", None) is not None:
             wg.create_dataset("c_r", data=model.c_r.numpy())
             wg.create_dataset("c_a", data=model.c_a.numpy())
+        if model._nep_mode == "sum":
+            for k in EXPERT_WEIGHTS:
+                wg.create_dataset(k, data=getattr(model, k).numpy())
 
         # Descriptor metadata
         dg = f.create_group("descriptor")
@@ -445,7 +450,7 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
                   U_pair=None, W_pre_angular=None, c_pair=None,
-                  M_radial=None, c_r=None, c_a=None) -> None:
+                  M_radial=None, c_r=None, c_a=None, experts=None) -> None:
     if model._neighbor_readout:
         # Clean break: the multi-channel readout changed the tail layout
         # (W1 [T, H, C]; c_pair when dipole_species_pairs). Old neighbor-mode
@@ -524,6 +529,20 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                     f"{tuple(var.shape)} (nep_n_max / nep_basis_size / "
                     f"num_types changed).")
             var.assign(saved)
+    if model._nep_mode == "sum":
+        experts = experts or {}
+        for k in EXPERT_WEIGHTS:
+            if k not in experts:
+                raise ValueError(
+                    f"cfg.nep_descriptor='sum' but the save has no {k} dataset — "
+                    f"the expert ANN would silently reset to its init. Re-train.")
+            var = getattr(model, k)
+            if tuple(experts[k].shape) != tuple(var.shape):
+                raise ValueError(
+                    f"saved {k} shape {tuple(experts[k].shape)} != model "
+                    f"{tuple(var.shape)} (nep_num_neurons / nep_n_max / "
+                    f"dipole head changed).")
+            var.assign(experts[k])
 
 
 def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
@@ -568,6 +587,7 @@ def _load_model_h5(path: str) -> TNEP:
             "M_radial": wg["M_radial"][:] if "M_radial" in wg else None,
             "c_r": wg["c_r"][:] if "c_r" in wg else None,
             "c_a": wg["c_a"][:] if "c_a" in wg else None,
+            "experts": {k: wg[k][:] for k in EXPERT_WEIGHTS if k in wg},
         }
 
     if "radial_basis_normalize" in config_dict:   # pre-2026-09-23 bool

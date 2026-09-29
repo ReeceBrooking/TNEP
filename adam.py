@@ -23,6 +23,7 @@ import numpy as np
 import tensorflow as tf
 
 from loss_functions import squared_error_per_structure
+from nep_descriptor import EXPERT_WEIGHTS
 
 
 def _tf_var(v):
@@ -37,6 +38,8 @@ def _trainable(model) -> dict:
     tf.Variable by construction (SNES owns it), so the tape watches the list
     explicitly."""
     vs = {"W0": model.W0, "b0": model.b0, "W1": model.W1, "b1": model.b1}
+    if model._nep_mode == "sum":
+        vs.update({k: getattr(model, k) for k in EXPERT_WEIGHTS})
     if model._neighbor_readout and model._c_learnable:
         vs["c_pair"] = model.c_pair
     if model.cfg.target_mode == 2:
@@ -55,6 +58,8 @@ def _ann_core(model) -> list:
     c_pair / U_pair / M_radial / c_r / c_a tails excluded, as in SNES's multi-type
     per-type penalty)."""
     core = [model.W0, model.b0, model.W1]
+    if model._nep_mode == "sum":
+        core += list(model.expert_weights)
     if model.cfg.target_mode == 2:
         core += [model.W0_pol, model.b0_pol, model.W1_pol]
     return [_tf_var(v) for v in core]
@@ -122,6 +127,8 @@ def fit_adam(model, train_data: dict, val_data: dict,
             c_pair=named.get("c_pair"),
             M_radial=named.get("M_radial"),
             c_r=named.get("c_r"), c_a=named.get("c_a"),
+            experts=(tuple(named[k] for k in EXPERT_WEIGHTS)
+                     if model._nep_mode == "sum" else None),
             nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
             nep_raw=chunk.get("nep_raw"))
         if scale_preds:

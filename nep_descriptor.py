@@ -154,6 +154,11 @@ def find_q_tf(s, four_body, five_body):
 
 
 # ── bookkeeping ────────────────────────────────────────────────────────────
+# nep_descriptor="sum": the two expert ANNs' weights (2-body on the radial
+# block, 3-body on the angular block), in SNES / Adam / save order.
+EXPERT_WEIGHTS = ("W0_r", "b0_r", "W1_r", "W0_a", "b0_a", "W1_a")
+
+
 def validate_nep_cfg(cfg):
     """Every NEP cfg guard in one place; returns cfg.nep_descriptor.
     Field checks run in every mode; mode-specific guards only when on."""
@@ -173,9 +178,6 @@ def validate_nep_cfg(cfg):
             f"cfg.nep_descriptor={mode!r}; expected 'off', 'concat', 'replace' or 'sum'.")
     if mode == "off":
         return mode
-    if mode == "sum":
-        raise NotImplementedError(
-            "cfg.nep_descriptor='sum' is Task 8 of multi_descriptor_plan.md.")
     from data import descriptor_gradients_needed   # lazy: data imports nep_descriptor (Task 5)
     if descriptor_gradients_needed(cfg):
         raise NotImplementedError(

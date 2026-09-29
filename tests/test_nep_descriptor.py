@@ -376,8 +376,11 @@ def test_ann_inputs_modes():
         _model(_cfg(nep_descriptor="replace", descriptor_mixing=True))
     with pytest.raises(ValueError, match="descriptor_preprocess_contract"):
         _model(_cfg(nep_descriptor="replace", descriptor_preprocess_contract="angular"))
-    with pytest.raises(NotImplementedError):
-        _model(_cfg(nep_descriptor="sum"))
+    m = _model(_cfg(nep_descriptor="sum"))           # main ANN sees SOAP only
+    raw, types = _nep_inputs(m.cfg, atoms)
+    assert m._ann_inputs(desc, tf.constant(raw[None]), tf.constant(types[None])) is desc
+    with pytest.raises(ValueError, match="nep_raw"):
+        m._ann_inputs(desc, None, tf.constant(types[None]))
     with pytest.raises(ValueError, match="nep_descriptor"):
         _model(_cfg(nep_descriptor="bogus"))
 
@@ -532,8 +535,13 @@ def test_nep_raw_rides_data_dict_and_padding():
 @pytest.mark.parametrize("mode", ["concat", "replace"])
 @pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
 def test_nep_four_path_consistency(mode, readout):
+    cfg = _cfg(nep_descriptor=mode, dipole_readout=readout)
+    _check_four_path(cfg, _model(cfg))
+
+
+def _check_four_path(cfg, m):
+    """predict / predict_batch (V slot + in-graph COO) / predict_batch_candidates agree."""
     from data import assemble_data_dict, pad_and_stack
-    cfg = _cfg(nep_descriptor=mode, dipole_readout=readout); m = _model(cfg)
     atoms = _bulk_frame()
     types_int = assign_type_indices([atoms], cfg.types)
     builder = make_descriptor_builder(cfg)
@@ -804,3 +812,233 @@ def test_nep_block_excluded_from_mixing():
     W0, W0_eff = m.W0.numpy(), m._W0_eff(m.W0).numpy()
     np.testing.assert_array_equal(W0_eff[:, ds:], W0[:, ds:])
     assert not np.allclose(W0_eff[:, :ds], W0[:, :ds])
+
+
+# ── Task 8: nep_descriptor="sum" — ANN_soap + ANN_2b + ANN_3b summed into the head ──
+
+EXPERTS = ("W0_r", "b0_r", "W1_r", "W0_a", "b0_a", "W1_a")
+
+
+def _sum_cfg(**kw):
+    return _cfg(**{"nep_descriptor": "sum", "nep_num_neurons": 6, **kw})
+
+
+def _randomise_experts(m, seed=11):
+    """Live experts: the gen-0 W1_r = W1_a = 0 would hide every expert bug."""
+    for i, k in enumerate(EXPERTS):
+        v = getattr(m, k)
+        v.assign(0.5 * tf.random.stateless_normal(v.shape, [seed, i]))
+
+
+def test_sum_mode_gen0_identity():
+    """A fresh sum-mode model equals the SOAP-only model with the same seed
+    (W1_r = W1_a = 0); the SNES μ-init does the same."""
+    from SNES import SNES
+    atoms = _bulk_frame()
+    cfg_off, cfg_sum = _cfg(), _sum_cfg()
+    m_off, m_sum = _model(cfg_off), _model(cfg_sum)
+    assert cfg_sum.dim_q == cfg_off.dim_q                       # main ANN input = SOAP
+    for k in ("W0", "b0", "W1"):
+        np.testing.assert_array_equal(getattr(m_sum, k).numpy(), getattr(m_off, k).numpy())
+    sl = nd.nep_slices(cfg_sum); He, Hw, T = 6, m_sum._head_width, 2
+    assert tuple(m_sum.W0_r.shape) == (T, sl["radial"].stop, He)
+    assert tuple(m_sum.W0_a.shape) == (T, sl["angular"].stop - sl["angular"].start, He)
+    assert tuple(m_sum.W1_r.shape) == tuple(m_sum.W1_a.shape) == (T, He, Hw)
+    assert np.all(m_sum.W1_r.numpy() == 0) and np.all(m_sum.W1_a.numpy() == 0)
+    assert np.any(m_sum.W0_r.numpy() != 0) and np.any(m_sum.W0_a.numpy() != 0)
+    d_off, d_sum = prepare_eval_data([atoms], cfg_off), prepare_eval_data([atoms], cfg_sum)
+    np.testing.assert_allclose(_predict_eff(m_sum, d_sum), _predict_eff(m_off, d_off), rtol=1e-6)
+    # SNES μ-init: same SOAP slab, zero expert W1, same candidate prediction.
+    o_off, o_sum = SNES(m_off), SNES(m_sum)
+    n_off, n_sum = (o._split_reconstructed(o.reconstruct_params_tf(o.mu)) for o in (o_off, o_sum))
+    for k in ("W0", "b0", "W1", "b1"):
+        np.testing.assert_array_equal(n_sum[k].numpy(), n_off[k].numpy())
+    assert np.all(n_sum["W1_r"].numpy() == 0) and np.all(n_sum["W1_a"].numpy() == 0)
+    assert np.any(n_sum["W0_r"].numpy() != 0) and np.all(n_sum["b0_r"].numpy() == 0)
+    np.testing.assert_allclose(o_sum.validate(d_sum, o_sum.mu), o_off.validate(d_off, o_off.mu), rtol=1e-5)
+
+
+def test_sum_mode_experts_add():
+    """Neighbor readout (K=0): μ is linear in the head, so μ(all) = μ(SOAP) + μ(2b) + μ(3b)."""
+    cfg = _sum_cfg(); m = _model(cfg); atoms = _bulk_frame()
+    _randomise_experts(m)
+    d = prepare_eval_data([atoms], cfg)
+    W1, W1_r, W1_a = (getattr(m, k).numpy().copy() for k in ("W1", "W1_r", "W1_a"))
+
+    def mu_with(**on):
+        for k, v in (("W1", W1), ("W1_r", W1_r), ("W1_a", W1_a)):
+            getattr(m, k).assign(v if on.get(k, True) else np.zeros_like(v))
+        return _predict_eff(m, d)[0]
+
+    mu_all = mu_with()
+    mu_soap = mu_with(W1_r=False, W1_a=False)
+    mu_2b = mu_with(W1=False, W1_a=False)
+    mu_3b = mu_with(W1=False, W1_r=False)
+    for v in (mu_soap, mu_2b, mu_3b):
+        assert np.linalg.norm(v) > 1e-6
+    np.testing.assert_allclose(mu_all, mu_soap + mu_2b + mu_3b, rtol=1e-5, atol=1e-6)
+    assert not np.allclose(mu_all, mu_soap, atol=1e-6)
+
+
+@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
+def test_sum_mode_four_path(readout):
+    cfg = _sum_cfg(dipole_readout=readout); m = _model(cfg)
+    _randomise_experts(m)
+    _check_four_path(cfg, m)
+
+
+def test_sum_mode_snes_layout_and_roundtrip():
+    """Typed slab [W0|b0|W1 | W0_r|b0_r|W1_r | W0_a|b0_a|W1_a], then b1, then c_pair."""
+    from SNES import SNES, _set_model_params
+    from data import assemble_data_dict, pad_and_stack
+    cfg = _sum_cfg(dipole_readout="bilinear", dipole_pair_rank=1, dipole_species_pairs="symmetric")
+    m = _model(cfg); opt = SNES(m)
+    T, H, He, Hw, Q = 2, cfg.num_neurons, 6, m._head_width, cfg.dim_q
+    sl = nd.nep_slices(cfg); dr, da = sl["radial"].stop, sl["angular"].stop - sl["angular"].start
+    n_main = T * (Q * H + H + H * Hw)
+    n_r, n_a = T * (dr * He + He + He * Hw), T * (da * He + He + He * Hw)
+    assert opt.n_typed == n_main + n_r + n_a
+    assert opt._n_per_type == opt.n_typed // T
+    assert opt.n_c > 0 and opt.n_primary == opt.n_typed + 1 + opt.n_c
+    assert opt.dim == opt.n_anns_total + opt.n_nep
+    mu = opt.mu.numpy()
+    assert int(opt._extract_type_params(opt.mu, 0).shape[0]) == opt._n_per_type
+    assert tuple(opt._extract_type_params_batched(opt.mu[tf.newaxis], 1).shape) == (1, opt._n_per_type)
+    named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
+    # Slab positions: experts right after W1, b1 at n_typed, c_pair after b1.
+    np.testing.assert_array_equal(mu[n_main:n_main + T * dr * He], named["W0_r"].numpy().ravel())
+    np.testing.assert_array_equal(mu[n_main + n_r:n_main + n_r + T * da * He], named["W0_a"].numpy().ravel())
+    assert mu[opt.n_typed] == named["b1"].numpy()
+    np.testing.assert_array_equal(mu[opt.n_typed + 1:opt.n_typed + 1 + opt.n_c], named["c_pair"].numpy().ravel())
+    assert np.all(named["W1_r"].numpy() == 0) and np.all(named["W1_a"].numpy() == 0)
+    # Per-type labels: each expert block is typed by its centre type.
+    tov = np.asarray(opt._type_of_variable)
+    np.testing.assert_array_equal(tov[n_main:n_main + T * dr * He], np.repeat(np.arange(T), dr * He))
+    np.testing.assert_array_equal(tov[n_main + n_r:n_main + n_r + T * da * He], np.repeat(np.arange(T), da * He))
+    assert tov[opt.n_typed] == T
+    # Per-type extraction picks type t's rows of every block.
+    tp0 = opt._extract_type_params(opt.mu, 0).numpy()
+    w0r_t0 = mu[n_main:n_main + dr * He]
+    assert any(np.array_equal(tp0[i:i + dr * He], w0r_t0) for i in range(0, tp0.size - dr * He + 1))
+    # Round trip: perturb μ → assign → predict_batch(model weights) == candidates(μ).
+    atoms = _bulk_frame()
+    types_int = assign_type_indices([atoms], cfg.types)
+    desc, grads, gidx = make_descriptor_builder(cfg).build_descriptors([atoms])
+    full = pad_and_stack(assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg),
+                         num_types=cfg.num_types, self_pairs_only=True)
+    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
+    _set_model_params(m, *opt.reconstruct_params_tf(mu_vec))
+    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec))
+    for k in EXPERTS:
+        np.testing.assert_array_equal(getattr(m, k).numpy(), n[k].numpy())
+    assert np.any(m.W1_r.numpy() != 0)
+    kw = dict(nbr_index=full["nbr_index"], nbr_G=full["nbr_G"], nep_raw=full["nep_raw"])
+    mu_model = m.predict_batch(*_forward_args(m, full), W_atom=full["V_atom"], **kw)[0].numpy()
+    nb = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
+    experts = tuple(nb[k] for k in EXPERTS)
+    mu_cand = m.predict_batch_candidates(
+        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
+        nb["W0"], nb["b0"], nb["W1"], nb["b1"], c_pair=nb["c_pair"],
+        c_r=nb["c_r"], c_a=nb["c_a"], experts=experts, **kw)[0, 0].numpy()
+    np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
+    assert np.any(mu_cand != 0.0)
+    # Liveness: two candidates differing only in the expert slabs.
+    d = prepare_eval_data([atoms, atoms], cfg)
+    mu_e = mu_vec.numpy().copy(); mu_e[n_main:opt.n_typed] *= 3.0
+    fit = opt.evaluate_population(tf.stack([mu_vec, tf.constant(mu_e)]), d).numpy()
+    assert np.all(np.isfinite(fit)) and fit[0] != fit[1]
+    assert opt.validate(d, tf.constant(mu_e)) != opt.validate(d, mu_vec)
+
+
+def test_sum_mode_regularisation_includes_experts():
+    from SNES import SNES
+    for types in ([8, 1], [8]):
+        kw = dict(lambda_1=0.1, lambda_2=0.1)
+        if len(types) == 1:
+            kw.update(types=[8], num_types=1, type_map={8: 0})
+        cfg = _sum_cfg(**kw); m = _model(cfg); opt = SNES(m)
+        T, H, Hw, Q = cfg.num_types, cfg.num_neurons, m._head_width, cfg.dim_q
+        n_main = T * (Q * H + H + H * Hw)
+        mu = opt.mu.numpy().copy(); mu2 = mu.copy()
+        mu2[n_main:n_main + T * m.W0_r.shape[1] * 6] *= 10.0     # W0_r slab
+        assert opt.compute_regularization(mu) != opt.compute_regularization(mu2)
+        assert not np.allclose(opt.compute_regularization_tf(tf.constant(mu[None])).numpy(),
+                               opt.compute_regularization_tf(tf.constant(mu2[None])).numpy())
+
+
+@pytest.mark.parametrize("scale", ["block", "channel", "minmax"])
+def test_sum_mode_scaled_is_gen0_reparameterisation(scale):
+    """gen0_ann_inputs is the full [q_soap ‖ q_nep]; the SOAP / radial / angular
+    slices fold into W0, W0_r, W0_a; a scaled model equals the unscaled one."""
+    from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
+    from TNEP import gen0_ann_inputs
+    atoms = _bulk_frame(); small = atoms[:12]; small.info["dipole"] = np.zeros(3)
+    cfg_off, cfg_on = _sum_cfg(), _sum_cfg(descriptor_scale=scale)
+    d = prepare_eval_data([atoms, small], cfg_off)
+    ds, dn = cfg_off.dim_q, nd.nep_dim(cfg_off)
+    q0 = gen0_ann_inputs(cfg_on, d)
+    assert q0.shape == (2, len(atoms), ds + dn)
+    groups = q_scale_groups(cfg_on)
+    assert sorted(np.concatenate(groups).tolist()) == list(range(ds + dn))
+    assert len(groups) == len(q_scale_groups(_cfg(descriptor_scale=scale))) + 1 + 4 + 1
+    m_np, mu_np = compute_q_scale(q0, d["atom_mask"].numpy(), cfg_on)
+    cfg_on.q_scale, cfg_on.q_shift = [float(v) for v in m_np], [float(v) for v in mu_np]
+    m_off, m_on = _model(cfg_off), _model(cfg_on)
+    sl = nd.nep_slices(cfg_on); m_r, m_a = m_np[ds:][sl["radial"]], m_np[ds:][sl["angular"]]
+    np.testing.assert_allclose(m_on.W0.numpy() * m_np[None, :ds, None], m_off.W0.numpy(), rtol=1e-6)
+    np.testing.assert_allclose(m_on.W0_r.numpy() * m_r[None, :, None], m_off.W0_r.numpy(), rtol=1e-6)
+    np.testing.assert_allclose(m_on.W0_a.numpy() * m_a[None, :, None], m_off.W0_a.numpy(), rtol=1e-6)
+    for m in (m_off, m_on):
+        _randomise_experts(m)                      # same draw on both → live experts
+    for k, mk in (("r", m_r), ("a", m_a)):     # re-fold the shared draw into m_on
+        getattr(m_on, f"W0_{k}").assign(getattr(m_off, f"W0_{k}").numpy() / mk[None, :, None])
+        mu_k = (m_np * mu_np)[ds:][sl["radial" if k == "r" else "angular"]]
+        getattr(m_on, f"b0_{k}").assign(getattr(m_off, f"b0_{k}").numpy()
+                                        + np.einsum('q,tqh->th', mu_k, getattr(m_on, f"W0_{k}").numpy()))
+    np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
+    assert np.abs(_predict_eff(m_on, d)).max() > 0
+    # Any scaled expert == unscaled with W0' = m∘W0, b0' = b0 − (m∘μ)·W0.
+    rng = np.random.default_rng(1)
+    for k, mk in (("r", m_r), ("a", m_a)):
+        W = rng.normal(size=getattr(m_on, f"W0_{k}").shape).astype(np.float32)
+        B = rng.normal(size=getattr(m_on, f"b0_{k}").shape).astype(np.float32)
+        mu_k = (m_np * mu_np)[ds:][sl["radial" if k == "r" else "angular"]]
+        getattr(m_on, f"W0_{k}").assign(W); getattr(m_on, f"b0_{k}").assign(B)
+        getattr(m_off, f"W0_{k}").assign(W * mk[None, :, None])
+        getattr(m_off, f"b0_{k}").assign(B - np.einsum('q,tqh->th', mu_k, W))
+    np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
+
+
+def test_sum_mode_save_load(tmp_path):
+    import h5py, model_io
+    cfg = _sum_cfg(); m = _model(cfg); atoms = _bulk_frame()
+    _randomise_experts(m)
+    mu0 = _mu_nep(m, atoms, cfg)
+    p = str(tmp_path / "sum.h5")
+    model_io.save_model(m, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.nep_descriptor == "sum" and loaded.cfg.nep_num_neurons == 6
+    for k in EXPERTS:
+        np.testing.assert_array_equal(getattr(loaded, k).numpy(), getattr(m, k).numpy())
+    np.testing.assert_allclose(_mu_nep(loaded, atoms, loaded.cfg), mu0, atol=1e-6)
+    with h5py.File(p, "a") as f:
+        del f["weights"]["W0_r"]
+    with pytest.raises(ValueError, match="W0_r"):
+        model_io.load_model(p)
+
+
+def test_sum_mode_adam_smoke():
+    from adam import _trainable, _ann_core
+    cfg = _sum_cfg(optimizer="adam", adam_lr=1e-2, num_generations=2, val_interval=1,
+                   batch_chunk_size=1, dipole_species_pairs="symmetric")
+    m = _model(cfg); atoms = _bulk_frame()
+    keys = list(_trainable(m))
+    assert keys[keys.index("b1") + 1:keys.index("b1") + 7] == list(EXPERTS)
+    assert keys.index("W1_a") < keys.index("c_pair")
+    assert len(_ann_core(m)) == 9
+    d = prepare_eval_data([atoms, atoms], cfg)
+    history, final, best = m.fit(d, d)
+    assert np.all(np.isfinite(history["train_loss"]))
+    for mdl in (final, best):
+        assert np.all(np.isfinite(mdl.W1_r.numpy())) and np.any(mdl.W1_r.numpy() != 0)
+        assert np.any(mdl.W1_a.numpy() != 0)

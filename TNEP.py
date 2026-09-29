@@ -10,8 +10,8 @@ from typing import Callable
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
-from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width,
-                            find_q_tf, NUM_ABC)
+from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices,
+                            find_q_tf, NUM_ABC, EXPERT_WEIGHTS)
 
 
 @tf.function(jit_compile=True)
@@ -260,6 +260,18 @@ class TNEP(layers.Layer):
             self.c_a = tf.Variable(rng.uniform(-1.0, 1.0, (
                 T, T, cfg.nep_n_max_angular + 1, cfg.nep_basis_size_angular + 1)
             ).astype(np.float32), trainable=False, name="nep_c_a")
+        # descriptor_scale sees the main ANN's input (dim_q_forward) and,
+        # under "sum", the NEP vector after it ([q_soap ‖ q_nep], see
+        # gen0_ann_inputs): one slice of cfg.q_scale per typed ANN.
+        self._sl_main = slice(0, int(self.dim_q_forward))
+        self._scale_width = int(self.dim_q_forward)
+        self._expert_in = ()      # (input slice of q_nep, slice of q_scale) per expert
+        if self._nep_mode == "sum":
+            nsl, ds = nep_slices(cfg), self._scale_width
+            self._expert_in = tuple(
+                (nsl[k], slice(ds + nsl[k].start, ds + nsl[k].stop))
+                for k in ("radial", "angular"))
+            self._scale_width += self._nep_dim
         # Descriptor scale preconditioning: m folded into W0 (see _W0_eff);
         # the Keras W0 init is divided by m so the initial function is the
         # unscaled one. SNES's μ init does the same in _build_mu_init.
@@ -279,10 +291,10 @@ class TNEP(layers.Layer):
                     "training driver computes it from the training set "
                     "(compute_q_scale) before building the model.")
             m = np.asarray(cfg.q_scale, dtype=np.float32)
-            if m.shape != (int(self.dim_q_forward),):
+            if m.shape != (self._scale_width,):
                 raise ValueError(
                     f"cfg.q_scale has shape {m.shape}, expected "
-                    f"({self.dim_q_forward},) — recompute for this descriptor.")
+                    f"({self._scale_width},) — recompute for this descriptor.")
             self._q_scale = tf.constant(m)
             if cfg.q_shift is None:
                 raise ValueError("cfg.q_shift is None — computed with q_scale.")
@@ -482,6 +494,22 @@ class TNEP(layers.Layer):
                 initializer="zeros",
                 trainable=True,
             )
+
+        # Typed single-hidden-layer ANN blocks in SNES order — (suffix, input
+        # width, hidden width, q_scale slice): the SOAP ANN, then under
+        # nep_descriptor="sum" the 2-body expert on the radial NEP block and
+        # the 3-body expert on the angular block, whose head outputs add to
+        # the SOAP ANN's before _split_head. W1_r / W1_a start at zero so a
+        # fresh model equals the SOAP-only one; b1 stays the one global bias.
+        self._ann_blocks = [("", int(cfg.dim_q), int(cfg.num_neurons), self._sl_main)]
+        for suf, (sl_in, sl_m) in zip(("_r", "_a"), self._expert_in):
+            d_in, He = sl_in.stop - sl_in.start, int(cfg.nep_num_neurons)
+            self._ann_blocks.append((suf, d_in, He, sl_m))
+            for name, shape, init in (("W0", (cfg.num_types, d_in, He), "glorot_uniform"),
+                                      ("b0", (cfg.num_types, He), "zeros"),
+                                      ("W1", (cfg.num_types, He, self._head_width), "zeros")):
+                setattr(self, name + suf, self.add_weight(
+                    name=name + suf, shape=shape, initializer=init, trainable=True))
 
         # Optional descriptor-mixing layer (GPUMD c_nk analog). One padded
         # square block per unordered neighbour-species pair (padded to
@@ -761,13 +789,15 @@ class TNEP(layers.Layer):
 
         if self._q_scale is not None:
             # Stored W0 = Glorot / m and b0 = (m∘μ)·W0_stored, so W0_eff / b0_eff
-            # at init equal the unscaled Glorot / zero init exactly.
-            inv = 1.0 / self._q_scale[:, tf.newaxis]
-            self.W0.assign(self.W0 * inv)
-            self.b0.assign(tf.einsum('q,tqh->th', self._q_shift_m, self.W0))
+            # at init equal the unscaled Glorot / zero init exactly — for every
+            # typed ANN on its own slice of q_scale.
+            anns = [(getattr(self, "W0" + suf), getattr(self, "b0" + suf), sl)
+                    for suf, _, _, sl in self._ann_blocks]
             if cfg.target_mode == 2:
-                self.W0_pol.assign(self.W0_pol * inv)
-                self.b0_pol.assign(tf.einsum('q,tqh->th', self._q_shift_m, self.W0_pol))
+                anns.append((self.W0_pol, self.b0_pol, self._sl_main))
+            for W0, b0, sl in anns:
+                W0.assign(W0 / self._q_scale[sl, tf.newaxis])
+                b0.assign(tf.einsum('q,tqh->th', self._q_shift_m[sl], W0))
 
         self.optimizer = SNES(self)
 
@@ -826,8 +856,7 @@ class TNEP(layers.Layer):
         any U. This is the ONLY fold site — every entry point must go
         through _W0_eff unconditionally.
         """
-        if self._q_scale is not None:
-            W0 = W0 * self._q_scale[:, tf.newaxis]                # [..., Q, H]
+        W0, _ = self._scale_fold(W0, None)                       # [..., Q, H]
         if self.descriptor_mixing:
             U_full = self._U_full(U_pair)
             if self.descriptor_mixing_per_type:
@@ -926,9 +955,22 @@ class TNEP(layers.Layer):
         b0_eff = b0 − (m∘μ)·W0_stored (W0 BEFORE _W0_eff; any leading
         candidate dim broadcasts). Identity when scaling is off. Call it
         wherever _W0_eff is called."""
+        return self._scale_fold(W0_stored, b0)[1]
+
+    def _scale_fold(self, W0: tf.Tensor, b0: tf.Tensor | None,
+                    sl: slice | None = None) -> tuple:
+        """descriptor_scale fold of one typed ANN whose input is channel
+        slice `sl` of the scaler vector (None → the main ANN's): the ANN sees
+        m∘(q − μ), so W0_eff = m∘W0 and b0_eff = b0 − (m∘μ)·W0_stored (any
+        leading candidate axis broadcasts). Identity when scaling is off.
+        The ONE fold site — the SOAP ANN and both "sum" experts use it."""
         if self._q_scale is None:
-            return b0
-        return b0 - tf.einsum('q,...tqh->...th', self._q_shift_m, W0_stored)
+            return W0, b0
+        sl = self._sl_main if sl is None else sl
+        W0_eff = W0 * self._q_scale[sl, tf.newaxis]
+        b0_eff = (None if b0 is None
+                  else b0 - tf.einsum('q,...tqh->...th', self._q_shift_m[sl], W0))
+        return W0_eff, b0_eff
 
     # ---- learned radial basis ---------------------------------------------
 
@@ -1127,6 +1169,8 @@ class TNEP(layers.Layer):
             raise ValueError(
                 f"nep_raw missing: cfg.nep_descriptor={self._nep_mode!r} needs "
                 f"the raw NEP basis at every forward site.")
+        if self._nep_mode == "sum":       # experts read nep_raw in _expert_outputs
+            return descriptors
         q_nep = self.nep_from_raw(nep_raw, Z, c_r, c_a)
         if self._nep_mode == "replace":
             return q_nep
@@ -1141,6 +1185,46 @@ class TNEP(layers.Layer):
                 q_nep[tf.newaxis],
                 tf.concat([tf.shape(descriptors)[:1], tf.shape(q_nep)], 0))
         return tf.concat([descriptors, q_nep], -1)
+
+    @property
+    def expert_weights(self) -> tuple:
+        """The six "sum"-mode expert tensors in EXPERT_WEIGHTS order."""
+        return tuple(getattr(self, k) for k in EXPERT_WEIGHTS)
+
+    def _expert_ann(self, q: tf.Tensor, Z: tf.Tensor, atom_mask: tf.Tensor,
+                    W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor,
+                    sl_in: slice, sl_m: slice) -> tf.Tensor:
+        """One summed expert: activation(q[.., sl_in]·W0[t] + b0[t])·W1[t] →
+        [(C,) ..., A, head_width]. q [(C,) ..., A, dim_nep]; Z / atom_mask
+        [..., A]; STORED weights [(C,) T, ...] — the descriptor_scale fold on
+        slice sl_m happens here (no mixing / preprocess reaches the experts,
+        so no caller pre-folds). Type-mask sum, no [.., A, d, H] gather."""
+        W0, b0 = self._scale_fold(W0, b0, sl_m)
+        x = q[..., sl_in]
+        cand = len(W0.shape) == 4
+        if not cand:
+            W0, b0, W1 = W0[tf.newaxis], b0[tf.newaxis], W1[tf.newaxis]
+        eq = ('c...ad,cdh->c...ah' if len(x.shape) == len(Z.shape) + 2
+              else '...ad,cdh->c...ah')
+        z = tf.add_n([
+            tf.einsum(eq, x, W0[:, t])
+            * tf.cast(tf.equal(Z, t), x.dtype)[..., tf.newaxis]
+            for t in range(self.num_types)])                    # [C, ..., A, H]
+        h = self.activation(z + tf.gather(b0, Z, axis=1)) * atom_mask[..., tf.newaxis]
+        out = tf.einsum('c...ah,c...ahk->c...ak', h, tf.gather(W1, Z, axis=1))
+        return out if cand else out[0]
+
+    def _expert_outputs(self, nep_raw: tf.Tensor, Z: tf.Tensor, atom_mask: tf.Tensor,
+                        c_r: tf.Tensor | None = None, c_a: tf.Tensor | None = None,
+                        experts: tuple | None = None) -> tf.Tensor:
+        """ANN_2b(q_r) + ANN_3b(q_ang) head outputs [(C,) ..., A, head_width]
+        under nep_descriptor="sum", added to the SOAP ANN's before
+        _split_head. experts: the six STORED tensors in EXPERT_WEIGHTS order
+        (optional leading candidate axis); None → the model's variables."""
+        q = self.nep_from_raw(nep_raw, Z, c_r, c_a)
+        w = self.expert_weights if experts is None else tuple(experts)
+        return tf.add_n([self._expert_ann(q, Z, atom_mask, *w[3 * i:3 * i + 3], *sl)
+                         for i, sl in enumerate(self._expert_in)])
 
     def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,
                 positions: tf.Tensor, Z: tf.Tensor, box: tf.Tensor,
@@ -1209,6 +1293,8 @@ class TNEP(layers.Layer):
             # under dipole_species_pairs="ordered" that identity breaks and
             # the exclusion is a modeling choice — keep it, don't "fix" it.
             out = tf.einsum('ah,ahk->ak', h, W1_t)               # [A, C(1+2K)]
+            if self._nep_mode == "sum":
+                out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a)
             s, a, b = self._split_head(out)                          # [A, C], [A, C, K] ×2
             dr, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)          # dr = neighbor − center
@@ -1732,7 +1818,8 @@ class TNEP(layers.Layer):
                       nbr_G: tf.Tensor | None = None,
                       nep_raw: tf.Tensor | None = None,
                       c_r: tf.Tensor | None = None,
-                      c_a: tf.Tensor | None = None) -> tf.Tensor:
+                      c_a: tf.Tensor | None = None,
+                      experts: tuple | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
         Weights are passed explicitly (not read from self) so this method can
@@ -1763,6 +1850,8 @@ class TNEP(layers.Layer):
             nbr_G       : [B, A, M, 3, C] per-slot R_n(r_ij)(r_i − r_j)
             nep_raw     : [B, A, W_raw] raw NEP basis (cfg.nep_descriptor != "off")
             c_r, c_a    : NEP contraction tensors (None → self.c_r / self.c_a)
+            experts     : "sum" mode: the six STORED expert tensors
+                          (EXPERT_WEIGHTS order; None → model variables)
 
         Returns:
             predictions : [B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
@@ -1810,6 +1899,8 @@ class TNEP(layers.Layer):
             if c_pair is None:
                 c_pair = self.c_pair  # model-weight callers (score, spectro)
             out = tf.einsum('bah,bahk->bak', h1, W1_t)          # [B, A, C(1+2K)]
+            if self._nep_mode == "sum":
+                out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts)
             s, a, b = self._split_head(out)
             V = W_atom  # [B, A, 3, C, T] geometry kernel via the W_atom slot
             if V is None:
@@ -1885,7 +1976,8 @@ class TNEP(layers.Layer):
                                   nbr_G: tf.Tensor | None = None,
                                   nep_raw: tf.Tensor | None = None,
                                   c_r: tf.Tensor | None = None,
-                                  c_a: tf.Tensor | None = None) -> tf.Tensor:
+                                  c_a: tf.Tensor | None = None,
+                                  experts: tuple | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
         Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
@@ -1917,6 +2009,8 @@ class TNEP(layers.Layer):
             nep_raw     : [B, A, W_raw] raw NEP basis (cfg.nep_descriptor != "off")
             c_r, c_a    : per-candidate [C, T, T, n+1, K+1] NEP contraction
                           tensors (None → the model's shared c_r / c_a)
+            experts     : "sum" mode: per-candidate [C, ...] STORED expert
+                          tensors (EXPERT_WEIGHTS order; None → the model's)
 
         Returns:
             predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
@@ -2003,6 +2097,8 @@ class TNEP(layers.Layer):
             # b1 stays excluded: exact gauge with c symmetric; a modeling
             # choice (kept deliberately) under "ordered" Ω.
             out = tf.einsum('cbah,cbahk->cbak', h1, W1_t_all)   # [C, B, A, Ch(1+2K)]
+            if self._nep_mode == "sum":
+                out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts)
             s, a, b = self._split_head(out)
             if c_pair is None:
                 # Candidate-independent c (frozen c ≡ 1, or model weights):
@@ -2460,7 +2556,8 @@ def gen0_ann_inputs(cfg, data) -> np.ndarray:
     compute_q_scale must see. The builder's `descriptors` slot is returned as
     is unless it needs finishing: a throwaway model (scaling off) applies
     soap_from_raw (learned basis) and _ann_inputs (NEP concat/replace) chunk by
-    chunk. "minmax" assembles the NEP block with c ≡ 1 like GPUMD's q_scaler
+    chunk; under "sum" the NEP vector the experts read follows the SOAP block
+    ([q_soap ‖ q_nep]). "minmax" assembles the NEP block with c ≡ 1 like GPUMD's q_scaler
     (fitness.cu:165-175, initial_para = 1); block/channel use the real gen-0 c."""
     q0, Z = data["descriptors"], data["Z_int"]
     if cfg.radial_basis_size is None and str(getattr(cfg, "nep_descriptor", "off")) == "off":
@@ -2479,5 +2576,9 @@ def gen0_ann_inputs(cfg, data) -> np.ndarray:
         d, z = q0[s:s + step], Z[s:s + step]
         if cfg.radial_basis_size is not None:
             d = m0.soap_from_raw(d, z)
-        out.append(m0._ann_inputs(d, None if nep_raw is None else nep_raw[s:s + step], z, **c))
+        raw = None if nep_raw is None else nep_raw[s:s + step]
+        x = m0._ann_inputs(d, raw, z, **c)
+        if m0._nep_mode == "sum":
+            x = tf.concat([x, m0.nep_from_raw(raw, z, **c)], axis=-1)
+        out.append(x)
     return tf.concat(out, axis=0).numpy()

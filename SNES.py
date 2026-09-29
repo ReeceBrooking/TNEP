@@ -8,6 +8,7 @@ import tensorflow as tf
 from typing import TYPE_CHECKING, Callable
 
 from loss_functions import squared_error_per_structure
+from nep_descriptor import EXPERT_WEIGHTS
 
 if TYPE_CHECKING:
     from TNEP import TNEP
@@ -31,8 +32,8 @@ def _format_duration(seconds: float) -> str:
 def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight tensors from reconstruct_params_tf into the model's Variables.
 
-    Tail order: W0,b0,W1,b1 | +c_pair (neighbor readout, _c_learnable)
-    | +pol ANN (mode 2) | +U_pair (mixing)
+    Tail order: W0,b0,W1,b1 | +experts (nep_descriptor="sum") | +c_pair
+    (neighbor readout, _c_learnable) | +pol ANN (mode 2) | +U_pair (mixing)
     | +W_pre_angular (preprocess_contract != "off") | +M_radial (learned
     radial basis) | +c_r, +c_a (NEP contraction coefficients).
     """
@@ -42,6 +43,9 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     model.b0.assign(params[idx]); idx += 1
     model.W1.assign(params[idx]); idx += 1
     model.b1.assign(params[idx]); idx += 1
+    if model._nep_mode == "sum":
+        for k in EXPERT_WEIGHTS:
+            getattr(model, k).assign(params[idx]); idx += 1
     if model._neighbor_readout and model._c_learnable:
         model.c_pair.assign(params[idx]); idx += 1
     if model.cfg.target_mode == 2:
@@ -108,18 +112,26 @@ class SNES:
         self.n_c = (self._Ch * (_T * _T if model._species_pairs == "ordered"
                                 else _T * (_T + 1) // 2)
                     if model._neighbor_readout and model._c_learnable else 0)
+        # Typed ANN blocks (model._ann_blocks): the SOAP ANN and, under
+        # nep_descriptor="sum", the 2-body / 3-body experts — each
+        # [W0(T,Q,H) | b0(T,H) | W1(T,H·Hw)] laid end to end in the typed
+        # slab; b1 follows the LAST block, so n_typed stays one contiguous
+        # slice (_global_typed) and every "after b1" offset moves with it.
+        self._blocks = [(int(Q), int(Hb)) for _, Q, Hb, _ in model._ann_blocks]
+        per_type = sum(Q * Hb + Hb + Hb * self._Hw for Q, Hb in self._blocks)
         n_W0 = self.cfg.num_types * self.cfg.dim_q * self.H
         n_b0 = self.cfg.num_types * self.H
         n_W1 = self.cfg.num_types * self.H * self._Hw
         n_b1 = 1
-        self.n_typed = n_W0 + n_b0 + n_W1
-        # Per-type param count (per type t): W0 Q·H + b0 H + W1 H·Ch.
-        # Per-type param count. target_mode==2 has a second (polarizability) ANN
-        # whose type-t block is ALSO extracted for per-type regularization, so
-        # the denominator doubles to match _extract_type_params.
-        self._n_per_type = ((self.cfg.dim_q * self.H + self.H
-                             + self.H * self._Hw)
-                            * (2 if self.cfg.target_mode == 2 else 1))
+        self.n_typed = _T * per_type
+        # Per-expert counts (breakdown); n_expert = 0 outside "sum".
+        self._n_expert = [_T * (Q * Hb + Hb + Hb * self._Hw) for Q, Hb in self._blocks[1:]]
+        self.n_expert = sum(self._n_expert)
+        # Per-type param count (type t's rows of every block). target_mode==2
+        # has a second (polarizability) ANN whose type-t block is ALSO
+        # extracted for per-type regularization, so the denominator doubles
+        # to match _extract_type_params.
+        self._n_per_type = per_type * (2 if self.cfg.target_mode == 2 else 1)
         self.n_primary = self.n_typed + n_b1 + self.n_c
         self._n_W0 = n_W0
         self._n_b0 = n_b0
@@ -482,54 +494,55 @@ class SNES:
         V_pair tail is always zeroed so U_full = I at gen 0.
         """
         T = self.cfg.num_types
-        Q = self.dim_q
-        H = self.H
         mu = np.zeros(self.dim, dtype=np.float32)
         # Activation-dependent Glorot gain (gain=1 → tanh init).
         gain = float(getattr(self.model, "_glorot_gain", 1.0))
-        c_W0 = gain * float(np.sqrt(6.0 / (Q + H)))
-        c_W1 = gain * float(np.sqrt(6.0 / (H + self._Hw)))
 
         q_scale = (self.model._q_scale.numpy() if self.model._q_scale is not None
                    else None)
         q_shift_m = (self.model._q_shift_m.numpy() if q_scale is not None else None)
 
-        def _fill_ann(off: int) -> int:
-            """Fill one ANN's worth of weights starting at ``off``.
-            Layout: [W0(T,Q,H) | b0(T,H) | W1(T,H·Ch) | b1(1)].
-            """
-            n_W0 = T * Q * H
-            w0 = rng.uniform(-c_W0, c_W0, size=n_W0).astype(np.float32)
-            if q_scale is not None:
-                # Stored weights = effective / m so W0_eff at gen 0 is the
-                # unscaled Glorot init (descriptor_scale is a reparameterisation).
-                w0 = (w0.reshape(T, Q, H) / q_scale[None, :, None]).reshape(-1)
-            mu[off:off + n_W0] = w0
-            off += n_W0
-            # b0 zero — or (m∘μ)·W0_stored so b0_eff is zero under centring.
-            if q_shift_m is not None:
-                mu[off:off + T * H] = np.einsum(
-                    'q,tqh->th', q_shift_m, w0.reshape(T, Q, H)).reshape(-1)
-            off += T * H
-            n_W1 = T * H * self._Hw
-            w1 = rng.uniform(-c_W1, c_W1, size=(T, H, self._Hw)).astype(np.float32)
-            if self.model._neighbor_readout and self.model._pair_rank > 0:
-                # Gen 0 == the difference model: b ≡ 0 kills the pair term.
-                C, K = self._Ch, self.model._pair_rank
-                w1[:, :, C + C * K:] = 0.0
-            mu[off:off + n_W1] = w1.reshape(-1)
-            off += n_W1
+        def _fill_ann(off: int, blocks: list) -> int:
+            """Fill typed blocks [W0(T,Q,H) | b0(T,H) | W1(T,H·Hw)] each,
+            then b1(1), starting at ``off``. Block i > 0 is a "sum" expert:
+            W1 zero so generation 0 equals the SOAP-only model."""
+            for i, (Q, Hb) in enumerate(blocks):
+                sl = self.model._ann_blocks[i][3]          # this block's q_scale slice
+                c_W0 = gain * float(np.sqrt(6.0 / (Q + Hb)))
+                c_W1 = gain * float(np.sqrt(6.0 / (Hb + self._Hw)))
+                n_W0 = T * Q * Hb
+                w0 = rng.uniform(-c_W0, c_W0, size=n_W0).astype(np.float32)
+                if q_scale is not None:
+                    # Stored weights = effective / m so W0_eff at gen 0 is the
+                    # unscaled Glorot init (descriptor_scale is a reparameterisation).
+                    w0 = (w0.reshape(T, Q, Hb) / q_scale[sl][None, :, None]).reshape(-1)
+                mu[off:off + n_W0] = w0
+                off += n_W0
+                # b0 zero — or (m∘μ)·W0_stored so b0_eff is zero under centring.
+                if q_shift_m is not None:
+                    mu[off:off + T * Hb] = np.einsum(
+                        'q,tqh->th', q_shift_m[sl], w0.reshape(T, Q, Hb)).reshape(-1)
+                off += T * Hb
+                n_W1 = T * Hb * self._Hw
+                if i == 0:
+                    w1 = rng.uniform(-c_W1, c_W1, size=(T, Hb, self._Hw)).astype(np.float32)
+                    if self.model._neighbor_readout and self.model._pair_rank > 0:
+                        # Gen 0 == the difference model: b ≡ 0 kills the pair term.
+                        C, K = self._Ch, self.model._pair_rank
+                        w1[:, :, C + C * K:] = 0.0
+                    mu[off:off + n_W1] = w1.reshape(-1)
+                off += n_W1
             # b1 zero
             off += 1
             return off
 
-        off = _fill_ann(0)
+        off = _fill_ann(0, self._blocks)
         # c_pair table: init 1.0 (C=1 with c=1 ≈ the single-channel readout).
         if self.n_c > 0:
             mu[off:off + self.n_c] = 1.0
             off += self.n_c
         if self.cfg.target_mode == 2:
-            off = _fill_ann(off)
+            off = _fill_ann(off, self._blocks[:1])
         # V_pair tail: zeroed so U_full = I at gen 0.
         if self.n_U_pair > 0:
             mu[self.n_anns_total:self.n_anns_total + self.n_U_pair] = 0.0
@@ -634,74 +647,49 @@ class SNES:
             pv : [dim] flat parameter vector
             t  : type index (0..num_types-1)
         """
+        return tf.concat([pv[s:e] for s, e in self._type_slices(t)], axis=0)
+
+    def _type_slices(self, t: int) -> list:
+        """(start, end) of type t's rows in W0 / b0 / W1 of every typed ANN
+        block (slab order), plus the polarizability ANN's (mode 2: the SOAP
+        block's layout offset by n_primary — its type-t block must share the
+        per-type penalty, else it is only weakly reached by the global term)."""
         T = self.cfg.num_types
-        Q = self.dim_q
-        H = self.H
-
-        # W0 block: [T, Q, H]
-        w0_start = t * Q * H
-        w0_end = w0_start + Q * H
-
-        # b0 block: after all W0
-        b0_offset = T * Q * H
-        b0_start = b0_offset + t * H
-        b0_end = b0_start + H
-
-        # W1 block: after all b0
-        w1_offset = b0_offset + T * H
-        w1_start = w1_offset + t * H * self._Hw
-        w1_end = w1_start + H * self._Hw
-
-        blocks = [
-            pv[w0_start:w0_end],
-            pv[b0_start:b0_end],
-            pv[w1_start:w1_end],
-        ]
+        out, off = [], 0
+        for Q, Hb in self._blocks:
+            for n in (Q * Hb, Hb, Hb * self._Hw):
+                out.append((off + t * n, off + (t + 1) * n))
+                off += T * n
         if self.cfg.target_mode == 2:
-            # Polarizability ANN: identical layout offset by n_primary. Its
-            # type-t block must share the per-type penalty (else it's only
-            # weakly reached by the global term — asymmetric regularization).
             p = self.n_primary
-            blocks += [
-                pv[p + w0_start:p + w0_end],
-                pv[p + b0_start:p + b0_end],
-                pv[p + w1_start:p + w1_end],
-            ]
-        return tf.concat(blocks, axis=0)
+            out += [(p + s, p + e) for s, e in out[:3]]
+        return out
 
     def _build_type_of_variable(self) -> np.ndarray:
         """Map each param index to its atom type → [dim] int array.
 
-        Layout per ANN: [W0(T,Q,H) | b0(T,H) | W1(T,H) | b1(1)]. Per-type
-        params get label t; b1 gets label T (global).
+        Layout per typed block: [W0(T,Q,H) | b0(T,H) | W1(T,H·Hw)], each
+        t-major, then b1(1). Per-type params get label t; b1 (and c_pair)
+        get label T (global).
         """
         T = self.cfg.num_types
-        Q = self.dim_q
-        H = self.H
 
-        def _ann_types() -> np.ndarray:
+        def _ann_types(blocks) -> np.ndarray:
             tov = np.empty(self.n_primary, dtype=np.int32)
             offset = 0
-            # W0: [T, Q, H] — type t owns contiguous block of Q*H
-            for t in range(T):
-                tov[offset:offset + Q * H] = t
-                offset += Q * H
-            # b0: [T, H]
-            for t in range(T):
-                tov[offset:offset + H] = t
-                offset += H
-            # W1: [T, H·Ch]
-            for t in range(T):
-                tov[offset:offset + H * self._Hw] = t
-                offset += H * self._Hw
+            for Q, Hb in blocks:
+                for n in (Q * Hb, Hb, Hb * self._Hw):
+                    for t in range(T):
+                        tov[offset:offset + n] = t
+                        offset += n
             # b1 (and the c_pair table, when present): global (label = T)
             tov[offset:] = T
             return tov
 
         if self.cfg.target_mode == 2:
-            ann_tov = np.concatenate([_ann_types(), _ann_types()])
+            ann_tov = np.concatenate([_ann_types(self._blocks), _ann_types(self._blocks[:1])])
         else:
-            ann_tov = _ann_types()
+            ann_tov = _ann_types(self._blocks)
 
         # U_pair labels: shared V_pair → global label T (mixing is shared
         # across central types); per-type V_pair → T contiguous slabs, each
@@ -1335,6 +1323,7 @@ class SNES:
             c_pair_val = named.get("c_pair")
             M_val = named.get("M_radial")
             c_r_val = named.get("c_r"); c_a_val = named.get("c_a")
+            experts_val = self._experts_of(named)
             # Centring fold (needs the stored W0), then absorb U_pair^T.
             b0 = self.model._b0_eff(b0, W0)
             if W0p is not None:
@@ -1354,16 +1343,17 @@ class SNES:
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
                 "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val,
-                         c_r_val, c_a_val),
+                         c_r_val, c_a_val, experts_val),
             }
         elif _cache_hit:
             (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val,
-             c_r_val, c_a_val) = _cache["fold"]
+             c_r_val, c_a_val, experts_val) = _cache["fold"]
         else:
             W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
             c_pair_val = None  # predict_batch falls back to model.c_pair
             M_val = None       # predict_batch falls back to model.M_radial
             c_r_val = c_a_val = None   # ... and to model.c_r / c_a
+            experts_val = None         # ... and to the model's expert weights
             W0p = getattr(self.model, 'W0_pol', None)
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
@@ -1429,7 +1419,7 @@ class SNES:
                 chunk["atom_mask"],
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
                 W_atom=W_atom_v, c_pair=c_pair_val, M_radial=M_val,
-                c_r=c_r_val, c_a=c_a_val,
+                c_r=c_r_val, c_a=c_a_val, experts=experts_val,
                 nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
                 nep_raw=chunk.get("nep_raw"),
             )
@@ -1467,12 +1457,18 @@ class SNES:
         rmse = tf.sqrt(tf.maximum(diff_sq_sum / tf.maximum(diff_count, 1.0), 0.0))
         return float(rmse)
 
+    def _experts_of(self, named: dict) -> tuple | None:
+        """The six "sum" expert tensors of a _split_reconstructed dict, in
+        EXPERT_WEIGHTS order (None outside "sum"), for the forward sites."""
+        return tuple(named[k] for k in EXPERT_WEIGHTS) if self.n_expert else None
+
     def _split_reconstructed(self, params: tuple) -> dict:
         """Parse the reconstruct_params_tf tuple into a named dict.
 
-        Tail order: W0,b0,W1,b1 | c_pair (neighbor readout, _c_learnable)
-        | W0_pol.. (mode 2) | U_pair (mixing) | W_pre_angular (preprocess !=
-        "off") | M_radial (learned radial basis) | c_r, c_a (NEP).
+        Tail order: W0,b0,W1,b1 | W0_r..W1_a (nep_descriptor="sum") | c_pair
+        (neighbor readout, _c_learnable) | W0_pol.. (mode 2) | U_pair (mixing)
+        | W_pre_angular (preprocess != "off") | M_radial (learned radial
+        basis) | c_r, c_a (NEP).
         """
         out: dict = {"U_pair": None, "W_pre_angular": None, "c_pair": None,
                      "M_radial": None, "c_r": None, "c_a": None}
@@ -1481,6 +1477,9 @@ class SNES:
         out["b0"] = params[idx]; idx += 1
         out["W1"] = params[idx]; idx += 1
         out["b1"] = params[idx]; idx += 1
+        if self.n_expert:
+            for k in EXPERT_WEIGHTS:
+                out[k] = params[idx]; idx += 1
         if self.n_c > 0:
             out["c_pair"] = params[idx]; idx += 1
         if self.cfg.target_mode == 2:
@@ -1512,35 +1511,25 @@ class SNES:
             [P, ...] for batched input or [...] for single.
         """
         T = self.cfg.num_types
-        Q = self.dim_q
-        H = self.H
-
-        n_W0 = T * Q * H
-        n_b0 = T * H
-        n_W1 = T * H * self._Hw
-        n_b1 = 1
-        # W1 shape: [T, H] except the neighbor readout's channel axis.
-        w1_shape = ([T, H, self._Hw] if self.model._neighbor_readout
-                    else [T, H])
-
         is_batched = len(param_vectors.shape) == 2
 
-        def _extract(pv, offset):
-            """Extract one ANN's weights → (W0, b0, W1, b1, offset)."""
-            W0 = tf.reshape(pv[..., offset:offset + n_W0],
-                            [-1, T, Q, H] if is_batched else [T, Q, H])
-            offset += n_W0
-            b0 = tf.reshape(pv[..., offset:offset + n_b0],
-                            [-1, T, H] if is_batched else [T, H])
-            offset += n_b0
-            W1 = tf.reshape(pv[..., offset:offset + n_W1],
-                            ([-1] + w1_shape) if is_batched else w1_shape)
-            offset += n_W1
+        def _extract(pv, offset, blocks):
+            """Typed blocks [W0 | b0 | W1] each, then b1 →
+            (W0, b0, W1, b1, *expert tensors in EXPERT_WEIGHTS order, offset)."""
+            ws = []
+            for Q, Hb in blocks:
+                # W1 shape: [T, H] except the neighbor readout's channel axis.
+                w1_shape = [T, Hb, self._Hw] if self.model._neighbor_readout else [T, Hb]
+                for shape in ([T, Q, Hb], [T, Hb], w1_shape):
+                    n = int(np.prod(shape))
+                    ws.append(tf.reshape(pv[..., offset:offset + n],
+                                         ([-1] + shape) if is_batched else shape))
+                    offset += n
             b1 = pv[..., offset]
-            offset += n_b1
-            return W0, b0, W1, b1, offset
+            offset += 1
+            return (*ws[:3], b1, *ws[3:], offset)
 
-        first = _extract(param_vectors, 0)
+        first = _extract(param_vectors, 0, self._blocks)
         offset = first[-1]
         primary = first[:-1]
 
@@ -1554,7 +1543,7 @@ class SNES:
             primary = primary + (c,)
 
         if self.cfg.target_mode == 2:
-            second = _extract(param_vectors, offset)
+            second = _extract(param_vectors, offset, self._blocks[:1])
             offset = second[-1]
             tail = primary + second[:-1]
         else:
@@ -1800,34 +1789,7 @@ class SNES:
 
     def _extract_type_params_batched(self, param_vectors: tf.Tensor, t: int) -> tf.Tensor:
         """Extract type-t params from batched flat vectors → [P, n_per_type]."""
-        T = self.cfg.num_types
-        Q = self.dim_q
-        H = self.H
-
-        w0_start = t * Q * H
-        w0_end = w0_start + Q * H
-
-        b0_offset = T * Q * H
-        b0_start = b0_offset + t * H
-        b0_end = b0_start + H
-
-        w1_offset = b0_offset + T * H
-        w1_start = w1_offset + t * H * self._Hw
-        w1_end = w1_start + H * self._Hw
-
-        blocks = [
-            param_vectors[:, w0_start:w0_end],
-            param_vectors[:, b0_start:b0_end],
-            param_vectors[:, w1_start:w1_end],
-        ]
-        if self.cfg.target_mode == 2:
-            p = self.n_primary   # polarizability ANN block (see _extract_type_params)
-            blocks += [
-                param_vectors[:, p + w0_start:p + w0_end],
-                param_vectors[:, p + b0_start:p + b0_end],
-                param_vectors[:, p + w1_start:p + w1_end],
-            ]
-        return tf.concat(blocks, axis=1)
+        return tf.concat([param_vectors[:, s:e] for s, e in self._type_slices(t)], axis=1)
 
     def evaluate_population(self, samples_tf: tf.Tensor, batch_data: dict[str, tf.Tensor],
                             return_per_type: bool = False) -> tf.Tensor:
@@ -2109,6 +2071,7 @@ class SNES:
                 c_pair=named.get("c_pair"),
                 M_radial=named.get("M_radial"),
                 c_r=named.get("c_r"), c_a=named.get("c_a"),
+                experts=self._experts_of(named),
                 nbr_index=batch_data.get("nbr_index"),
                 nbr_G=batch_data.get("nbr_G"),
                 nep_raw=batch_data.get("nep_raw"))  # [C, B, T_dim]

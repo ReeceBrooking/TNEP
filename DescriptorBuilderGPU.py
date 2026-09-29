@@ -404,9 +404,14 @@ def extra_block_widths(cfg) -> list:
         n_on = _radial_extras_on(cfg)
         widths += [n_extra // n_on] * n_on
     if mode in ("concat", "replace"):
-        from nep_descriptor import nep_slices
-        widths += [sl.stop - sl.start for k, sl in nep_slices(cfg).items() if k != "angular"]
+        widths += nep_block_widths(cfg)
     return widths
+
+
+def nep_block_widths(cfg) -> list:
+    """NEP sub-block widths in channel order: radial, L1..L4, 4-body, 5-body."""
+    from nep_descriptor import nep_slices
+    return [sl.stop - sl.start for k, sl in nep_slices(cfg).items() if k != "angular"]
 
 
 def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int,
@@ -465,12 +470,17 @@ Q_SCALE_CLAMP = 10.0   # max boost / damping of any channel
 def q_scale_groups(cfg) -> list:
     """Channel groups for descriptor_scale="block": each SOAP l group (union
     over species pairs; none under nep_descriptor="replace") then each
-    appended block (extra_block_widths), covering every channel exactly once."""
+    appended block (extra_block_widths), covering every channel exactly once.
+    Under "sum" the scaler sees [q_soap ‖ q_nep] (gen0_ann_inputs) although
+    the main ANN's layout is SOAP only, so the NEP sub-blocks follow."""
     lay = descriptor_block_layout(cfg)
     groups = [np.asarray(v, dtype=np.int32) for _, v in sorted(lay["l_index"].items())
               if len(v)]
     start = sum(len(g) for g in groups)
-    for w in extra_block_widths(cfg):
+    widths = extra_block_widths(cfg)
+    if str(getattr(cfg, "nep_descriptor", "off")) == "sum":
+        widths = widths + nep_block_widths(cfg)
+    for w in widths:
         groups.append(np.arange(start, start + w, dtype=np.int32))
         start += w
     return groups

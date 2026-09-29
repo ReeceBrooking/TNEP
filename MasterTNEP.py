@@ -357,6 +357,10 @@ def _print_param_breakdown(model) -> None:
     if opt.n_c > 0:
         rows.append(("c_pair  [C·T²]" if model._species_pairs == "ordered"
                      else "c_pair  [C·T(T+1)/2]", int(opt.n_c)))
+    # nep_descriptor="sum": the 2-body / 3-body experts (inside the typed slab).
+    for name, n in zip(("ANN_2b  [T·(d_r·H_e + H_e + H_e·Hw)]",
+                        "ANN_3b  [T·(d_a·H_e + H_e + H_e·Hw)]"), opt._n_expert):
+        rows.append((name, int(n)))
 
     # Polarisability ANN — same per-layer shape, mirrored doubling.
     if cfg.target_mode == 2:
@@ -489,7 +493,9 @@ def _train_model_inner(cfg: TNEPconfig,
               f"n_max=({cfg.nep_n_max_radial}, {cfg.nep_n_max_angular}), "
               f"basis_size=({cfg.nep_basis_size_radial}, {cfg.nep_basis_size_angular}), "
               f"four_body={cfg.nep_four_body}, five_body={cfg.nep_five_body}; "
-              f"c init U(−1,1) per GPUMD; c excluded from L1/L2 (GPUMD includes it)")
+              f"c init U(−1,1) per GPUMD; c excluded from L1/L2 (GPUMD includes it)"
+              + (f"; sum: ANN_2b + ANN_3b (H_e = {cfg.nep_num_neurons}) + SOAP ANN, "
+                 f"expert W1 = 0 at gen 0" if cfg.nep_descriptor == "sum" else ""))
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
     # On resume, reuse the checkpoint's existing run dir.
