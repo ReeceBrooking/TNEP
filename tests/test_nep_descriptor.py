@@ -2,6 +2,7 @@
 
 Task 1: radial_basis_norm="none" on the FIXED GPU SOAP builder.
 Task 3: GPUMD-exact NEP basis / raw builder (nep_descriptor.py).
+Task 4: in-model contraction nep_from_raw, c variables, _ann_inputs, dim bookkeeping.
 """
 import os
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
@@ -12,10 +13,12 @@ sys.path.insert(0, ROOT)
 
 import numpy as np
 import pytest
+import tensorflow as tf
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from DescriptorBuilder import make_descriptor_builder
 import nep_descriptor as nd
+from data import assign_type_indices, prepare_eval_data
 from test_neighbor_dipole import _cfg as _base_cfg, _model, _bulk_frame
 
 
@@ -263,3 +266,185 @@ def test_nep_descriptor_matches_calorine_on_users_nep_txt():
     np.testing.assert_allclose(ours, theirs, rtol=1e-5, atol=1e-5 * np.abs(theirs).max())
     # And the raw q does NOT match — calorine really returns the scaled form.
     assert not np.allclose(q, theirs, rtol=1e-3, atol=1e-3 * np.abs(theirs).max())
+
+
+# ── Task 4: nep_from_raw, c variables, _ann_inputs, dim bookkeeping ────────
+
+def _nep_inputs(cfg, atoms):
+    """(raw [A, W_raw], types [A]) of one frame in cfg.types order."""
+    types = np.asarray(assign_type_indices([atoms], cfg.types)[0])
+    return nd.nep_raw_numpy(atoms, types, cfg), types
+
+
+def test_nep_from_raw_matches_numpy_contraction():
+    cfg = _cfg(nep_descriptor="concat", nep_five_body=True); m = _model(cfg)
+    atoms = _bulk_frame()
+    raw, types = _nep_inputs(cfg, atoms)
+    R, Zt = tf.constant(raw[None]), tf.constant(types[None])
+    q_tf = m.nep_from_raw(R, Zt, m.c_r, m.c_a)[0].numpy()
+    q_np = nd.nep_contract_numpy(raw, types, m.c_r.numpy(), m.c_a.numpy(), cfg)
+    assert q_tf.shape == (len(atoms), nd.nep_dim(cfg)) and q_tf.dtype == np.float32
+    np.testing.assert_allclose(q_tf, q_np, rtol=1e-5, atol=1e-6 * np.abs(q_np).max())
+    # c defaults to the model's own variables.
+    np.testing.assert_array_equal(m.nep_from_raw(R, Zt)[0].numpy(), q_tf)
+    # Per-candidate c [Cc, T, T, n, k] on candidate-independent raw →
+    # [Cc, ..., A, dim]; doubling c scales each block by its degree in c.
+    c_r2 = tf.stack([m.c_r, 2.0 * m.c_r]); c_a2 = tf.stack([m.c_a, 2.0 * m.c_a])
+    q2 = m.nep_from_raw(R, Zt, c_r2, c_a2).numpy()
+    assert q2.shape == (2, 1, len(atoms), nd.nep_dim(cfg))
+    np.testing.assert_allclose(q2[0, 0], q_tf, rtol=1e-5, atol=1e-6 * np.abs(q_tf).max())
+    sl = nd.nep_slices(cfg)
+    for k, deg in [("radial", 1), ("L1", 2), ("L2", 2), ("L3", 2), ("L4", 2),
+                   ("four_body", 3), ("five_body", 4)]:
+        ref = 2.0 ** deg * q_tf[:, sl[k]]
+        np.testing.assert_allclose(q2[1, 0][:, sl[k]], ref, rtol=1e-5,
+                                   atol=1e-6 * np.abs(ref).max())
+
+
+def test_nep_descriptor_ordering_is_gpumd():
+    cfg = _cfg(nep_descriptor="concat"); m = _model(cfg); atoms = _bulk_frame()
+    raw, types = _nep_inputs(cfg, atoms)
+    R, Zt = tf.constant(raw[None]), tf.constant(types[None])
+    q = m.nep_from_raw(R, Zt)[0].numpy()
+    sl = nd.nep_slices(cfg)
+    assert np.all(np.abs(q).max(0) > 0.0)                       # every column live
+    # [radial ‖ angular]: zero c_a kills exactly the angular/4b columns, zero c_r the radial.
+    q_no_a = m.nep_from_raw(R, Zt, m.c_r, tf.zeros_like(m.c_a))[0].numpy()
+    np.testing.assert_array_equal(q_no_a[:, sl["radial"]], q[:, sl["radial"]])
+    assert np.all(q_no_a[:, sl["angular"]] == 0.0)
+    q_no_r = m.nep_from_raw(R, Zt, tf.zeros_like(m.c_r), m.c_a)[0].numpy()
+    assert np.all(q_no_r[:, sl["radial"]] == 0.0)
+    np.testing.assert_array_equal(q_no_r[:, sl["angular"]], q[:, sl["angular"]])
+    # l-major (ln = l·(n_max_a+1) + n): keeping only c_a[..., n0, :] leaves
+    # column n0 of EVERY L / 4-body block and zeroes the rest.
+    n0, na = 2, cfg.nep_n_max_angular + 1
+    c_a = np.zeros(m.c_a.shape, np.float32); c_a[:, :, n0] = m.c_a.numpy()[:, :, n0]
+    q_n0 = m.nep_from_raw(R, Zt, m.c_r, tf.constant(c_a))[0].numpy()
+    others = [n for n in range(na) if n != n0]
+    for k in ("L1", "L2", "L3", "L4", "four_body"):
+        blk = q_n0[:, sl[k]]
+        assert blk.shape[1] == na and np.all(blk[:, others] == 0.0)
+        np.testing.assert_allclose(blk[:, n0], q[:, sl[k]][:, n0], rtol=1e-6)
+
+
+def test_nep_c_init_uniform_pm1_and_shapes():
+    cfg = _cfg(nep_descriptor="concat"); m = _model(cfg)
+    T, nr, Kr = 2, cfg.nep_n_max_radial, cfg.nep_basis_size_radial
+    na, Ka = cfg.nep_n_max_angular, cfg.nep_basis_size_angular
+    assert tuple(m.c_r.shape) == (T, T, nr + 1, Kr + 1)
+    assert tuple(m.c_a.shape) == (T, T, na + 1, Ka + 1)
+    for c in (m.c_r, m.c_a):
+        assert isinstance(c, tf.Variable) and not c.trainable and c.dtype == tf.float32
+        v = c.numpy()
+        assert v.min() > -1.0 and v.max() < 1.0 and v.std() > 0.4   # uniform(−1, 1): σ 0.577
+    m2 = _model(_cfg(nep_descriptor="concat"))                     # same seed → same c
+    np.testing.assert_array_equal(m2.c_r.numpy(), m.c_r.numpy())
+    np.testing.assert_array_equal(m2.c_a.numpy(), m.c_a.numpy())
+    m3 = _model(_cfg(nep_descriptor="concat", seed=8))
+    assert not np.array_equal(m3.c_r.numpy(), m.c_r.numpy())
+    m_off = _model(_cfg())
+    assert m_off.c_r is None and m_off.c_a is None
+
+
+def test_ann_inputs_modes():
+    from DescriptorBuilderGPU import compute_dim_q
+    atoms = _bulk_frame()
+    cfg0 = _cfg(); dim_soap = cfg0.dim_q
+    desc = tf.constant(_descriptors(cfg0, atoms)[None].astype(np.float32))   # [1, A, dim_soap]
+    for mode in ("off", "concat", "replace"):
+        cfg = _cfg(nep_descriptor=mode); m = _model(cfg)
+        raw, types = _nep_inputs(cfg, atoms)
+        R, Zt = tf.constant(raw[None]), tf.constant(types[None])
+        x = m._ann_inputs(desc, R, Zt)
+        assert int(x.shape[-1]) == cfg.dim_q == compute_dim_q(cfg)
+        if mode == "off":
+            assert x is desc and cfg.dim_q == dim_soap
+            assert m._ann_inputs(desc, None, Zt) is desc
+            continue
+        q_nep = m.nep_from_raw(R, Zt).numpy()
+        if mode == "concat":
+            assert cfg.dim_q == dim_soap + nd.nep_dim(cfg)
+            np.testing.assert_array_equal(x[..., :dim_soap].numpy(), desc.numpy())
+            np.testing.assert_array_equal(x[..., dim_soap:].numpy(), q_nep)
+        else:
+            assert cfg.dim_q == nd.nep_dim(cfg)
+            np.testing.assert_array_equal(x.numpy(), q_nep)
+        with pytest.raises(ValueError, match="nep_raw"):
+            m._ann_inputs(desc, None, Zt)
+    with pytest.raises(ValueError, match="descriptor_mixing"):
+        _model(_cfg(nep_descriptor="replace", descriptor_mixing=True))
+    with pytest.raises(ValueError, match="descriptor_preprocess_contract"):
+        _model(_cfg(nep_descriptor="replace", descriptor_preprocess_contract="angular"))
+    with pytest.raises(NotImplementedError):
+        _model(_cfg(nep_descriptor="sum"))
+    with pytest.raises(ValueError, match="nep_descriptor"):
+        _model(_cfg(nep_descriptor="bogus"))
+
+
+def test_forward_sites_take_nep_raw():
+    """predict_batch / predict_batch_candidates consume nep_raw through
+    _ann_inputs; the candidate path with per-candidate c reproduces the batched one."""
+    cfg = _cfg(nep_descriptor="concat"); m = _model(cfg); atoms = _bulk_frame()
+    data = prepare_eval_data([atoms], cfg)
+    raw, _ = _nep_inputs(cfg, atoms)
+    R = tf.constant(raw[None])
+    args = (data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"],
+            data["pair_struct"], data["positions"], data["Z_int"], data["boxes"],
+            data["atom_mask"], m.W0, m.b0, m.W1, m.b1)
+    with pytest.raises(ValueError, match="nep_raw"):
+        m.predict_batch(*args, W_atom=data.get("V_atom"))
+    mu = m.predict_batch(*args, W_atom=data.get("V_atom"), nep_raw=R).numpy()
+    assert mu.shape == (1, 3) and np.all(np.isfinite(mu))
+    # nep_raw changes the prediction (the NEP block reaches the ANN).
+    mu0 = m.predict_batch(*args, W_atom=data.get("V_atom"), nep_raw=tf.zeros_like(R)).numpy()
+    assert not np.allclose(mu, mu0)
+    C = 2
+    tile = lambda v: tf.tile(v[tf.newaxis], [C] + [1] * len(v.shape))
+    mu_c = m.predict_batch_candidates(
+        data["descriptors"], data.get("V_atom"), data["Z_int"], data["atom_mask"],
+        tile(m.W0), tile(m.b0), tile(m.W1), tile(m.b1),
+        nep_raw=R, c_r=tile(m.c_r), c_a=tile(m.c_a)).numpy()
+    assert mu_c.shape == (C, 1, 3)
+    np.testing.assert_allclose(mu_c[0], mu, rtol=1e-5, atol=1e-6 * np.abs(mu).max())
+    np.testing.assert_allclose(mu_c[1], mu, rtol=1e-5, atol=1e-6 * np.abs(mu).max())
+    # Shared c (None → model variables) on the candidate path gives the same μ.
+    mu_s = m.predict_batch_candidates(
+        data["descriptors"], data.get("V_atom"), data["Z_int"], data["atom_mask"],
+        tile(m.W0), tile(m.b0), tile(m.W1), tile(m.b1), nep_raw=R).numpy()
+    np.testing.assert_allclose(mu_s[1], mu, rtol=1e-5, atol=1e-6 * np.abs(mu).max())
+
+
+def test_compute_dim_q_and_layout_per_mode():
+    from DescriptorBuilderGPU import (compute_dim_q, descriptor_block_layout,
+                                      q_scale_groups, descriptor_input_width)
+    off = _cfg(); cc = _cfg(nep_descriptor="concat")
+    rp = _cfg(nep_descriptor="replace", nep_five_body=True)
+    ds, dn = compute_dim_q(off), nd.nep_dim(cc)
+    assert compute_dim_q(cc) == ds + dn and compute_dim_q(rp) == nd.nep_dim(rp)
+    assert compute_dim_q(_cfg(nep_descriptor="sum")) == ds
+    # The builder's width is the SOAP width in every mode.
+    assert descriptor_input_width(off) == descriptor_input_width(cc) == descriptor_input_width(rp) == ds
+
+    def covers(cfg, n_groups):
+        g = q_scale_groups(cfg)
+        assert len(g) == n_groups
+        assert sorted(np.concatenate(g).tolist()) == list(range(compute_dim_q(cfg)))
+        return g
+
+    L = off.l_max + 1
+    g_off = covers(off, L); g_cc = covers(cc, L + 1 + 4 + 1); g_rp = covers(rp, 1 + 4 + 2)
+    assert all(np.array_equal(a, b) for a, b in zip(g_off, g_cc[:L]))
+    for g, k in zip(g_cc[L:], ["radial", "L1", "L2", "L3", "L4", "four_body"]):
+        assert g.tolist() == [ds + i for i in range(dn)[nd.nep_slices(cc)[k]]]
+    for g, k in zip(g_rp, ["radial", "L1", "L2", "L3", "L4", "four_body", "five_body"]):
+        assert g.tolist() == list(range(nd.nep_dim(rp))[nd.nep_slices(rp)[k]])
+    lo, lc, lr = (descriptor_block_layout(c) for c in (off, cc, rp))
+    assert lc["pair_keys"] == lo["pair_keys"]
+    assert all(np.array_equal(lc["pair_q_index"][k], lo["pair_q_index"][k]) for k in lo["pair_keys"])
+    assert lo["dim_q"] == ds and lc["dim_q"] == ds + dn
+    assert max(int(v.max()) for v in lc["pair_q_index"].values()) < ds   # NEP block outside the pairs
+    assert lr["pair_keys"] == [] and lr["dim_q"] == nd.nep_dim(rp) and lr["max_block_size"] == 0
+    # "replace" drops the SOAP output, learned-basis extras included.
+    rp2 = _cfg(nep_descriptor="replace", radial_basis_size=4, radial_basis_two_body=True)
+    assert compute_dim_q(rp2) == descriptor_block_layout(rp2)["dim_q"] == nd.nep_dim(rp2)
+    covers(rp2, 1 + 4 + 1)

@@ -8,7 +8,8 @@ from typing import Callable
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
-from nep_descriptor import validate_nep_cfg
+from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width,
+                            find_q_tf, NUM_ABC)
 
 
 @tf.function(jit_compile=True)
@@ -61,11 +62,30 @@ class TNEP(layers.Layer):
         super().__init__(**kwargs)
         self.cfg = cfg
 
-        if str(getattr(cfg, "nep_descriptor", "off")) != "off":
+        # GPUMD NEP descriptor block (multi_descriptor_plan.md §0.3): raw
+        # per-atom basis from data, contracted in-model by c_r/c_a (below).
+        self._nep_mode = str(getattr(cfg, "nep_descriptor", "off"))
+        if self._nep_mode not in ("off", "concat", "replace", "sum"):
+            raise ValueError(
+                f"cfg.nep_descriptor={self._nep_mode!r}; expected 'off', "
+                f"'concat', 'replace' or 'sum'.")
+        if self._nep_mode != "off":
             validate_nep_cfg(cfg)
+        if self._nep_mode == "sum":
             raise NotImplementedError(
-                f"cfg.nep_descriptor={cfg.nep_descriptor!r}: only 'off' is wired; "
-                "Task 4/5 of multi_descriptor_plan.md add concat/replace/sum.")
+                "cfg.nep_descriptor='sum' is Task 8 of multi_descriptor_plan.md.")
+        if self._nep_mode == "replace":
+            for f in ("descriptor_mixing", "descriptor_preprocess_contract"):
+                if getattr(cfg, f, None) not in (False, None, "off"):
+                    raise ValueError(
+                        f"cfg.nep_descriptor='replace' has no SOAP species-pair "
+                        f"blocks; set cfg.{f} off.")
+        if (self._nep_mode == "concat"
+                and str(getattr(cfg, "descriptor_preprocess_contract", "off")) != "off"):
+            raise NotImplementedError(
+                "descriptor_preprocess_contract layouts cover every channel "
+                "with SOAP pair blocks; the appended NEP block "
+                "(nep_descriptor='concat') is not plumbed through them.")
 
         # Preprocess contraction phase 1/2: run guards, then override cfg.dim_q
         # to the contracted dim BEFORE allocating W0. Phase 2 allocates W_pre_*.
@@ -189,16 +209,16 @@ class TNEP(layers.Layer):
                     "cfg.radial_basis_species_sum=True has no species-pair "
                     "blocks, which descriptor_preprocess_contract layouts "
                     "assume; set descriptor_preprocess_contract='off'.")
-            from DescriptorBuilderGPU import radial_extra_count
+            from DescriptorBuilderGPU import radial_extra_count, soap_dim
             cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types,
                                           species_sum=self._rb_species_sum)
             self._rb_n_extra = int(radial_extra_count(cfg))
             if (int(cm["gather_idx"].size) + self._rb_n_extra
-                    != int(self.dim_q_forward)):
+                    != int(soap_dim(cfg))):
                 raise RuntimeError(
                     f"radial_basis_channel_map gives {cm['gather_idx'].size} "
                     f"(+{self._rb_n_extra} extra) channels, "
-                    f"dim_q={self.dim_q_forward}.")
+                    f"SOAP dim={soap_dim(cfg)}.")
             L = int(cfg.l_max) + 1
             self._rb_alpha, self._rb_K = alpha, K
             self._rb_L, self._rb_kmax = L, L * (L + 1) // 2
@@ -238,6 +258,22 @@ class TNEP(layers.Layer):
                     "cfg.radial_basis_norm='none' requires descriptor_mode=1 "
                     "(the quippy builder always L2-normalises).")
             self.M_radial = None
+        # NEP contraction tensors c[t_centre, t_neighbour, n, k]: uniform(−1, 1)
+        # like GPUMD's snes.cu init; non-trainable like M_radial (SNES assigns,
+        # Adam tape-watches). "off": None, and dim_q is the SOAP width.
+        self.c_r = self.c_a = None
+        self._nep_dim = 0
+        if self._nep_mode != "off":
+            self._nep_dim = int(nep_dim(cfg))
+            self._nep_raw_width = int(nep_raw_width(cfg))
+            T = int(cfg.num_types)
+            rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
+            self.c_r = tf.Variable(rng.uniform(-1.0, 1.0, (
+                T, T, cfg.nep_n_max_radial + 1, cfg.nep_basis_size_radial + 1)
+            ).astype(np.float32), trainable=False, name="nep_c_r")
+            self.c_a = tf.Variable(rng.uniform(-1.0, 1.0, (
+                T, T, cfg.nep_n_max_angular + 1, cfg.nep_basis_size_angular + 1)
+            ).astype(np.float32), trainable=False, name="nep_c_a")
         # Descriptor scale preconditioning: m folded into W0 (see _W0_eff);
         # the Keras W0 init is divided by m so the initial function is the
         # unscaled one. SNES's μ init does the same in _build_mu_init.
@@ -1049,10 +1085,87 @@ class TNEP(layers.Layer):
             return tf.reshape(q, tf.concat([[-1], out_shape], axis=0))
         return tf.reshape(q[0], out_shape)
 
+    def nep_from_raw(self, raw: tf.Tensor, Z: tf.Tensor,
+                     c_r: tf.Tensor | None = None,
+                     c_a: tf.Tensor | None = None) -> tf.Tensor:
+        """GPUMD NEP descriptor from the raw per-atom basis (nep_descriptor.py):
+            q_r[a, n]  = Σ_{t',k} c_r[t_a, t', n, k] · raw_r[a, t', k]
+            s[a, n, p] = Σ_{t',k} c_a[t_a, t', n, k] · raw_a[a, t', k, p]
+            q_a = find_q(s)  → [q_r ‖ angular l-major (ln = l·(n_max_a+1)+n) ‖ 4b ‖ 5b]
+        Args:
+            raw : [..., A, W_raw]  flatten([raw_r [T, K_r+1] ‖ raw_a [T, K_a+1, 24]])
+            Z   : [..., A]         type indices
+            c_r, c_a : [T, T, n+1, K+1] (None → self.c_r / self.c_a) or
+                       per-candidate [C, T, T, n+1, K+1]
+        Returns [..., A, dim_nep], or [C, ..., A, dim_nep] for per-candidate c.
+        Contracts per centre type (masked sum) rather than gathering c per
+        atom: the per-candidate gather would be [C, N, T, n, k] per call.
+        """
+        c_r = self.c_r if c_r is None else c_r
+        c_a = self.c_a if c_a is None else c_a
+        cfg = self.cfg
+        T, Kr, Ka = self.num_types, cfg.nep_basis_size_radial + 1, cfg.nep_basis_size_angular + 1
+        per_cand = len(c_r.shape) == 5
+        lead = tf.shape(raw)[:-1]
+        N = tf.reduce_prod(lead)
+        raw = tf.reshape(raw, [N, self._nep_raw_width])
+        raw_r = tf.reshape(raw[:, :T * Kr], [N, T, Kr])
+        raw_a = tf.reshape(raw[:, T * Kr:], [N, T, Ka, NUM_ABC])
+        Zf = tf.reshape(Z, [N])
+        eq_r = "atk,ctnk->can" if per_cand else "atk,tnk->an"
+        eq_a = "atkp,ctnk->canp" if per_cand else "atkp,tnk->anp"
+        q_r, s = [], []
+        for t in range(T):
+            mask = tf.cast(tf.equal(Zf, t), raw.dtype)[:, tf.newaxis]     # [N, 1]
+            ct_r = c_r[:, t] if per_cand else c_r[t]
+            ct_a = c_a[:, t] if per_cand else c_a[t]
+            q_r.append(tf.einsum(eq_r, raw_r, ct_r) * mask)
+            s.append(tf.einsum(eq_a, raw_a, ct_a) * mask[..., tf.newaxis])
+        q_r, s = tf.add_n(q_r), tf.add_n(s)                             # [(C,) N, n], [(C,) N, n, 24]
+        q_a = find_q_tf(s, cfg.nep_four_body, cfg.nep_five_body)        # [(C,) N, n, L]
+        q_a = tf.linalg.matrix_transpose(q_a)                           # [(C,) N, L, n] → l-major
+        q_a = tf.reshape(q_a, tf.concat([tf.shape(q_a)[:-2], [-1]], 0))
+        q = tf.concat([q_r, q_a], -1)
+        out_shape = tf.concat([lead, [self._nep_dim]], 0)
+        if per_cand:
+            out_shape = tf.concat([tf.shape(c_r)[:1], out_shape], 0)
+        return tf.reshape(q, out_shape)
+
+    def _ann_inputs(self, descriptors: tf.Tensor, nep_raw: tf.Tensor | None,
+                    Z: tf.Tensor, c_r: tf.Tensor | None = None,
+                    c_a: tf.Tensor | None = None) -> tf.Tensor:
+        """The [..., A, dim_q] vector the ANN consumes — the one place that
+        knows cfg.nep_descriptor: "off" → descriptors (same object);
+        "concat" → [descriptors ‖ nep_from_raw]; "replace" → nep_from_raw.
+        `descriptors` is the builder output after soap_from_raw."""
+        if self._nep_mode == "off":
+            return descriptors
+        if nep_raw is None:
+            raise ValueError(
+                f"nep_raw missing: cfg.nep_descriptor={self._nep_mode!r} needs "
+                f"the raw NEP basis at every forward site.")
+        q_nep = self.nep_from_raw(nep_raw, Z, c_r, c_a)
+        if self._nep_mode == "replace":
+            return q_nep
+        # One side may carry a candidate axis (learned SOAP basis with shared
+        # c, or per-candidate c with fixed SOAP): broadcast the other to it.
+        if len(q_nep.shape) > len(descriptors.shape):
+            descriptors = tf.broadcast_to(
+                descriptors[tf.newaxis],
+                tf.concat([tf.shape(q_nep)[:1], tf.shape(descriptors)], 0))
+        elif len(q_nep.shape) < len(descriptors.shape):
+            q_nep = tf.broadcast_to(
+                q_nep[tf.newaxis],
+                tf.concat([tf.shape(descriptors)[:1], tf.shape(q_nep)], 0))
+        return tf.concat([descriptors, q_nep], -1)
+
     def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,
                 positions: tf.Tensor, Z: tf.Tensor, box: tf.Tensor,
                 atom_mask: tf.Tensor, neighbor_mask: tf.Tensor,
-                M_radial: tf.Tensor | None = None) -> tf.Tensor:
+                M_radial: tf.Tensor | None = None,
+                nep_raw: tf.Tensor | None = None,
+                c_r: tf.Tensor | None = None,
+                c_a: tf.Tensor | None = None) -> tf.Tensor:
         """Run the forward pass for a single structure using padded tensors.
 
         Args:
@@ -1074,6 +1187,7 @@ class TNEP(layers.Layer):
         """
         if self._learn_radial:
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)
+        descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
         # Absorb U_pairᵀ into W0 once so forward and calc_forces share the
         # folded weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
@@ -1631,7 +1745,10 @@ class TNEP(layers.Layer):
                       c_pair: tf.Tensor | None = None,
                       M_radial: tf.Tensor | None = None,
                       nbr_index: tf.Tensor | None = None,
-                      nbr_G: tf.Tensor | None = None) -> tf.Tensor:
+                      nbr_G: tf.Tensor | None = None,
+                      nep_raw: tf.Tensor | None = None,
+                      c_r: tf.Tensor | None = None,
+                      c_a: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
         Weights are passed explicitly (not read from self) so this method can
@@ -1660,12 +1777,15 @@ class TNEP(layers.Layer):
             nbr_index   : [B, A, M] padded neighbor table (bilinear readout;
                           None → build the pair term from the COO stream)
             nbr_G       : [B, A, M, 3, C] per-slot R_n(r_ij)(r_i − r_j)
+            nep_raw     : [B, A, W_raw] raw NEP basis (cfg.nep_descriptor != "off")
+            c_r, c_a    : NEP contraction tensors (None → self.c_r / self.c_a)
 
         Returns:
             predictions : [B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
         if self._learn_radial:
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)
+        descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
         # Pure forward primitive: caller decides whether W0/W0_pol are raw or
@@ -1778,7 +1898,10 @@ class TNEP(layers.Layer):
                                   c_pair: tf.Tensor | None = None,
                                   M_radial: tf.Tensor | None = None,
                                   nbr_index: tf.Tensor | None = None,
-                                  nbr_G: tf.Tensor | None = None) -> tf.Tensor:
+                                  nbr_G: tf.Tensor | None = None,
+                                  nep_raw: tf.Tensor | None = None,
+                                  c_r: tf.Tensor | None = None,
+                                  c_a: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
         Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
@@ -1807,6 +1930,9 @@ class TNEP(layers.Layer):
                           are then raw centre coefficients [B, A, W_in])
             nbr_index   : [B, A, M], nbr_G [B, A, M, 3, Ch] — padded pair
                           table of the bilinear readout (candidate-independent)
+            nep_raw     : [B, A, W_raw] raw NEP basis (cfg.nep_descriptor != "off")
+            c_r, c_a    : per-candidate [C, T, T, n+1, K+1] NEP contraction
+                          tensors (None → the model's shared c_r / c_a)
 
         Returns:
             predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
@@ -1841,14 +1967,17 @@ class TNEP(layers.Layer):
         # ── Forward: input→hidden ─────────────────────────────────────────────
         pre_h_terms = []
         if self._learn_radial:
-            # Learned radial basis: descriptors are per candidate [C, B, A, Q],
-            # so the input→hidden product is a batched GEMM over C per type.
             if M_radial is None:
                 raise ValueError(
                     "predict_batch_candidates needs per-candidate M_radial "
                     "[C, T, S, α, K] under cfg.radial_basis_size.")
-            desc_c = tf.reshape(
-                self.soap_from_raw(descriptors, Z, M_radial), [C, B * A, Q])   # [C, B*A, Q]
+            descriptors = self.soap_from_raw(descriptors, Z, M_radial)         # [C, B, A, Q]
+        descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
+        if len(descriptors.shape) == 4:
+            # Per-candidate descriptors [C, B, A, Q] (learned radial basis or
+            # per-candidate c): the input→hidden product is a batched GEMM
+            # over C per type.
+            desc_c = tf.reshape(descriptors, [C, B * A, Q])                    # [C, B*A, Q]
             for t in range(T):
                 ph = tf.reshape(tf.matmul(desc_c, W0[:, t, :, :]), [C, B, A, H])  # [C,B,A,H]
                 pre_h_terms.append(ph * type_masks[t][tf.newaxis])

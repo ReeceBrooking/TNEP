@@ -19,6 +19,7 @@ Descriptor order (parameters.cu:203-211): [q_r] ‖ angular l-major
 (ln = l·(n_max_a+1) + n) ‖ 4-body ‖ 5-body.
 """
 import numpy as np
+import tensorflow as tf
 from ase.neighborlist import neighbor_list
 
 # ── constants (nep_utilities.cuh) ──────────────────────────────────────────
@@ -126,6 +127,30 @@ def find_q(s, four_body, five_body):
         s12 = s[..., 1] ** 2 + s[..., 2] ** 2
         q.append(C5B[0] * s0_sq * s0_sq + C5B[1] * s0_sq * s12 + C5B[2] * s12 * s12)
     return np.stack(q, -1)
+
+
+_C3B_TF = tf.constant(C3B, tf.float32)
+_C4B_TF = tf.constant(C4B, tf.float32)
+_C5B_TF = tf.constant(C5B, tf.float32)
+
+
+def find_q_tf(s, four_body, five_body):
+    """TF twin of find_q: s [..., 24] float32 → q [..., 4 (+1) (+1)], same columns."""
+    q = []
+    for L in range(1, 5):
+        i0 = L * L - 1
+        q.append(_C3B_TF[i0] * s[..., i0] ** 2
+                 + 2.0 * tf.reduce_sum(_C3B_TF[i0 + 1:i0 + 2 * L + 1] * s[..., i0 + 1:i0 + 2 * L + 1] ** 2, -1))
+    if four_body:
+        s3, s4, s5, s6, s7 = (s[..., k] for k in range(3, 8))
+        q.append(_C4B_TF[0] * s3 * s3 * s3 + _C4B_TF[1] * s3 * (s4 * s4 + s5 * s5)
+                 + _C4B_TF[2] * s3 * (s6 * s6 + s7 * s7) + _C4B_TF[3] * s6 * (s5 * s5 - s4 * s4)
+                 + _C4B_TF[4] * s4 * s5 * s7)
+    if five_body:
+        s0_sq = s[..., 0] ** 2
+        s12 = s[..., 1] ** 2 + s[..., 2] ** 2
+        q.append(_C5B_TF[0] * s0_sq * s0_sq + _C5B_TF[1] * s0_sq * s12 + _C5B_TF[2] * s12 * s12)
+    return tf.stack(q, -1)
 
 
 # ── bookkeeping ────────────────────────────────────────────────────────────

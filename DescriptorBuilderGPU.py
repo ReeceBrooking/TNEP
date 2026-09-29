@@ -319,7 +319,19 @@ def build_block_W(alpha_max_per_species: list[int]) -> np.ndarray:
 
 
 def compute_dim_q(cfg) -> int:
-    """SOAP descriptor dimension n_compressed from cfg alone (closed-form).
+    """Width of the ANN input: soap_dim, plus the NEP block under
+    cfg.nep_descriptor="concat", or the NEP block alone under "replace"
+    ("sum" feeds the main ANN the SOAP block only)."""
+    from nep_descriptor import nep_dim
+    mode = str(getattr(cfg, "nep_descriptor", "off"))
+    if mode == "replace":
+        return int(nep_dim(cfg))
+    return soap_dim(cfg) + (int(nep_dim(cfg)) if mode == "concat" else 0)
+
+
+def soap_dim(cfg) -> int:
+    """SOAP descriptor dimension n_compressed from cfg alone (closed-form),
+    plus the learned-basis extras (radial_extra_count).
 
     Depends only on (alpha_max, l_max, num_types, compress_mode); no
     neighbour-list build. compress_mode 'linear' is special-cased; others
@@ -374,6 +386,24 @@ def radial_extra_count(cfg) -> int:
         "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
     a = int(cfg.alpha_max)
     return n_on * (a if _radial_species_sum(cfg) else a * int(cfg.num_types))
+
+
+def extra_block_widths(cfg) -> list:
+    """Widths of the blocks appended after the SOAP species-pair blocks, in
+    channel order: the learned-basis extras (2-/4-/5-body, one block each),
+    then under cfg.nep_descriptor in ("concat", "replace") the NEP sub-blocks
+    (radial, L1..L4, 4-body, 5-body from nep_slices)."""
+    mode = str(getattr(cfg, "nep_descriptor", "off"))
+    widths = []
+    n_extra = radial_extra_count(cfg)
+    if n_extra and mode != "replace":      # "replace" drops the whole SOAP output
+        n_on = sum(bool(getattr(cfg, f, False)) for f in (
+            "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
+        widths += [n_extra // n_on] * n_on
+    if mode in ("concat", "replace"):
+        from nep_descriptor import nep_slices
+        widths += [sl.stop - sl.start for k, sl in nep_slices(cfg).items() if k != "angular"]
+    return widths
 
 
 def radial_basis_channel_map(alpha_max: int, l_max: int, n_species: int,
@@ -431,18 +461,15 @@ Q_SCALE_CLAMP = 10.0   # max boost / damping of any channel
 
 def q_scale_groups(cfg) -> list:
     """Channel groups for descriptor_scale="block": each SOAP l group (union
-    over species pairs) then each learned-basis extra block (2-/4-/5-body),
-    covering every channel exactly once."""
+    over species pairs; none under nep_descriptor="replace") then each
+    appended block (extra_block_widths), covering every channel exactly once."""
     lay = descriptor_block_layout(cfg)
-    groups = [np.asarray(v, dtype=np.int32) for _, v in sorted(lay["l_index"].items())]
-    n_soap = sum(len(g) for g in groups)
-    n_extra = radial_extra_count(cfg)
-    if n_extra:
-        n_on = sum(bool(getattr(cfg, f, False)) for f in (
-            "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
-        width = n_extra // n_on
-        for b in range(n_on):
-            groups.append(np.arange(n_soap + b * width, n_soap + (b + 1) * width, dtype=np.int32))
+    groups = [np.asarray(v, dtype=np.int32) for _, v in sorted(lay["l_index"].items())
+              if len(v)]
+    start = sum(len(g) for g in groups)
+    for w in extra_block_widths(cfg):
+        groups.append(np.arange(start, start + w, dtype=np.int32))
+        start += w
     return groups
 
 
@@ -491,7 +518,7 @@ def descriptor_input_width(cfg) -> int:
     flattened raw centre coefficients S·K·k_max·2 (species, κ, (l,m), re/im)."""
     K = getattr(cfg, "radial_basis_size", None)
     if K is None:
-        return compute_dim_q(cfg)
+        return soap_dim(cfg)
     L = int(cfg.l_max) + 1
     return int(cfg.num_types) * int(K) * (L * (L + 1) // 2) * 2
 
@@ -518,6 +545,16 @@ def descriptor_block_layout(cfg) -> dict:
     alpha_max = int(cfg.alpha_max)
     l_max = int(cfg.l_max)
     n_species = int(cfg.num_types)
+    if str(getattr(cfg, "nep_descriptor", "off")) == "replace":
+        # The ANN sees the NEP block only: no SOAP species-pair blocks
+        # (mixing / preprocess are rejected in this mode).
+        return dict(
+            pair_keys=[], pair_q_index={}, pair_ln_index={},
+            l_index={l: np.zeros(0, dtype=np.int32) for l in range(l_max + 1)},
+            block_sizes={}, max_block_size=0, alpha_eff_per_pair={},
+            max_alpha_eff=0, N_per_l=0,
+            dim_q=sum(extra_block_widths(cfg)),
+        )
     if _radial_species_sum(cfg):
         # Species-summed learned basis: no species pairs — one block over the
         # alpha channels, per-l sub-blocks of alpha(alpha+1)/2 channels
@@ -536,8 +573,9 @@ def descriptor_block_layout(cfg) -> dict:
             alpha_eff_per_pair={(0, 0): per_l},
             max_alpha_eff=per_l,
             N_per_l=per_l,
-            # 2-body channels (if any) sit after the SOAP block, outside every pair.
-            dim_q=int(per_l * L) + radial_extra_count(cfg),
+            # Appended blocks (learned-basis extras, NEP) sit after the SOAP
+            # block, outside every pair.
+            dim_q=int(per_l * L) + sum(extra_block_widths(cfg)),
         )
     alpha_per_species = [alpha_max] * n_species
 
@@ -619,8 +657,9 @@ def descriptor_block_layout(cfg) -> dict:
         alpha_eff_per_pair=alpha_eff_per_pair,
         max_alpha_eff=max(alpha_eff_per_pair.values()) if alpha_eff_per_pair else 0,
         N_per_l=N_per_l,
-        # 2-body channels (if any) sit after the SOAP block, outside every pair.
-        dim_q=int(q_counter) + radial_extra_count(cfg),
+        # Appended blocks (learned-basis extras, NEP) sit after the SOAP
+        # block, outside every pair.
+        dim_q=int(q_counter) + sum(extra_block_widths(cfg)),
     )
 
 
