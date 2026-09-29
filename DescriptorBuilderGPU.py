@@ -461,8 +461,7 @@ def compute_q_scale(q: np.ndarray, atom_mask: np.ndarray, cfg) -> tuple:
     x = np.asarray(q, dtype=np.float64).reshape(-1, Q)[np.asarray(atom_mask).reshape(-1) > 0]
     if str(cfg.descriptor_scale) == "minmax":
         rng = x.max(0) - x.min(0)
-        with np.errstate(divide="ignore"):
-            m = np.where(rng > 0, 1.0 / rng, 1.0)
+        m = 1.0 / np.where(rng > 0, rng, 1.0)
         return m.astype(np.float32), np.zeros(Q, np.float32)
     mu = x.mean(axis=0)
     s = x.std(axis=0)

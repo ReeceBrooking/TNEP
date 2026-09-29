@@ -55,7 +55,7 @@ def test_compute_q_scale_rules(monkeypatch):
     print("\nblock scales:", np.round([mb[gr][0] for gr in groups], 3))
 
 
-@pytest.mark.parametrize("mode", ["block", "channel"])
+@pytest.mark.parametrize("mode", ["block", "channel", "minmax"])
 def test_scaling_is_a_reparameterisation_identical_at_gen0(mode):
     frames = _cho_frames(6)
     cfg_off = _cfg(**FULL)
@@ -67,7 +67,7 @@ def test_scaling_is_a_reparameterisation_identical_at_gen0(mode):
     m = np.asarray(cfg_on.q_scale, np.float32)
     # I3: same seed -> stored W0 differ by 1/m, b0 absorbs the shift; effective forward identical.
     np.testing.assert_allclose(m_on.W0.numpy() * m[None, :, None], m_off.W0.numpy(), rtol=1e-6)
-    assert np.abs(m_on.b0.numpy()).max() > 0 and np.abs(m_off.b0.numpy()).max() == 0
+    assert (np.abs(m_on.b0.numpy()).max() > 0) == (mode != "minmax") and np.abs(m_off.b0.numpy()).max() == 0
     np.testing.assert_allclose(_predict_eff(m_on, data), _predict_eff(m_off, data), rtol=1e-4, atol=1e-6)
     mu_on, mu_off = m_on.optimizer.mu.numpy(), m_off.optimizer.mu.numpy()
     assert abs(m_on.optimizer.validate(data, tf.constant(mu_on)) - m_off.optimizer.validate(data, tf.constant(mu_off))) < 1e-5

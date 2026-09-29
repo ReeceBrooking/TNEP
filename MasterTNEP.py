@@ -493,7 +493,7 @@ def _train_model_inner(cfg: TNEPconfig,
     if cfg.radial_basis_norm != "l2" and str(cfg.descriptor_scale) == "off":
         print("WARNING: radial_basis_norm != 'l2' without descriptor_scale — "
               "the raw spectrum's per-channel spread is uncorrected; set "
-              "descriptor_scale='block' or 'channel'.")
+              "descriptor_scale='block', 'channel' or 'minmax'.")
     # Descriptor scale preconditioning: m from the generation-0 descriptor
     # of the training set, computed once (a checkpoint's cfg already has it).
     if str(cfg.descriptor_scale) != "off" and cfg.q_scale is None:
