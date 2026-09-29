@@ -605,8 +605,12 @@ def _train_model_inner(cfg: TNEPconfig,
     print_score_summary(metrics, cfg, prefix="Best-val test set")
 
     if cfg.save_path is not None:
-        save_model(best_val_model, cfg, cfg.save_path, label="best_val")
-        save_model(final_model, cfg, cfg.save_path, label="final_gen")
+        # Filename = {dataset}_{elements}_{mode}_{label}.h5 with the test
+        # metrics in the label, e.g. ..._best_val_r2_0.9987_rmse_0.0021.h5
+        def _label(tag, m):
+            return f"{tag}_r2_{m['r2']:.4f}_rmse_{m['rmse']:.4g}"
+        save_model(best_val_model, cfg, cfg.save_path, label=_label("best_val", metrics))
+        save_model(final_model, cfg, cfg.save_path, label=_label("final_gen", final_metrics))
         save_history(history, cfg)
 
     # Timing summary
