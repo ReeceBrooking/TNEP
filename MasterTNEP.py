@@ -490,8 +490,7 @@ def _train_model_inner(cfg: TNEPconfig,
         cfg.save_plots = os.path.join(run_dir, "plots")
         print(f"  resume: writing outputs to existing run dir {run_dir}")
 
-    if (cfg.radial_basis_size is not None and cfg.radial_basis_norm != "l2"
-            and str(cfg.descriptor_scale) == "off"):
+    if cfg.radial_basis_norm != "l2" and str(cfg.descriptor_scale) == "off":
         print("WARNING: radial_basis_norm != 'l2' without descriptor_scale — "
               "the raw spectrum's per-channel spread is uncorrected; set "
               "descriptor_scale='block' or 'channel'.")

@@ -11,71 +11,15 @@ sys.path.insert(0, ROOT)
 
 import numpy as np
 import pytest
-import tensorflow as tf
-from ase.io import read
 
-from TNEPconfig import TNEPconfig
-from TNEP import TNEP
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from DescriptorBuilder import make_descriptor_builder
-from DescriptorBuilderGPU import compute_dim_q
-
-WATER_XYZ = os.path.join(ROOT, "datasets", "train_waterbulk.xyz")
+from test_neighbor_dipole import _cfg as _base_cfg, _model, _bulk_frame
 
 
 def _cfg(**kw):
-    cfg = TNEPconfig()
-    cfg.target_mode = 1
-    cfg.dipole_readout = "neighbor"
-    cfg.rcut_hard = 3.5
-    cfg.rcut_soft = 3.0
-    cfg.dipole_rc = 3.0
-    cfg.num_neurons = 8
-    cfg.activation = "tanh"
-    cfg.descriptor_mixing = False
-    cfg.seed = 7
-    cfg.types = [8, 1]
-    cfg.num_types = 2
-    cfg.type_map = {8: 0, 1: 1}
-    # Pin readout fields so working-tree experiment defaults in TNEPconfig
-    # never leak into the suite (kwargs still override).
-    cfg.dipole_channels = 4
-    cfg.dipole_species_pairs = "off"
-    cfg.dipole_radial = "chebyshev"
-    cfg.dipole_zeta = -2.0
-    cfg.dipole_cutoff = None
-    cfg.dipole_gauss_sigma_scale = 1.0
-    cfg.l_max = 4
-    cfg.alpha_max = 4
-    cfg.radial_basis_size = None
-    cfg.radial_basis_species_sum = False
-    cfg.radial_basis_per_l = False
-    cfg.radial_basis_two_body = False
-    cfg.radial_basis_four_body = False
-    cfg.radial_basis_five_body = False
-    cfg.radial_basis_norm = "l2"
-    cfg.q_shift = None
-    cfg.descriptor_scale = "off"
-    cfg.q_scale = None
-    cfg.optimizer = "snes"
-    cfg.dipole_pair_rank = 2
-    # This file exercises the GPU (TF) builder specifically.
-    cfg.descriptor_mode = 1
-    cfg.descriptor_precision = "float64"
-    for k, v in kw.items():
-        setattr(cfg, k, v)
-    cfg.dim_q = compute_dim_q(cfg)
-    return cfg
-
-
-def _model(cfg):
-    tf.keras.utils.set_random_seed(0)
-    return TNEP(cfg)
-
-
-def _bulk_frame():
-    at = read(WATER_XYZ, index="0")
-    at.info["dipole"] = np.zeros(3)
-    return at
+    # GPU (TF) builder specifically; kwargs still override.
+    return _base_cfg(**{"descriptor_mode": 1, "descriptor_precision": "float64", **kw})
 
 
 def _descriptors(cfg, atoms):
@@ -135,11 +79,14 @@ def test_fixed_soap_norm_none_gradient_is_unprojected(tile):
     # tolerate 1e-3 of the tensor scale (measured residual ~7e-5 of it).
     np.testing.assert_allclose(g[0], g_fd, rtol=1e-3,
                                atol=1e-3 * np.abs(g_fd).max())
-    # The L2 projection (I − q̂q̂ᵀ)/‖q‖ is gone: the gradient is a different
-    # tensor from the normalised one (q·∂q/∂r = ½∂‖q‖²/∂r ≠ 0).
+    # Projection identity: applying (I − q̂q̂ᵀ)/‖q‖ to the raw gradient must
+    # reproduce the "l2" builder's gradient exactly.
     g_l2 = _self_gradients(_cfg(dipole_readout="tnep",
                                 descriptor_pair_tile_size=tile), atoms)
-    assert not np.allclose(g[0], g_l2[0], rtol=1e-3, atol=1e-4)
+    q = _descriptors(cfg, atoms)[0]; n = np.linalg.norm(q); qh = q / n
+    g_proj = (g[0] - (g[0] @ qh)[:, None] * qh) / n
+    np.testing.assert_allclose(g_proj, g_l2[0], rtol=1e-5,
+                               atol=1e-6 * np.abs(g_l2[0]).max())
 
 
 def test_fixed_soap_rejects_sqrt():
