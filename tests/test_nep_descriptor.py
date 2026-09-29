@@ -381,11 +381,6 @@ def test_ann_inputs_modes():
         _model(_cfg(nep_descriptor="bogus"))
 
 
-def test_nep_rejects_descriptor_scale_until_task7():
-    with pytest.raises(NotImplementedError, match="descriptor_scale"):
-        _model(_cfg(nep_descriptor="concat", descriptor_scale="minmax"))
-
-
 def test_forward_sites_take_nep_raw():
     """predict_batch / predict_batch_candidates consume nep_raw through
     _ann_inputs; the candidate path with per-candidate c reproduces the batched one."""
@@ -740,3 +735,80 @@ def test_adam_trains_c():
     assert not np.array_equal(final.c_r.numpy(), c_r0)
     assert not np.array_equal(final.c_a.numpy(), c_a0)
     assert "c_r" not in _trainable(_model(_cfg(nep_descriptor="off")))
+
+
+# ── Task 7: descriptor_scale groups / gen-0 scaler input / mixing exclusion ──
+
+def _predict_eff(m, d):
+    return m.predict_batch(
+        d["descriptors"], d["grad_values"], d["pair_atom"], d["pair_gidx"], d["pair_struct"],
+        d["positions"], d["Z_int"], d["boxes"], d["atom_mask"],
+        m._W0_eff(m.W0), m._b0_eff(m.b0, m.W0), m.W1, m.b1,
+        W_atom=d.get("V_atom"), nep_raw=d.get("nep_raw")).numpy()
+
+
+def test_q_scale_groups_cover_nep_block_once():
+    from DescriptorBuilderGPU import compute_dim_q, q_scale_groups
+    n_soap = len(q_scale_groups(_cfg(nep_descriptor="off", descriptor_scale="block")))
+    for mode, extra in (("concat", n_soap), ("replace", 0)):
+        cfg = _cfg(nep_descriptor=mode, descriptor_scale="block")
+        groups = q_scale_groups(cfg)
+        assert sorted(np.concatenate(groups).tolist()) == list(range(compute_dim_q(cfg)))
+        assert len(groups) == extra + 1 + 4 + 1          # radial, L1..L4, four_body
+
+
+def test_minmax_scaler_uses_c_equal_one():
+    """The scaler input is the assembled ANN vector: c ≡ 1 for minmax (GPUMD
+    fitness.cu:165-175), the model's real gen-0 c for block/channel."""
+    from TNEP import gen0_ann_inputs
+    atoms = _bulk_frame()
+    cfg = _cfg(nep_descriptor="concat", descriptor_scale="minmax")
+    d = prepare_eval_data([atoms, atoms], cfg)
+    q_mm = gen0_ann_inputs(cfg, d)
+    assert cfg.descriptor_scale == "minmax"                       # restored after the throwaway model
+    m = _model(_cfg(nep_descriptor="concat"))
+    ones = m._ann_inputs(d["descriptors"], d["nep_raw"], d["Z_int"],
+                         c_r=tf.ones_like(m.c_r), c_a=tf.ones_like(m.c_a)).numpy()
+    real = m._ann_inputs(d["descriptors"], d["nep_raw"], d["Z_int"]).numpy()
+    assert q_mm.shape == (2, len(atoms), cfg.dim_q)
+    np.testing.assert_array_equal(q_mm, ones)
+    q_bl = gen0_ann_inputs(_cfg(nep_descriptor="concat", descriptor_scale="block"), d)
+    np.testing.assert_array_equal(q_bl, real)
+    assert not np.allclose(q_mm, q_bl)
+    # "off" NEP with the fixed basis: the builder output itself.
+    cfg0 = _cfg(descriptor_scale="block"); d0 = prepare_eval_data([atoms], cfg0)
+    np.testing.assert_array_equal(gen0_ann_inputs(cfg0, d0), d0["descriptors"].numpy())
+
+
+@pytest.mark.parametrize("scale", ["block", "minmax"])
+@pytest.mark.parametrize("mode", ["concat", "replace"])
+def test_scaled_nep_model_is_gen0_reparameterisation(mode, scale):
+    from DescriptorBuilderGPU import compute_q_scale
+    from TNEP import gen0_ann_inputs
+    atoms = _bulk_frame(); small = atoms[:12]; small.info["dipole"] = np.zeros(3)
+    cfg_off = _cfg(nep_descriptor=mode)
+    cfg_on = _cfg(nep_descriptor=mode, descriptor_scale=scale)
+    d = prepare_eval_data([atoms, small], cfg_off)
+    m_np, mu_np = compute_q_scale(gen0_ann_inputs(cfg_on, d), d["atom_mask"].numpy(), cfg_on)
+    cfg_on.q_scale, cfg_on.q_shift = [float(v) for v in m_np], [float(v) for v in mu_np]
+    assert len(cfg_on.q_scale) == cfg_on.dim_q and (mu_np == 0).all() == (scale == "minmax")
+    m_off, m_on = _model(cfg_off), _model(cfg_on)
+    np.testing.assert_array_equal(m_on.c_r.numpy(), m_off.c_r.numpy())
+    np.testing.assert_allclose(m_on.W0.numpy() * m_np[None, :, None], m_off.W0.numpy(), rtol=1e-6)
+    np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
+    # Any scaled model == unscaled model with W0' = m∘W0, b0' = b0 − (m∘μ)·W0.
+    rng = np.random.default_rng(1)
+    W = rng.normal(size=m_on.W0.shape).astype(np.float32)
+    B = rng.normal(size=m_on.b0.shape).astype(np.float32)
+    m_on.W0.assign(W); m_on.b0.assign(B)
+    m_off.W0.assign(W * m_np[None, :, None]); m_off.b0.assign(B - np.einsum('q,tqh->th', m_np * mu_np, W))
+    np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
+
+
+def test_nep_block_excluded_from_mixing():
+    cfg = _cfg(nep_descriptor="concat", descriptor_mixing=True); m = _model(cfg)
+    ds = _cfg().dim_q
+    m.U_pair.assign(0.3 * np.random.default_rng(2).normal(size=m.U_pair.shape).astype(np.float32))
+    W0, W0_eff = m.W0.numpy(), m._W0_eff(m.W0).numpy()
+    np.testing.assert_array_equal(W0_eff[:, ds:], W0[:, ds:])
+    assert not np.allclose(W0_eff[:, :ds], W0[:, :ds])

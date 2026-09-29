@@ -85,7 +85,7 @@ for _gpu in tf.config.list_physical_devices('GPU'):
     except RuntimeError:
         pass
 
-from TNEP import TNEP
+from TNEP import TNEP, gen0_ann_inputs
 from TNEPconfig import TNEPconfig
 from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
@@ -509,29 +509,18 @@ def _train_model_inner(cfg: TNEPconfig,
     # of the training set, computed once (a checkpoint's cfg already has it).
     if str(cfg.descriptor_scale) != "off" and cfg.q_scale is None:
         from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
-        q0 = train_data["descriptors"]
+        q0 = gen0_ann_inputs(cfg, train_data)
         amask = train_data["atom_mask"]
-        if cfg.radial_basis_size is not None:
-            # Learned basis: the slot holds raw coefficients; finish them at M0
-            # with a throwaway model (scaling off) chunk by chunk.
-            cfg.descriptor_scale, _mode = "off", cfg.descriptor_scale
-            _m0 = TNEP(cfg)
-            cfg.descriptor_scale = _mode
-            S_all = int(q0.shape[0])
-            step = cfg.batch_chunk_size or S_all
-            q0 = tf.concat([_m0.soap_from_raw(q0[s:s + step], train_data["Z_int"][s:s + step])
-                            for s in range(0, S_all, step)], axis=0)
-            del _m0
-        m, mu = compute_q_scale(q0.numpy() if hasattr(q0, "numpy") else np.asarray(q0),
-                                amask.numpy() if hasattr(amask, "numpy") else np.asarray(amask), cfg)
+        m, mu = compute_q_scale(q0, amask.numpy() if hasattr(amask, "numpy") else np.asarray(amask), cfg)
         cfg.q_scale = [float(v) for v in m]
         cfg.q_shift = [float(v) for v in mu]
         print(f"Descriptor scale ({cfg.descriptor_scale}): m per group "
               f"[min / median / max] = "
               + ", ".join(f"{m[g].min():.2f}/{np.median(m[g]):.2f}/{m[g].max():.2f}"
                           for g in q_scale_groups(cfg))
-              + "; centred (mean|μ| per group = "
-              + ", ".join(f"{np.abs(mu[g]).mean():.2e}" for g in q_scale_groups(cfg)) + ")")
+              + ("; no centring (minmax)" if cfg.descriptor_scale == "minmax" else
+                 "; centred (mean|μ| per group = "
+                 + ", ".join(f"{np.abs(mu[g]).mean():.2e}" for g in q_scale_groups(cfg)) + ")"))
         del q0
 
     model = TNEP(cfg)

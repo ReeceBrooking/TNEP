@@ -2451,3 +2451,33 @@ class TNEP(layers.Layer):
                              tf.zeros_like(scalar_sum),
                              tf.zeros_like(scalar_sum)], axis=1)
         return pol + diag_add
+
+
+def gen0_ann_inputs(cfg, data) -> np.ndarray:
+    """[S, A, dim_q] generation-0 ANN input of a padded data dict — what
+    compute_q_scale must see. The builder's `descriptors` slot is returned as
+    is unless it needs finishing: a throwaway model (scaling off) applies
+    soap_from_raw (learned basis) and _ann_inputs (NEP concat/replace) chunk by
+    chunk. "minmax" assembles the NEP block with c ≡ 1 like GPUMD's q_scaler
+    (fitness.cu:165-175, initial_para = 1); block/channel use the real gen-0 c."""
+    q0, Z = data["descriptors"], data["Z_int"]
+    if cfg.radial_basis_size is None and str(getattr(cfg, "nep_descriptor", "off")) == "off":
+        return q0.numpy() if hasattr(q0, "numpy") else np.asarray(q0)
+    mode, cfg.descriptor_scale = cfg.descriptor_scale, "off"
+    try:
+        m0 = TNEP(cfg)
+    finally:
+        cfg.descriptor_scale = mode
+    nep_raw = data.get("nep_raw")
+    c = {}
+    if m0.c_r is not None and str(mode) == "minmax":
+        c = dict(c_r=tf.ones_like(m0.c_r), c_a=tf.ones_like(m0.c_a))
+    S = int(q0.shape[0])
+    step = cfg.batch_chunk_size or S
+    out = []
+    for s in range(0, S, step):
+        d, z = q0[s:s + step], Z[s:s + step]
+        if cfg.radial_basis_size is not None:
+            d = m0.soap_from_raw(d, z)
+        out.append(m0._ann_inputs(d, None if nep_raw is None else nep_raw[s:s + step], z, **c))
+    return tf.concat(out, axis=0).numpy()

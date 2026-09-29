@@ -182,10 +182,6 @@ def validate_nep_cfg(cfg):
             f"cfg.nep_descriptor={mode!r}: NEP descriptors currently support only "
             "the neighbor/bilinear dipole readouts (target_mode=1); descriptor "
             "gradients are Phase B of multi_descriptor_plan.md.")
-    if str(getattr(cfg, "descriptor_scale", "off")) != "off":
-        raise NotImplementedError(
-            f"cfg.nep_descriptor={mode!r} with descriptor_scale: the gen-0 scaler "
-            "runs on the SOAP-width builder output (Task 7 of multi_descriptor_plan.md).")
     preprocess = str(getattr(cfg, "descriptor_preprocess_contract", "off"))
     if mode == "replace":
         for f, v in (("descriptor_mixing", bool(getattr(cfg, "descriptor_mixing", False))),
