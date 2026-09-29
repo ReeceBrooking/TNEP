@@ -597,9 +597,11 @@ def test_nep_adam_step_smoke():
                num_generations=2, val_interval=1, batch_chunk_size=1)
     m = _model(cfg); atoms = _bulk_frame()
     d = prepare_eval_data([atoms, atoms], cfg)
+    c_r0 = m.c_r.numpy().copy()
     history, _, _ = m.fit(d, d)
     assert len(history["val_loss"]) == 2 and np.all(np.isfinite(history["val_loss"]))
     assert np.all(np.isfinite(history["train_loss"]))
+    assert not np.array_equal(m.c_r.numpy(), c_r0)   # c is in Adam's tape
 
 
 def test_score_takes_nep_raw():

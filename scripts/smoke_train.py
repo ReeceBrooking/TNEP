@@ -3,6 +3,8 @@
 Runs load → descriptors → SNES/Adam → test scoring → save, then re-loads the
 saved best-val model and scores the test slice again (save/load path).
 No accuracy is claimed; the smoke proves "runs, validates, saves, loads".
+The 5-frame test slice is frames 0-4 of the training file and may overlap
+the (shuffled) training frames, so its RMSE is not a held-out number.
 
     CUDA_VISIBLE_DEVICES='' python scripts/smoke_train.py \
         --readout bilinear --pair-rank 1 --nep sum --optimizer adam --out /tmp/smoke
@@ -15,7 +17,8 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+sys.path.insert(0, ROOT)
 
 
 def main(argv=None) -> None:
@@ -29,7 +32,7 @@ def main(argv=None) -> None:
     p.add_argument("--generations", type=int, default=6)
     p.add_argument("--frames", type=int, default=12)
     p.add_argument("--pop", type=int, default=8)
-    p.add_argument("--data", default="datasets/train_waterbulk.xyz")
+    p.add_argument("--data", default=os.path.join(ROOT, "datasets", "train_waterbulk.xyz"))
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
 
@@ -46,19 +49,19 @@ def main(argv=None) -> None:
     cfg.data_path = a.data
     cfg.test_data_path = test_path
     cfg.total_N = a.frames
-    cfg.descriptor_mode = 1                 # TF builder (norm="none", learned c need it)
+    cfg.descriptor_mode = 1                 # TF builder; radial_basis_norm="none" requires it
     cfg.dipole_readout = a.readout
     cfg.dipole_pair_rank = a.pair_rank
     cfg.nep_descriptor = a.nep
     cfg.descriptor_scale = a.scale
     cfg.radial_basis_norm = a.norm
     cfg.optimizer = a.optimizer
-    cfg.adam_lr = 1e-3
     cfg.num_generations = a.generations     # adam.py: steps = num_generations
     cfg.pop_size = a.pop
     if a.nep == "replace":
         cfg.descriptor_mixing = False       # replace has no SOAP blocks to mix
     # CPU sizing.
+    cfg.adam_lr = 1e-3
     cfg.num_neurons = 8
     cfg.nep_num_neurons = 8
     cfg.dipole_channels = 4
