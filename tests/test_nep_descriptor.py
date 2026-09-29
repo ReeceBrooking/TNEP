@@ -663,6 +663,13 @@ def test_nep_c_tail_roundtrip_snes():
         nb["W0"], nb["b0"], nb["W1"], nb["b1"], c_pair=nb["c_pair"],
         c_r=2.0 * nb["c_r"], c_a=nb["c_a"], **kw)[0, 0].numpy()
     assert not np.allclose(mu_other, mu_model, atol=1e-6)
+    # The SNES fit and validate call sites forward per-candidate c: doubling
+    # the c tail of μ must change both the population fitness and val RMSE.
+    d = prepare_eval_data([atoms, atoms], cfg)
+    mu_c = opt.mu.numpy().copy(); mu_c[-n_c:] *= 2.0
+    fit = opt.evaluate_population(tf.stack([opt.mu, tf.constant(mu_c)]), d).numpy()
+    assert np.all(np.isfinite(fit)) and fit[0] != fit[1]
+    assert opt.validate(d, tf.constant(mu_c)) != opt.validate(d, opt.mu)
     # off: no tail.
     assert SNES(_model(_cfg(nep_descriptor="off"))).n_nep == 0
 

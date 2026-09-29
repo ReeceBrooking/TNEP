@@ -546,14 +546,15 @@ class SNES:
                 summed_init = rng.uniform(
                     -limit, limit, size=summed_init.size).astype(np.float32)
             mu[pre_start:pre_start + self.n_preprocess] = summed_init
-        # Learned radial basis: M0 (reproduces the fixed descriptor at gen 0).
-        if self.n_radial > 0:
-            start = self.dim - self.n_nep - self.n_radial
-            mu[start:start + self.n_radial] = self.model.M_radial.numpy().reshape(-1)
-        # NEP c: the model's uniform(−1, 1) draw (GPUMD snes.cu:107-115).
-        if self.n_nep > 0:
-            mu[self.dim - self.n_nep:self.dim - self.n_c_a] = self.model.c_r.numpy().reshape(-1)
-            mu[self.dim - self.n_c_a:] = self.model.c_a.numpy().reshape(-1)
+        # Learned radial basis M0 (reproduces the fixed descriptor at gen 0),
+        # then NEP c_r, c_a (the model's uniform(−1, 1) draw, GPUMD
+        # snes.cu:107-115): each copied from its model Variable in tail order.
+        off = self.n_anns_total + self.n_U_pair + self.n_preprocess
+        for var, n in ((self.model.M_radial, self.n_radial),
+                       (self.model.c_r, self.n_c_r),
+                       (self.model.c_a, self.n_c_a)):
+            if n > 0:
+                mu[off:off + n] = var.numpy().reshape(-1); off += n
         return mu
 
     def _maybe_adapt_lambda(self, gen: int, data_loss: float,
