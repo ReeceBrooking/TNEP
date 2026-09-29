@@ -116,7 +116,8 @@ def fit_adam(model, train_data: dict, val_data: dict,
             W0p, b0p, named.get("W1_pol"), named.get("b1_pol"),
             W_atom=chunk.get("V_atom"),
             c_pair=named.get("c_pair"),
-            M_radial=named.get("M_radial"))
+            M_radial=named.get("M_radial"),
+            nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"))
         if scale_preds:
             num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
             preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]

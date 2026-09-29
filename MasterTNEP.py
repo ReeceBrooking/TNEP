@@ -345,7 +345,8 @@ def _print_param_breakdown(model) -> None:
     # Primary ANN — per-layer breakdown.
     rows.append(("ANN  W0  [T·Q·H]", int(opt._n_W0)))
     rows.append(("ANN  b0  [T·H]",   int(opt._n_b0)))
-    _w1_label = ("ANN  W1  [T·H·C]" if model._neighbor_readout
+    _w1_label = ("ANN  W1  [T·H·C(1+2K)]" if model._pair_rank > 0
+                 else "ANN  W1  [T·H·C]" if model._neighbor_readout
                  else "ANN  W1  [T·H]")
     rows.append((_w1_label,          int(opt._n_W1)))
     # b1 stays in the SNES tail for layout stability but cancels identically
@@ -440,7 +441,7 @@ def _train_model_inner(cfg: TNEPconfig,
         n_train_pairs = int(train_data["grad_values"].shape[0])
         n_val_pairs   = int(val_data["grad_values"].shape[0])
         _reason = ("neighbor readout"
-                   if cfg.dipole_readout == "neighbor"
+                   if cfg.dipole_readout in ("neighbor", "bilinear")
                    else "dipole_rij_power=0")
         print(f"  {_reason}: COO restricted to self-pairs only "
               f"(train P={n_train_pairs}, val P={n_val_pairs})")
@@ -559,7 +560,9 @@ def _train_model_inner(cfg: TNEPconfig,
               f"b_ij = Σ_n c_n[t_i,t_j]·R_n(r_ij)·s_i^n (+ mirrored j term), "
               f"μ = Σ_pairs b_ij·(r_i − r_j); {_r_desc}, {_fc_desc}, "
               f"C = {model._dipole_channels} channels, {_c_desc}, "
-              f"r_c = {cfg.dipole_rc} Å")
+              f"r_c = {cfg.dipole_rc} Å"
+              + (f"; bilinear pair term, rank K = {model._pair_rank}"
+                 if model._pair_rank > 0 else ""))
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
     print("Parameter Root: " + str(np.sqrt(model.optimizer.dim)))
@@ -656,8 +659,12 @@ def _train_model_inner(cfg: TNEPconfig,
     print_score_summary(metrics, cfg, prefix="Best-val test set")
 
     if cfg.save_path is not None:
-        save_model(best_val_model, cfg, cfg.save_path, label="best_val")
-        save_model(final_model, cfg, cfg.save_path, label="final_gen")
+        # Filename = {dataset}_{elements}_{mode}_{label}.h5 with the test
+        # metrics in the label, e.g. ..._best_val_r2_0.9987_rmse_0.0021.h5
+        def _label(tag, m):
+            return f"{tag}_r2_{m['r2']:.4f}_rmse_{m['rmse']:.4g}"
+        save_model(best_val_model, cfg, cfg.save_path, label=_label("best_val", metrics))
+        save_model(final_model, cfg, cfg.save_path, label=_label("final_gen", final_metrics))
         save_history(history, cfg)
 
     # Timing summary

@@ -206,6 +206,37 @@ single radial channel
   flow f_c r^(ζ−1)(s_i − s_j) is a screened charge transfer whose
   magnitude decays as a power of distance inside the cutoff.
 
+## 6b. Bilinear pair head (cfg.dipole_readout = "bilinear")
+
+Motivation (locality): with the difference form the charges are q = L s
+for a weighted graph Laplacian L fixed by geometry, so the site scalars
+the ANN must produce are s = L⁺ q — a non-local function of a local
+target. The bilinear head puts the learned quantity back on the bond so
+q_i is a sum of local terms (plan: `neighbor_dipole_bilinear_plan.md`).
+
+    μ = Σ_i Σ_n s_i^n Σ_t' c[n,p(t_i,t')] V_i[:,n,t']                    (unchanged)
+      + Σ_i Σ_{j≠i, r_ij<r_c} Σ_n c[n,p(t_i,t_j)] R_n(r_ij)(r_i − r_j) · Σ_k a_i^{n,k} b_j^{n,k}
+
+- The ANN head widens from C to C·(1+2K) outputs per atom: s [C], a [C,K],
+  b [C,K] (K = cfg.dipole_pair_rank ≥ 1). The pair sum runs over ORDERED
+  pairs; since the geometry factor is odd under i↔j the term is
+  antisymmetric by construction (tested: swapping a↔b negates it).
+- The same learned species-pair table c multiplies both terms; the radial
+  channels R_n and cutoff are shared. No new radial parameters.
+- The site-scalar term is the b ≡ 1 special case; it is kept as its own
+  slice so "neighbor" stays bit-identical and generation 0 of a bilinear
+  run equals the difference model exactly (SNES μ-init zeroes the b-slice).
+- The bilinear term has no per-frame gauge (a constant shift of s is
+  invisible; a shift of a or b is not) — intended, that is the locality gain.
+- Data: a padded per-centre pair table (nbr_index [S,A,M], nbr_G
+  [S,A,M,3,C] = R_n(r_ij)(r_i − r_j)) rides the dense per-structure keys
+  next to V_atom. The SNES candidates forward materialises [P_cand,B,A,M,C]
+  tensors; `population_chunk_size` is the memory knob.
+- GAP mode refuses this readout (μ is quadratic in the ANN outputs).
+- Status: implemented and tested (brute-force reference, antisymmetry,
+  four-path consistency at K=2, SNES tail sizing + gen-0 identity, save/
+  load); 8-generation smoke only. No accuracy claim yet.
+
 ## 7. Diagnostics: the rigid-LSQ floor theory
 
 Setting s to per-type constants makes (2) linear in ≤ T·C numbers — a
