@@ -5,13 +5,23 @@ import copy
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
 from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices,
                             find_q_tf, NUM_ABC, EXPERT_WEIGHTS)
+
+
+class AnnBlock(NamedTuple):
+    """One typed single-hidden-layer ANN in the SNES typed slab: weights
+    W0<suffix> [T, dim_in, hidden], b0<suffix> [T, hidden], W1<suffix>
+    [T, hidden, head_width]; scale_slice = its channels of cfg.q_scale."""
+    suffix: str
+    dim_in: int
+    hidden: int
+    scale_slice: slice
 
 
 @tf.function(jit_compile=True)
@@ -501,10 +511,10 @@ class TNEP(layers.Layer):
         # the 3-body expert on the angular block, whose head outputs add to
         # the SOAP ANN's before _split_head. W1_r / W1_a start at zero so a
         # fresh model equals the SOAP-only one; b1 stays the one global bias.
-        self._ann_blocks = [("", int(cfg.dim_q), int(cfg.num_neurons), self._sl_main)]
+        self._ann_blocks = [AnnBlock("", int(cfg.dim_q), int(cfg.num_neurons), self._sl_main)]
         for suf, (sl_in, sl_m) in zip(("_r", "_a"), self._expert_in):
             d_in, He = sl_in.stop - sl_in.start, int(cfg.nep_num_neurons)
-            self._ann_blocks.append((suf, d_in, He, sl_m))
+            self._ann_blocks.append(AnnBlock(suf, d_in, He, sl_m))
             for name, shape, init in (("W0", (cfg.num_types, d_in, He), "glorot_uniform"),
                                       ("b0", (cfg.num_types, He), "zeros"),
                                       ("W1", (cfg.num_types, He, self._head_width), "zeros")):
@@ -791,8 +801,8 @@ class TNEP(layers.Layer):
             # Stored W0 = Glorot / m and b0 = (m∘μ)·W0_stored, so W0_eff / b0_eff
             # at init equal the unscaled Glorot / zero init exactly — for every
             # typed ANN on its own slice of q_scale.
-            anns = [(getattr(self, "W0" + suf), getattr(self, "b0" + suf), sl)
-                    for suf, _, _, sl in self._ann_blocks]
+            anns = [(getattr(self, "W0" + b.suffix), getattr(self, "b0" + b.suffix), b.scale_slice)
+                    for b in self._ann_blocks]
             if cfg.target_mode == 2:
                 anns.append((self.W0_pol, self.b0_pol, self._sl_main))
             for W0, b0, sl in anns:
@@ -1198,14 +1208,21 @@ class TNEP(layers.Layer):
         [(C,) ..., A, head_width]. q [(C,) ..., A, dim_nep]; Z / atom_mask
         [..., A]; STORED weights [(C,) T, ...] — the descriptor_scale fold on
         slice sl_m happens here (no mixing / preprocess reaches the experts,
-        so no caller pre-folds). Type-mask sum, no [.., A, d, H] gather."""
+        so no caller pre-folds). Type-mask sum, no [.., A, d, H] gather.
+        Per-candidate q (c_r / c_a with a candidate axis) requires
+        per-candidate experts with the same C: the einsum names both axes
+        'c' (no broadcast); shared q with per-candidate experts is fine."""
         W0, b0 = self._scale_fold(W0, b0, sl_m)
         x = q[..., sl_in]
         cand = len(W0.shape) == 4
         if not cand:
             W0, b0, W1 = W0[tf.newaxis], b0[tf.newaxis], W1[tf.newaxis]
-        eq = ('c...ad,cdh->c...ah' if len(x.shape) == len(Z.shape) + 2
-              else '...ad,cdh->c...ah')
+        per_cand_q = len(x.shape) == len(Z.shape) + 2   # x [C, ...] when c_r is per-candidate
+        if per_cand_q:
+            tf.debugging.assert_equal(
+                tf.shape(x)[0], tf.shape(W0)[0],
+                message="per-candidate c_r/c_a need per-candidate expert weights (same C)")
+        eq = 'c...ad,cdh->c...ah' if per_cand_q else '...ad,cdh->c...ah'
         z = tf.add_n([
             tf.einsum(eq, x, W0[:, t])
             * tf.cast(tf.equal(Z, t), x.dtype)[..., tf.newaxis]

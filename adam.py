@@ -127,7 +127,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
             c_pair=named.get("c_pair"),
             M_radial=named.get("M_radial"),
             c_r=named.get("c_r"), c_a=named.get("c_a"),
-            experts=(tuple(named[k] for k in EXPERT_WEIGHTS)
+            experts=(tuple(map(_tf_var, model.expert_weights))   # Keras vars → tf.Variables
                      if model._nep_mode == "sum" else None),
             nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
             nep_raw=chunk.get("nep_raw"))

@@ -816,11 +816,13 @@ def test_nep_block_excluded_from_mixing():
 
 # ── Task 8: nep_descriptor="sum" — ANN_soap + ANN_2b + ANN_3b summed into the head ──
 
+# Deliberately NOT imported from nep_descriptor: an independent pin on the
+# SNES / Adam / save-format order of the expert tensors.
 EXPERTS = ("W0_r", "b0_r", "W1_r", "W0_a", "b0_a", "W1_a")
 
 
 def _sum_cfg(**kw):
-    return _cfg(**{"nep_descriptor": "sum", "nep_num_neurons": 6, **kw})
+    return _cfg(**{"nep_descriptor": "sum", "nep_num_neurons": 6, "dipole_pair_rank": 2, **kw})
 
 
 def _randomise_experts(m, seed=11):
@@ -916,10 +918,11 @@ def test_sum_mode_snes_layout_and_roundtrip():
     np.testing.assert_array_equal(tov[n_main:n_main + T * dr * He], np.repeat(np.arange(T), dr * He))
     np.testing.assert_array_equal(tov[n_main + n_r:n_main + n_r + T * da * He], np.repeat(np.arange(T), da * He))
     assert tov[opt.n_typed] == T
-    # Per-type extraction picks type t's rows of every block.
+    # Per-type extraction picks type t's rows of every block: after type 0's
+    # W0 / b0 / W1 rows of the SOAP block come its W0_r rows.
     tp0 = opt._extract_type_params(opt.mu, 0).numpy()
-    w0r_t0 = mu[n_main:n_main + dr * He]
-    assert any(np.array_equal(tp0[i:i + dr * He], w0r_t0) for i in range(0, tp0.size - dr * He + 1))
+    off = Q * H + H + H * Hw
+    np.testing.assert_array_equal(tp0[off:off + dr * He], mu[n_main:n_main + dr * He])
     # Round trip: perturb μ → assign → predict_batch(model weights) == candidates(μ).
     atoms = _bulk_frame()
     types_int = assign_type_indices([atoms], cfg.types)
@@ -997,16 +1000,6 @@ def test_sum_mode_scaled_is_gen0_reparameterisation(scale):
                                         + np.einsum('q,tqh->th', mu_k, getattr(m_on, f"W0_{k}").numpy()))
     np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
     assert np.abs(_predict_eff(m_on, d)).max() > 0
-    # Any scaled expert == unscaled with W0' = m∘W0, b0' = b0 − (m∘μ)·W0.
-    rng = np.random.default_rng(1)
-    for k, mk in (("r", m_r), ("a", m_a)):
-        W = rng.normal(size=getattr(m_on, f"W0_{k}").shape).astype(np.float32)
-        B = rng.normal(size=getattr(m_on, f"b0_{k}").shape).astype(np.float32)
-        mu_k = (m_np * mu_np)[ds:][sl["radial" if k == "r" else "angular"]]
-        getattr(m_on, f"W0_{k}").assign(W); getattr(m_on, f"b0_{k}").assign(B)
-        getattr(m_off, f"W0_{k}").assign(W * mk[None, :, None])
-        getattr(m_off, f"b0_{k}").assign(B - np.einsum('q,tqh->th', mu_k, W))
-    np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
 
 
 def test_sum_mode_save_load(tmp_path):

@@ -43,7 +43,7 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     model.b0.assign(params[idx]); idx += 1
     model.W1.assign(params[idx]); idx += 1
     model.b1.assign(params[idx]); idx += 1
-    if model._nep_mode == "sum":
+    if model.optimizer.n_expert > 0:
         for k in EXPERT_WEIGHTS:
             getattr(model, k).assign(params[idx]); idx += 1
     if model._neighbor_readout and model._c_learnable:
@@ -117,15 +117,22 @@ class SNES:
         # [W0(T,Q,H) | b0(T,H) | W1(T,H·Hw)] laid end to end in the typed
         # slab; b1 follows the LAST block, so n_typed stays one contiguous
         # slice (_global_typed) and every "after b1" offset moves with it.
-        self._blocks = [(int(Q), int(Hb)) for _, Q, Hb, _ in model._ann_blocks]
-        per_type = sum(Q * Hb + Hb + Hb * self._Hw for Q, Hb in self._blocks)
+        self._blocks = list(model._ann_blocks)          # AnnBlock rows
+
+        def _block_per_type(b) -> int:
+            """Type t's parameters of one block: W0 Q·H + b0 H + W1 H·Hw."""
+            return b.dim_in * b.hidden + b.hidden + b.hidden * self._Hw
+
+        per_type = sum(_block_per_type(b) for b in self._blocks)
         n_W0 = self.cfg.num_types * self.cfg.dim_q * self.H
         n_b0 = self.cfg.num_types * self.H
         n_W1 = self.cfg.num_types * self.H * self._Hw
         n_b1 = 1
         self.n_typed = _T * per_type
+        # The mode-2 polarizability ANN mirrors the SOAP block only.
+        self.n_typed_pol = _T * _block_per_type(self._blocks[0])
         # Per-expert counts (breakdown); n_expert = 0 outside "sum".
-        self._n_expert = [_T * (Q * Hb + Hb + Hb * self._Hw) for Q, Hb in self._blocks[1:]]
+        self._n_expert = [_T * _block_per_type(b) for b in self._blocks[1:]]
         self.n_expert = sum(self._n_expert)
         # Per-type param count (type t's rows of every block). target_mode==2
         # has a second (polarizability) ANN whose type-t block is ALSO
@@ -427,8 +434,9 @@ class SNES:
     def _global_typed(self, pv):
         """Global-reg parameter slice for batched [P, dim] vectors → (typed
         [P, n], n). Typed ANN weights, plus c_pair (pair-indexed, rides the
-        global term) when present, plus the mode-2 second ANN. Excludes b1.
-        Single source of truth for the tail-skip arithmetic."""
+        global term) when present, plus the mode-2 second ANN (SOAP block
+        only: n_typed_pol). Excludes b1. Single source of truth for the
+        global-term slice; per-type slices live in _type_slices."""
         typed = pv[:, :self.n_typed]
         n = self.n_typed
         if self.n_c > 0:
@@ -438,9 +446,9 @@ class SNES:
             n += self.n_c
         if self.cfg.target_mode == 2:
             typed = tf.concat(
-                [typed, pv[:, self.n_primary:self.n_primary + self.n_typed]],
+                [typed, pv[:, self.n_primary:self.n_primary + self.n_typed_pol]],
                 axis=1)
-            n = 2 * self.n_typed
+            n += self.n_typed_pol
         return typed, n
 
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray
@@ -506,8 +514,8 @@ class SNES:
             """Fill typed blocks [W0(T,Q,H) | b0(T,H) | W1(T,H·Hw)] each,
             then b1(1), starting at ``off``. Block i > 0 is a "sum" expert:
             W1 zero so generation 0 equals the SOAP-only model."""
-            for i, (Q, Hb) in enumerate(blocks):
-                sl = self.model._ann_blocks[i][3]          # this block's q_scale slice
+            for i, b in enumerate(blocks):
+                Q, Hb, sl = b.dim_in, b.hidden, b.scale_slice
                 c_W0 = gain * float(np.sqrt(6.0 / (Q + Hb)))
                 c_W1 = gain * float(np.sqrt(6.0 / (Hb + self._Hw)))
                 n_W0 = T * Q * Hb
@@ -656,8 +664,8 @@ class SNES:
         per-type penalty, else it is only weakly reached by the global term)."""
         T = self.cfg.num_types
         out, off = [], 0
-        for Q, Hb in self._blocks:
-            for n in (Q * Hb, Hb, Hb * self._Hw):
+        for b in self._blocks:
+            for n in (b.dim_in * b.hidden, b.hidden, b.hidden * self._Hw):
                 out.append((off + t * n, off + (t + 1) * n))
                 off += T * n
         if self.cfg.target_mode == 2:
@@ -677,8 +685,8 @@ class SNES:
         def _ann_types(blocks) -> np.ndarray:
             tov = np.empty(self.n_primary, dtype=np.int32)
             offset = 0
-            for Q, Hb in blocks:
-                for n in (Q * Hb, Hb, Hb * self._Hw):
+            for b in blocks:
+                for n in (b.dim_in * b.hidden, b.hidden, b.hidden * self._Hw):
                     for t in range(T):
                         tov[offset:offset + n] = t
                         offset += n
@@ -1517,7 +1525,8 @@ class SNES:
             """Typed blocks [W0 | b0 | W1] each, then b1 →
             (W0, b0, W1, b1, *expert tensors in EXPERT_WEIGHTS order, offset)."""
             ws = []
-            for Q, Hb in blocks:
+            for b in blocks:
+                Q, Hb = b.dim_in, b.hidden
                 # W1 shape: [T, H] except the neighbor readout's channel axis.
                 w1_shape = [T, Hb, self._Hw] if self.model._neighbor_readout else [T, Hb]
                 for shape in ([T, Q, Hb], [T, Hb], w1_shape):
