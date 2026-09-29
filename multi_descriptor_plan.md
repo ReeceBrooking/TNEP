@@ -47,9 +47,9 @@ nep_num_neurons: int = 30            # "sum" mode only: width of ANN_2b and ANN_
 
 **Radial block (`nep.cu:110-155`):** q_n^i = Σ_j g_n(r_ij), g_n(r_ij) = Σ_k c_r[t_i, t_j, n, k] f_k(r_ij; rc_r). Learned c_r [T, T, n_max_r+1, K_r+1] (GPUMD index `(n*(K+1)+k)*T² + t1*T + t2`).
 
-**Angular block (`nep.cu:157-215`, `accumulate_s_one<L>` at `nep_utilities.cuh:846-895`, `find_q_one<L>` at 650-664 with `C3B` constants at 19-39, the `Z_COEFFICIENT_L` tables BELOW them (lines 48+), `complex_product`):**
+**Angular block (`nep.cu:157-215`, `accumulate_s_one<L>` at `nep_utilities.cuh:846-895`, `find_q_one<L>` at 930-942 (`calculate_s_one<L>` at 650-664 is its derivative twin) with `C3B` constants at 19-39, the `Z_COEFFICIENT_L` tables BELOW them (lines 48+), `complex_product`):**
 - s^i_{n,·} = Σ_j g_n(r_ij; c_a, rc_a) · P_L(r̂_ij) where P_L is GPUMD's 2L+1 real polynomial components for L = 1..4 (24 components, s index L²−1 … L²+2L−1; port `accumulate_s_one<1..4>` and its coefficient tables VERBATIM, including the `complex_product` iteration of (x+iy)^{n1})
-- q^i_{nL} = C3B[L²−1]·(s_{n,L²−1})² + 2·Σ_{k=1}^{2L} C3B[L²−1+k]·(s_{n,L²−1+k})² (`find_q_one<L>`, lines 650-664: the m≠0 components carry a factor 2 — do NOT drop it; `calculate_s_one` mirrors it with `Fp_factor = 2·Fp` for k=0 and ×2 again for k≥1)
+- q^i_{nL} = C3B[L²−1]·(s_{n,L²−1})² + 2·Σ_{k=1}^{2L} C3B[L²−1+k]·(s_{n,L²−1+k})² (`find_q_one<L>`, lines 930-942: the m≠0 components carry a factor 2 — do NOT drop it; `calculate_s_one` mirrors it with `Fp_factor = 2·Fp` for k=0 and ×2 again for k≥1)
 - 4-body q_{n222} and 5-body q_{n1111} from the same s per `find_q` at `nep_utilities.cuh:944-1000` (C4B, C5B constants at 40-46) — port verbatim
 - Descriptor order = GPUMD's: [q_0..q_{n_max_r}] ‖ angular l-major (`ln = l*(n_max_a+1)+n`, l = 0..3 for L = 1..4) ‖ 4-body (n_max_a+1) ‖ 5-body (n_max_a+1). dim_nep = (n_max_r+1) + (n_max_a+1)·(4 + four_body + five_body) (`parameters.cu:203-211`).
 
@@ -231,7 +231,7 @@ Z_COEFFICIENT = {1: [[..]], 2: [[..]], 3: [[..]], 4: [[..]]}   # the Z_COEFFICIE
 def fc(r, rc): ...                     # ½(1+cos πr/rc) for r<rc else 0     (line 339)
 def fn_all(r, rc, K):                  # [P, K+1]: f_0 = fc, f_k = ½(T_k(x)+1) fc, x = 2(r/rc−1)²−1   (line 500-517)
 def real_harmonics(xhat, yhat, zhat):  # [P, 24]: GPUMD's P_c for L=1..4 in s-index order L²−1.., via accumulate_s_one<L> (846-895)
-def find_q(s, four_body, five_body):   # s [.., n, 24] → q_a [.., n, 4 (+1) (+1)] per find_q / find_q_one (944-1000, 650-664)
+def find_q(s, four_body, five_body):   # s [.., n, 24] → q_a [.., n, 4 (+1) (+1)] per find_q / find_q_one (944-1000, 930-942)
 def nep_raw_numpy(atoms, types_int, cfg) -> np.ndarray   # [N, W_raw] = flatten(raw_r [N,T,Kr+1] ‖ raw_a [N,T,Ka+1,24])
 def nep_dim(cfg) -> int; def nep_raw_width(cfg) -> int; def nep_slices(cfg) -> dict   # radial / angular / 4b / 5b column ranges
 ```
