@@ -679,9 +679,11 @@ def power_spectrum_with_grad_tf(
     n_compressed: int,
     n_sites,                          # int OR scalar int32 tensor
     l_max: int = None,                # accepted for sig parity (unused here)
+    normalize: bool = True,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
     """Power spectrum p_{nn'l} = Σ_m c_nlm·conj(c_n'lm), plus its 3 spherical
-    derivatives, both L2-normalised.
+    derivatives, both L2-normalised (normalize=False: raw, cfg.radial_basis_norm
+    "none").
     Returns (soap_norm [n_sites, n_compressed], soap_*_der each [n_compressed, P]).
     """
     # Per-triple Python loop reduced immediately (small live memory); unrolled
@@ -746,6 +748,11 @@ def power_spectrum_with_grad_tf(
         shape=tf.stack([n_compressed_t, P_dim]),
     )
 
+    if not normalize:
+        # radial_basis_norm="none": raw soap_unnorm, no scale factor (unlike
+        # the learned basis's scale²), and the derivatives stay un-projected —
+        # (I − q̂q̂ᵀ)/‖q‖ below is exactly ∂(q/‖q‖)/∂q, so skipping it gives ∂q/∂r.
+        return tf.transpose(soap_unnorm), soap_rad_der, soap_azi_der, soap_pol_der
     norms = tf.linalg.norm(soap_unnorm, axis=0)
     sqrt_dot_p = tf.where(norms < 1e-5, tf.ones_like(norms), norms)
     sdpp = tf.gather(sqrt_dot_p, pair_atom)                          # [P]
@@ -844,12 +851,13 @@ def power_spectrum_grad_only_tile_tf(
     sqrt_dot_p: tf.Tensor,            # [n_sites] (full forward result)
     n_compressed: int,
     l_max: int = None,
+    normalize: bool = True,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """Pair-tile derivative branch of the power spectrum.
 
     Mirrors the derivative branch of `power_spectrum_with_grad_tf` but on a
     tile of pairs (peak memory ~ P_tile, not full P), L2-corrected against the
-    full forward soap_unnorm / sqrt_dot_p.
+    full forward soap_unnorm / sqrt_dot_p (normalize=False: un-projected).
     Returns (soap_rad_der, soap_azi_der, soap_pol_der), each [n_compressed, P_tile].
     """
     cnk_at = tf.gather(cnk, pair_atom, axis=2)  # [k_max, n_max, P_tile]
@@ -888,6 +896,8 @@ def power_spectrum_grad_only_tile_tf(
                                   shape=tf.stack([n_compressed_t, P_tile_dim]))
     del rad_kept, azi_kept, pol_kept
 
+    if not normalize:
+        return soap_rad_der, soap_azi_der, soap_pol_der
     sdpp = tf.gather(sqrt_dot_p, pair_atom)                      # [P_tile]
     soap_per_pair = tf.gather(soap_unnorm, pair_atom, axis=1)    # [n_compressed, P_tile]
 
@@ -911,6 +921,7 @@ def _compute_soap_with_grad_inner_tf(
     amplitude_scaling, central_weight,
     radial_enhancement, nf, do_central, n_compressed, n_max,
     pair_tile_size: int = 0,
+    normalize: bool = True,
 ):
     """Inner forward+grad TF compute (TF tensor inputs, Python/NumPy constants).
 
@@ -954,6 +965,7 @@ def _compute_soap_with_grad_inner_tf(
             cnk, cnk_rad, cnk_azi, cnk_pol, pair_atom,
             multiplicity_array, kept_triples, compressed_idx, coeffs,
             n_compressed=n_compressed, n_sites=n_atoms, l_max=l_max,
+            normalize=normalize,
         )
         grad_cart = _spherical_to_cartesian_per_pair_tf(
             soap_rad_der, soap_azi_der, soap_pol_der,
@@ -984,9 +996,13 @@ def _compute_soap_with_grad_inner_tf(
         compressed_idx[:, None], coeffs[:, None] * fwd_kept,
         shape=tf.stack([n_compressed_t, n_sites_t]))
     del fwd_kept
-    norms = tf.linalg.norm(soap_unnorm, axis=0)
-    sqrt_dot_p = tf.where(norms < 1e-5, tf.ones_like(norms), norms)
-    soap_norm = tf.transpose(soap_unnorm / sqrt_dot_p[None, :])
+    if normalize:
+        norms = tf.linalg.norm(soap_unnorm, axis=0)
+        sqrt_dot_p = tf.where(norms < 1e-5, tf.ones_like(norms), norms)
+        soap_norm = tf.transpose(soap_unnorm / sqrt_dot_p[None, :])
+    else:
+        sqrt_dot_p = None                      # unused by the un-projected tiles
+        soap_norm = tf.transpose(soap_unnorm)
 
     # 2) Pair-tiled derivative loop. Caller padded P to a multiple of
     # pair_tile_size so every tile is exactly P_TILE long (XLA fuses one reused
@@ -1027,7 +1043,7 @@ def _compute_soap_with_grad_inner_tf(
             cnk, cnk_rad_t, cnk_azi_t, cnk_pol_t, pair_atom_t,
             multiplicity_array, kept_triples, compressed_idx, coeffs,
             soap_unnorm, sqrt_dot_p,
-            n_compressed=n_compressed, l_max=l_max_eff,
+            n_compressed=n_compressed, l_max=l_max_eff, normalize=normalize,
         )
         grad_cart_t = _spherical_to_cartesian_per_pair_tf(
             soap_rad_t, soap_azi_t, soap_pol_t,
@@ -1141,7 +1157,7 @@ def aggregate_cnk_tf(
 def power_spectrum_tf(
     cnk: tf.Tensor, multiplicity_array: tf.Tensor, kept_triples: list,
     compressed_idx: tf.Tensor, coeffs: tf.Tensor,
-    n_compressed: int, n_sites, l_max: int = None,
+    n_compressed: int, n_sites, l_max: int = None, normalize: bool = True,
 ) -> tf.Tensor:
     """Forward-only power spectrum. Returns [n_sites, n_compressed]."""
     fwd_rows = []
@@ -1162,6 +1178,8 @@ def power_spectrum_tf(
         coeffs[:, None] * fwd_kept,
         shape=tf.stack([n_compressed_t, n_sites_t]),
     )
+    if not normalize:
+        return tf.transpose(soap_unnorm)
     norms = tf.linalg.norm(soap_unnorm, axis=0)
     sqrt_dot_p = tf.where(norms < 1e-5, tf.ones_like(norms), norms)
     return tf.transpose(soap_unnorm / sqrt_dot_p[None, :])
@@ -1178,6 +1196,7 @@ def _compute_soap_inner_tf(
     atom_sigma_r, atom_sigma_r_scaling, atom_sigma_t, atom_sigma_t_scaling,
     amplitude_scaling, central_weight,
     radial_enhancement, nf, do_central, n_compressed, n_max,
+    normalize: bool = True,
 ):
     """Forward-only inner pipeline (no derivatives)."""
     # fp32 caveat as in _compute_soap_with_grad_inner_tf: radial recursion in fp64.
@@ -1208,6 +1227,7 @@ def _compute_soap_inner_tf(
     return power_spectrum_tf(
         cnk, multiplicity_array, kept_triples, compressed_idx, coeffs,
         n_compressed=n_compressed, n_sites=n_atoms, l_max=l_max,
+        normalize=normalize,
     )
 
 
@@ -1724,6 +1744,15 @@ class DescriptorBuilderGPUTF:
             radial_basis_size=getattr(cfg, "radial_basis_size", None),
         )
         self._learn_radial = self._soap_params["radial_basis_size"] is not None
+        # Per-atom L2 normalisation of the fixed power spectrum ("l2") or the
+        # raw spectrum ("none"); "sqrt" is learned-basis only (∂/∂r singular
+        # at q=0). The learned basis normalises in TNEP.soap_from_raw instead.
+        rb_norm = str(getattr(cfg, "radial_basis_norm", "l2"))
+        if not self._learn_radial and rb_norm not in ("l2", "none"):
+            raise ValueError(
+                f"cfg.radial_basis_norm={rb_norm!r}: the fixed SOAP builder "
+                f"supports 'l2' or 'none' ('sqrt' needs cfg.radial_basis_size).")
+        self._normalize = rb_norm != "none"
         # Precision: float64 (quippy/Fortran) or float32 (~2x faster, ~half VRAM).
         # Compute fns are cached by (dtype, jit_compile).
         self._real_dtype = (tf.float32
@@ -1846,6 +1875,7 @@ class DescriptorBuilderGPUTF:
             do_central=(float(sp["central_weight"]) != 0.0),
             n_compressed=n_compressed, n_max=n_max,
             pair_tile_size=int(getattr(self, "_pair_tile_size", 0)),
+            normalize=self._normalize,
         )
 
         sig = [

@@ -133,5 +133,9 @@ def test_norm_options(norm):
     assert np.all(np.isfinite(m)) and np.all(np.isfinite(mu))
     print(f"\n{norm}: SOAP norms median {np.median(norms):.3f} range {norms.min():.3f}-{norms.max():.3f}; l0/l4 mean|q| ratio "
           f"{np.abs(soap_u[:, :10]).mean() / np.abs(soap_u[:, 40:50]).mean():.1f}")
-    with pytest.raises(ValueError):
+    # Fixed builder: "none" is supported (tests/test_nep_descriptor.py), "sqrt" is not.
+    if norm == "sqrt":
+        with pytest.raises(ValueError):
+            _model(_cfg(radial_basis_norm=norm))
+    else:
         _model(_cfg(radial_basis_norm=norm))

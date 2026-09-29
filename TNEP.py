@@ -221,10 +221,15 @@ class TNEP(layers.Layer):
                     raise ValueError(
                         f"cfg.{f}=True requires cfg.radial_basis_size (the "
                         f"learned radial basis).")
-            if str(getattr(cfg, "radial_basis_norm", "l2")) != "l2":
+            _norm = str(getattr(cfg, "radial_basis_norm", "l2"))
+            if _norm not in ("l2", "none"):
                 raise ValueError(
-                    "cfg.radial_basis_norm != 'l2' requires cfg.radial_basis_size "
-                    "(the fixed builder always L2-normalises).")
+                    f"cfg.radial_basis_norm={_norm!r}: the fixed builder supports "
+                    f"'l2' or 'none' ('sqrt' requires cfg.radial_basis_size).")
+            if _norm == "none" and int(cfg.descriptor_mode) != 1:
+                raise ValueError(
+                    "cfg.radial_basis_norm='none' requires descriptor_mode=1 "
+                    "(the quippy builder always L2-normalises).")
             self.M_radial = None
         # Descriptor scale preconditioning: m folded into W0 (see _W0_eff);
         # the Keras W0 init is divided by m so the initial function is the
