@@ -20,6 +20,7 @@ from DescriptorBuilder import make_descriptor_builder
 import nep_descriptor as nd
 from data import assign_type_indices, prepare_eval_data
 from test_neighbor_dipole import _cfg as _base_cfg, _model, _bulk_frame
+from test_q_scale import _predict_eff
 
 
 def _cfg(**kw):
@@ -739,14 +740,6 @@ def test_adam_trains_c():
 
 # ── Task 7: descriptor_scale groups / gen-0 scaler input / mixing exclusion ──
 
-def _predict_eff(m, d):
-    return m.predict_batch(
-        d["descriptors"], d["grad_values"], d["pair_atom"], d["pair_gidx"], d["pair_struct"],
-        d["positions"], d["Z_int"], d["boxes"], d["atom_mask"],
-        m._W0_eff(m.W0), m._b0_eff(m.b0, m.W0), m.W1, m.b1,
-        W_atom=d.get("V_atom"), nep_raw=d.get("nep_raw")).numpy()
-
-
 def test_q_scale_groups_cover_nep_block_once():
     from DescriptorBuilderGPU import compute_dim_q, q_scale_groups
     n_soap = len(q_scale_groups(_cfg(nep_descriptor="off", descriptor_scale="block")))
@@ -765,7 +758,6 @@ def test_minmax_scaler_uses_c_equal_one():
     cfg = _cfg(nep_descriptor="concat", descriptor_scale="minmax")
     d = prepare_eval_data([atoms, atoms], cfg)
     q_mm = gen0_ann_inputs(cfg, d)
-    assert cfg.descriptor_scale == "minmax"                       # restored after the throwaway model
     m = _model(_cfg(nep_descriptor="concat"))
     ones = m._ann_inputs(d["descriptors"], d["nep_raw"], d["Z_int"],
                          c_r=tf.ones_like(m.c_r), c_a=tf.ones_like(m.c_a)).numpy()
@@ -780,7 +772,7 @@ def test_minmax_scaler_uses_c_equal_one():
     np.testing.assert_array_equal(gen0_ann_inputs(cfg0, d0), d0["descriptors"].numpy())
 
 
-@pytest.mark.parametrize("scale", ["block", "minmax"])
+@pytest.mark.parametrize("scale", ["block", "channel", "minmax"])
 @pytest.mark.parametrize("mode", ["concat", "replace"])
 def test_scaled_nep_model_is_gen0_reparameterisation(mode, scale):
     from DescriptorBuilderGPU import compute_q_scale

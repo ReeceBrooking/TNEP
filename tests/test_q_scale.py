@@ -13,6 +13,7 @@ import tensorflow as tf
 
 import DescriptorBuilderGPU as DB
 from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
+from TNEP import gen0_ann_inputs
 from test_radial_basis import _cfg, _cho_frames, _model, _eval_data, _predict
 
 FULL = dict(radial_basis_size=8, radial_basis_per_l=True, radial_basis_two_body=True,
@@ -22,9 +23,8 @@ FULL = dict(radial_basis_size=8, radial_basis_per_l=True, radial_basis_two_body=
 
 
 def _q0(cfg, frames):
-    m0 = _model(_cfg(**{k: v for k, v in vars(cfg).items() if k in FULL or k == "radial_basis_species_sum"}))
     d = _eval_data(cfg, frames)
-    return m0.soap_from_raw(d["descriptors"], d["Z_int"]).numpy(), d["atom_mask"].numpy(), d
+    return gen0_ann_inputs(cfg, d), d["atom_mask"].numpy(), d
 
 
 def test_compute_q_scale_rules(monkeypatch):
@@ -102,7 +102,7 @@ def _predict_eff(model, data):
         data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"],
         data["pair_struct"], data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
         model._W0_eff(model.W0), model._b0_eff(model.b0, model.W0), model.W1, model.b1,
-        W_atom=data.get("V_atom")).numpy()
+        W_atom=data.get("V_atom"), nep_raw=data.get("nep_raw")).numpy()
 
 
 @pytest.mark.parametrize("norm", ["none", "sqrt"])

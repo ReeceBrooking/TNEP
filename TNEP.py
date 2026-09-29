@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
@@ -2463,14 +2465,12 @@ def gen0_ann_inputs(cfg, data) -> np.ndarray:
     q0, Z = data["descriptors"], data["Z_int"]
     if cfg.radial_basis_size is None and str(getattr(cfg, "nep_descriptor", "off")) == "off":
         return q0.numpy() if hasattr(q0, "numpy") else np.asarray(q0)
-    mode, cfg.descriptor_scale = cfg.descriptor_scale, "off"
-    try:
-        m0 = TNEP(cfg)
-    finally:
-        cfg.descriptor_scale = mode
+    cfg0 = copy.copy(cfg)
+    cfg0.descriptor_scale = "off"
+    m0 = TNEP(cfg0)
     nep_raw = data.get("nep_raw")
     c = {}
-    if m0.c_r is not None and str(mode) == "minmax":
+    if m0.c_r is not None and str(cfg.descriptor_scale) == "minmax":
         c = dict(c_r=tf.ones_like(m0.c_r), c_a=tf.ones_like(m0.c_a))
     S = int(q0.shape[0])
     step = cfg.batch_chunk_size or S

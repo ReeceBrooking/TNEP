@@ -518,7 +518,7 @@ def _train_model_inner(cfg: TNEPconfig,
               f"[min / median / max] = "
               + ", ".join(f"{m[g].min():.2f}/{np.median(m[g]):.2f}/{m[g].max():.2f}"
                           for g in q_scale_groups(cfg))
-              + ("; no centring (minmax)" if cfg.descriptor_scale == "minmax" else
+              + ("; no centring (minmax)" if str(cfg.descriptor_scale) == "minmax" else
                  "; centred (mean|μ| per group = "
                  + ", ".join(f"{np.abs(mu[g]).mean():.2e}" for g in q_scale_groups(cfg)) + ")"))
         del q0
