@@ -84,6 +84,40 @@ is bounded by soap_turbo's own C¹ amplitude contact regardless.
   attached to center/neighbor roles telescope back to a difference; only
   pair-level role asymmetry escapes.
 
+### 2.5 ANN inputs: SOAP / NEP / sum (cfg.nep_descriptor)
+
+The site scalars s_i^ν are functions of a per-atom invariant vector q_i.
+Input modes (multi_descriptor_plan.md §0.3–0.4, Phase A):
+
+- "off"     : q_i = 𝒟_i (soap_turbo, as in §4).
+- "concat"  : q_i = [𝒟_i ‖ q_i^NEP].
+- "replace" : q_i = q_i^NEP (no SOAP blocks → descriptor_mixing /
+              preprocess_contract off).
+- "sum"     : three experts summed into one head,
+              s_i = ANN_soap(𝒟_i) + ANN_2b(q_i^rad) + ANN_3b(q_i^ang);
+              W1 of the two NEP experts is zero at generation 0, so
+              generation 0 is identical to the SOAP-only model.
+
+q^NEP is GPUMD's NEP descriptor (radial q_n, angular q_nl, 4-body q_n222,
+optional 5-body q_n1111), split raw/contraction: the data pipeline stores
+the raw per-atom Chebyshev basis (fixed by geometry), and the model
+contracts it in the forward pass with the learned c_r[t,t′,n,k],
+c_a[t,t′,n,k] (GPUMD init U(−1,1); in the SNES tail and in Adam's tape).
+`descriptor_scale="minmax"` is GPUMD's q_scaler — m_k = 1/(max_k − min_k)
+over all training atoms, no centring, computed once with c ≡ 1 — folded
+into W0 like the other scale modes (§4 model class unchanged).
+`radial_basis_norm="none"` drops soap_turbo's per-atom L2 normalisation on
+the fixed builder (pair with a descriptor_scale).
+
+Status. Exactness of q^NEP vs GPUMD rests on the calorine oracle
+(`tests/test_nep_descriptor.py::test_nep_descriptor_matches_calorine_on_users_nep_txt`):
+max |ours·q_scaler − calorine.get_descriptors| = 2.1e-8 on the user's
+bulk-water nep.txt (96 atoms × 49 channels, max |q| = 0.28). Every mode
+runs end to end (SNES and Adam; scripts/smoke_train.py). NO accuracy
+comparison between the modes has been run. Not done: descriptor gradients
+∂q^NEP/∂r (so `dipole_readout="tnep"` with NEP inputs = Phase B), and
+trajectory inference for NEP-input models.
+
 ## 3. Exact properties (theory)
 
 1. **Translation invariance / acoustic sum rule.** Only displacements d
