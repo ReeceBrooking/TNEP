@@ -372,6 +372,9 @@ def _print_param_breakdown(model) -> None:
         rows.append(("preprocess  W_pre (summed only)", int(opt.n_preprocess)))
     if int(getattr(opt, "n_radial", 0)) > 0:
         rows.append(("radial basis  M_radial [T·S·α·K]", int(opt.n_radial)))
+    if int(getattr(opt, "n_nep", 0)) > 0:
+        rows.append(("NEP  c_r  [T·T·(n+1)·(K+1)]", int(opt.n_c_r)))
+        rows.append(("NEP  c_a  [T·T·(n+1)·(K+1)]", int(opt.n_c_a)))
 
     accounted = sum(n for _, n in rows)
     if accounted != total:
@@ -485,7 +488,8 @@ def _train_model_inner(cfg: TNEPconfig,
               f"rc_radial={cfg.nep_rc_radial}, rc_angular={cfg.nep_rc_angular}, "
               f"n_max=({cfg.nep_n_max_radial}, {cfg.nep_n_max_angular}), "
               f"basis_size=({cfg.nep_basis_size_radial}, {cfg.nep_basis_size_angular}), "
-              f"four_body={cfg.nep_four_body}, five_body={cfg.nep_five_body}")
+              f"four_body={cfg.nep_four_body}, five_body={cfg.nep_five_body}; "
+              f"c init U(−1,1) per GPUMD; c excluded from L1/L2 (GPUMD includes it)")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
     # On resume, reuse the checkpoint's existing run dir.

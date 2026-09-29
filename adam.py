@@ -4,7 +4,8 @@ Gradient-based alternative to SNES: tf.GradientTape through predict_batch,
 so every learnable tensor the forward reads — the ANN weights, c_pair, the
 descriptor-mixing tail (the same flat skew/dense parameters SNES searches,
 mapped to V by SNES._reconstruct_one_mixing_layer, so cayley/expm stay
-structural) and the learned radial basis M_radial — is trained by autodiff,
+structural), the learned radial basis M_radial and the NEP contraction
+coefficients c_r / c_a — is trained by autodiff,
 including through soap_from_raw. Objective = RMSE + L1 + L2 on the ANN core,
 the same quantity SNES ranks on.
 
@@ -43,12 +44,15 @@ def _trainable(model) -> dict:
                   W1_pol=model.W1_pol, b1_pol=model.b1_pol)
     if model.M_radial is not None:
         vs["M_radial"] = model.M_radial
+    if model.c_r is not None:
+        vs["c_r"] = model.c_r
+        vs["c_a"] = model.c_a
     return {k: _tf_var(v) for k, v in vs.items()}
 
 
 def _ann_core(model) -> list:
     """Weights the L1/L2 penalty covers — the ANN(s) only (b1 and the
-    c_pair / U_pair / M_radial tails excluded, as in SNES's multi-type
+    c_pair / U_pair / M_radial / c_r / c_a tails excluded, as in SNES's multi-type
     per-type penalty)."""
     core = [model.W0, model.b0, model.W1]
     if model.cfg.target_mode == 2:
@@ -117,6 +121,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
             W_atom=chunk.get("V_atom"),
             c_pair=named.get("c_pair"),
             M_radial=named.get("M_radial"),
+            c_r=named.get("c_r"), c_a=named.get("c_a"),
             nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
             nep_raw=chunk.get("nep_raw"))
         if scale_preds:

@@ -34,7 +34,7 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     Tail order: W0,b0,W1,b1 | +c_pair (neighbor readout, _c_learnable)
     | +pol ANN (mode 2) | +U_pair (mixing)
     | +W_pre_angular (preprocess_contract != "off") | +M_radial (learned
-    radial basis).
+    radial basis) | +c_r, +c_a (NEP contraction coefficients).
     """
     params = list(params)
     idx = 0
@@ -60,6 +60,9 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     if (idx < len(params)
             and getattr(model, "M_radial", None) is not None):
         model.M_radial.assign(params[idx]); idx += 1
+    if idx < len(params) and getattr(model, "c_r", None) is not None:
+        model.c_r.assign(params[idx]); idx += 1
+        model.c_a.assign(params[idx]); idx += 1
 
 class SNES:
     """Separable NES optimizer for TNEP.
@@ -322,8 +325,15 @@ class SNES:
         # Learned radial basis tail: M_radial [T, S, α, K], centre-type-major.
         self.n_radial = (int(np.prod(model.M_radial.shape))
                          if getattr(model, "M_radial", None) is not None else 0)
+        # NEP contraction tail: c_r [T, T, n_r+1, K_r+1] then c_a, both
+        # centre-type-major (GPUMD c init U(−1, 1) lives in the model).
+        self.n_c_r = (int(np.prod(model.c_r.shape))
+                      if getattr(model, "c_r", None) is not None else 0)
+        self.n_c_a = (int(np.prod(model.c_a.shape))
+                      if getattr(model, "c_a", None) is not None else 0)
+        self.n_nep = self.n_c_r + self.n_c_a
         self.dim = (self.n_anns_total + self.n_U_pair + self.n_preprocess
-                    + self.n_radial)
+                    + self.n_radial + self.n_nep)
 
         # Search distribution params as tf.Variables (stay on GPU). μ init
         # is Glorot (W0/W1 scaled by sqrt(6/(fan_in+fan_out)), biases zero);
@@ -538,7 +548,12 @@ class SNES:
             mu[pre_start:pre_start + self.n_preprocess] = summed_init
         # Learned radial basis: M0 (reproduces the fixed descriptor at gen 0).
         if self.n_radial > 0:
-            mu[self.dim - self.n_radial:] = self.model.M_radial.numpy().reshape(-1)
+            start = self.dim - self.n_nep - self.n_radial
+            mu[start:start + self.n_radial] = self.model.M_radial.numpy().reshape(-1)
+        # NEP c: the model's uniform(−1, 1) draw (GPUMD snes.cu:107-115).
+        if self.n_nep > 0:
+            mu[self.dim - self.n_nep:self.dim - self.n_c_a] = self.model.c_r.numpy().reshape(-1)
+            mu[self.dim - self.n_c_a:] = self.model.c_a.numpy().reshape(-1)
         return mu
 
     def _maybe_adapt_lambda(self, gen: int, data_loss: float,
@@ -715,6 +730,11 @@ class SNES:
         if self.n_radial > 0:
             tail_labels_parts.append(
                 np.repeat(np.arange(T, dtype=np.int32), self.n_radial // T))
+        # c_r / c_a [T(centre), T, n, k]: centre-type-major like M_radial.
+        for n_c in (self.n_c_r, self.n_c_a):
+            if n_c > 0:
+                tail_labels_parts.append(
+                    np.repeat(np.arange(T, dtype=np.int32), n_c // T))
         if tail_labels_parts:
             tail_labels = np.concatenate(tail_labels_parts)
             return np.concatenate([ann_tov, tail_labels])
@@ -1313,6 +1333,7 @@ class SNES:
             W_pre_angular_val = named.get("W_pre_angular")
             c_pair_val = named.get("c_pair")
             M_val = named.get("M_radial")
+            c_r_val = named.get("c_r"); c_a_val = named.get("c_a")
             # Centring fold (needs the stored W0), then absorb U_pair^T.
             b0 = self.model._b0_eff(b0, W0)
             if W0p is not None:
@@ -1331,14 +1352,17 @@ class SNES:
             # Stash folded tensors for the next validate() call this gen.
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
-                "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val),
+                "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val,
+                         c_r_val, c_a_val),
             }
         elif _cache_hit:
-            (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val) = _cache["fold"]
+            (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val,
+             c_r_val, c_a_val) = _cache["fold"]
         else:
             W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
             c_pair_val = None  # predict_batch falls back to model.c_pair
             M_val = None       # predict_batch falls back to model.M_radial
+            c_r_val = c_a_val = None   # ... and to model.c_r / c_a
             W0p = getattr(self.model, 'W0_pol', None)
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
@@ -1404,6 +1428,7 @@ class SNES:
                 chunk["atom_mask"],
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
                 W_atom=W_atom_v, c_pair=c_pair_val, M_radial=M_val,
+                c_r=c_r_val, c_a=c_a_val,
                 nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
                 nep_raw=chunk.get("nep_raw"),
             )
@@ -1446,10 +1471,10 @@ class SNES:
 
         Tail order: W0,b0,W1,b1 | c_pair (neighbor readout, _c_learnable)
         | W0_pol.. (mode 2) | U_pair (mixing) | W_pre_angular (preprocess !=
-        "off") | M_radial (learned radial basis).
+        "off") | M_radial (learned radial basis) | c_r, c_a (NEP).
         """
         out: dict = {"U_pair": None, "W_pre_angular": None, "c_pair": None,
-                     "M_radial": None}
+                     "M_radial": None, "c_r": None, "c_a": None}
         idx = 0
         out["W0"] = params[idx]; idx += 1
         out["b0"] = params[idx]; idx += 1
@@ -1468,6 +1493,9 @@ class SNES:
             out["W_pre_angular"] = params[idx]; idx += 1
         if self.n_radial > 0 and idx < len(params):
             out["M_radial"] = params[idx]; idx += 1
+        if self.n_nep > 0 and idx < len(params):
+            out["c_r"] = params[idx]; idx += 1
+            out["c_a"] = params[idx]; idx += 1
         return out
 
     def reconstruct_params_tf(self, param_vectors: tf.Tensor) -> tuple:
@@ -1574,6 +1602,16 @@ class SNES:
                            ([-1] + shape) if is_batched else shape)
             offset += self.n_radial
             tail = tail + (M,)
+
+        # NEP contraction tail: c_r then c_a, [T, T, n+1, K+1] (+ leading C).
+        if self.n_nep > 0:
+            for var, n_c in ((self.model.c_r, self.n_c_r),
+                             (self.model.c_a, self.n_c_a)):
+                shape = list(var.shape)
+                c = tf.reshape(param_vectors[..., offset:offset + n_c],
+                               ([-1] + shape) if is_batched else shape)
+                offset += n_c
+                tail = tail + (c,)
 
         return tail
 
@@ -2069,6 +2107,7 @@ class SNES:
                 W_pre_angular=W_pre_angular_cand,
                 c_pair=named.get("c_pair"),
                 M_radial=named.get("M_radial"),
+                c_r=named.get("c_r"), c_a=named.get("c_a"),
                 nbr_index=batch_data.get("nbr_index"),
                 nbr_G=batch_data.get("nbr_G"),
                 nep_raw=batch_data.get("nep_raw"))  # [C, B, T_dim]

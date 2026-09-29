@@ -254,6 +254,10 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         # Learned radial basis coefficients (cfg.radial_basis_size).
         if getattr(model, "M_radial", None) is not None:
             wg.create_dataset("M_radial", data=model.M_radial.numpy())
+        # NEP contraction coefficients (cfg.nep_descriptor != "off").
+        if getattr(model, "c_r", None) is not None:
+            wg.create_dataset("c_r", data=model.c_r.numpy())
+            wg.create_dataset("c_a", data=model.c_a.numpy())
 
         # Descriptor metadata
         dg = f.create_group("descriptor")
@@ -441,7 +445,7 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
                   U_pair=None, W_pre_angular=None, c_pair=None,
-                  M_radial=None) -> None:
+                  M_radial=None, c_r=None, c_a=None) -> None:
     if model._neighbor_readout:
         # Clean break: the multi-channel readout changed the tail layout
         # (W1 [T, H, C]; c_pair when dipole_species_pairs). Old neighbor-mode
@@ -507,6 +511,19 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                 f"{tuple(model.M_radial.shape)} (alpha_max / "
                 f"radial_basis_size / num_types changed).")
         model.M_radial.assign(M_radial)
+    if getattr(model, "c_r", None) is not None:
+        for name, saved, var in (("c_r", c_r, model.c_r), ("c_a", c_a, model.c_a)):
+            if saved is None:
+                raise ValueError(
+                    f"cfg.nep_descriptor={cfg.nep_descriptor!r} but the save has "
+                    f"no {name} dataset — the NEP coefficients would silently "
+                    f"reset to their init. Re-train, or set nep_descriptor='off'.")
+            if tuple(saved.shape) != tuple(var.shape):
+                raise ValueError(
+                    f"saved {name} shape {tuple(saved.shape)} != model "
+                    f"{tuple(var.shape)} (nep_n_max / nep_basis_size / "
+                    f"num_types changed).")
+            var.assign(saved)
 
 
 def _print_load_summary(path: str, cfg: TNEPconfig) -> None:
@@ -549,6 +566,8 @@ def _load_model_h5(path: str) -> TNEP:
             "W_pre_angular": (wg["W_pre_angular"][:]
                               if "W_pre_angular" in wg else None),
             "M_radial": wg["M_radial"][:] if "M_radial" in wg else None,
+            "c_r": wg["c_r"][:] if "c_r" in wg else None,
+            "c_a": wg["c_a"][:] if "c_a" in wg else None,
         }
 
     if "radial_basis_normalize" in config_dict:   # pre-2026-09-23 bool
@@ -631,6 +650,7 @@ def _load_model_npz(path: str) -> TNEP:
         U_pair=(data["U_pair"] if has_U_pair else None),
         W_pre_angular=data.get("W_pre_angular"),
         M_radial=data.get("M_radial"),
+        c_r=data.get("c_r"), c_a=data.get("c_a"),
     )
 
     _print_load_summary(path, cfg)

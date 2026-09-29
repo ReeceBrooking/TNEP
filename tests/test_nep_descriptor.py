@@ -611,3 +611,125 @@ def test_spectroscopy_rejects_nep():
     types = assign_type_indices([atoms], cfg.types)
     with pytest.raises(NotImplementedError, match="trajectory inference"):
         spectroscopy.predict_trajectory_batch(m, make_descriptor_builder(cfg), [atoms], types)
+
+
+# ── Task 6: c_r / c_a in the SNES tail (after M_radial), Adam, save/load ────
+
+def _mu_nep(model, atoms, cfg):
+    """μ through predict_batch with nep_raw (the eval path for a NEP model)."""
+    d = prepare_eval_data([atoms], cfg)
+    return model.predict_batch(*_forward_args(model, d), W_atom=d.get("V_atom"),
+                               nbr_index=d.get("nbr_index"), nbr_G=d.get("nbr_G"),
+                               nep_raw=d["nep_raw"])[0].numpy()
+
+
+def test_nep_c_tail_roundtrip_snes():
+    from SNES import SNES, _set_model_params
+    from data import assemble_data_dict, pad_and_stack
+    cfg = _cfg(nep_descriptor="concat", dipole_readout="bilinear", dipole_pair_rank=1)
+    m = _model(cfg); opt = SNES(m)
+    n_c_r = int(np.prod(m.c_r.shape)); n_c_a = int(np.prod(m.c_a.shape)); n_c = n_c_r + n_c_a
+    assert opt.n_nep == n_c
+    assert opt.dim == opt.n_anns_total + opt.n_U_pair + opt.n_preprocess + opt.n_radial + n_c
+    named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
+    np.testing.assert_array_equal(named["c_r"].numpy(), m.c_r.numpy())   # μ-init carries the model's draw
+    np.testing.assert_array_equal(named["c_a"].numpy(), m.c_a.numpy())
+    tail = opt.mu.numpy()[-n_c:]
+    np.testing.assert_array_equal(tail[:n_c_r], m.c_r.numpy().ravel())   # tail order: c_r then c_a
+    np.testing.assert_array_equal(tail[n_c_r:], m.c_a.numpy().ravel())
+    # Round trip: perturb μ → assign → predict_batch(c=None) == candidates(μ) with per-candidate c.
+    atoms = _bulk_frame()
+    types_int = assign_type_indices([atoms], cfg.types)
+    desc, grads, gidx = make_descriptor_builder(cfg).build_descriptors([atoms])
+    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
+    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
+    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
+    _set_model_params(m, *opt.reconstruct_params_tf(mu_vec))
+    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec))
+    np.testing.assert_array_equal(m.c_r.numpy(), n["c_r"].numpy())
+    assert not np.array_equal(m.c_r.numpy(), named["c_r"].numpy())        # assign actually moved c
+    kw = dict(nbr_index=full["nbr_index"], nbr_G=full["nbr_G"], nep_raw=full["nep_raw"])
+    mu_model = m.predict_batch(*_forward_args(m, full), W_atom=full["V_atom"], **kw)[0].numpy()
+    nb = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
+    mu_cand = m.predict_batch_candidates(
+        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
+        nb["W0"], nb["b0"], nb["W1"], nb["b1"], c_pair=nb["c_pair"],
+        c_r=nb["c_r"], c_a=nb["c_a"], **kw)[0, 0].numpy()
+    np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
+    assert np.any(mu_cand != 0.0)
+    # A different c in the candidate path must change μ (the kwarg is live).
+    mu_other = m.predict_batch_candidates(
+        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
+        nb["W0"], nb["b0"], nb["W1"], nb["b1"], c_pair=nb["c_pair"],
+        c_r=2.0 * nb["c_r"], c_a=nb["c_a"], **kw)[0, 0].numpy()
+    assert not np.allclose(mu_other, mu_model, atol=1e-6)
+    # off: no tail.
+    assert SNES(_model(_cfg(nep_descriptor="off"))).n_nep == 0
+
+
+def test_nep_c_per_type_labels():
+    from SNES import SNES
+    cfg = _cfg(nep_descriptor="concat"); m = _model(cfg); opt = SNES(m)
+    T = cfg.num_types
+    n_c_r = int(np.prod(m.c_r.shape)); n_c_a = int(np.prod(m.c_a.shape))
+    tov = np.asarray(opt._type_of_variable)
+    assert tov.shape == (opt.dim,)
+    tail = tov[-(n_c_r + n_c_a):]
+    np.testing.assert_array_equal(tail[:n_c_r], np.repeat(np.arange(T), n_c_r // T))
+    np.testing.assert_array_equal(tail[n_c_r:], np.repeat(np.arange(T), n_c_a // T))
+
+
+@pytest.mark.parametrize("types", [[8, 1], [8]])
+def test_nep_c_excluded_from_regularisation(types):
+    from SNES import SNES
+    kw = dict(nep_descriptor="concat", lambda_1=0.1, lambda_2=0.1)
+    if len(types) == 1:
+        kw.update(types=[8], num_types=1, type_map={8: 0})
+    cfg = _cfg(**kw); m = _model(cfg); opt = SNES(m)
+    mu = opt.mu.numpy().copy()
+    mu2 = mu.copy(); mu2[-opt.n_nep:] *= 10.0
+    assert opt.compute_regularization(mu) == opt.compute_regularization(mu2)
+    l1, l2, _ = opt.compute_regularization(mu)
+    assert l1 > 0 and l2 > 0
+    np.testing.assert_allclose(opt.compute_regularization_tf(tf.constant(mu[None])).numpy(),
+                               opt.compute_regularization_tf(tf.constant(mu2[None])).numpy())
+
+
+def test_save_load_roundtrip_nep(tmp_path):
+    import h5py, model_io
+    cfg = _cfg(nep_descriptor="concat", nep_five_body=True, nep_n_max_radial=3,
+               nep_rc_radial=4.5, q_scale="minmax")
+    m = _model(cfg); atoms = _bulk_frame()
+    m.W1.assign(tf.random.stateless_normal(m.W1.shape, [5, 6]))
+    mu0 = _mu_nep(m, atoms, cfg)
+    p = str(tmp_path / "nep.h5")
+    model_io.save_model(m, cfg, path=p)
+    loaded = model_io.load_model(p)
+    for k in ("nep_descriptor", "nep_five_body", "nep_n_max_radial", "nep_rc_radial",
+              "nep_rc_angular", "nep_basis_size_radial", "q_scale"):
+        assert getattr(loaded.cfg, k) == getattr(cfg, k), k
+    np.testing.assert_array_equal(loaded.c_r.numpy(), m.c_r.numpy())
+    np.testing.assert_array_equal(loaded.c_a.numpy(), m.c_a.numpy())
+    np.testing.assert_allclose(_mu_nep(loaded, atoms, loaded.cfg), mu0, atol=1e-6)
+    # A save without c_r must not silently reset c to its init.
+    with h5py.File(p, "a") as f:
+        del f["weights"]["c_r"]
+    with pytest.raises(ValueError, match="c_r"):
+        model_io.load_model(p)
+
+
+def test_adam_trains_c():
+    from adam import _trainable
+    cfg = _cfg(nep_descriptor="concat", optimizer="adam", adam_lr=1e-2,
+               num_generations=2, val_interval=1, batch_chunk_size=1)
+    m = _model(cfg); atoms = _bulk_frame()
+    d = prepare_eval_data([atoms, atoms], cfg)
+    assert set(_trainable(m)) >= {"c_r", "c_a"}
+    c_r0 = m.c_r.numpy().copy(); c_a0 = m.c_a.numpy().copy()
+    history, final, best = m.fit(d, d)
+    assert np.all(np.isfinite(history["train_loss"]))
+    for mdl in (final, best):
+        assert np.all(np.isfinite(mdl.c_r.numpy())) and np.all(np.isfinite(mdl.c_a.numpy()))
+    assert not np.array_equal(final.c_r.numpy(), c_r0)
+    assert not np.array_equal(final.c_a.numpy(), c_a0)
+    assert "c_r" not in _trainable(_model(_cfg(nep_descriptor="off")))
