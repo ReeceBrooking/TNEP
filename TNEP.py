@@ -71,6 +71,13 @@ class TNEP(layers.Layer):
                 f"'concat', 'replace' or 'sum'.")
         if self._nep_mode != "off":
             validate_nep_cfg(cfg)
+            from data import descriptor_gradients_needed
+            if descriptor_gradients_needed(cfg):
+                raise NotImplementedError(
+                    f"cfg.nep_descriptor={self._nep_mode!r}: NEP descriptors "
+                    "currently support only the neighbor/bilinear dipole "
+                    "readouts (target_mode=1); descriptor gradients are "
+                    "Phase B of multi_descriptor_plan.md.")
         if self._nep_mode == "sum":
             raise NotImplementedError(
                 "cfg.nep_descriptor='sum' is Task 8 of multi_descriptor_plan.md.")
@@ -126,6 +133,10 @@ class TNEP(layers.Layer):
             self._preprocess_layout = None
 
         self.dim_q = cfg.dim_q
+        # SOAP-only width (the builder's output after soap_from_raw); under
+        # nep_descriptor="concat" dim_q_forward is wider by the NEP block.
+        from DescriptorBuilderGPU import soap_dim
+        self._soap_dim = int(soap_dim(cfg))
         # With preprocess on, W0 stores at Q_new but the forward matmul folds
         # the contraction in and operates on RAW descriptors at Q_raw; track it.
         if self.descriptor_preprocess_contract != "off":
@@ -209,16 +220,16 @@ class TNEP(layers.Layer):
                     "cfg.radial_basis_species_sum=True has no species-pair "
                     "blocks, which descriptor_preprocess_contract layouts "
                     "assume; set descriptor_preprocess_contract='off'.")
-            from DescriptorBuilderGPU import radial_extra_count, soap_dim
+            from DescriptorBuilderGPU import radial_extra_count
             cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types,
                                           species_sum=self._rb_species_sum)
             self._rb_n_extra = int(radial_extra_count(cfg))
             if (int(cm["gather_idx"].size) + self._rb_n_extra
-                    != int(soap_dim(cfg))):
+                    != self._soap_dim):
                 raise RuntimeError(
                     f"radial_basis_channel_map gives {cm['gather_idx'].size} "
                     f"(+{self._rb_n_extra} extra) channels, "
-                    f"SOAP dim={soap_dim(cfg)}.")
+                    f"SOAP dim={self._soap_dim}.")
             L = int(cfg.l_max) + 1
             self._rb_alpha, self._rb_K = alpha, K
             self._rb_L, self._rb_kmax = L, L * (L + 1) // 2
@@ -1080,7 +1091,7 @@ class TNEP(layers.Layer):
             extras.append(sq[..., 0] + 2.0 * sq[..., 1])
         if extras:
             q = tf.concat([q] + extras, axis=-1)
-        out_shape = tf.concat([lead, [self.dim_q_forward]], axis=0)
+        out_shape = tf.concat([lead, [self._soap_dim]], axis=0)
         if per_cand:
             return tf.reshape(q, tf.concat([[-1], out_shape], axis=0))
         return tf.reshape(q[0], out_shape)

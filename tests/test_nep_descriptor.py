@@ -414,6 +414,45 @@ def test_forward_sites_take_nep_raw():
     np.testing.assert_allclose(mu_s[1], mu, rtol=1e-5, atol=1e-6 * np.abs(mu).max())
 
 
+def test_nep_concat_with_learned_soap_basis():
+    """soap_from_raw reshapes to the SOAP width, not the (wider) ANN width."""
+    cfg = _cfg(nep_descriptor="concat", radial_basis_size=4); m = _model(cfg)
+    atoms = _bulk_frame()
+    data = prepare_eval_data([atoms], cfg)
+    raw, _ = _nep_inputs(cfg, atoms)
+    R = tf.constant(raw[None])
+    x = m._ann_inputs(m.soap_from_raw(data["descriptors"], data["Z_int"]), R, data["Z_int"])
+    assert int(x.shape[-1]) == cfg.dim_q == m._soap_dim + nd.nep_dim(cfg)
+
+    def mu_of(M, c_r, c_a):
+        return m.predict_batch(
+            data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"],
+            data["pair_struct"], data["positions"], data["Z_int"], data["boxes"],
+            data["atom_mask"], m.W0, m.b0, m.W1, m.b1, W_atom=data.get("V_atom"),
+            M_radial=M, nep_raw=R, c_r=c_r, c_a=c_a).numpy()
+
+    rng = np.random.default_rng(5)
+    M2 = tf.constant(np.stack([m.M_radial.numpy(),
+                               rng.standard_normal(m.M_radial.shape).astype(np.float32)]))
+    c_r2 = tf.stack([m.c_r, 0.5 * m.c_r]); c_a2 = tf.stack([m.c_a, -m.c_a])
+    mu = np.stack([mu_of(M2[i], c_r2[i], c_a2[i]) for i in range(2)])   # [2, 1, 3]
+    assert mu.shape == (2, 1, 3) and np.all(np.isfinite(mu)) and not np.allclose(mu[0], mu[1])
+    C = 2
+    tile = lambda v: tf.tile(v[tf.newaxis], [C] + [1] * len(v.shape))
+    mu_c = m.predict_batch_candidates(
+        data["descriptors"], data.get("V_atom"), data["Z_int"], data["atom_mask"],
+        tile(m.W0), tile(m.b0), tile(m.W1), tile(m.b1),
+        M_radial=M2, nep_raw=R, c_r=c_r2, c_a=c_a2).numpy()
+    np.testing.assert_allclose(mu_c, mu, rtol=1e-5, atol=1e-5 * np.abs(mu).max())
+
+
+def test_nep_rejects_descriptor_gradient_readouts():
+    with pytest.raises(NotImplementedError, match="neighbor/bilinear"):
+        _model(_cfg(nep_descriptor="concat", dipole_readout="tnep"))
+    with pytest.raises(NotImplementedError, match="neighbor/bilinear"):
+        _model(_cfg(nep_descriptor="replace", target_mode=0))
+
+
 def test_compute_dim_q_and_layout_per_mode():
     from DescriptorBuilderGPU import (compute_dim_q, descriptor_block_layout,
                                       q_scale_groups, descriptor_input_width)
