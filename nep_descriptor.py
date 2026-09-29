@@ -3,7 +3,8 @@
 NumPy reference for the per-atom raw basis and the GPUMD contraction.
 Constants and formulas are transcribed VERBATIM from GPUMD commit fee6340c,
 /home/reece/GPUMD/src/utilities/nep_utilities.cuh (C3B/C4B/C5B lines 19-46,
-Z_COEFFICIENT_L 48-65, find_fc 339-347, find_fn 500-517, accumulate_s_one
+Z_COEFFICIENT_L 48-65, find_fc 339-347, find_fc_and_fcp 349-361, find_fn
+500-517, find_fn_and_fnp 519-552, accumulate_s_one
 846-895, find_q_one 930-942, find_q 944-1000) and src/main_nep/nep.cu
 (neighbour list 60-100: x12 = x[n2] − x[n1]; radial 110-155; angular 157-215).
 
@@ -61,51 +62,109 @@ Z_COEFFICIENT = {
 NUM_ABC = 24   # 3 + 5 + 7 + 9 for L = 1..4
 
 
-# ── basis (find_fc, find_fn) ───────────────────────────────────────────────
+# ── basis (find_fc, find_fn, find_fc_and_fcp, find_fn_and_fnp) ─────────────
+# Bodies are shared between NumPy (float64) and TF (float32): `xp` is np or tf.
 def fc(r, rc):
     r = np.asarray(r, dtype=np.float64)
     return np.where(r < rc, 0.5 * np.cos(np.pi * r / rc) + 0.5, 0.0)
 
 
+def _fn_and_fnp(r, rc, K, xp):
+    """(fn [P,K+1], fnp [P,K+1]) = find_fc_and_fcp (nep_utilities.cuh:349-361) +
+    find_fn_and_fnp (519-552): f_0 = fc, f_k = (T_k(x)+1)·fc/2, x = 2(r/rc−1)²−1,
+    derivative through T_k' = k·U_{k−1} (Chebyshev U recursion u0,u1 as in GPUMD)."""
+    inside = r < rc
+    fc12 = xp.where(inside, 0.5 * xp.cos(np.pi * r / rc) + 0.5, 0.0)
+    fcp12 = xp.where(inside, -0.5 * np.pi * xp.sin(np.pi * r / rc) / rc, 0.0)
+    x = 2.0 * (r / rc - 1.0) ** 2 - 1.0
+    dx = 2.0 * (r / rc - 1.0) / rc                 # GPUMD: 2(d·rcinv − 1)·rcinv
+    fn, fnp = [fc12], [fcp12]
+    if K >= 1:
+        fn.append((x + 1.0) * 0.5 * fc12)
+        fnp.append(dx * fc12 + (x + 1.0) * 0.5 * fcp12)
+    u0, u1 = xp.ones_like(x), 2.0 * x               # U_0, U_1
+    t_m2, t_m1 = xp.ones_like(x), x                 # T_0, T_1
+    for m in range(2, K + 1):
+        t_m2, t_m1 = t_m1, 2.0 * x * t_m1 - t_m2
+        fnp_tmp = m * u1                            # T_m' = m·U_{m−1}
+        u0, u1 = u1, 2.0 * x * u1 - u0
+        half = (t_m1 + 1.0) * 0.5
+        fnp.append(fnp_tmp * dx * fc12 + half * fcp12)
+        fn.append(half * fc12)
+    return xp.stack(fn, 1), xp.stack(fnp, 1)
+
+
+def fn_and_fnp(r, rc, K):
+    """NumPy float64: (fn [P,K+1], fnp [P,K+1] = ∂fn/∂r)."""
+    return _fn_and_fnp(np.asarray(r, dtype=np.float64), float(rc), int(K), np)
+
+
+def fn_and_fnp_tf(r, rc, K):
+    """TF float32 twin of fn_and_fnp."""
+    return _fn_and_fnp(tf.cast(r, tf.float32), float(rc), int(K), tf)
+
+
 def fn_all(r, rc, K):
     """[P, K+1]: f_0 = fc, f_k = (T_k(x) + 1)·fc/2 with x = 2(r/rc − 1)² − 1."""
-    r = np.asarray(r, dtype=np.float64)
-    fc12 = fc(r, rc)
-    x = 2.0 * (r / rc - 1.0) ** 2 - 1.0
-    out = np.empty((r.shape[0], K + 1), dtype=np.float64)
-    out[:, 0] = fc12
-    t_m2, t_m1 = np.ones_like(x), x
-    for k in range(1, K + 1):
-        if k >= 2:
-            t_m2, t_m1 = t_m1, 2.0 * x * t_m1 - t_m2
-        out[:, k] = (t_m1 + 1.0) * 0.5 * fc12
-    return out
+    return fn_and_fnp(r, rc, K)[0]
 
 
 # ── angular polynomials (accumulate_s_one<L> with fn = 1) ──────────────────
-def real_harmonics(xhat, yhat, zhat):
-    """[P, 24]: P_c(r̂) in GPUMD s-index order (L=1: 0..2, L=2: 3..7, L=3: 8..14, L=4: 15..23)."""
-    x, y, z = (np.asarray(v, dtype=np.float64) for v in (xhat, yhat, zhat))
-    out = np.empty((x.shape[0], NUM_ABC), dtype=np.float64)
+def _real_harmonics(x, y, z, xp):
+    """(P [P,24], dP [P,3,24]): P_c(r̂) in GPUMD s-index order (L=1: 0..2, L=2: 3..7,
+    L=3: 8..14, L=4: 15..23) and ∂P_c/∂(x̂, ŷ, ẑ) with the unit-vector components as
+    FREE variables (the caller applies (I − r̂r̂ᵀ)/r for a Cartesian derivative).
+    Z-polynomial part: d/dz Σ Z[n1][n2] z^n2; complex part: d/dx (x+iy)^n1 =
+    n1 (x+iy)^(n1−1), d/dy (x+iy)^n1 = i·n1 (x+iy)^(n1−1)."""
+    one, zero = xp.ones_like(z), xp.zeros_like(z)
+    P, dP = [], []
     for L in range(1, 5):
-        s_index = L * L - 1
-        z_pow = [np.ones_like(z)]
+        z_pow = [one]
         for n in range(1, L + 1):
             z_pow.append(z * z_pow[n - 1])
-        real_part, imag_part = x.copy(), y.copy()
+        re, im = x, y                               # (x + iy)^n1
+        re_p, im_p = one, zero                      # (x + iy)^(n1 − 1)
         for n1 in range(L + 1):
             n2_start = 0 if (L + n1) % 2 == 0 else 1
-            z_factor = np.zeros_like(z)
+            zf, dzf = zero, zero
             for n2 in range(n2_start, L - n1 + 1, 2):
-                z_factor = z_factor + Z_COEFFICIENT[L][n1][n2] * z_pow[n2]
+                zf = zf + Z_COEFFICIENT[L][n1][n2] * z_pow[n2]
+                if n2 >= 1:
+                    dzf = dzf + n2 * Z_COEFFICIENT[L][n1][n2] * z_pow[n2 - 1]
             if n1 == 0:
-                out[:, s_index] = z_factor; s_index += 1
+                P.append(zf); dP.append((zero, zero, dzf))
             else:
-                out[:, s_index] = z_factor * real_part; s_index += 1
-                out[:, s_index] = z_factor * imag_part; s_index += 1
-                real_part, imag_part = (x * real_part - y * imag_part,
-                                        x * imag_part + y * real_part)   # complex_product
-    return out
+                P.append(zf * re); dP.append((n1 * zf * re_p, -n1 * zf * im_p, dzf * re))
+                P.append(zf * im); dP.append((n1 * zf * im_p, n1 * zf * re_p, dzf * im))
+                re_p, im_p = re, im
+                re, im = x * re - y * im, x * im + y * re   # complex_product
+    return xp.stack(P, 1), xp.stack([xp.stack(c, 1) for c in dP], -1)
+
+
+def _np64(*v):
+    return [np.asarray(a, dtype=np.float64) for a in v]
+
+
+def _tf32(*v):
+    return [tf.cast(a, tf.float32) for a in v]
+
+
+def real_harmonics(xhat, yhat, zhat):
+    """[P, 24] float64: P_c(r̂)."""
+    return _real_harmonics(*_np64(xhat, yhat, zhat), np)[0]
+
+
+def real_harmonics_grad(xhat, yhat, zhat):
+    """[P, 3, 24] float64: ∂P_c/∂(x̂, ŷ, ẑ) as free variables."""
+    return _real_harmonics(*_np64(xhat, yhat, zhat), np)[1]
+
+
+def real_harmonics_tf(xhat, yhat, zhat):
+    return _real_harmonics(*_tf32(xhat, yhat, zhat), tf)[0]
+
+
+def real_harmonics_grad_tf(xhat, yhat, zhat):
+    return _real_harmonics(*_tf32(xhat, yhat, zhat), tf)[1]
 
 
 # ── invariant forms (find_q_one<L>, find_q) ────────────────────────────────
@@ -224,17 +283,26 @@ def nep_slices(cfg):
     return out
 
 
-# ── raw builder ────────────────────────────────────────────────────────────
-def nep_raw_numpy(atoms, types_int, cfg):
+# ── raw builder + pair stream ──────────────────────────────────────────────
+def nep_pair_list(atoms, cfg):
+    """(i, j, D) from ONE ase call at max(rc_r, rc_a): D = r_j − r_i including the
+    image offset (image-exact — NOT MIC: rc_r = 8 Å exceeds L/2 for the water box),
+    zero-length self entries dropped, sorted by centre i. Shared by nep_raw_numpy
+    and nep_pairs_numpy."""
+    i, j, D = neighbor_list("ijD", atoms, max(float(cfg.nep_rc_radial), float(cfg.nep_rc_angular)))
+    keep = np.linalg.norm(D, axis=1) > 0.0
+    order = np.argsort(i[keep], kind="stable")
+    return i[keep][order], j[keep][order], D[keep][order]
+
+
+def nep_raw_numpy(atoms, types_int, cfg, pairs=None):
     """[N, W_raw] float32 = flatten([raw_r [N,T,K_r+1] ‖ raw_a [N,T,K_a+1,24]])."""
     N, T = len(atoms), int(cfg.num_types)
     Kr, Ka = int(cfg.nep_basis_size_radial), int(cfg.nep_basis_size_angular)
     rc_r, rc_a = float(cfg.nep_rc_radial), float(cfg.nep_rc_angular)
     types_int = np.asarray(types_int)
-    i, j, D = neighbor_list("ijD", atoms, max(rc_r, rc_a))   # D = r_j − r_i (+image)
+    i, j, D = nep_pair_list(atoms, cfg) if pairs is None else pairs
     r = np.linalg.norm(D, axis=1)
-    keep = r > 0.0
-    i, j, D, r = i[keep], j[keep], D[keep], r[keep]
     tj = types_int[j]
 
     raw_r = np.zeros((N, T, Kr + 1), dtype=np.float64)
@@ -248,6 +316,17 @@ def nep_raw_numpy(atoms, types_int, cfg):
     np.add.at(raw_a, (i[m], tj[m]), fn_all(r[m], rc_a, Ka)[:, :, None] * P[:, None, :])
 
     return np.concatenate([raw_r.reshape(N, -1), raw_a.reshape(N, -1)], 1).astype(np.float32)
+
+
+def nep_pairs_numpy(atoms, cfg, pairs=None):
+    """Image-exact pair stream for the Phase B force contraction (plan §B.3), keyed as
+    in the data dict: nep_pair_atom [P] int32, nep_pair_gidx [P] int32,
+    nep_pair_D [P,3] float32 (r_j − r_i incl. image), nep_pair_ang [P] bool (r < rc_a).
+    No basis values stored — Task 11 computes fn/fnp/P/∇P in-graph from D."""
+    i, j, D = nep_pair_list(atoms, cfg) if pairs is None else pairs
+    return dict(nep_pair_atom=i.astype(np.int32), nep_pair_gidx=j.astype(np.int32),
+                nep_pair_D=D.astype(np.float32),
+                nep_pair_ang=np.linalg.norm(D, axis=1) < float(cfg.nep_rc_angular))
 
 
 def nep_contract_numpy(raw, types_int, c_r, c_a, cfg):

@@ -7,7 +7,7 @@ from DescriptorBuilder import make_descriptor_builder
 from ase.io import read
 from ase import Atoms
 from ase.neighborlist import neighbor_list
-from nep_descriptor import nep_raw_numpy
+from nep_descriptor import nep_pair_list, nep_raw_numpy, nep_pairs_numpy
 
 
 BOHR_TO_ANGSTROM = 0.529177210903
@@ -389,8 +389,18 @@ def assemble_data_dict(
 
     # GPUMD NEP descriptor block: raw per-atom basis [N, W_raw], contracted
     # in-model by c_r/c_a (multi_descriptor_plan.md §0.3).
+    # Phase B adds the image-exact pair stream (plan §B.3) when ∂q/∂r is
+    # needed; both consume one ase pair list per frame.
     if cfg.nep_descriptor != "off":
-        data["nep_raw"] = [nep_raw_numpy(s, t, cfg) for s, t in zip(dataset, types_int)]
+        need_pairs = descriptor_gradients_needed(cfg)
+        data["nep_raw"] = []
+        if need_pairs:
+            data["nep_pairs"] = []
+        for s, t in zip(dataset, types_int):
+            p = nep_pair_list(s, cfg)
+            data["nep_raw"].append(nep_raw_numpy(s, t, cfg, p))
+            if need_pairs:
+                data["nep_pairs"].append(nep_pairs_numpy(s, cfg, p))
 
     # Auto-detect and include force/virial targets for PES mode
     if cfg.target_mode == 0:
@@ -788,6 +798,9 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             pair_gidx   : [P]            int32    — neighbor atom index for each pair
             struct_ptr  : [S+1]          int32    — CSR row pointer: pairs for struct s
                                                      are grad_values[struct_ptr[s]:struct_ptr[s+1]]
+            nep_pair_atom/gidx/struct [P'] int32, nep_pair_D [P',3] float32,
+            nep_pair_ang [P'] bool, nep_struct_ptr [S+1] — NEP image-exact pair
+                                                     stream, same CSR pattern (only with data["nep_pairs"])
             positions   : [S, A, 3]      float32
             Z_int       : [S, A]         int32
             targets     : [S, T]         float32
@@ -857,6 +870,13 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     has_nep = "nep_raw" in data  # raw NEP basis [S, A, W_raw]
     if has_nep:
         nep_np = np.zeros((S, max_atoms, data["nep_raw"][0].shape[1]), dtype=np.float32)
+    has_nep_pairs = "nep_pairs" in data  # Phase B stream: concatenate, CSR by nep_struct_ptr
+    if has_nep_pairs:
+        nps = data["nep_pairs"]
+        counts = np.array([p["nep_pair_atom"].shape[0] for p in nps], dtype=np.int32)
+        nep_ptr_np = np.concatenate([[0], np.cumsum(counts)]).astype(np.int32)
+        nep_struct_np = np.repeat(np.arange(S, dtype=np.int32), counts)
+        nep_cat = {k: np.concatenate([p[k] for p in nps]) for k in _NEP_PAIR_KEYS}
     if num_types is not None:
         types_contained_np = np.zeros((S, num_types), dtype=np.float32)
 
@@ -953,6 +973,12 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             result["nbr_G"]     = tf.constant(nbr_G_np);     del nbr_G_np
         if has_nep:
             result["nep_raw"]   = tf.constant(nep_np);       del nep_np
+        if has_nep_pairs:
+            result["nep_struct_ptr"]  = tf.constant(nep_ptr_np)
+            result["nep_pair_struct"] = tf.constant(nep_struct_np)
+            for k in _NEP_PAIR_KEYS:
+                result[k] = tf.constant(nep_cat[k])
+            del nep_cat
         if num_types is not None:
             result["types_contained"] = tf.constant(types_contained_np); del types_contained_np
     return result
@@ -1045,6 +1071,23 @@ _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                          "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
 
 
+_NEP_PAIR_KEYS = ("nep_pair_atom", "nep_pair_gidx", "nep_pair_D", "nep_pair_ang")
+
+
+def _gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
+    """NEP pair stream for structures idx_tf → chunk: CSR gather by nep_struct_ptr,
+    nep_pair_struct remapped chunk-local (mirrors the grad_values gather). No-op
+    when the stream is absent."""
+    ptr = data.get("nep_struct_ptr")
+    if ptr is None:
+        return
+    rng = tf.ragged.range(tf.gather(ptr, idx_tf), tf.gather(ptr, idx_tf + 1))
+    flat = tf.cast(rng.flat_values, tf.int32)
+    chunk["nep_pair_struct"] = tf.cast(rng.value_rowids(), tf.int32)
+    for k in _NEP_PAIR_KEYS:
+        chunk[k] = tf.gather(data[k], flat)
+
+
 def slice_and_complete_chunk(data: dict, indices) -> dict:
     """Build a chunk dict by slicing per-structure fields from `data`.
 
@@ -1055,6 +1098,7 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
         pair_atom    [P_chunk]    int32  — frame-local centre index
         pair_gidx    [P_chunk]    int32  — frame-local neighbour index
         pair_struct  [P_chunk]    int32  — chunk-local structure index
+        nep_pair_*   / nep_pair_struct   — NEP pair stream, same contract (when present)
         positions    [B_chunk, A_max, 3]
         Z_int        [B_chunk, A_max]
         boxes        [B_chunk, 3, 3]
@@ -1091,6 +1135,7 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
     chunk["grad_values"] = tf.gather(gv, flat_pair_idx_tf)
     chunk["pair_atom"]   = tf.gather(data["pair_atom"],   flat_pair_idx_tf)
     chunk["pair_gidx"]   = tf.gather(data["pair_gidx"],   flat_pair_idx_tf)
+    _gather_nep_pairs(data, chunk, idx_tf)
     return chunk
 
 
@@ -1246,6 +1291,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
             chunk["grad_values"] = tf.gather(raw["_passthrough_grad_values"], flat_pair_idx_tf)
             chunk["pair_atom"]   = tf.gather(raw["_passthrough_pair_atom"],   flat_pair_idx_tf)
             chunk["pair_gidx"]   = tf.gather(raw["_passthrough_pair_gidx"],   flat_pair_idx_tf)
+        _gather_nep_pairs(data, chunk, tf.constant(raw["_idx_np"]))
     return chunk
 
 
@@ -1274,7 +1320,7 @@ def move_data_to_gpu(data: dict) -> None:
     """
     keys = list(_RESIDENT_SMALL_KEYS) + [
         "descriptors", "pair_atom", "pair_gidx", "pair_struct",
-        "struct_ptr", "grad_values"]
+        "struct_ptr", "grad_values", "nep_struct_ptr", "nep_pair_struct", *_NEP_PAIR_KEYS]
     with _gpu_device_ctx():
         for k in keys:
             v = data.get(k)
@@ -1343,6 +1389,7 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
         chunk["pair_atom"] = pair_atom
         chunk["pair_gidx"] = pair_gidx
         chunk["pair_struct"] = pair_struct
+        _gather_nep_pairs(data, chunk, idx_tf)
     return chunk
 
 

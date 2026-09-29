@@ -1037,3 +1037,130 @@ def test_sum_mode_adam_smoke():
     for mdl in (final, best):
         assert np.all(np.isfinite(mdl.W1_r.numpy())) and np.any(mdl.W1_r.numpy() != 0)
         assert np.any(mdl.W1_a.numpy() != 0)
+
+
+# ── Task 10 (Phase B): per-pair basis derivatives + image-exact pair stream ─
+
+def _fd(f, x, h=1e-6):
+    """Central FD of f: [P] → [P, ...] w.r.t. its single vector argument."""
+    return (f(x + h) - f(x - h)) / (2.0 * h)
+
+
+def test_fn_and_fnp_matches_fd_of_fn_all():
+    rc, K = 8.0, 6
+    r = np.linspace(0.1, rc - 0.01, 300)
+    fn, fnp = nd.fn_and_fnp(r, rc, K)
+    assert fn.shape == fnp.shape == (300, K + 1) and fn.dtype == fnp.dtype == np.float64
+    np.testing.assert_array_equal(fn, nd.fn_all(r, rc, K))
+    np.testing.assert_allclose(fnp, _fd(lambda x: nd.fn_all(x, rc, K), r), rtol=1e-6, atol=1e-8)
+    # Beyond the cutoff both vanish (find_fc_and_fcp else-branch).
+    fn0, fnp0 = nd.fn_and_fnp(np.array([rc, rc + 1.0]), rc, K)
+    assert np.all(fn0 == 0.0) and np.all(fnp0 == 0.0)
+
+
+def test_real_harmonics_grad_matches_fd():
+    rng = np.random.default_rng(3)
+    u = rng.standard_normal((40, 3)); u /= np.linalg.norm(u, axis=1, keepdims=True)
+    g = nd.real_harmonics_grad(u[:, 0], u[:, 1], u[:, 2])
+    assert g.shape == (40, 3, 24) and g.dtype == np.float64
+    h = 1e-6
+    for c in range(3):   # x̂, ŷ, ẑ perturbed as FREE variables (no renormalisation)
+        def P(uc, c=c):
+            v = u.copy(); v[:, c] = uc
+            return nd.real_harmonics(v[:, 0], v[:, 1], v[:, 2])
+        np.testing.assert_allclose(g[:, c], _fd(P, u[:, c], h), rtol=1e-6, atol=1e-8)
+
+
+def test_tf_basis_twins_match_numpy():
+    rng = np.random.default_rng(4)
+    rc, K = 8.0, 6
+    r = rng.uniform(0.1, rc + 0.5, 100)   # includes r ≥ rc
+    u = rng.standard_normal((100, 3)); u /= np.linalg.norm(u, axis=1, keepdims=True)
+    fn, fnp = nd.fn_and_fnp(r, rc, K)
+    fn_t, fnp_t = nd.fn_and_fnp_tf(tf.constant(r, tf.float32), rc, K)
+    assert fn_t.dtype == fnp_t.dtype == tf.float32
+    np.testing.assert_allclose(fn_t.numpy(), fn, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(fnp_t.numpy(), fnp, rtol=1e-5, atol=1e-6)
+    ut = [tf.constant(u[:, c], tf.float32) for c in range(3)]
+    P_t = nd.real_harmonics_tf(*ut); g_t = nd.real_harmonics_grad_tf(*ut)
+    assert P_t.dtype == g_t.dtype == tf.float32
+    np.testing.assert_allclose(P_t.numpy(), nd.real_harmonics(*u.T), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(g_t.numpy(), nd.real_harmonics_grad(*u.T), rtol=1e-5, atol=1e-6)
+
+
+def test_nep_pairs_numpy_resums_to_raw_and_is_image_exact():
+    from ase.neighborlist import neighbor_list
+    cfg = _cfg(nep_descriptor="concat"); atoms = _bulk_frame()
+    t = _types_int(atoms, ["O", "H"]); N, T = len(atoms), 2
+    rc_r, rc_a = cfg.nep_rc_radial, cfg.nep_rc_angular
+    Kr, Ka = cfg.nep_basis_size_radial, cfg.nep_basis_size_angular
+    p = nd.nep_pairs_numpy(atoms, cfg)
+    assert set(p) == {"nep_pair_atom", "nep_pair_gidx", "nep_pair_D", "nep_pair_ang"}
+    P = p["nep_pair_atom"].shape[0]
+    assert (p["nep_pair_atom"].dtype, p["nep_pair_gidx"].dtype, p["nep_pair_D"].dtype, p["nep_pair_ang"].dtype) == \
+        (np.int32, np.int32, np.float32, np.bool_)
+    assert p["nep_pair_D"].shape == (P, 3) and p["nep_pair_ang"].shape == (P,)
+    assert np.all(np.diff(p["nep_pair_atom"]) >= 0)                 # sorted by centre
+    r = np.linalg.norm(p["nep_pair_D"].astype(np.float64), axis=1)
+    assert np.all(r > 0.0) and np.all(r < rc_r)                 # no self image, within rc_r
+    L = float(atoms.cell[0, 0])
+    assert rc_r > L / 2 and np.any(r > L / 2)                   # MIC would be WRONG here
+    assert int(p["nep_pair_ang"].sum()) == int(np.sum(np.linalg.norm(
+        neighbor_list("D", atoms, rc_a), axis=1) > 0.0))        # ang = the rc_a list
+    # Re-summing the stream reproduces nep_raw_numpy.
+    raw = nd.nep_raw_numpy(atoms, t, cfg)
+    raw_r = np.zeros((N, T, Kr + 1)); raw_a = np.zeros((N, T, Ka + 1, 24))
+    tj = t[p["nep_pair_gidx"]]
+    np.add.at(raw_r, (p["nep_pair_atom"], tj), nd.fn_all(r, rc_r, Kr))
+    a = p["nep_pair_ang"]; u = p["nep_pair_D"][a].astype(np.float64) / r[a][:, None]
+    np.add.at(raw_a, (p["nep_pair_atom"][a], tj[a]),
+              nd.fn_all(r[a], rc_a, Ka)[:, :, None] * nd.real_harmonics(*u.T)[:, None, :])
+    ours = np.concatenate([raw_r.reshape(N, -1), raw_a.reshape(N, -1)], 1)
+    # atol: the stream stores float32 D (raw sums float64 D) → ~5e-7 on cancelling sums.
+    np.testing.assert_allclose(ours, raw, rtol=1e-6, atol=2e-6)
+
+
+def test_nep_pair_stream_rides_data_dict_and_every_slicer():
+    from data import (prepare_eval_data, slice_and_complete_chunk, prefetched_chunks,
+                      move_data_to_gpu, prestage_chunk_indices)
+    # dipole_readout="tnep" needs the stream; the Phase B guard lives in TNEP.__init__,
+    # not in the data path, so no model is built here.
+    cfg = _cfg(nep_descriptor="concat", dipole_readout="tnep")
+    full = _bulk_frame(); small = full[:12]; small.info["dipole"] = np.zeros(3)
+    d = prepare_eval_data([full, small], cfg)
+    p0, p1 = nd.nep_pairs_numpy(full, cfg), nd.nep_pairs_numpy(small, cfg)
+    P0, P1 = p0["nep_pair_atom"].shape[0], p1["nep_pair_atom"].shape[0]
+    np.testing.assert_array_equal(d["nep_struct_ptr"].numpy(), [0, P0, P0 + P1])
+    assert d["nep_pair_D"].dtype == tf.float32 and d["nep_pair_ang"].dtype == tf.bool
+    assert d["nep_pair_atom"].dtype == d["nep_pair_gidx"].dtype == d["nep_pair_struct"].dtype == tf.int32
+    np.testing.assert_array_equal(d["nep_pair_struct"].numpy(), [0] * P0 + [1] * P1)
+    np.testing.assert_array_equal(d["nep_pair_atom"].numpy()[P0:], p1["nep_pair_atom"])
+    np.testing.assert_array_equal(d["nep_pair_D"].numpy()[:P0], p0["nep_pair_D"])
+    np.testing.assert_array_equal(d["nep_pair_ang"].numpy()[P0:], p1["nep_pair_ang"])
+
+    def check_frame1(ch):
+        assert int(ch["nep_pair_atom"].shape[0]) == P1
+        assert np.all(ch["nep_pair_struct"].numpy() == 0)          # chunk-local
+        np.testing.assert_array_equal(ch["nep_pair_atom"].numpy(), p1["nep_pair_atom"])
+        np.testing.assert_array_equal(ch["nep_pair_gidx"].numpy(), p1["nep_pair_gidx"])
+        np.testing.assert_array_equal(ch["nep_pair_D"].numpy(), p1["nep_pair_D"])
+        np.testing.assert_array_equal(ch["nep_pair_ang"].numpy(), p1["nep_pair_ang"])
+
+    check_frame1(slice_and_complete_chunk(d, [1]))
+    ranges = [(0, 1), (1, 2)]
+    prestage_chunk_indices(d, ranges)
+    for pin in (True, False):                                      # in-RAM / GPU-resident stagers
+        dd = dict(d)
+        if not pin:
+            dd["_gv_resident_gpu"] = True
+            move_data_to_gpu(dd)
+        chunks = [c for _, _, c in prefetched_chunks(dd, ranges, pin_to_cpu=pin)]
+        assert int(chunks[0]["nep_pair_atom"].shape[0]) == P0
+        check_frame1(chunks[1])
+    # Both frames: struct index remapped, pairs concatenated in order.
+    ch = slice_and_complete_chunk(d, [1, 0])
+    np.testing.assert_array_equal(ch["nep_pair_struct"].numpy(), [0] * P1 + [1] * P0)
+    np.testing.assert_array_equal(ch["nep_pair_D"].numpy()[P1:], p0["nep_pair_D"])
+    # Not built without descriptor gradients, or with NEP off.
+    assert "nep_struct_ptr" not in prepare_eval_data([small], _cfg(nep_descriptor="concat"))
+    assert "nep_struct_ptr" not in prepare_eval_data([small], _cfg(dipole_readout="tnep"))
