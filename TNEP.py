@@ -11,7 +11,9 @@ from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
 from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices,
-                            find_q_tf, NUM_ABC, EXPERT_WEIGHTS)
+                            find_q_tf, fn_and_fnp_tf, real_harmonics_tf,
+                            real_harmonics_grad_tf, nep_pair_kwargs, NUM_ABC,
+                            EXPERT_WEIGHTS)
 
 
 class AnnBlock(NamedTuple):
@@ -47,6 +49,38 @@ def _bilinear_padded_xla(a, b, c_full, Z, nbr_index, nbr_G, T, C, K):
         mu += tf.reduce_sum(w[..., tf.newaxis] * nbr_G[tf.newaxis, ..., n],
                             axis=[2, 3])                              # [Cc,B,3]
     return mu
+
+
+@tf.function(jit_compile=True)
+def _nep_radial_xla(alpha, slot, fnp, rhat, K):
+    """F^r [Cc, P, 3] = (Σ_k α[c, slot_p, k] fnp[p, k]) r̂_p; k-loop so the largest
+    live tensor is [Cc, P] (alpha [Cc, N·T, K] gathered by slot = i·T + t_j)."""
+    acc = tf.zeros(tf.shape(slot)[:1], alpha.dtype)[tf.newaxis]          # [1, P]
+    for k in range(K):                                                   # static K
+        acc = acc + tf.gather(alpha[:, :, k], slot, axis=1) * fnp[tf.newaxis, :, k]
+    return acc[:, :, tf.newaxis] * rhat[tf.newaxis]
+
+
+@tf.function(jit_compile=True)
+def _nep_angular_xla(Gs, c_a_flat, i_lin, slot, fn, fnp, rhat, Pc, dPc, n_a, K):
+    """F^a [Cc, P_a, 3] = Σ_n [ gnp_n (Σ_c Gs[i,n,c] P_c) r̂ + g_n Σ_c Gs[i,n,c] ∇P_c ]
+    with g_n = Σ_k c_a[t_i,t_j,n,k] fn_k, gnp_n likewise with fnp_k (plan §B.2).
+    Gs [Cc, N, n_a, 24] gathered by i_lin; c_a_flat [Cc, T·T, n_a, K] by slot =
+    t_i·T + t_j; Pc [P_a, 24]; dPc [P_a, 3, 24] Cartesian ∇P_c. n-loop (and k-loop,
+    Cartesian loop) so the largest live tensor is [Cc, P_a, 24]."""
+    F = tf.zeros([1, 1, 3], Gs.dtype)
+    for n in range(n_a):                                                 # static n_a
+        Gs_n = tf.gather(Gs[:, :, n, :], i_lin, axis=1)                  # [Cc, P_a, 24]
+        GP = tf.reduce_sum(Gs_n * Pc[tf.newaxis], axis=-1)               # [Cc, P_a]
+        GdP = tf.stack([tf.reduce_sum(Gs_n * dPc[tf.newaxis, :, x, :], axis=-1)
+                        for x in range(3)], axis=-1)                     # [Cc, P_a, 3]
+        g = gnp = tf.zeros(tf.shape(GP), Gs.dtype)
+        for k in range(K):                                               # static K
+            c_nk = tf.gather(c_a_flat[:, :, n, k], slot, axis=1)         # [Cc, P_a]
+            g = g + c_nk * fn[tf.newaxis, :, k]
+            gnp = gnp + c_nk * fnp[tf.newaxis, :, k]
+        F = F + (gnp * GP)[:, :, tf.newaxis] * rhat[tf.newaxis] + g[:, :, tf.newaxis] * GdP
+    return F
 
 
 class TNEP(layers.Layer):
@@ -259,6 +293,10 @@ class TNEP(layers.Layer):
         # Adam tape-watches). "off": None, and dim_q is the SOAP width.
         self.c_r = self.c_a = None
         self._nep_dim = 0
+        # Phase B: dipole via per-candidate NEP pair forces (plan §B.2).
+        self._nep_pair_forces_on = (self._nep_mode in ("concat", "replace")
+                                    and cfg.target_mode == 1
+                                    and str(cfg.dipole_readout) == "tnep")
         if self._nep_mode != "off":
             self._nep_dim = int(nep_dim(cfg))
             self._nep_raw_width = int(nep_raw_width(cfg))
@@ -1125,7 +1163,8 @@ class TNEP(layers.Layer):
 
     def nep_from_raw(self, raw: tf.Tensor, Z: tf.Tensor,
                      c_r: tf.Tensor | None = None,
-                     c_a: tf.Tensor | None = None) -> tf.Tensor:
+                     c_a: tf.Tensor | None = None,
+                     return_s: bool = False) -> tf.Tensor:
         """GPUMD NEP descriptor from the raw per-atom basis (nep_descriptor.py):
             q_r[a, n]  = Σ_{t',k} c_r[t_a, t', n, k] · raw_r[a, t', k]
             s[a, n, p] = Σ_{t',k} c_a[t_a, t', n, k] · raw_a[a, t', k, p]
@@ -1135,7 +1174,8 @@ class TNEP(layers.Layer):
             Z   : [..., A]         type indices
             c_r, c_a : [T, T, n+1, K+1] (None → self.c_r / self.c_a) or
                        per-candidate [C, T, T, n+1, K+1]
-        Returns [..., A, dim_nep], or [C, ..., A, dim_nep] for per-candidate c.
+        Returns [..., A, dim_nep], or [C, ..., A, dim_nep] for per-candidate c;
+        with return_s also s [(C,) ..., A, n_a+1, 24] (the tnep pair forces).
         """
         c_r = self.c_r if c_r is None else c_r
         c_a = self.c_a if c_a is None else c_a
@@ -1164,26 +1204,30 @@ class TNEP(layers.Layer):
         out_shape = tf.concat([lead, [self._nep_dim]], 0)
         if per_cand:
             out_shape = tf.concat([tf.shape(c_r)[:1], out_shape], 0)
-        return tf.reshape(q, out_shape)
+        q = tf.reshape(q, out_shape)
+        if not return_s:
+            return q
+        return q, tf.reshape(s, tf.concat([out_shape[:-1], tf.shape(s)[-2:]], 0))
 
     def _ann_inputs(self, descriptors: tf.Tensor, nep_raw: tf.Tensor | None,
                     Z: tf.Tensor, c_r: tf.Tensor | None = None,
-                    c_a: tf.Tensor | None = None) -> tf.Tensor:
+                    c_a: tf.Tensor | None = None, return_s: bool = False):
         """The [..., A, dim_q] vector the ANN consumes — the one place that
         knows cfg.nep_descriptor: "off" → descriptors (same object);
         "concat" → [descriptors ‖ nep_from_raw]; "replace" → nep_from_raw.
-        `descriptors` is the builder output after soap_from_raw."""
+        `descriptors` is the builder output after soap_from_raw. With
+        return_s: (inputs, s) — s from nep_from_raw (None when unused)."""
         if self._nep_mode == "off":
-            return descriptors
+            return (descriptors, None) if return_s else descriptors
         if nep_raw is None:
             raise ValueError(
                 f"nep_raw missing: cfg.nep_descriptor={self._nep_mode!r} needs "
                 f"the raw NEP basis at every forward site.")
         if self._nep_mode == "sum":       # experts read nep_raw in _expert_outputs
-            return descriptors
-        q_nep = self.nep_from_raw(nep_raw, Z, c_r, c_a)
+            return (descriptors, None) if return_s else descriptors
+        q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a, return_s=True)
         if self._nep_mode == "replace":
-            return q_nep
+            return (q_nep, s) if return_s else q_nep
         # One side may carry a candidate axis (learned SOAP basis with shared
         # c, or per-candidate c with fixed SOAP): broadcast the other to it.
         if len(q_nep.shape) > len(descriptors.shape):
@@ -1194,7 +1238,8 @@ class TNEP(layers.Layer):
             q_nep = tf.broadcast_to(
                 q_nep[tf.newaxis],
                 tf.concat([tf.shape(descriptors)[:1], tf.shape(q_nep)], 0))
-        return tf.concat([descriptors, q_nep], -1)
+        out = tf.concat([descriptors, q_nep], -1)
+        return (out, s) if return_s else out
 
     @property
     def expert_weights(self) -> tuple:
@@ -1252,6 +1297,11 @@ class TNEP(layers.Layer):
                 c_a: tf.Tensor | None = None) -> tf.Tensor:
         """Run the forward pass for a single structure using padded tensors.
 
+        Not available for the NEP tnep readout (cfg.nep_descriptor != "off"
+        with dipole_readout="tnep"): the padded [A, M] table is the
+        rcut_hard-limited MIC SOAP list and cannot serve the 8 Å image-exact
+        NEP pair stream — use predict_batch (score / validate / fit do).
+
         Args:
             descriptors    : [A, dim_q]     padded per-atom SOAP descriptors
                              ([A, W_in] raw centre coefficients under
@@ -1271,6 +1321,10 @@ class TNEP(layers.Layer):
         """
         if self._learn_radial:
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)
+        if self._nep_pair_forces_on:
+            raise NotImplementedError(
+                "predict() (padded single-structure path) has no NEP pair "
+                "stream; use predict_batch for the NEP tnep readout.")
         descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
         # Absorb U_pairᵀ into W0 once so forward and calc_forces share the
         # folded weights (no-op when mixing is off).
@@ -1540,7 +1594,7 @@ class TNEP(layers.Layer):
                 getattr(self, 'b1_pol', None),
                 W_atom=chunk.get("V_atom"),  # neighbor readout: [B,A,3] kernel
                 nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
-                nep_raw=chunk.get("nep_raw"),
+                nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk),
             ))
             del chunk
         raw_preds = tf.concat(pred_parts, axis=0)
@@ -1836,7 +1890,12 @@ class TNEP(layers.Layer):
                       nep_raw: tf.Tensor | None = None,
                       c_r: tf.Tensor | None = None,
                       c_a: tf.Tensor | None = None,
-                      experts: tuple | None = None) -> tf.Tensor:
+                      experts: tuple | None = None,
+                      nep_pair_atom: tf.Tensor | None = None,
+                      nep_pair_gidx: tf.Tensor | None = None,
+                      nep_pair_struct: tf.Tensor | None = None,
+                      nep_pair_D: tf.Tensor | None = None,
+                      nep_pair_ang: tf.Tensor | None = None) -> tf.Tensor:
         """Batched forward pass for B structures using COO gradient storage.
 
         Weights are passed explicitly (not read from self) so this method can
@@ -1869,13 +1928,16 @@ class TNEP(layers.Layer):
             c_r, c_a    : NEP contraction tensors (None → self.c_r / self.c_a)
             experts     : "sum" mode: the six STORED expert tensors
                           (EXPERT_WEIGHTS order; None → model variables)
+            nep_pair_*  : image-exact NEP pair stream (data.py nep_pairs; the
+                          tnep readout under NEP): atom/gidx/struct [P],
+                          D [P, 3] = r_j − r_i incl. image, ang [P] bool
 
         Returns:
             predictions : [B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
         """
         if self._learn_radial:
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)
-        descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
+        descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a, return_s=True)
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
         # Pure forward primitive: caller decides whether W0/W0_pol are raw or
@@ -1953,6 +2015,22 @@ class TNEP(layers.Layer):
 
         B = tf.shape(descriptors)[0]
 
+        if self._nep_pair_forces_on:
+            # NEP columns → per-pair forces on the image-exact stream; SOAP
+            # columns (concat) → the unchanged W_atom / COO path below.
+            off = self._soap_dim if self._nep_mode == "concat" else 0
+            mu = self._dipole_nep_pairs(
+                de_dq[tf.newaxis, :, :, off:], s_nep[tf.newaxis], c_r, c_a, Z, B,
+                nep_pair_atom, nep_pair_gidx, nep_pair_struct, nep_pair_D, nep_pair_ang)[0]
+            if self._nep_mode == "replace":
+                return mu
+            de_dq = de_dq[:, :, :off]
+            if W_atom is not None:
+                return mu - tf.einsum('baq,basq->bs', de_dq, W_atom)
+            return mu + self._dipole_coo(
+                self._calc_forces_coo(de_dq, grad_values, pair_struct, pair_atom),
+                pair_struct, pair_atom, pair_gidx, positions, boxes, box_inv, B)
+
         if self.cfg.target_mode == 1 and W_atom is not None:
             # Precomputed-kernel path (avoids [C, P, Q]):
             # dipole[b,s] = -Σ_{a,q} de_dq[b,a,q]·W_atom[b,a,s,q], identical to
@@ -1994,7 +2072,12 @@ class TNEP(layers.Layer):
                                   nep_raw: tf.Tensor | None = None,
                                   c_r: tf.Tensor | None = None,
                                   c_a: tf.Tensor | None = None,
-                                  experts: tuple | None = None) -> tf.Tensor:
+                                  experts: tuple | None = None,
+                                  nep_pair_atom: tf.Tensor | None = None,
+                                  nep_pair_gidx: tf.Tensor | None = None,
+                                  nep_pair_struct: tf.Tensor | None = None,
+                                  nep_pair_D: tf.Tensor | None = None,
+                                  nep_pair_ang: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
         Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
@@ -2028,6 +2111,8 @@ class TNEP(layers.Layer):
                           tensors (None → the model's shared c_r / c_a)
             experts     : "sum" mode: per-candidate [C, ...] STORED expert
                           tensors (EXPERT_WEIGHTS order; None → the model's)
+            nep_pair_*  : image-exact NEP pair stream (see predict_batch); the
+                          tnep readout under NEP contracts it per candidate
 
         Returns:
             predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
@@ -2067,7 +2152,7 @@ class TNEP(layers.Layer):
                     "predict_batch_candidates needs per-candidate M_radial "
                     "[C, T, S, α, K] under cfg.radial_basis_size.")
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)         # [C, B, A, Q]
-        descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
+        descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a, return_s=True)
         if len(descriptors.shape) == 4:
             # Per-candidate descriptors [C, B, A, Q] (learned radial basis or
             # per-candidate c): the input→hidden product is a batched GEMM
@@ -2145,8 +2230,112 @@ class TNEP(layers.Layer):
             de_dq_terms.append(dq * type_masks[t][tf.newaxis])
         de_dq = tf.add_n(de_dq_terms)  # [C, B, A, Q]
 
+        if self._nep_pair_forces_on:
+            off = self._soap_dim if self._nep_mode == "concat" else 0
+            mu = self._dipole_nep_pairs(
+                de_dq[:, :, :, off:], s_nep, c_r, c_a, Z, B,
+                nep_pair_atom, nep_pair_gidx, nep_pair_struct, nep_pair_D, nep_pair_ang)
+            if self._nep_mode == "replace":
+                return mu
+            return mu - tf.einsum('cbaq,basq->cbs', de_dq[:, :, :, :off], W_atom)
+
         # W_atom [B, A, 3, Q]: dipole[c,b,s] = -Σ_{a,q} de_dq[c,b,a,q]*W_atom[b,a,s,q]
         return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
+
+    def _dipole_nep_pairs(self, de_dq_nep: tf.Tensor, s: tf.Tensor,
+                          c_r: tf.Tensor | None, c_a: tf.Tensor | None,
+                          Z: tf.Tensor, B: tf.Tensor,
+                          nep_pair_atom, nep_pair_gidx, nep_pair_struct,
+                          nep_pair_D, nep_pair_ang) -> tf.Tensor:
+        """μ [Cc, B, 3] = −Σ_p |D_p|^N F_p from the NEP pair forces, N =
+        cfg.dipole_rij_power ≥ 1, |D| from the stored image-exact D (never MIC:
+        rc_r = 8 Å exceeds L/2 for the water box — plan §B.2)."""
+        if nep_pair_D is None:
+            raise ValueError(
+                "nep_pair_* stream missing: the tnep readout under "
+                f"cfg.nep_descriptor={self._nep_mode!r} needs data['nep_pair_*'] "
+                "(built by prepare_eval_data when descriptor gradients are needed).")
+        F = self._nep_pair_forces(de_dq_nep, s, c_r, c_a, Z, nep_pair_atom, nep_pair_gidx,
+                                  nep_pair_struct, nep_pair_D, nep_pair_ang)      # [Cc, P, 3]
+        w = self._scalar_rij_pow(tf.reduce_sum(tf.square(nep_pair_D), axis=-1))   # [P]
+        contrib = tf.transpose(w[tf.newaxis, :, tf.newaxis] * F, [1, 0, 2])        # [P, Cc, 3]
+        mu = tf.math.unsorted_segment_sum(contrib, nep_pair_struct, num_segments=B)
+        return -tf.transpose(mu, [1, 0, 2])                                       # [Cc, B, 3]
+
+    def _nep_pair_forces(self, de_dq_nep: tf.Tensor, s: tf.Tensor,
+                         c_r: tf.Tensor | None, c_a: tf.Tensor | None, Z: tf.Tensor,
+                         nep_pair_atom, nep_pair_gidx, nep_pair_struct,
+                         nep_pair_D, nep_pair_ang) -> tf.Tensor:
+        """Per-pair NEP forces F_p = ∂U_{i_p}/∂D_p [Cc, P, 3] (D = r_j − r_i, the
+        neighbour-side derivative as GPUMD's x12 = x[j] − x[i]; the centre side is
+        −F_p), for U_i = Σ_d Fp[i,d] q_d with Fp = de_dq over the NEP block.
+        Plan §B.2 factorisation:
+            radial   F^r_p = (Σ_k α[i,t_j,k] fnp_k(r)) r̂,  α[i,t',k] = Σ_n Fp[i,n] c_r[t_i,t',n,k]
+            angular  Gs[i,n,c] = ∂(Σ_d Fp[i,d] q_d(s_i))/∂s[i,n,c]   (GradientTape over
+                     find_q_tf — covers L=1..4, 4-body, 5-body)
+                     F^a_p = Σ_n [ gnp_n (Σ_c Gs P_c) r̂ + g_n Σ_c Gs ∇P_c ]  (XLA n-loop)
+        Args:
+            de_dq_nep : [Cc, B, A, dim_nep]     (Cc = 1 for predict_batch)
+            s         : [(Cc,) B, A, n_a+1, 24] from nep_from_raw(return_s=True)
+            c_r, c_a  : [(Cc,) T, T, n+1, K+1] (None → self.c_r / self.c_a); shared
+                        c is broadcast over the candidate axis
+            Z         : [B, A]
+            nep_pair_atom/gidx/struct [P], nep_pair_D [P, 3], nep_pair_ang [P] bool —
+            ang is the authoritative rc_a mask (never re-derived from float32 D).
+        """
+        cfg = self.cfg
+        c_r = self.c_r if c_r is None else c_r
+        c_a = self.c_a if c_a is None else c_a
+        T = self.num_types
+        n_r, n_a = cfg.nep_n_max_radial + 1, cfg.nep_n_max_angular + 1
+        K_r, K_a = cfg.nep_basis_size_radial + 1, cfg.nep_basis_size_angular + 1
+        Cc = tf.shape(de_dq_nep)[0]
+        A = tf.shape(Z)[1]
+        N = tf.shape(Z)[0] * A
+        if len(c_r.shape) == 4:
+            c_r = tf.broadcast_to(c_r[tf.newaxis], tf.concat([[Cc], tf.shape(c_r)], 0))
+        if len(c_a.shape) == 4:
+            c_a = tf.broadcast_to(c_a[tf.newaxis], tf.concat([[Cc], tf.shape(c_a)], 0))
+        if len(s.shape) == 4:
+            s = tf.broadcast_to(s[tf.newaxis], tf.concat([[Cc], tf.shape(s)], 0))
+        Fp = tf.reshape(de_dq_nep, [Cc, N, self._nep_dim])
+        s = tf.reshape(s, [Cc, N, n_a, NUM_ABC])
+        Zf = tf.reshape(Z, [N])
+        i_lin = nep_pair_struct * A + nep_pair_atom
+        j_lin = nep_pair_struct * A + nep_pair_gidx
+        t_i, t_j = tf.gather(Zf, i_lin), tf.gather(Zf, j_lin)
+        slot = t_i * T + t_j                                                 # (t_i, t_j) → T·T
+
+        # Candidate-independent per-pair basis (in-graph from D).
+        r = tf.norm(nep_pair_D, axis=1)                                      # [P]
+        rhat = nep_pair_D / r[:, tf.newaxis]
+        _, fnp_r = fn_and_fnp_tf(r, cfg.nep_rc_radial, K_r - 1)              # [P, K_r]
+
+        # Radial: α [Cc, N, T, K_r] → gathered per pair at (i, t_j).
+        c_r_i = tf.gather(c_r, Zf, axis=1)                                   # [Cc, N, T, n_r, K_r]
+        alpha = tf.einsum('cin,citnk->citk', Fp[:, :, :n_r], c_r_i)
+        F = _nep_radial_xla(tf.reshape(alpha, [Cc, N * T, K_r]),
+                            i_lin * T + t_j, fnp_r, rhat, K_r)                # [Cc, P, 3]
+
+        # Angular: Gs by tape at the atom level (l-major Fp columns → [n, L]).
+        Fp_a = tf.transpose(tf.reshape(Fp[:, :, n_r:], [Cc, N, -1, n_a]), [0, 1, 3, 2])
+        with tf.GradientTape() as tape:
+            tape.watch(s)
+            G = tf.reduce_sum(find_q_tf(s, cfg.nep_four_body, cfg.nep_five_body) * Fp_a)
+        Gs = tape.gradient(G, s)                                             # [Cc, N, n_a, 24]
+        ang = tf.where(nep_pair_ang)[:, 0]                                   # [P_a]
+        r_a, u = tf.gather(r, ang), tf.gather(rhat, ang)
+        fn_a, fnp_a = fn_and_fnp_tf(r_a, cfg.nep_rc_angular, K_a - 1)        # [P_a, K_a]
+        Pc = real_harmonics_tf(u[:, 0], u[:, 1], u[:, 2])                    # [P_a, 24]
+        dP = real_harmonics_grad_tf(u[:, 0], u[:, 1], u[:, 2])               # [P_a, 3, 24] free r̂
+        dPc = (dP - u[:, :, tf.newaxis] * tf.reduce_sum(u[:, :, tf.newaxis] * dP, 1, keepdims=True)
+               ) / r_a[:, tf.newaxis, tf.newaxis]                            # (I − r̂r̂ᵀ)/r · dP
+        F_a = _nep_angular_xla(Gs, tf.reshape(c_a, [Cc, T * T, n_a, K_a]),
+                               tf.gather(i_lin, ang), tf.gather(slot, ang),
+                               fn_a, fnp_a, u, Pc, dPc, n_a, K_a)             # [Cc, P_a, 3]
+        F_a = tf.math.unsorted_segment_sum(tf.transpose(F_a, [1, 0, 2]), ang,
+                                           num_segments=tf.shape(r)[0])      # [P, Cc, 3]
+        return F + tf.transpose(F_a, [1, 0, 2])
 
     def _scalar_rij_pow(self, rij2: tf.Tensor) -> tf.Tensor:
         """|r_ij|^N per-pair weight from the rij² primitive (N ≥ 1; avoids sqrt

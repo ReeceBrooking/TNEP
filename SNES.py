@@ -7,8 +7,9 @@ import numpy as np
 import tensorflow as tf
 from typing import TYPE_CHECKING, Callable
 
+from data import _gather_nep_pairs
 from loss_functions import squared_error_per_structure
-from nep_descriptor import EXPERT_WEIGHTS
+from nep_descriptor import EXPERT_WEIGHTS, nep_pair_kwargs
 
 if TYPE_CHECKING:
     from TNEP import TNEP
@@ -1028,6 +1029,8 @@ class SNES:
                 batch_pair_counts = tf.cast(pair_ranges.row_lengths(), tf.int32)
                 batch_data["struct_ptr"] = tf.concat(
                     [[0], tf.cumsum(batch_pair_counts)], axis=0)
+                # NEP pair stream twin (Phase B): same CSR gather + local pointer.
+                _gather_nep_pairs(train_data, batch_data, batch_idx_tf)
 
             t1 = time.perf_counter()
 
@@ -1429,7 +1432,7 @@ class SNES:
                 W_atom=W_atom_v, c_pair=c_pair_val, M_radial=M_val,
                 c_r=c_r_val, c_a=c_a_val, experts=experts_val,
                 nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
-                nep_raw=chunk.get("nep_raw"),
+                nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk),
             )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
                 num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
@@ -2083,7 +2086,8 @@ class SNES:
                 experts=self._experts_of(named),
                 nbr_index=batch_data.get("nbr_index"),
                 nbr_G=batch_data.get("nbr_G"),
-                nep_raw=batch_data.get("nep_raw"))  # [C, B, T_dim]
+                nep_raw=batch_data.get("nep_raw"),
+                **nep_pair_kwargs(batch_data))  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]

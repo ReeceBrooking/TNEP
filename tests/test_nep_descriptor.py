@@ -460,10 +460,13 @@ def test_nep_concat_with_learned_soap_basis():
 
 
 def test_nep_rejects_descriptor_gradient_readouts():
-    with pytest.raises(NotImplementedError, match="neighbor/bilinear"):
-        _model(_cfg(nep_descriptor="concat", dipole_readout="tnep"))
-    with pytest.raises(NotImplementedError, match="neighbor/bilinear"):
+    # Phase B lifts the guard for the tnep dipole readout only (Task 11).
+    with pytest.raises(NotImplementedError, match="target_mode"):
         _model(_cfg(nep_descriptor="replace", target_mode=0))
+    with pytest.raises(NotImplementedError, match="target_mode"):
+        _model(_cfg(nep_descriptor="concat", target_mode=2))
+    with pytest.raises(NotImplementedError, match="target_mode"):
+        _model(_cfg(nep_descriptor="sum", dipole_readout="tnep", dipole_rij_power=2))
 
 
 def test_compute_dim_q_and_layout_per_mode():
@@ -1167,3 +1170,198 @@ def test_nep_pair_stream_rides_data_dict_and_every_slicer():
     # Not built without descriptor gradients, or with NEP off.
     assert "nep_struct_ptr" not in prepare_eval_data([small], _cfg(nep_descriptor="concat"))
     assert "nep_struct_ptr" not in prepare_eval_data([small], _cfg(dipole_readout="tnep"))
+
+
+# ── Task 11 (Phase B): per-candidate NEP pair forces for dipole_readout="tnep" ─
+
+def _tnep_cfg(mode, **kw):
+    return _cfg(**{"nep_descriptor": mode, "dipole_readout": "tnep", "dipole_rij_power": 2, **kw})
+
+
+def _small_frames(n, seed=0):
+    """12-atom truncations of the bulk frame (cell kept → images at rc_r = 8 Å > L/2)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for k in range(n):
+        at = _bulk_frame()[:12]
+        at.set_positions(at.get_positions() + 0.05 * rng.standard_normal((12, 3)))
+        at.info["dipole"] = rng.standard_normal(3)
+        out.append(at)
+    return out
+
+
+def _tnep_kw(d):
+    return dict(nep_raw=d["nep_raw"], **nd.nep_pair_kwargs(d))
+
+
+def _mu_batch(m, d, W_atom=None, weights=None, c=None):
+    """μ [B, 3] via predict_batch (W_atom None → SOAP part through the COO path)."""
+    W0, b0, W1, b1 = weights if weights is not None else (m.W0, m.b0, m.W1, m.b1)
+    c_r, c_a = c if c is not None else (None, None)
+    return m.predict_batch(
+        d["descriptors"], d["grad_values"], d["pair_atom"], d["pair_gidx"], d["pair_struct"],
+        d["positions"], d["Z_int"], d["boxes"], d["atom_mask"], W0, b0, W1, b1,
+        W_atom=W_atom, c_r=c_r, c_a=c_a, **_tnep_kw(d)).numpy()
+
+
+@pytest.mark.parametrize("four_body", [True, False])
+def test_nep_pair_forces_match_fd(four_body):
+    """F_p = ∂U_i/∂D_p (D = r_j − r_i) for U = Σ_{i,d} Fp[i,d] q_d with Fp frozen:
+    FD of U w.r.t. atom a's position == Σ_{p: j_p=a} F_p − Σ_{p: i_p=a} F_p."""
+    cfg = _tnep_cfg("replace", nep_four_body=four_body); m = _model(cfg)
+    atoms = _small_frames(1)[0]
+    d = prepare_eval_data([atoms], cfg)
+    types = np.asarray(assign_type_indices([atoms], cfg.types)[0]); N = len(atoms)
+    rng = np.random.default_rng(5)
+    c_r = rng.uniform(-1, 1, m.c_r.shape).astype(np.float32)
+    c_a = rng.uniform(-1, 1, m.c_a.shape).astype(np.float32)
+    Fp = rng.standard_normal((N, nd.nep_dim(cfg))).astype(np.float32)
+    _, s = m.nep_from_raw(d["nep_raw"], d["Z_int"], tf.constant(c_r), tf.constant(c_a), return_s=True)
+    F = m._nep_pair_forces(tf.constant(Fp)[None, None], s[None], tf.constant(c_r), tf.constant(c_a),
+                           d["Z_int"], **nd.nep_pair_kwargs(d))
+    i, j = d["nep_pair_atom"].numpy(), d["nep_pair_gidx"].numpy()
+    assert tuple(F.shape) == (1, i.shape[0], 3)
+    F = F[0].numpy().astype(np.float64)
+
+    def U(pos):
+        at = atoms.copy(); at.set_positions(pos)
+        raw = nd.nep_raw_numpy(at, types, cfg, dtype=np.float64)
+        return float(np.sum(Fp.astype(np.float64) * nd.nep_contract_numpy(raw, types, c_r, c_a, cfg)))
+
+    h = 1e-3
+    for a in (0, 5):                                     # an O and an H
+        analytic = F[j == a].sum(0) - F[i == a].sum(0)
+        fd = np.zeros(3)
+        for x in range(3):
+            pos_p, pos_m = atoms.get_positions(), atoms.get_positions()
+            pos_p[a, x] += h; pos_m[a, x] -= h
+            fd[x] = (U(pos_p) - U(pos_m)) / (2.0 * h)
+        assert np.abs(fd).max() > 1e-2
+        np.testing.assert_allclose(analytic, fd, rtol=1e-4, atol=1e-4 * np.abs(fd).max())
+
+
+def _mu_reference(m, cfg, d):
+    """Independent μ: U = Σ_i ANN(q_i) with q_nep built in-graph from the pair
+    displacements D as free variables; μ = −Σ_p |D_p|² ∂U/∂D_p (+ the SOAP COO
+    part from ∂U/∂q_soap under concat). Uses only basis VALUES — no derivative code."""
+    A, T = int(d["Z_int"].shape[1]), cfg.num_types
+    Z = d["Z_int"][0]; i = d["nep_pair_atom"]; j = d["nep_pair_gidx"]
+    ang = tf.cast(d["nep_pair_ang"], tf.float32)
+    D = tf.Variable(d["nep_pair_D"]); q_soap = tf.Variable(d["descriptors"][0])
+    Kr, Ka = cfg.nep_basis_size_radial, cfg.nep_basis_size_angular
+    with tf.GradientTape(persistent=True) as tape:
+        r = tf.norm(D, axis=1); u = D / r[:, None]
+        seg = i * T + tf.gather(Z, j)
+        fr = nd.fn_and_fnp_tf(r, cfg.nep_rc_radial, Kr)[0]
+        raw_r = tf.math.unsorted_segment_sum(fr, seg, A * T)
+        fa = nd.fn_and_fnp_tf(r, cfg.nep_rc_angular, Ka)[0] * ang[:, None]
+        Pc = nd.real_harmonics_tf(u[:, 0], u[:, 1], u[:, 2])
+        raw_a = tf.math.unsorted_segment_sum(fa[:, :, None] * Pc[:, None, :], seg, A * T)
+        raw = tf.concat([tf.reshape(raw_r, [A, -1]), tf.reshape(raw_a, [A, -1])], 1)
+        q = m.nep_from_raw(raw[None], Z[None])[0]
+        if cfg.nep_descriptor == "concat":
+            q = tf.concat([q_soap, q], 1)
+        h1 = m.activation(tf.einsum('aq,aqh->ah', q, tf.gather(m.W0, Z)) + tf.gather(m.b0, Z))
+        U = tf.reduce_sum(h1 * tf.gather(m.W1, Z)) + tf.cast(A, tf.float32) * m.b1
+    np.testing.assert_allclose(raw.numpy(), d["nep_raw"][0].numpy(), rtol=1e-5, atol=1e-5)
+    F = tape.gradient(U, D)
+    mu = -tf.reduce_sum(tf.reduce_sum(tf.square(D), 1)[:, None] * F, 0)
+    if cfg.nep_descriptor == "concat":
+        de_dq = tape.gradient(U, q_soap)[None]
+        mu += m._dipole_coo(m._calc_forces_coo(de_dq, d["grad_values"], d["pair_struct"], d["pair_atom"]),
+                            d["pair_struct"], d["pair_atom"], d["pair_gidx"], d["positions"],
+                            d["boxes"], tf.linalg.inv(d["boxes"]), 1)[0]
+    return mu.numpy()
+
+
+@pytest.mark.parametrize("mode", ["concat", "replace"])
+def test_nep_tnep_mu_matches_autodiff_reference(mode):
+    cfg = _tnep_cfg(mode); m = _model(cfg)
+    m.W1.assign(m.W1 + 0.5)                              # live output weights
+    atoms = _small_frames(1, seed=1)[0]
+    d = prepare_eval_data([atoms], cfg)
+    mu = _mu_batch(m, d)[0]
+    ref = _mu_reference(m, cfg, d)
+    assert np.linalg.norm(ref) > 1e-3
+    np.testing.assert_allclose(mu, ref, rtol=1e-4, atol=1e-4 * np.linalg.norm(ref))
+
+
+@pytest.mark.parametrize("mode", ["concat", "replace"])
+def test_nep_tnep_candidates_match_batch(mode):
+    cfg = _tnep_cfg(mode); m = _model(cfg)
+    d = prepare_eval_data(_small_frames(2, seed=2), cfg)
+    rng = np.random.default_rng(3)
+    def two(v):                                          # two distinct candidates
+        v = v.numpy(); return tf.constant(np.stack([v, 0.7 * v + 0.1 * rng.standard_normal(v.shape)]).astype(np.float32))
+    W0, b0, W1, b1 = (two(getattr(m, k)) for k in ("W0", "b0", "W1", "b1"))
+    W1 = W1 + 0.5; c_r, c_a = two(m.c_r), two(m.c_a)
+    W_atom = m._precompute_dipole_kernel(d["grad_values"], d["pair_struct"], d["pair_atom"], d["pair_gidx"],
+                                         d["positions"], d["boxes"], 2, int(d["Z_int"].shape[1]))
+    mu_c = m.predict_batch_candidates(d["descriptors"], W_atom, d["Z_int"], d["atom_mask"],
+                                      W0, b0, W1, b1, c_r=c_r, c_a=c_a, **_tnep_kw(d)).numpy()
+    assert mu_c.shape == (2, 2, 3) and not np.allclose(mu_c[0], mu_c[1])
+    for c in range(2):
+        w = (W0[c], b0[c], W1[c], b1[c]); cc = (c_r[c], c_a[c])
+        mu_k = _mu_batch(m, d, W_atom=W_atom, weights=w, c=cc)
+        mu_coo = _mu_batch(m, d, W_atom=None, weights=w, c=cc)
+        atol = 1e-5 * max(np.abs(mu_k).max(), 1.0)
+        np.testing.assert_allclose(mu_c[c], mu_k, atol=atol)
+        np.testing.assert_allclose(mu_coo, mu_k, atol=atol)
+
+
+def test_tnep_soap_only_paths_agree():
+    """NEP off: the SOAP tnep readout is untouched — W_atom path == COO path == candidates."""
+    cfg = _cfg(dipole_readout="tnep", dipole_rij_power=2); m = _model(cfg)
+    m.W1.assign(m.W1 + 0.5)
+    d = prepare_eval_data(_small_frames(2, seed=4), cfg)
+    args = _forward_args(m, d)
+    W_atom = m._precompute_dipole_kernel(d["grad_values"], d["pair_struct"], d["pair_atom"], d["pair_gidx"],
+                                         d["positions"], d["boxes"], 2, int(d["Z_int"].shape[1]))
+    mu_k = m.predict_batch(*args, W_atom=W_atom).numpy()
+    mu_coo = m.predict_batch(*args).numpy()
+    mu_c = m.predict_batch_candidates(d["descriptors"], W_atom, d["Z_int"], d["atom_mask"],
+                                      m.W0[None], m.b0[None], m.W1[None], m.b1[None])[0].numpy()
+    assert np.abs(mu_k).max() > 1e-4
+    np.testing.assert_allclose(mu_coo, mu_k, atol=1e-5 * np.abs(mu_k).max())
+    np.testing.assert_allclose(mu_c, mu_k, atol=1e-5 * np.abs(mu_k).max())
+
+
+def test_nep_tnep_snes_roundtrip_and_minibatch():
+    cfg = _tnep_cfg("concat", pop_size=4, num_generations=2, batch_size=2, val_interval=1)
+    m = _model(cfg)
+    d = prepare_eval_data(_small_frames(3, seed=5), cfg)
+    snes = m.optimizer
+    fit = snes.evaluate_population(tf.stack([snes.mu, snes.mu + 0.1]), d).numpy()
+    assert fit.shape == (2,) and np.all(np.isfinite(fit)) and fit[0] != fit[1]
+    assert np.isfinite(snes.validate(d, snes.mu))
+    missing = {k: v for k, v in d.items() if not k.startswith("nep_pair") and k != "nep_struct_ptr"}
+    with pytest.raises(ValueError, match="nep_pair"):
+        snes.validate(missing)
+    with pytest.raises(ValueError, match="nep_pair"):
+        snes.evaluate_population(tf.stack([snes.mu]), missing)
+    history, _, _ = m.fit(d, d)                          # batch_size=2: the mini-batch CSR twin
+    assert len(history["val_loss"]) == 2 and np.all(np.isfinite(history["val_loss"]))
+    metrics, preds = m.score(d)
+    assert np.isfinite(float(metrics["rmse"])) and preds.shape == (3, 3)
+
+
+def test_nep_tnep_adam_smoke():
+    cfg = _tnep_cfg("replace", optimizer="adam", adam_lr=1e-2, num_generations=2, val_interval=1,
+                    batch_chunk_size=2)
+    m = _model(cfg)
+    d = prepare_eval_data(_small_frames(2, seed=6), cfg)
+    c_a0 = m.c_a.numpy().copy()
+    history, _, _ = m.fit(d, d)
+    assert np.all(np.isfinite(history["train_loss"])) and np.all(np.isfinite(history["val_loss"]))
+    assert not np.array_equal(m.c_a.numpy(), c_a0)      # c_a in the tape through the pair forces
+
+
+def test_nep_tnep_guards():
+    with pytest.raises(ValueError, match="dipole_rij_power"):
+        _model(_tnep_cfg("concat", dipole_rij_power=0))
+    cfg = _tnep_cfg("replace"); m = _model(cfg)
+    atoms = _small_frames(1)[0]; d = prepare_eval_data([atoms], cfg); A = len(atoms)
+    with pytest.raises(NotImplementedError, match="predict_batch"):
+        m.predict(d["descriptors"][0], tf.zeros([A, 1, 3, cfg.dim_q]), tf.zeros([A, 1], tf.int32),
+                  d["positions"][0], d["Z_int"][0], d["boxes"][0], d["atom_mask"][0],
+                  tf.zeros([A, 1]), nep_raw=d["nep_raw"][0])

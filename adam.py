@@ -23,7 +23,7 @@ import numpy as np
 import tensorflow as tf
 
 from loss_functions import squared_error_per_structure
-from nep_descriptor import EXPERT_WEIGHTS
+from nep_descriptor import EXPERT_WEIGHTS, nep_pair_kwargs
 
 
 def _tf_var(v):
@@ -130,7 +130,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
             experts=(tuple(map(_tf_var, model.expert_weights))   # Keras vars → tf.Variables
                      if model._nep_mode == "sum" else None),
             nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
-            nep_raw=chunk.get("nep_raw"))
+            nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk))
         if scale_preds:
             num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
             preds = preds / tf.maximum(num_atoms, 1.0)[:, tf.newaxis]

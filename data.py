@@ -1084,6 +1084,9 @@ def _gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
     rng = tf.ragged.range(tf.gather(ptr, idx_tf), tf.gather(ptr, idx_tf + 1))
     flat = tf.cast(rng.flat_values, tf.int32)
     chunk["nep_pair_struct"] = tf.cast(rng.value_rowids(), tf.int32)
+    # Chunk-local pointer so the chunk can itself be sliced (SNES mini-batch).
+    chunk["nep_struct_ptr"] = tf.concat(
+        [[0], tf.cumsum(tf.cast(rng.row_lengths(), tf.int32))], axis=0)
     for k in _NEP_PAIR_KEYS:
         chunk[k] = tf.gather(data[k], flat)
 

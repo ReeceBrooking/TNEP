@@ -239,10 +239,19 @@ def validate_nep_cfg(cfg):
         return mode
     from data import descriptor_gradients_needed   # lazy: data imports nep_descriptor (Task 5)
     if descriptor_gradients_needed(cfg):
-        raise NotImplementedError(
-            f"cfg.nep_descriptor={mode!r}: NEP descriptors currently support only "
-            "the neighbor/bilinear dipole readouts (target_mode=1); descriptor "
-            "gradients are Phase B of multi_descriptor_plan.md.")
+        # Phase B (plan §B.2/§B.4): per-candidate NEP pair forces exist for the
+        # tnep DIPOLE readout only; PES / polarisability need forces on both
+        # atoms and virials, "sum" would need de_dq through the experts.
+        if not (int(cfg.target_mode) == 1 and str(cfg.dipole_readout) == "tnep"
+                and mode in ("concat", "replace")):
+            raise NotImplementedError(
+                f"cfg.nep_descriptor={mode!r}: descriptor gradients are implemented "
+                "only for target_mode=1 with dipole_readout='tnep' (concat/replace); "
+                "the neighbor/bilinear readouts need none.")
+        if int(cfg.dipole_rij_power) < 1:
+            raise ValueError(
+                "cfg.dipole_rij_power=0 (self-pairs only) has no NEP pair stream; "
+                "the faithful GPUMD tnep readout is dipole_rij_power=2.")
     preprocess = str(getattr(cfg, "descriptor_preprocess_contract", "off"))
     if mode == "replace":
         for f, v in (("descriptor_mixing", bool(getattr(cfg, "descriptor_mixing", False))),
@@ -294,8 +303,9 @@ def nep_pair_list(atoms, cfg):
     return i[keep], j[keep], D[keep]
 
 
-def nep_raw_numpy(atoms, types_int, cfg, pairs=None):
-    """[N, W_raw] float32 = flatten([raw_r [N,T,K_r+1] ‖ raw_a [N,T,K_a+1,24]])."""
+def nep_raw_numpy(atoms, types_int, cfg, pairs=None, dtype=np.float32):
+    """[N, W_raw] float32 = flatten([raw_r [N,T,K_r+1] ‖ raw_a [N,T,K_a+1,24]])
+    (dtype=np.float64 keeps the float64 accumulation — FD tests)."""
     N, T = len(atoms), int(cfg.num_types)
     Kr, Ka = int(cfg.nep_basis_size_radial), int(cfg.nep_basis_size_angular)
     rc_r, rc_a = float(cfg.nep_rc_radial), float(cfg.nep_rc_angular)
@@ -314,7 +324,17 @@ def nep_raw_numpy(atoms, types_int, cfg, pairs=None):
     P = real_harmonics(u[:, 0], u[:, 1], u[:, 2])
     np.add.at(raw_a, (i[m], tj[m]), fn_all(r[m], rc_a, Ka)[:, :, None] * P[:, None, :])
 
-    return np.concatenate([raw_r.reshape(N, -1), raw_a.reshape(N, -1)], 1).astype(np.float32)
+    return np.concatenate([raw_r.reshape(N, -1), raw_a.reshape(N, -1)], 1).astype(dtype)
+
+
+# The five per-pair keys every forward site threads (data dict → predict_batch
+# / predict_batch_candidates kwargs); nep_struct_ptr is the CSR pointer only.
+NEP_PAIR_KW = ("nep_pair_atom", "nep_pair_gidx", "nep_pair_struct", "nep_pair_D", "nep_pair_ang")
+
+
+def nep_pair_kwargs(d):
+    """{key: d.get(key)} for NEP_PAIR_KW — None values when the stream is absent."""
+    return {k: d.get(k) for k in NEP_PAIR_KW}
 
 
 def nep_pairs_numpy(atoms, cfg, pairs=None):

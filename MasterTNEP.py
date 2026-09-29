@@ -495,7 +495,10 @@ def _train_model_inner(cfg: TNEPconfig,
               f"four_body={cfg.nep_four_body}, five_body={cfg.nep_five_body}; "
               f"c init U(−1,1) per GPUMD; c excluded from L1/L2 (GPUMD includes it)"
               + (f"; sum: ANN_2b + ANN_3b (H_e = {cfg.nep_num_neurons}) + SOAP ANN, "
-                 f"expert W1 = 0 at gen 0" if cfg.nep_descriptor == "sum" else ""))
+                 f"expert W1 = 0 at gen 0" if cfg.nep_descriptor == "sum" else "")
+              + ("; tnep readout: NEP pair forces per candidate (image-exact |r_ij|^"
+                 f"{cfg.dipole_rij_power} weights)"
+                 if cfg.target_mode == 1 and cfg.dipole_readout == "tnep" else ""))
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
     # On resume, reuse the checkpoint's existing run dir.
