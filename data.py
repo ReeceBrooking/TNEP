@@ -401,6 +401,12 @@ def assemble_data_dict(
             data["nep_raw"].append(nep_raw_numpy(s, t, cfg, p))
             if need_pairs:
                 data["nep_pairs"].append(nep_pairs_numpy(s, cfg, p))
+        if need_pairs:
+            # Displacement of the bucket-padding pairs (gather_nep_pairs): beyond
+            # every cutoff, so fc = fn = fnp = 0 and they contribute exactly nothing.
+            data["nep_pad_D"] = np.array(
+                [max(float(cfg.nep_rc_radial), float(cfg.nep_rc_angular)) + 1.0, 0.0, 0.0],
+                dtype=np.float32)
 
     # Auto-detect and include force/virial targets for PES mode
     if cfg.target_mode == 0:
@@ -976,6 +982,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
         if has_nep_pairs:
             result["nep_struct_ptr"]  = tf.constant(nep_ptr_np)
             result["nep_pair_struct"] = tf.constant(nep_struct_np)
+            result["nep_pad_D"]       = tf.constant(data["nep_pad_D"])
             for k in _NEP_PAIR_KEYS:
                 result[k] = tf.constant(nep_cat[k])
             del nep_cat
@@ -1074,21 +1081,45 @@ _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
 _NEP_PAIR_KEYS = ("nep_pair_atom", "nep_pair_gidx", "nep_pair_D", "nep_pair_ang")
 
 
-def _gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
+def _pow2(n: int) -> int:
+    """Smallest power of two ≥ n (n ≥ 0; _pow2(0) = 1)."""
+    return 1 << max(n - 1, 0).bit_length()
+
+
+def gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
     """NEP pair stream for structures idx_tf → chunk: CSR gather by nep_struct_ptr,
     nep_pair_struct remapped chunk-local (mirrors the grad_values gather). No-op
-    when the stream is absent."""
+    when the stream is absent.
+
+    The chunk stream is bucket-padded to a power of two — both the pair count P
+    and the angular count P_a — so the XLA pair kernels (TNEP._nep_radial_xla /
+    _nep_angular_xla, compiled per shape) compile once per bucket instead of once
+    per mini-batch. Padding pairs are (atom 0, gidx 0, struct 0, D = nep_pad_D =
+    (rc + 1, 0, 0)): fc = fn = fnp = 0 beyond the cutoff, so their radial and
+    angular forces are exactly 0 and the |D|^N μ weight multiplies zero; the first
+    pow2(P_a) − P_a of them carry nep_pair_ang=True to pad the angular subset.
+    The chunk-local nep_struct_ptr counts real pairs only (re-slicing re-pads)."""
     ptr = data.get("nep_struct_ptr")
     if ptr is None:
         return
     rng = tf.ragged.range(tf.gather(ptr, idx_tf), tf.gather(ptr, idx_tf + 1))
     flat = tf.cast(rng.flat_values, tf.int32)
-    chunk["nep_pair_struct"] = tf.cast(rng.value_rowids(), tf.int32)
-    # Chunk-local pointer so the chunk can itself be sliced (SNES mini-batch).
     chunk["nep_struct_ptr"] = tf.concat(
         [[0], tf.cumsum(tf.cast(rng.row_lengths(), tf.int32))], axis=0)
-    for k in _NEP_PAIR_KEYS:
-        chunk[k] = tf.gather(data[k], flat)
+    chunk["nep_pad_D"] = data["nep_pad_D"]
+    real = {k: tf.gather(data[k], flat) for k in _NEP_PAIR_KEYS}
+    real["nep_pair_struct"] = tf.cast(rng.value_rowids(), tf.int32)
+    P = int(flat.shape[0])
+    P_a = int(tf.reduce_sum(tf.cast(real["nep_pair_ang"], tf.int32)))
+    n_ang = _pow2(P_a) - P_a
+    n_pad = _pow2(P + n_ang) - P
+    zeros = tf.zeros([n_pad], tf.int32)
+    pad = dict(nep_pair_atom=zeros, nep_pair_gidx=zeros, nep_pair_struct=zeros,
+               nep_pair_D=tf.tile(data["nep_pad_D"][tf.newaxis], [n_pad, 1]),
+               nep_pair_ang=tf.concat([tf.ones([n_ang], tf.bool),
+                                       tf.zeros([n_pad - n_ang], tf.bool)], 0))
+    for k in real:
+        chunk[k] = tf.concat([real[k], pad[k]], axis=0)
 
 
 def slice_and_complete_chunk(data: dict, indices) -> dict:
@@ -1138,7 +1169,7 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
     chunk["grad_values"] = tf.gather(gv, flat_pair_idx_tf)
     chunk["pair_atom"]   = tf.gather(data["pair_atom"],   flat_pair_idx_tf)
     chunk["pair_gidx"]   = tf.gather(data["pair_gidx"],   flat_pair_idx_tf)
-    _gather_nep_pairs(data, chunk, idx_tf)
+    gather_nep_pairs(data, chunk, idx_tf)
     return chunk
 
 
@@ -1294,7 +1325,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
             chunk["grad_values"] = tf.gather(raw["_passthrough_grad_values"], flat_pair_idx_tf)
             chunk["pair_atom"]   = tf.gather(raw["_passthrough_pair_atom"],   flat_pair_idx_tf)
             chunk["pair_gidx"]   = tf.gather(raw["_passthrough_pair_gidx"],   flat_pair_idx_tf)
-        _gather_nep_pairs(data, chunk, tf.constant(raw["_idx_np"]))
+        gather_nep_pairs(data, chunk, tf.constant(raw["_idx_np"]))
     return chunk
 
 
@@ -1323,7 +1354,8 @@ def move_data_to_gpu(data: dict) -> None:
     """
     keys = list(_RESIDENT_SMALL_KEYS) + [
         "descriptors", "pair_atom", "pair_gidx", "pair_struct",
-        "struct_ptr", "grad_values", "nep_struct_ptr", "nep_pair_struct", *_NEP_PAIR_KEYS]
+        "struct_ptr", "grad_values", "nep_struct_ptr", "nep_pair_struct", "nep_pad_D",
+        *_NEP_PAIR_KEYS]
     with _gpu_device_ctx():
         for k in keys:
             v = data.get(k)
@@ -1392,7 +1424,7 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
         chunk["pair_atom"] = pair_atom
         chunk["pair_gidx"] = pair_gidx
         chunk["pair_struct"] = pair_struct
-        _gather_nep_pairs(data, chunk, idx_tf)
+        gather_nep_pairs(data, chunk, idx_tf)
     return chunk
 
 

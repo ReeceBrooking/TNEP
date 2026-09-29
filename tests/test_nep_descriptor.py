@@ -356,11 +356,11 @@ def test_ann_inputs_modes():
         cfg = _cfg(nep_descriptor=mode); m = _model(cfg)
         raw, types = _nep_inputs(cfg, atoms)
         R, Zt = tf.constant(raw[None]), tf.constant(types[None])
-        x = m._ann_inputs(desc, R, Zt)
+        x = m._ann_inputs(desc, R, Zt)[0]
         assert int(x.shape[-1]) == cfg.dim_q == compute_dim_q(cfg)
         if mode == "off":
             assert x is desc and cfg.dim_q == dim_soap
-            assert m._ann_inputs(desc, None, Zt) is desc
+            assert m._ann_inputs(desc, None, Zt)[0] is desc
             continue
         q_nep = m.nep_from_raw(R, Zt).numpy()
         if mode == "concat":
@@ -378,7 +378,7 @@ def test_ann_inputs_modes():
         _model(_cfg(nep_descriptor="replace", descriptor_preprocess_contract="angular"))
     m = _model(_cfg(nep_descriptor="sum"))           # main ANN sees SOAP only
     raw, types = _nep_inputs(m.cfg, atoms)
-    assert m._ann_inputs(desc, tf.constant(raw[None]), tf.constant(types[None])) is desc
+    assert m._ann_inputs(desc, tf.constant(raw[None]), tf.constant(types[None]))[0] is desc
     with pytest.raises(ValueError, match="nep_raw"):
         m._ann_inputs(desc, None, tf.constant(types[None]))
     with pytest.raises(ValueError, match="nep_descriptor"):
@@ -425,7 +425,7 @@ def test_nep_concat_with_learned_soap_basis():
     data = prepare_eval_data([atoms], cfg)
     raw, _ = _nep_inputs(cfg, atoms)
     R = tf.constant(raw[None])
-    x = m._ann_inputs(m.soap_from_raw(data["descriptors"], data["Z_int"]), R, data["Z_int"])
+    x = m._ann_inputs(m.soap_from_raw(data["descriptors"], data["Z_int"]), R, data["Z_int"])[0]
     assert int(x.shape[-1]) == cfg.dim_q == m._soap_dim + nd.nep_dim(cfg)
 
     def mu_of(M, c_r, c_a):
@@ -450,7 +450,7 @@ def test_nep_concat_with_learned_soap_basis():
     np.testing.assert_allclose(mu_c, mu, rtol=1e-5, atol=1e-5 * np.abs(mu).max())
     # Per-candidate M with SHARED c (None → model variables): _ann_inputs
     # broadcasts the rank-3 NEP block onto the rank-4 SOAP descriptors.
-    x = m._ann_inputs(m.soap_from_raw(data["descriptors"], data["Z_int"], M2), R, data["Z_int"])
+    x = m._ann_inputs(m.soap_from_raw(data["descriptors"], data["Z_int"], M2), R, data["Z_int"])[0]
     assert tuple(x.shape) == (2, 1, len(atoms), cfg.dim_q)
     mu_s = np.stack([mu_of(M2[i], None, None) for i in range(2)])
     mu_sc = m.predict_batch_candidates(
@@ -773,8 +773,8 @@ def test_minmax_scaler_uses_c_equal_one():
     q_mm = gen0_ann_inputs(cfg, d)
     m = _model(_cfg(nep_descriptor="concat"))
     ones = m._ann_inputs(d["descriptors"], d["nep_raw"], d["Z_int"],
-                         c_r=tf.ones_like(m.c_r), c_a=tf.ones_like(m.c_a)).numpy()
-    real = m._ann_inputs(d["descriptors"], d["nep_raw"], d["Z_int"]).numpy()
+                         c_r=tf.ones_like(m.c_r), c_a=tf.ones_like(m.c_a))[0].numpy()
+    real = m._ann_inputs(d["descriptors"], d["nep_raw"], d["Z_int"])[0].numpy()
     assert q_mm.shape == (2, len(atoms), cfg.dim_q)
     np.testing.assert_array_equal(q_mm, ones)
     q_bl = gen0_ann_inputs(_cfg(nep_descriptor="concat", descriptor_scale="block"), d)
@@ -1145,12 +1145,16 @@ def test_nep_pair_stream_rides_data_dict_and_every_slicer():
     np.testing.assert_array_equal(d["nep_pair_ang"].numpy()[P0:], p1["nep_pair_ang"])
 
     def check_frame1(ch):
-        assert int(ch["nep_pair_atom"].shape[0]) == P1
+        n = int(ch["nep_pair_atom"].shape[0])                      # bucket-padded (power of two)
+        assert n >= P1 and n & (n - 1) == 0
+        np.testing.assert_array_equal(ch["nep_struct_ptr"].numpy(), [0, P1])   # real pairs only
         assert np.all(ch["nep_pair_struct"].numpy() == 0)          # chunk-local
-        np.testing.assert_array_equal(ch["nep_pair_atom"].numpy(), p1["nep_pair_atom"])
-        np.testing.assert_array_equal(ch["nep_pair_gidx"].numpy(), p1["nep_pair_gidx"])
-        np.testing.assert_array_equal(ch["nep_pair_D"].numpy(), p1["nep_pair_D"])
-        np.testing.assert_array_equal(ch["nep_pair_ang"].numpy(), p1["nep_pair_ang"])
+        np.testing.assert_array_equal(ch["nep_pair_atom"].numpy()[:P1], p1["nep_pair_atom"])
+        np.testing.assert_array_equal(ch["nep_pair_gidx"].numpy()[:P1], p1["nep_pair_gidx"])
+        np.testing.assert_array_equal(ch["nep_pair_D"].numpy()[:P1], p1["nep_pair_D"])
+        np.testing.assert_array_equal(ch["nep_pair_ang"].numpy()[:P1], p1["nep_pair_ang"])
+        np.testing.assert_array_equal(ch["nep_pair_D"].numpy()[P1:], np.tile([[cfg.nep_rc_radial + 1, 0, 0]], (n - P1, 1)))
+        assert np.all(ch["nep_pair_atom"].numpy()[P1:] == 0) and np.all(ch["nep_pair_gidx"].numpy()[P1:] == 0)
 
     check_frame1(slice_and_complete_chunk(d, [1]))
     ranges = [(0, 1), (1, 2)]
@@ -1161,12 +1165,12 @@ def test_nep_pair_stream_rides_data_dict_and_every_slicer():
             dd["_gv_resident_gpu"] = True
             move_data_to_gpu(dd)
         chunks = [c for _, _, c in prefetched_chunks(dd, ranges, pin_to_cpu=pin)]
-        assert int(chunks[0]["nep_pair_atom"].shape[0]) == P0
+        np.testing.assert_array_equal(chunks[0]["nep_pair_atom"].numpy()[:P0], p0["nep_pair_atom"])
         check_frame1(chunks[1])
     # Both frames: struct index remapped, pairs concatenated in order.
     ch = slice_and_complete_chunk(d, [1, 0])
-    np.testing.assert_array_equal(ch["nep_pair_struct"].numpy(), [0] * P1 + [1] * P0)
-    np.testing.assert_array_equal(ch["nep_pair_D"].numpy()[P1:], p0["nep_pair_D"])
+    np.testing.assert_array_equal(ch["nep_pair_struct"].numpy()[:P1 + P0], [0] * P1 + [1] * P0)
+    np.testing.assert_array_equal(ch["nep_pair_D"].numpy()[P1:P1 + P0], p0["nep_pair_D"])
     # Not built without descriptor gradients, or with NEP off.
     assert "nep_struct_ptr" not in prepare_eval_data([small], _cfg(nep_descriptor="concat"))
     assert "nep_struct_ptr" not in prepare_eval_data([small], _cfg(dipole_readout="tnep"))
@@ -1228,6 +1232,8 @@ def test_nep_pair_forces_match_fd(four_body):
         raw = nd.nep_raw_numpy(at, types, cfg, dtype=np.float64)
         return float(np.sum(Fp.astype(np.float64) * nd.nep_contract_numpy(raw, types, c_r, c_a, cfg)))
 
+    # h = 1e-3 in float64 FD (truncation ~h² = 1e-6 relative, roundoff eps/h ~ 1e-13);
+    # the analytic side is float32 TF summed over ~30 pairs → rtol 1e-4 is the float32 floor.
     h = 1e-3
     for a in (0, 5):                                     # an O and an H
         analytic = F[j == a].sum(0) - F[i == a].sum(0)
@@ -1365,3 +1371,28 @@ def test_nep_tnep_guards():
         m.predict(d["descriptors"][0], tf.zeros([A, 1, 3, cfg.dim_q]), tf.zeros([A, 1], tf.int32),
                   d["positions"][0], d["Z_int"][0], d["boxes"][0], d["atom_mask"][0],
                   tf.zeros([A, 1]), nep_raw=d["nep_raw"][0])
+
+
+def test_nep_pair_padding_is_exact_and_bucketed():
+    """Chunks bucket-pad the pair stream (P and the angular count P_a to powers of
+    two) so the XLA kernels compile once per bucket: μ is unchanged, and two
+    mini-batches with different true pair counts share one bucket."""
+    from data import slice_and_complete_chunk
+    cfg = _tnep_cfg("concat"); m = _model(cfg); m.W1.assign(m.W1 + 0.5)
+    d = prepare_eval_data(_small_frames(3, seed=5), cfg)          # full dict: unpadded
+    ptr = d["nep_struct_ptr"].numpy(); P = int(ptr[-1]); P_a = int(d["nep_pair_ang"].numpy().sum())
+    ch = slice_and_complete_chunk(d, [0, 1, 2])
+    Pp = int(ch["nep_pair_D"].shape[0]); Pap = int(ch["nep_pair_ang"].numpy().sum())
+    assert Pp > P and Pp & (Pp - 1) == 0 and Pap > P_a and Pap & (Pap - 1) == 0
+    np.testing.assert_array_equal(ch["nep_pair_D"].numpy()[P:], np.tile([[cfg.nep_rc_radial + 1, 0, 0]], (Pp - P, 1)))
+    assert np.all(ch["nep_pair_ang"].numpy()[P:P + Pap - P_a]) and not np.any(ch["nep_pair_ang"].numpy()[P + Pap - P_a:])
+    mu, mu_pad = _mu_batch(m, d), _mu_batch(m, ch)
+    assert np.abs(mu).max() > 1e-4
+    np.testing.assert_allclose(mu_pad, mu, atol=1e-6)
+    # Different true pair counts (258 vs 256 here) → same bucket for P and P_a.
+    n0, n1 = ptr[1] - ptr[0], ptr[2] - ptr[1]
+    assert n0 != n1
+    c0, c1 = slice_and_complete_chunk(d, [0]), slice_and_complete_chunk(d, [1])
+    assert int(c0["nep_pair_D"].shape[0]) == int(c1["nep_pair_D"].shape[0])
+    assert int(c0["nep_pair_ang"].numpy().sum()) == int(c1["nep_pair_ang"].numpy().sum())
+    np.testing.assert_allclose(_mu_batch(m, c0)[0], mu[0], atol=1e-6)

@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 from typing import TYPE_CHECKING, Callable
 
-from data import _gather_nep_pairs
+from data import gather_nep_pairs
 from loss_functions import squared_error_per_structure
 from nep_descriptor import EXPERT_WEIGHTS, nep_pair_kwargs
 
@@ -1030,7 +1030,7 @@ class SNES:
                 batch_data["struct_ptr"] = tf.concat(
                     [[0], tf.cumsum(batch_pair_counts)], axis=0)
                 # NEP pair stream twin (Phase B): same CSR gather + local pointer.
-                _gather_nep_pairs(train_data, batch_data, batch_idx_tf)
+                gather_nep_pairs(train_data, batch_data, batch_idx_tf)
 
             t1 = time.perf_counter()
 

@@ -66,19 +66,17 @@ def _nep_angular_xla(Gs, c_a_flat, i_lin, slot, fn, fnp, rhat, Pc, dPc, n_a, K):
     """F^a [Cc, P_a, 3] = Σ_n [ gnp_n (Σ_c Gs[i,n,c] P_c) r̂ + g_n Σ_c Gs[i,n,c] ∇P_c ]
     with g_n = Σ_k c_a[t_i,t_j,n,k] fn_k, gnp_n likewise with fnp_k (plan §B.2).
     Gs [Cc, N, n_a, 24] gathered by i_lin; c_a_flat [Cc, T·T, n_a, K] by slot =
-    t_i·T + t_j; Pc [P_a, 24]; dPc [P_a, 3, 24] Cartesian ∇P_c. n-loop (and k-loop,
-    Cartesian loop) so the largest live tensor is [Cc, P_a, 24]."""
+    t_i·T + t_j; Pc [P_a, 24]; dPc [P_a, 3, 24] Cartesian ∇P_c. n-loop (and
+    Cartesian loop) so the largest live tensor is [Cc, P_a, 24] (K ≤ 24)."""
     F = tf.zeros([1, 1, 3], Gs.dtype)
     for n in range(n_a):                                                 # static n_a
         Gs_n = tf.gather(Gs[:, :, n, :], i_lin, axis=1)                  # [Cc, P_a, 24]
         GP = tf.reduce_sum(Gs_n * Pc[tf.newaxis], axis=-1)               # [Cc, P_a]
         GdP = tf.stack([tf.reduce_sum(Gs_n * dPc[tf.newaxis, :, x, :], axis=-1)
                         for x in range(3)], axis=-1)                     # [Cc, P_a, 3]
-        g = gnp = tf.zeros(tf.shape(GP), Gs.dtype)
-        for k in range(K):                                               # static K
-            c_nk = tf.gather(c_a_flat[:, :, n, k], slot, axis=1)         # [Cc, P_a]
-            g = g + c_nk * fn[tf.newaxis, :, k]
-            gnp = gnp + c_nk * fnp[tf.newaxis, :, k]
+        c_n = tf.gather(c_a_flat[:, :, n, :], slot, axis=1)              # [Cc, P_a, K]
+        g = tf.reduce_sum(c_n * fn[tf.newaxis], axis=-1)                 # [Cc, P_a]
+        gnp = tf.reduce_sum(c_n * fnp[tf.newaxis], axis=-1)
         F = F + (gnp * GP)[:, :, tf.newaxis] * rhat[tf.newaxis] + g[:, :, tf.newaxis] * GdP
     return F
 
@@ -1211,23 +1209,24 @@ class TNEP(layers.Layer):
 
     def _ann_inputs(self, descriptors: tf.Tensor, nep_raw: tf.Tensor | None,
                     Z: tf.Tensor, c_r: tf.Tensor | None = None,
-                    c_a: tf.Tensor | None = None, return_s: bool = False):
-        """The [..., A, dim_q] vector the ANN consumes — the one place that
-        knows cfg.nep_descriptor: "off" → descriptors (same object);
-        "concat" → [descriptors ‖ nep_from_raw]; "replace" → nep_from_raw.
-        `descriptors` is the builder output after soap_from_raw. With
-        return_s: (inputs, s) — s from nep_from_raw (None when unused)."""
+                    c_a: tf.Tensor | None = None):
+        """(inputs, s): the [..., A, dim_q] vector the ANN consumes — the one
+        place that knows cfg.nep_descriptor: "off" → descriptors (same
+        object); "concat" → [descriptors ‖ nep_from_raw]; "replace" →
+        nep_from_raw — and s from nep_from_raw (the tnep pair forces; None
+        when no NEP block is formed). `descriptors` is the builder output
+        after soap_from_raw."""
         if self._nep_mode == "off":
-            return (descriptors, None) if return_s else descriptors
+            return descriptors, None
         if nep_raw is None:
             raise ValueError(
                 f"nep_raw missing: cfg.nep_descriptor={self._nep_mode!r} needs "
                 f"the raw NEP basis at every forward site.")
         if self._nep_mode == "sum":       # experts read nep_raw in _expert_outputs
-            return (descriptors, None) if return_s else descriptors
+            return descriptors, None
         q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a, return_s=True)
         if self._nep_mode == "replace":
-            return (q_nep, s) if return_s else q_nep
+            return q_nep, s
         # One side may carry a candidate axis (learned SOAP basis with shared
         # c, or per-candidate c with fixed SOAP): broadcast the other to it.
         if len(q_nep.shape) > len(descriptors.shape):
@@ -1238,8 +1237,7 @@ class TNEP(layers.Layer):
             q_nep = tf.broadcast_to(
                 q_nep[tf.newaxis],
                 tf.concat([tf.shape(descriptors)[:1], tf.shape(q_nep)], 0))
-        out = tf.concat([descriptors, q_nep], -1)
-        return (out, s) if return_s else out
+        return tf.concat([descriptors, q_nep], -1), s
 
     @property
     def expert_weights(self) -> tuple:
@@ -1319,13 +1317,13 @@ class TNEP(layers.Layer):
             target_mode 1: [3]  dipole vector
             target_mode 2: [6]  polarizability tensor
         """
-        if self._learn_radial:
-            descriptors = self.soap_from_raw(descriptors, Z, M_radial)
         if self._nep_pair_forces_on:
             raise NotImplementedError(
                 "predict() (padded single-structure path) has no NEP pair "
                 "stream; use predict_batch for the NEP tnep readout.")
-        descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
+        if self._learn_radial:
+            descriptors = self.soap_from_raw(descriptors, Z, M_radial)
+        descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)[0]
         # Absorb U_pairᵀ into W0 once so forward and calc_forces share the
         # folded weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
@@ -1937,7 +1935,7 @@ class TNEP(layers.Layer):
         """
         if self._learn_radial:
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)
-        descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a, return_s=True)
+        descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
         # Pure forward primitive: caller decides whether W0/W0_pol are raw or
@@ -2152,7 +2150,7 @@ class TNEP(layers.Layer):
                     "predict_batch_candidates needs per-candidate M_radial "
                     "[C, T, S, α, K] under cfg.radial_basis_size.")
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)         # [C, B, A, Q]
-        descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a, return_s=True)
+        descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
         if len(descriptors.shape) == 4:
             # Per-candidate descriptors [C, B, A, Q] (learned radial basis or
             # per-candidate c): the input→hidden product is a batched GEMM
@@ -2783,7 +2781,7 @@ def gen0_ann_inputs(cfg, data) -> np.ndarray:
         if cfg.radial_basis_size is not None:
             d = m0.soap_from_raw(d, z)
         raw = None if nep_raw is None else nep_raw[s:s + step]
-        x = m0._ann_inputs(d, raw, z, **c)
+        x = m0._ann_inputs(d, raw, z, **c)[0]
         if m0._nep_mode == "sum":
             x = tf.concat([x, m0.nep_from_raw(raw, z, **c)], axis=-1)
         out.append(x)
