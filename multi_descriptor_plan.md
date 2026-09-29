@@ -440,3 +440,89 @@ def test_sum_mode_save_load(tmp_path): ...
 ## Validation the plan does NOT do
 
 Per the standing rule (tests + short smokes only), no long SNES runs. The comparisons the user wants — SOAP vs NEP-replace vs concat vs sum — are 300-generation arms at `init_sigma=0.02` (see the σ finding of 2026-09-28), run by the user.
+## Phase B addendum (2026-09-29) — design detail for Tasks 10–12
+
+Written after Phase A landed; supersedes the coarse §0.5 where they differ.
+
+### B.1 Why the per-pair derivative tensors of §0.5 cannot be stored
+
+§0.5 proposed static `dfa [P, 3, K_a+1, 24]`. On bulk water (500 frames × 96 atoms,
+~32 angular neighbours at 4 Å) that is 1.5M pairs × 504 floats ≈ 3 GB; the radial
+list at 8 Å has ~10M pairs. Storing full derivative tensors is out. What IS cheap is
+the per-pair basis: for each pair, `fn_k, fnp_k` (K+1 each), the unit vector `r̂`,
+`P_c(r̂)` (24) and `∇P_c(r̂)` (3×24). Everything else factorises.
+
+### B.2 Factorisation (this is the whole design)
+
+Pair (i, j) with displacement D = r_j − r_i (image-exact, from ase), r = |D|, r̂ = D/r.
+Let Fp[i, d] = ∂U/∂q_d at atom i (`de_dq`, per candidate) over the NEP block only.
+
+Radial block: q_n = Σ_j Σ_k c_r[t_i,t_j,n,k] fn_k(r).
+    ∂q_n/∂r_j = Σ_k c_r[t_i,t_j,n,k] fnp_k(r) r̂
+    F^r_{ij} = Σ_n Fp[i,n] ∂q_n/∂r_j = ( Σ_k α[i,t_j,k] fnp_k(r) ) r̂,
+    α[i,t',k] = Σ_n Fp[i,n] c_r[t_i,t',n,k]                    ← per atom, [N, T, K_r+1], per candidate
+
+Angular block: s[i,n,c] = Σ_j g_n(r) P_c(r̂), g_n = Σ_k c_a[t_i,t_j,n,k] fn_k(r).
+    Define the per-atom "Fp-weighted s-gradient" via autodiff of the scalar
+    G_i = Σ_d Fp[i,d] q_d(s_i) w.r.t. s_i:   Gs[i,n,c] = ∂G_i/∂s[i,n,c]
+    (tf.GradientTape over find_q_tf at the atom level — exact, tiny: [Cc, N, n_a+1, 24];
+    covers L=1..4, 4-body and 5-body in one line instead of transcribing
+    get_f12_4body/5body).
+    ∂s[i,n,c]/∂r_j = gnp_n(r) r̂ P_c(r̂) + g_n(r) ∇P_c(r̂),  gnp_n = Σ_k c_a[..,n,k] fnp_k
+    F^a_{ij} = Σ_{n,c} Gs[i,n,c] ∂s[i,n,c]/∂r_j
+             = Σ_n [ gnp_n(r) (Σ_c Gs[i,n,c] P_c) r̂ + g_n(r) Σ_c Gs[i,n,c] ∇P_c ]
+    Per pair the work is: gather Gs at i → [Cc, P_a, n_a+1, 24], dot with P/∇P.
+
+    Memory: loop over n (n_a+1 = 7 iterations) exactly like `_bilinear_padded_xla`
+    loops over channels, so the largest live tensor is [Cc, P_a, 24] ≈ 10 × 1.5M × 24
+    = 360M floats; wrap in the same XLA jit pattern (multiply + reduce_sum, no einsum
+    → fp32-exact). g_n and gnp_n per pair are candidate-DEPENDENT through c_a but tiny:
+    [Cc, P_a, n_a+1] via a gather of c_a by (t_i, t_j) then dot with fn/fnp [P_a, K+1].
+
+Forces on the centre (i) side: GPUMD accumulates ±f12 on n1 and n2. For the dipole
+readout only pair forces enter: μ = −Σ_pairs |r_ij|² F_ij with `dipole_rij_power=2`
+(`_dipole_coo` pattern), where |r_ij|² must come from the stored D (image-exact), NOT
+from `_neighbor_displacements_coo`'s MIC (8 Å > L/2 for the 9.94 Å box).
+
+### B.3 Data (Task 10)
+
+New per-structure COO stream, separate from the SOAP `grad_values` stream (different
+cutoff, image-exact): `nep_pair_atom [P] int32`, `nep_pair_gidx [P] int32`,
+`nep_pair_struct [P] int32`, `nep_pair_D [P, 3] float32` (r_j − r_i incl. image),
+`nep_pair_ang [P] bool` (r < rc_a). One list at rc_r ⊇ rc_a. Built in
+`nep_descriptor.nep_pairs_numpy(atoms, cfg)` from the same ase call as `nep_raw_numpy`
+(share the neighbour list — the reviewer measured 70 ms/frame, 97 % in ase).
+`pad_and_stack`/`slice_and_complete_chunk` must slice it by structure like
+`grad_values` (CSR `struct_ptr` pattern) — read how `pair_struct`/`struct_ptr` are
+handled and mirror with a second pointer array `nep_struct_ptr`. Only built when
+`nep_descriptor != "off"` AND `descriptor_gradients_needed(cfg)`.
+
+Per-pair basis values are computed IN-GRAPH from D (candidate-independent, once per
+chunk): `fn_all_tf`, `fn_and_fnp_tf` (port `find_fn_and_fnp`, nep_utilities.cuh:519–540),
+`real_harmonics_tf` and `real_harmonics_grad_tf` (∇P_c: differentiate the Z-polynomial
+form; verify by FD against `real_harmonics`, and by the rotation identity
+Σ_c C3B w_c P_c ∇P_c = 0 … or simply FD). TF twins live in nep_descriptor.py next to
+the NumPy ones (same column-list + stack structure).
+
+Tests (Task 10): `fn_and_fnp` vs FD of `fn_all`; `real_harmonics_grad` vs FD;
+`nep_pairs_numpy` consistency with `nep_raw_numpy` (re-summing the pair stream
+reproduces raw_r/raw_a exactly); pair-stream padding/slicing round trip.
+
+### B.4 Model (Task 11)
+
+`TNEP._nep_pair_forces(de_dq_nep, s, c_r, c_a, Z, nep_pair_*, D)` → `[Cc, P, 3]`
+implementing B.2 (α gather by (i, t_j); Gs by tape; n-loop XLA kernel). `s` is already
+formed inside `nep_from_raw` — return it (or recompute) so the tape can use it.
+`predict_batch` / `predict_batch_candidates` tnep branch: SOAP forces from the existing
+`_calc_forces_coo` (concat) + NEP pair forces (concat/replace), each contracted with
+its own |r_ij|² weights and summed into μ. `de_dq` splits into SOAP columns and NEP
+columns by `_soap_dim`. Under "replace" the SOAP COO stream may be self-only/empty.
+Lift the Phase B guard in `validate_nep_cfg` for target_mode=1 + tnep readout only
+(PES/polarisability stay NotImplemented: they need forces on both atoms and virials —
+out of scope).
+
+Tests (Task 11): analytic μ vs finite-difference μ on a 3-molecule cell (perturb one
+atom, `_dipole_coo` weights recomputed) for replace and concat, random c, 4-body on and
+off; candidates(Cc=2) vs per-candidate predict_batch; "off" untouched.
+
+### B.5 Smoke (Task 12) as planned; parameter-count check vs GPUMD's formula.
