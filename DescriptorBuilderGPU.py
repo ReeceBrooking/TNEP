@@ -382,10 +382,14 @@ def radial_extra_count(cfg) -> int:
     species-summed, S·alpha_max blocked), 0 when the knob is off."""
     if getattr(cfg, "radial_basis_size", None) is None:
         return 0
-    n_on = sum(bool(getattr(cfg, f, False)) for f in (
-        "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
     a = int(cfg.alpha_max)
-    return n_on * (a if _radial_species_sum(cfg) else a * int(cfg.num_types))
+    return _radial_extras_on(cfg) * (a if _radial_species_sum(cfg) else a * int(cfg.num_types))
+
+
+def _radial_extras_on(cfg) -> int:
+    """How many learned-basis extra blocks (2-/4-/5-body) are switched on."""
+    return sum(bool(getattr(cfg, f, False)) for f in (
+        "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
 
 
 def extra_block_widths(cfg) -> list:
@@ -397,8 +401,7 @@ def extra_block_widths(cfg) -> list:
     widths = []
     n_extra = radial_extra_count(cfg)
     if n_extra and mode != "replace":      # "replace" drops the whole SOAP output
-        n_on = sum(bool(getattr(cfg, f, False)) for f in (
-            "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
+        n_on = _radial_extras_on(cfg)
         widths += [n_extra // n_on] * n_on
     if mode in ("concat", "replace"):
         from nep_descriptor import nep_slices

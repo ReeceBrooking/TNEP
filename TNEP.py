@@ -64,35 +64,10 @@ class TNEP(layers.Layer):
 
         # GPUMD NEP descriptor block (multi_descriptor_plan.md §0.3): raw
         # per-atom basis from data, contracted in-model by c_r/c_a (below).
+        # validate_nep_cfg owns every NEP cfg guard.
         self._nep_mode = str(getattr(cfg, "nep_descriptor", "off"))
-        if self._nep_mode not in ("off", "concat", "replace", "sum"):
-            raise ValueError(
-                f"cfg.nep_descriptor={self._nep_mode!r}; expected 'off', "
-                f"'concat', 'replace' or 'sum'.")
         if self._nep_mode != "off":
-            validate_nep_cfg(cfg)
-            from data import descriptor_gradients_needed
-            if descriptor_gradients_needed(cfg):
-                raise NotImplementedError(
-                    f"cfg.nep_descriptor={self._nep_mode!r}: NEP descriptors "
-                    "currently support only the neighbor/bilinear dipole "
-                    "readouts (target_mode=1); descriptor gradients are "
-                    "Phase B of multi_descriptor_plan.md.")
-        if self._nep_mode == "sum":
-            raise NotImplementedError(
-                "cfg.nep_descriptor='sum' is Task 8 of multi_descriptor_plan.md.")
-        if self._nep_mode == "replace":
-            for f in ("descriptor_mixing", "descriptor_preprocess_contract"):
-                if getattr(cfg, f, None) not in (False, None, "off"):
-                    raise ValueError(
-                        f"cfg.nep_descriptor='replace' has no SOAP species-pair "
-                        f"blocks; set cfg.{f} off.")
-        if (self._nep_mode == "concat"
-                and str(getattr(cfg, "descriptor_preprocess_contract", "off")) != "off"):
-            raise NotImplementedError(
-                "descriptor_preprocess_contract layouts cover every channel "
-                "with SOAP pair blocks; the appended NEP block "
-                "(nep_descriptor='concat') is not plumbed through them.")
+            self._nep_mode = validate_nep_cfg(cfg)
 
         # Preprocess contraction phase 1/2: run guards, then override cfg.dim_q
         # to the contracted dim BEFORE allocating W0. Phase 2 allocates W_pre_*.
@@ -1109,8 +1084,6 @@ class TNEP(layers.Layer):
             c_r, c_a : [T, T, n+1, K+1] (None → self.c_r / self.c_a) or
                        per-candidate [C, T, T, n+1, K+1]
         Returns [..., A, dim_nep], or [C, ..., A, dim_nep] for per-candidate c.
-        Contracts per centre type (masked sum) rather than gathering c per
-        atom: the per-candidate gather would be [C, N, T, n, k] per call.
         """
         c_r = self.c_r if c_r is None else c_r
         c_a = self.c_a if c_a is None else c_a
@@ -1123,16 +1096,15 @@ class TNEP(layers.Layer):
         raw_r = tf.reshape(raw[:, :T * Kr], [N, T, Kr])
         raw_a = tf.reshape(raw[:, T * Kr:], [N, T, Ka, NUM_ABC])
         Zf = tf.reshape(Z, [N])
-        eq_r = "atk,ctnk->can" if per_cand else "atk,tnk->an"
-        eq_a = "atkp,ctnk->canp" if per_cand else "atkp,tnk->anp"
-        q_r, s = [], []
-        for t in range(T):
-            mask = tf.cast(tf.equal(Zf, t), raw.dtype)[:, tf.newaxis]     # [N, 1]
-            ct_r = c_r[:, t] if per_cand else c_r[t]
-            ct_a = c_a[:, t] if per_cand else c_a[t]
-            q_r.append(tf.einsum(eq_r, raw_r, ct_r) * mask)
-            s.append(tf.einsum(eq_a, raw_a, ct_a) * mask[..., tf.newaxis])
-        q_r, s = tf.add_n(q_r), tf.add_n(s)                             # [(C,) N, n], [(C,) N, n, 24]
+        axis = 1 if per_cand else 0
+        c_r = tf.gather(c_r, Zf, axis=axis)                              # [(C,) N, T, n, k]
+        c_a = tf.gather(c_a, Zf, axis=axis)
+        if per_cand:
+            q_r = tf.einsum("atk,catnk->can", raw_r, c_r)                # [C, N, n]
+            s = tf.einsum("atkp,catnk->canp", raw_a, c_a)                # [C, N, n, 24]
+        else:
+            q_r = tf.einsum("atk,atnk->an", raw_r, c_r)
+            s = tf.einsum("atkp,atnk->anp", raw_a, c_a)
         q_a = find_q_tf(s, cfg.nep_four_body, cfg.nep_five_body)        # [(C,) N, n, L]
         q_a = tf.linalg.matrix_transpose(q_a)                           # [(C,) N, L, n] → l-major
         q_a = tf.reshape(q_a, tf.concat([tf.shape(q_a)[:-2], [-1]], 0))

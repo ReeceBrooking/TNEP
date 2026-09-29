@@ -129,9 +129,9 @@ def find_q(s, four_body, five_body):
     return np.stack(q, -1)
 
 
-_C3B_TF = tf.constant(C3B, tf.float32)
-_C4B_TF = tf.constant(C4B, tf.float32)
-_C5B_TF = tf.constant(C5B, tf.float32)
+_C3B_TF = C3B.astype(np.float32)   # NumPy: TF ops accept them; no eager context at import
+_C4B_TF = C4B.astype(np.float32)
+_C5B_TF = C5B.astype(np.float32)
 
 
 def find_q_tf(s, four_body, five_body):
@@ -155,6 +155,8 @@ def find_q_tf(s, four_body, five_body):
 
 # ── bookkeeping ────────────────────────────────────────────────────────────
 def validate_nep_cfg(cfg):
+    """Every NEP cfg guard in one place; returns cfg.nep_descriptor.
+    Field checks run in every mode; mode-specific guards only when on."""
     if int(cfg.nep_l_max) != 4:
         raise ValueError(f"cfg.nep_l_max={cfg.nep_l_max}: GPUMD supports only 4.")
     if cfg.nep_five_body and not cfg.nep_four_body:
@@ -165,6 +167,39 @@ def validate_nep_cfg(cfg):
               "nep_basis_size_radial", "nep_basis_size_angular"):
         if int(getattr(cfg, k)) < 0:
             raise ValueError(f"cfg.{k} must be >= 0.")
+    mode = str(getattr(cfg, "nep_descriptor", "off"))
+    if mode not in ("off", "concat", "replace", "sum"):
+        raise ValueError(
+            f"cfg.nep_descriptor={mode!r}; expected 'off', 'concat', 'replace' or 'sum'.")
+    if mode == "off":
+        return mode
+    if mode == "sum":
+        raise NotImplementedError(
+            "cfg.nep_descriptor='sum' is Task 8 of multi_descriptor_plan.md.")
+    from data import descriptor_gradients_needed   # lazy: data imports nep_descriptor (Task 5)
+    if descriptor_gradients_needed(cfg):
+        raise NotImplementedError(
+            f"cfg.nep_descriptor={mode!r}: NEP descriptors currently support only "
+            "the neighbor/bilinear dipole readouts (target_mode=1); descriptor "
+            "gradients are Phase B of multi_descriptor_plan.md.")
+    if str(getattr(cfg, "descriptor_scale", "off")) != "off":
+        raise NotImplementedError(
+            f"cfg.nep_descriptor={mode!r} with descriptor_scale: the gen-0 scaler "
+            "runs on the SOAP-width builder output (Task 7 of multi_descriptor_plan.md).")
+    preprocess = str(getattr(cfg, "descriptor_preprocess_contract", "off"))
+    if mode == "replace":
+        for f, v in (("descriptor_mixing", bool(getattr(cfg, "descriptor_mixing", False))),
+                     ("descriptor_preprocess_contract", preprocess != "off")):
+            if v:
+                raise ValueError(
+                    f"cfg.nep_descriptor='replace' has no SOAP species-pair blocks; "
+                    f"set cfg.{f} off.")
+    if mode == "concat" and preprocess != "off":
+        raise NotImplementedError(
+            "descriptor_preprocess_contract layouts cover every channel with SOAP "
+            "pair blocks; the appended NEP block (nep_descriptor='concat') is not "
+            "plumbed through them.")
+    return mode
 
 
 def _num_L(cfg):

@@ -381,6 +381,11 @@ def test_ann_inputs_modes():
         _model(_cfg(nep_descriptor="bogus"))
 
 
+def test_nep_rejects_descriptor_scale_until_task7():
+    with pytest.raises(NotImplementedError, match="descriptor_scale"):
+        _model(_cfg(nep_descriptor="concat", descriptor_scale="minmax"))
+
+
 def test_forward_sites_take_nep_raw():
     """predict_batch / predict_batch_candidates consume nep_raw through
     _ann_inputs; the candidate path with per-candidate c reproduces the batched one."""
@@ -444,6 +449,15 @@ def test_nep_concat_with_learned_soap_basis():
         tile(m.W0), tile(m.b0), tile(m.W1), tile(m.b1),
         M_radial=M2, nep_raw=R, c_r=c_r2, c_a=c_a2).numpy()
     np.testing.assert_allclose(mu_c, mu, rtol=1e-5, atol=1e-5 * np.abs(mu).max())
+    # Per-candidate M with SHARED c (None → model variables): _ann_inputs
+    # broadcasts the rank-3 NEP block onto the rank-4 SOAP descriptors.
+    x = m._ann_inputs(m.soap_from_raw(data["descriptors"], data["Z_int"], M2), R, data["Z_int"])
+    assert tuple(x.shape) == (2, 1, len(atoms), cfg.dim_q)
+    mu_s = np.stack([mu_of(M2[i], None, None) for i in range(2)])
+    mu_sc = m.predict_batch_candidates(
+        data["descriptors"], data.get("V_atom"), data["Z_int"], data["atom_mask"],
+        tile(m.W0), tile(m.b0), tile(m.W1), tile(m.b1), M_radial=M2, nep_raw=R).numpy()
+    np.testing.assert_allclose(mu_sc, mu_s, rtol=1e-5, atol=1e-5 * np.abs(mu_s).max())
 
 
 def test_nep_rejects_descriptor_gradient_readouts():
