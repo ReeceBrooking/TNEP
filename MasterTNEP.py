@@ -479,6 +479,13 @@ def _train_model_inner(cfg: TNEPconfig,
               + {"l2": "", "none": "; per-atom L2 normalisation OFF (raw spectrum × scale²)",
                  "sqrt": "; per-atom L2 normalisation OFF (sign·√|q| × scale, degree 1)"}[cfg.radial_basis_norm]
               + f" (M_radial {_shape} in the SNES vector; init = fixed basis)")
+    if cfg.nep_descriptor != "off":
+        from nep_descriptor import nep_dim
+        print(f"NEP descriptor ({cfg.nep_descriptor}): dim_nep={nep_dim(cfg)}, "
+              f"rc_radial={cfg.nep_rc_radial}, rc_angular={cfg.nep_rc_angular}, "
+              f"n_max=({cfg.nep_n_max_radial}, {cfg.nep_n_max_angular}), "
+              f"basis_size=({cfg.nep_basis_size_radial}, {cfg.nep_basis_size_angular}), "
+              f"four_body={cfg.nep_four_body}, five_body={cfg.nep_five_body}")
 
     # Set up run directory: models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/.
     # On resume, reuse the checkpoint's existing run dir.

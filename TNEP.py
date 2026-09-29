@@ -65,9 +65,7 @@ class TNEP(layers.Layer):
         # GPUMD NEP descriptor block (multi_descriptor_plan.md §0.3): raw
         # per-atom basis from data, contracted in-model by c_r/c_a (below).
         # validate_nep_cfg owns every NEP cfg guard.
-        self._nep_mode = str(getattr(cfg, "nep_descriptor", "off"))
-        if self._nep_mode != "off":
-            self._nep_mode = validate_nep_cfg(cfg)
+        self._nep_mode = validate_nep_cfg(cfg)
 
         # Preprocess contraction phase 1/2: run guards, then override cfg.dim_q
         # to the contracted dim BEFORE allocating W0. Phase 2 allocates W_pre_*.
@@ -1437,6 +1435,7 @@ class TNEP(layers.Layer):
                 getattr(self, 'b1_pol', None),
                 W_atom=chunk.get("V_atom"),  # neighbor readout: [B,A,3] kernel
                 nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
+                nep_raw=chunk.get("nep_raw"),
             ))
             del chunk
         raw_preds = tf.concat(pred_parts, axis=0)

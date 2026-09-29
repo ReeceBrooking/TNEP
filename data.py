@@ -7,6 +7,7 @@ from DescriptorBuilder import make_descriptor_builder
 from ase.io import read
 from ase import Atoms
 from ase.neighborlist import neighbor_list
+from nep_descriptor import nep_raw_numpy
 
 
 BOHR_TO_ANGSTROM = 0.529177210903
@@ -385,6 +386,11 @@ def assemble_data_dict(
                     for s in dataset]
             data["nbr_index"] = [n for n, _ in _nbr]
             data["nbr_G"] = [g for _, g in _nbr]
+
+    # GPUMD NEP descriptor block: raw per-atom basis [N, W_raw], contracted
+    # in-model by c_r/c_a (multi_descriptor_plan.md §0.3).
+    if cfg.nep_descriptor != "off":
+        data["nep_raw"] = [nep_raw_numpy(s, t, cfg) for s, t in zip(dataset, types_int)]
 
     # Auto-detect and include force/virial targets for PES mode
     if cfg.target_mode == 0:
@@ -848,6 +854,9 @@ def pad_and_stack(data: dict, num_types: int | None = None,
         nbr_idx_np = np.zeros((S, max_atoms, max_nbr), dtype=np.int32)
         nbr_G_np = np.zeros((S, max_atoms, max_nbr)
                             + data["nbr_G"][0].shape[2:], dtype=np.float32)
+    has_nep = "nep_raw" in data  # raw NEP basis [S, A, W_raw]
+    if has_nep:
+        nep_np = np.zeros((S, max_atoms, data["nep_raw"][0].shape[1]), dtype=np.float32)
     if num_types is not None:
         types_contained_np = np.zeros((S, num_types), dtype=np.float32)
 
@@ -883,6 +892,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             M_s = int(data["nbr_index"][s].shape[1])
             nbr_idx_np[s, :N_s, :M_s] = data["nbr_index"][s]
             nbr_G_np[s, :N_s, :M_s] = data["nbr_G"][s]
+        if has_nep:
+            nep_np[s, :N_s] = data["nep_raw"][s]
 
         for i in range(N_s):
             gv_full = data["gradients"][s][i]
@@ -940,6 +951,8 @@ def pad_and_stack(data: dict, num_types: int | None = None,
         if has_nbr:
             result["nbr_index"] = tf.constant(nbr_idx_np);   del nbr_idx_np
             result["nbr_G"]     = tf.constant(nbr_G_np);     del nbr_G_np
+        if has_nep:
+            result["nep_raw"]   = tf.constant(nep_np);       del nep_np
         if num_types is not None:
             result["types_contained"] = tf.constant(types_contained_np); del types_contained_np
     return result
@@ -1055,7 +1068,7 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom", "nbr_index", "nbr_G")
+                  "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
     for k in SMALL_KEYS:
         if k in data:
             chunk[k] = tf.gather(data[k], idx_tf)
@@ -1170,7 +1183,7 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     out: dict = {"_idx_np": idx_np, "_precomputed": precomputed}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom", "nbr_index", "nbr_G")
+                  "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
     for k in SMALL_KEYS:
         if k in data:
             v = data[k]
@@ -1196,7 +1209,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
     chunk: dict = {}
     SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                   "targets", "atom_mask", "types_contained",
-                  "forces", "virials", "V_atom", "nbr_index", "nbr_G")
+                  "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
     # pin_to_cpu=True ⇒ host RAM, upload each chunk to GPU if present.
     # False ⇒ already on-device, no device context needed.
     ctx = _gpu_device_ctx() if pin_to_cpu else _NullCtx()
@@ -1258,7 +1271,7 @@ def _gpu_device_ctx():
 
 _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                          "targets", "atom_mask", "types_contained",
-                         "forces", "virials", "V_atom", "nbr_index", "nbr_G")
+                         "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
 
 
 def move_data_to_gpu(data: dict) -> None:

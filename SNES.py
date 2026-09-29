@@ -990,7 +990,7 @@ class SNES:
                                "num_atoms", "targets", "atom_mask"]
                 if "types_contained" in train_data:
                     struct_keys.append("types_contained")
-                for _k in ("V_atom", "nbr_index", "nbr_G"):
+                for _k in ("V_atom", "nbr_index", "nbr_G", "nep_raw"):
                     if _k in train_data:
                         struct_keys.append(_k)
                 batch_data = {
@@ -1405,6 +1405,7 @@ class SNES:
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
                 W_atom=W_atom_v, c_pair=c_pair_val, M_radial=M_val,
                 nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
+                nep_raw=chunk.get("nep_raw"),
             )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
                 num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)
@@ -2069,7 +2070,8 @@ class SNES:
                 c_pair=named.get("c_pair"),
                 M_radial=named.get("M_radial"),
                 nbr_index=batch_data.get("nbr_index"),
-                nbr_G=batch_data.get("nbr_G"))  # [C, B, T_dim]
+                nbr_G=batch_data.get("nbr_G"),
+                nep_raw=batch_data.get("nep_raw"))  # [C, B, T_dim]
 
             if _scale_preds:
                 preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]

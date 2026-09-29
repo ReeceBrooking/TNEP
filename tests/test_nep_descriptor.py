@@ -501,3 +501,113 @@ def test_compute_dim_q_and_layout_per_mode():
     rp2 = _cfg(nep_descriptor="replace", radial_basis_size=4, radial_basis_two_body=True)
     assert compute_dim_q(rp2) == descriptor_block_layout(rp2)["dim_q"] == nd.nep_dim(rp2)
     covers(rp2, 1 + 4 + 1)
+
+
+# ── Task 5: nep_raw data plumbing + every forward call site ────────────────
+
+def _forward_args(m, d):
+    return (d["descriptors"], d["grad_values"], d["pair_atom"], d["pair_gidx"],
+            d["pair_struct"], d["positions"], d["Z_int"], d["boxes"], d["atom_mask"],
+            m.W0, m.b0, m.W1, m.b1)
+
+
+def test_nep_raw_rides_data_dict_and_padding():
+    cfg = _cfg(nep_descriptor="concat"); atoms = _bulk_frame()
+    d = prepare_eval_data([atoms, atoms], cfg)                   # two frames → [2, A, W_raw]
+    assert tuple(d["nep_raw"].shape) == (2, len(atoms), nd.nep_raw_width(cfg))
+    assert d["nep_raw"].dtype == tf.float32
+    raw, _ = _nep_inputs(cfg, atoms)
+    np.testing.assert_array_equal(d["nep_raw"][0].numpy(), raw)
+    np.testing.assert_array_equal(d["nep_raw"][1].numpy(), raw)
+    # Padding: a shorter frame is zero-filled beyond its atom count.
+    small = atoms[:10]; small.info["dipole"] = np.zeros(3)
+    d2 = prepare_eval_data([atoms, small], cfg)
+    assert tuple(d2["nep_raw"].shape) == (2, len(atoms), nd.nep_raw_width(cfg))
+    assert np.all(d2["nep_raw"][1, 10:].numpy() == 0.0)
+    raw_s, _ = _nep_inputs(cfg, small)
+    np.testing.assert_array_equal(d2["nep_raw"][1, :10].numpy(), raw_s)
+    # Chunk slicing carries it (SMALL_KEYS).
+    from data import slice_and_complete_chunk
+    ch = slice_and_complete_chunk(d2, [1])
+    np.testing.assert_array_equal(ch["nep_raw"].numpy(), d2["nep_raw"][1:2].numpy())
+    assert "nep_raw" not in prepare_eval_data([atoms], _cfg(nep_descriptor="off"))
+
+
+@pytest.mark.parametrize("mode", ["concat", "replace"])
+@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
+def test_nep_four_path_consistency(mode, readout):
+    from data import assemble_data_dict, pad_and_stack
+    cfg = _cfg(nep_descriptor=mode, dipole_readout=readout); m = _model(cfg)
+    atoms = _bulk_frame()
+    types_int = assign_type_indices([atoms], cfg.types)
+    builder = make_descriptor_builder(cfg)
+    desc, grads, gidx = builder.build_descriptors([atoms])
+    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
+    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=False)
+    kw = dict(nbr_index=full.get("nbr_index"), nbr_G=full.get("nbr_G"),
+              nep_raw=full["nep_raw"])
+    args = _forward_args(m, full)
+    mu_slot = m.predict_batch(*args, W_atom=full["V_atom"], **kw)[0].numpy()
+    mu_ingraph = m.predict_batch(*args, W_atom=None, nep_raw=full["nep_raw"])[0].numpy()
+    mu_cand = m.predict_batch_candidates(
+        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
+        m.W0[tf.newaxis], m.b0[tf.newaxis], m.W1[tf.newaxis], m.b1[tf.newaxis],
+        **kw)[0, 0].numpy()
+    gi = gidx[0]; A = len(atoms); M = max(len(lst) for lst in gi)
+    grad_index = np.zeros((A, M), dtype=np.int32); nmask = np.zeros((A, M), dtype=np.float32)
+    for a, lst in enumerate(gi):
+        grad_index[a, :len(lst)] = lst; nmask[a, :len(lst)] = 1.0
+    mu_single = m.predict(
+        full["descriptors"][0], tf.zeros([A, M, 3, cfg.dim_q]),
+        tf.constant(grad_index), full["positions"][0], full["Z_int"][0],
+        full["boxes"][0], full["atom_mask"][0], tf.constant(nmask),
+        nep_raw=full["nep_raw"][0]).numpy()
+    assert np.all(np.isfinite(mu_slot)) and np.abs(mu_slot).max() > 0
+    atol = 1e-4 * max(np.linalg.norm(mu_slot), 1.0)
+    assert np.allclose(mu_slot, mu_ingraph, atol=atol)
+    assert np.allclose(mu_slot, mu_cand, atol=atol)
+    assert np.allclose(mu_slot, mu_single, atol=atol)
+
+
+def test_nep_snes_validate_and_candidates_smoke():
+    cfg = _cfg(nep_descriptor="concat", pop_size=4, num_generations=2, batch_size=1,
+               val_interval=1)
+    m = _model(cfg); atoms = _bulk_frame()
+    d = prepare_eval_data([atoms, atoms], cfg)
+    snes = m.optimizer
+    fit = snes.evaluate_population(tf.stack([snes.mu, snes.mu]), d).numpy()
+    assert fit.shape == (2,) and np.all(np.isfinite(fit))
+    assert np.isfinite(snes.validate(d, snes.mu)) and np.isfinite(snes.validate(d))
+    missing = {k: v for k, v in d.items() if k != "nep_raw"}
+    with pytest.raises(ValueError, match="nep_raw missing"):
+        snes.validate(missing)
+    with pytest.raises(ValueError, match="nep_raw missing"):
+        snes.evaluate_population(tf.stack([snes.mu]), missing)
+    # Minibatch fit path (struct_keys gather) + validate: two generations.
+    history, _, _ = m.fit(d, d)
+    assert np.all(np.isfinite(history["val_loss"]))
+
+
+def test_nep_adam_step_smoke():
+    cfg = _cfg(nep_descriptor="concat", optimizer="adam", adam_lr=1e-2,
+               num_generations=2, val_interval=1, batch_chunk_size=1)
+    m = _model(cfg); atoms = _bulk_frame()
+    d = prepare_eval_data([atoms, atoms], cfg)
+    history, _, _ = m.fit(d, d)
+    assert len(history["val_loss"]) == 2 and np.all(np.isfinite(history["val_loss"]))
+    assert np.all(np.isfinite(history["train_loss"]))
+
+
+def test_score_takes_nep_raw():
+    cfg = _cfg(nep_descriptor="replace"); m = _model(cfg); atoms = _bulk_frame()
+    d = prepare_eval_data([atoms, atoms], cfg)
+    metrics, preds = m.score(d)
+    assert np.isfinite(float(metrics["rmse"])) and preds.shape == (2, 3)
+
+
+def test_spectroscopy_rejects_nep():
+    import spectroscopy
+    cfg = _cfg(nep_descriptor="concat"); m = _model(cfg); atoms = _bulk_frame()
+    types = assign_type_indices([atoms], cfg.types)
+    with pytest.raises(NotImplementedError, match="trajectory inference"):
+        spectroscopy.predict_trajectory_batch(m, make_descriptor_builder(cfg), [atoms], types)
