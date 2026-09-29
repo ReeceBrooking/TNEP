@@ -281,7 +281,8 @@ def gpumd_num_params(cfg, soap_dim=0):
     NEP4 (one typed ANN per species), one hidden layer, no charge mode —
     ANN = T·(dim+2)·H + 1 shared bias, c = T²·[(n_r+1)(K_r+1) + (n_a+1)(K_a+1)].
     Equals SNES.dim for nep_descriptor="replace" + dipole_readout="tnep" with
-    mixing / preprocess / descriptor_scale / learned SOAP basis off. soap_dim
+    mixing / preprocess / learned SOAP basis off (descriptor_scale is a pure W0
+    reparameterisation: zero parameters, identity holds under minmax). soap_dim
     adds the SOAP columns of "concat" to dim (the ANN input width)."""
     T, H = int(cfg.num_types), int(cfg.num_neurons)
     ann = T * (nep_dim(cfg) + int(soap_dim) + 2) * H + 1

@@ -92,7 +92,8 @@ def main(argv=None) -> None:
 
     if a.readout == "tnep" and a.nep in ("concat", "replace"):
         # GPUMD's number_of_variables for the same header; under "replace"
-        # (no mixing / preprocess / scale-with-params / learned SOAP basis)
+        # (no mixing / preprocess / learned SOAP basis; descriptor_scale adds
+        # no parameters, so the identity holds under --scale minmax too)
         # our typed slab is exactly (dim+2)·H per type + b1 + c_r/c_a.
         n_gpumd = nd.gpumd_num_params(cfg, soap_dim=cfg.dim_q - nd.nep_dim(cfg))
         print(f"n_params={n_params} n_params_gpumd={n_gpumd}")

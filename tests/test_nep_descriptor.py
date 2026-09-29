@@ -1213,10 +1213,12 @@ def test_parameter_count_matches_gpumd_formula():
     number_of_variables (parameters.cu:203-235): typed slab (dim+2)·H per
     type + shared b1 + c_r/c_a — no extra parameters anywhere."""
     cfg = _tnep_cfg("replace", descriptor_mixing=False,
-                    descriptor_preprocess_contract="off", descriptor_scale="off")
+                    descriptor_preprocess_contract="off", descriptor_scale="off",
+                    nep_n_max_radial=6, nep_n_max_angular=6, nep_basis_size_radial=6,
+                    nep_basis_size_angular=6, nep_four_body=True, nep_five_body=False)
     m = _model(cfg)
     assert int(m.optimizer.dim) == nd.gpumd_num_params(cfg)
-    assert nd.gpumd_num_params(cfg) == 2 * (42 + 2) * 8 + 1 + 4 * (49 + 49)   # header by hand
+    assert nd.gpumd_num_params(cfg) == 1097   # = 2*(42+2)*8 + 1 + 4*(49+49): T=2, dim=7+7·5, H=8
 
 
 @pytest.mark.parametrize("four_body", [True, False])

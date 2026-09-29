@@ -129,7 +129,8 @@ basis off — the SNES parameter count equals GPUMD's `number_of_variables`
 exactly (`nep_descriptor.gpumd_num_params`, asserted by
 `test_parameter_count_matches_gpumd_formula` and by scripts/smoke_train.py):
 typed slab (dim+2)·H per species + one shared b1 + c_r/c_a. Under "concat"
-the count differs by the mixing tail only. Still not done: trajectory
+the count differs by the mixing tail (and the learned-basis tail M_radial,
+if on). Still not done: trajectory
 inference, PES / polarisability (forces on both atoms, virials), and
 "sum"+tnep. No accuracy comparison has been run.
 
