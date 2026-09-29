@@ -359,6 +359,7 @@ def test_multiscale_off_default_bitcompat(tmp_path):
     (dict(gap_kernel_power=[0]), "gap_kernel_power"),
     (dict(gap_kernel_power=[]), "gap_kernel_power"),
     (dict(gap_extra_rcut=-1.0), "gap_extra_rcut"),
+    (dict(nep_descriptor="concat"), "nep_descriptor"),
 ])
 def test_validation_raises(kw, msg):
     cfg = _cfg(data_path="/nonexistent.xyz", **kw)  # raise happens FIRST

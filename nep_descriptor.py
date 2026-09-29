@@ -254,6 +254,11 @@ def validate_nep_cfg(cfg):
                 "the faithful GPUMD tnep readout is dipole_rij_power=2.")
     preprocess = str(getattr(cfg, "descriptor_preprocess_contract", "off"))
     if mode == "replace":
+        if cfg.radial_basis_size is not None:
+            raise ValueError(
+                "cfg.nep_descriptor='replace' drops the SOAP output: "
+                "radial_basis_size would ride the genome (M_radial) with its "
+                "output discarded; set radial_basis_size=None.")
         for f, v in (("descriptor_mixing", bool(getattr(cfg, "descriptor_mixing", False))),
                      ("descriptor_preprocess_contract", preprocess != "off")):
             if v:

@@ -392,7 +392,7 @@ def assemble_data_dict(
     # Phase B adds the image-exact pair stream (plan §B.3) when ∂q/∂r is
     # needed; both consume one ase pair list per frame.
     if cfg.nep_descriptor != "off":
-        need_pairs = descriptor_gradients_needed(cfg)
+        need_pairs = nep_pairs_needed(cfg)
         data["nep_raw"] = []
         if need_pairs:
             data["nep_pairs"] = []
@@ -424,22 +424,37 @@ def assemble_data_dict(
 
 def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
     """True when mode-1 batches need only self descriptor gradients:
-    dipole_rij_power=0 (self-pair readout) or the neighbor readout (which
-    reads no descriptor gradients at all)."""
+    dipole_rij_power=0 (self-pair readout) or a readout that reads no SOAP
+    descriptor gradients at all (neighbor/bilinear; tnep under
+    nep_descriptor="replace")."""
     return cfg.target_mode == 1 and (
-        int(cfg.dipole_rij_power) == 0
-        or cfg.dipole_readout in ("neighbor", "bilinear"))
+        int(cfg.dipole_rij_power) == 0 or not soap_gradients_needed(cfg))
 
 
 def descriptor_gradients_needed(cfg: TNEPconfig) -> bool:
     """False only for the neighbor/bilinear dipole readouts, which read no
-    descriptor gradients — every other mode contracts ∂q/∂r. NOTE: these
-    readouts still need the PAIR INDEX stream (pair_atom/pair_gidx) on the
-    trajectory path, where V (and the bilinear pair term) is built in-graph —
-    that path keeps calc_gradients=True and only the gradient VALUES are
-    skipped (zero-width under the learned basis)."""
+    descriptor gradients — every other mode contracts ∂q/∂r (model-side
+    guards: learned basis, Phase B). NOTE: these readouts still need the PAIR
+    INDEX stream (pair_atom/pair_gidx) on the trajectory path, where V (and
+    the bilinear pair term) is built in-graph — that path keeps
+    calc_gradients=True and only the gradient VALUES are skipped (zero-width
+    under the learned basis)."""
     return not (cfg.target_mode == 1
                 and cfg.dipole_readout in ("neighbor", "bilinear"))
+
+
+def soap_gradients_needed(cfg: TNEPconfig) -> bool:
+    """Whether the SOAP builder must emit ∂q^SOAP/∂r: descriptor gradients are
+    needed AND the SOAP block reaches the ANN (nep_descriptor="replace" feeds
+    NEP only, so its tnep readout contracts the NEP pair stream alone)."""
+    return descriptor_gradients_needed(cfg) and cfg.nep_descriptor != "replace"
+
+
+def nep_pairs_needed(cfg: TNEPconfig) -> bool:
+    """Whether the image-exact NEP pair stream (Phase B) is built: the tnep
+    dipole readout with NEP inputs in the ANN ("concat"/"replace")."""
+    return (cfg.nep_descriptor in ("concat", "replace")
+            and cfg.target_mode == 1 and cfg.dipole_readout == "tnep")
 
 
 def _neighbor_pairs(atoms: Atoms, rc: float):
@@ -596,7 +611,7 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
     types_int = assign_type_indices(dataset, cfg.types)
     builder = make_descriptor_builder(cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(
-        dataset, calc_gradients=descriptor_gradients_needed(cfg))
+        dataset, calc_gradients=soap_gradients_needed(cfg))
     data = assemble_data_dict(dataset, types_int, descriptors, gradients, grad_index, cfg)
     return pad_and_stack(
         data,
@@ -754,7 +769,7 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     builder = make_descriptor_builder(cfg)
     _kw = {"progress_desc": "Building test descriptors"} if cfg.descriptor_mode == 1 else {}
     test_descriptors, test_gradients, test_grad_index = builder.build_descriptors(
-        test_dataset, calc_gradients=descriptor_gradients_needed(cfg), **_kw)
+        test_dataset, calc_gradients=soap_gradients_needed(cfg), **_kw)
 
     test_data = assemble_data_dict(
         test_dataset, test_types_int,
@@ -1089,7 +1104,7 @@ def _pow2(n: int) -> int:
 def gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
     """NEP pair stream for structures idx_tf → chunk: CSR gather by nep_struct_ptr,
     nep_pair_struct remapped chunk-local (mirrors the grad_values gather). No-op
-    when the stream is absent.
+    when the stream is absent. Eager only (int(...) on shapes sizes the padding).
 
     The chunk stream is bucket-padded to a power of two — both the pair count P
     and the angular count P_a — so the XLA pair kernels (TNEP._nep_radial_xla /

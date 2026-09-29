@@ -1345,8 +1345,9 @@ def test_tnep_soap_only_paths_agree():
     np.testing.assert_allclose(mu_c, mu_k, atol=1e-5 * np.abs(mu_k).max())
 
 
-def test_nep_tnep_snes_roundtrip_and_minibatch():
-    cfg = _tnep_cfg("concat", pop_size=4, num_generations=2, batch_size=2, val_interval=1)
+@pytest.mark.parametrize("mode", ["concat", "replace"])
+def test_nep_tnep_snes_roundtrip_and_minibatch(mode):
+    cfg = _tnep_cfg(mode, pop_size=4, num_generations=2, batch_size=2, val_interval=1)
     m = _model(cfg)
     d = prepare_eval_data(_small_frames(3, seed=5), cfg)
     snes = m.optimizer
@@ -1378,6 +1379,8 @@ def test_nep_tnep_adam_smoke():
 def test_nep_tnep_guards():
     with pytest.raises(ValueError, match="dipole_rij_power"):
         _model(_tnep_cfg("concat", dipole_rij_power=0))
+    with pytest.raises(ValueError, match="radial_basis_size"):   # M_radial would ride the genome unused
+        _model(_cfg(nep_descriptor="replace", radial_basis_size=4))
     cfg = _tnep_cfg("replace"); m = _model(cfg)
     atoms = _small_frames(1)[0]; d = prepare_eval_data([atoms], cfg); A = len(atoms)
     with pytest.raises(NotImplementedError, match="predict_batch"):
@@ -1409,3 +1412,51 @@ def test_nep_pair_padding_is_exact_and_bucketed():
     assert int(c0["nep_pair_D"].shape[0]) == int(c1["nep_pair_D"].shape[0])
     assert int(c0["nep_pair_ang"].numpy().sum()) == int(c1["nep_pair_ang"].numpy().sum())
     np.testing.assert_allclose(_mu_batch(m, c0)[0], mu[0], atol=1e-6)
+
+
+
+def test_replace_tnep_skips_soap_gradients_and_w_atom(monkeypatch, tmp_path):
+    """replace+tnep: μ is NEP-only, so the SOAP gradient stream is not built
+    (zero-width, like the neighbour readout) and SNES never forms W_atom;
+    concat keeps both streams. μ is unchanged by the SOAP stream's width."""
+    from data import (soap_gradients_needed, nep_pairs_needed, descriptor_gradients_needed,
+                      assemble_data_dict, pad_and_stack)
+    cfg, cc = _tnep_cfg("replace"), _tnep_cfg("concat")
+    assert descriptor_gradients_needed(cfg) and nep_pairs_needed(cfg) and not soap_gradients_needed(cfg)
+    assert soap_gradients_needed(cc) and nep_pairs_needed(cc)
+    assert not nep_pairs_needed(_cfg(nep_descriptor="replace")) and not nep_pairs_needed(_cfg(dipole_readout="tnep"))
+    frames = _small_frames(2, seed=7)
+    d = prepare_eval_data(frames, cfg)
+    assert int(d["grad_values"].shape[0]) == 0 and "nep_struct_ptr" in d
+    dc = prepare_eval_data(frames, cc)
+    assert int(dc["grad_values"].shape[0]) > 0 and "nep_struct_ptr" in dc
+
+    m = _model(cfg); m.W1.assign(m.W1 + 0.5)
+    # Same frames with the full SOAP COO stream forced: identical μ (never read).
+    b = make_descriptor_builder(cfg)
+    full = pad_and_stack(assemble_data_dict(frames, assign_type_indices(frames, cfg.types),
+                                            *b.build_descriptors(frames, calc_gradients=True), cfg),
+                         num_types=cfg.num_types)
+    assert int(full["grad_values"].shape[0]) > 0
+    mu = _mu_batch(m, d)
+    assert np.abs(mu).max() > 1e-4
+    np.testing.assert_array_equal(mu, _mu_batch(m, full))
+    mu_c = m.predict_batch_candidates(d["descriptors"], None, d["Z_int"], d["atom_mask"],
+                                      m.W0[None], m.b0[None], m.W1[None], m.b1[None],
+                                      c_r=m.c_r[None], c_a=m.c_a[None], **_tnep_kw(d))[0].numpy()
+    np.testing.assert_allclose(mu_c, mu, atol=1e-5 * np.abs(mu).max())
+
+    def no_kernel(*a, **k):
+        raise AssertionError("W_atom kernel must not be built under nep_descriptor='replace'")
+    monkeypatch.setattr(m, "_precompute_dipole_kernel", no_kernel)
+    snes = m.optimizer
+    fit = snes.evaluate_population(tf.stack([snes.mu, snes.mu + 0.1]), d).numpy()
+    assert fit.shape == (2,) and np.all(np.isfinite(fit)) and fit[0] != fit[1]
+    assert np.isfinite(snes.validate(d, snes.mu))
+    assert np.isfinite(snes.validate(d, snes.mu))      # cached path (val_size None)
+    # score_from_file builds with the same gating (no SOAP gradients) and scores.
+    from ase.io import write
+    write(str(tmp_path / "f.xyz"), frames)
+    _, preds = m.score_from_file(str(tmp_path / "f.xyz"), plot=False)
+    _, preds_d = m.score(d)                            # same consumer, empty-stream dict
+    np.testing.assert_allclose(preds.numpy(), preds_d.numpy(), atol=1e-5 * np.abs(preds_d).max())

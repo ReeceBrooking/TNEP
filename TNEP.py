@@ -842,7 +842,7 @@ class TNEP(layers.Layer):
             if cfg.target_mode == 2:
                 anns.append((self.W0_pol, self.b0_pol, self._sl_main))
             for W0, b0, sl in anns:
-                W0.assign(W0 / self._q_scale[sl, tf.newaxis])
+                W0.assign(W0 * (1.0 / self._q_scale[sl, tf.newaxis]))
                 b0.assign(tf.einsum('q,tqh->th', self._q_shift_m[sl], W0))
 
         self.optimizer = SNES(self)
@@ -1778,14 +1778,20 @@ class TNEP(layers.Layer):
 
         # Build descriptors using the model's training-time SOAP layout.
         print(f"  building descriptors for {len(dataset)} structures ...")
+        # Same gradient gating as data.materialize_test_data (score() is the
+        # same consumer): no SOAP gradients for the neighbour/bilinear readouts
+        # or tnep under nep_descriptor="replace".
+        from data import soap_gradients_needed, dipole_self_pairs_only
         builder = make_descriptor_builder(cfg_for_load)
-        descs, grads, gidx = builder.build_descriptors(dataset)
+        descs, grads, gidx = builder.build_descriptors(
+            dataset, calc_gradients=soap_gradients_needed(cfg_for_load))
 
         # Assemble + pad. Descriptors are now [N_i, TRAIN_DIM_Q] per structure.
         data_dict = assemble_data_dict(
             dataset, ti, descs, grads, gidx, cfg_for_load)
         test_data = pad_and_stack(
-            data_dict, num_types=TRAIN_NUM_TYPES, pin_to_cpu=pin_to_cpu)
+            data_dict, num_types=TRAIN_NUM_TYPES, pin_to_cpu=pin_to_cpu,
+            self_pairs_only=dipole_self_pairs_only(cfg_for_load))
 
         print(f"  scoring on {test_data['descriptors'].shape[0]} structures ...")
         try:

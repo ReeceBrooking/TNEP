@@ -2368,12 +2368,13 @@ class DescriptorBuilderGPUTF:
     def build_descriptors_self_only(self, dataset: list, batch_size=None,
                                     **build_kwargs):
         """Same triple as `build_descriptors`, reduced to what mode-1 self-only
-        callers read: nothing for the neighbor readout (no descriptor
-        gradients at all), the self-pair row ∂q_i/∂r_i otherwise.
+        callers read: nothing when no SOAP gradients are read (neighbor /
+        bilinear readouts; tnep under nep_descriptor="replace"), the
+        self-pair row ∂q_i/∂r_i otherwise.
         `batch_size` is accepted for API parity with the quippy builder (this
         backend already batches by cfg.descriptor_batch_frames)."""
-        from data import descriptor_gradients_needed
-        if not descriptor_gradients_needed(self.cfg):
+        from data import soap_gradients_needed
+        if not soap_gradients_needed(self.cfg):
             return self.build_descriptors(dataset, calc_gradients=False,
                                           **build_kwargs)
         from DescriptorBuilder import _filter_to_self_pairs

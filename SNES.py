@@ -1408,7 +1408,8 @@ class SNES:
                         _cache_top = self._W_atom_validate_cache
                     _sub = _cache_top.setdefault(_vd_id, {})
                     W_atom_v = _sub.get(chunk_idx)
-                if W_atom_v is None:
+                # replace+tnep: μ is NEP-only, the SOAP kernel is never read.
+                if W_atom_v is None and self.model._nep_mode != "replace":
                     if self.model._neighbor_readout:
                         # Neighbor readout: V [B,A,3] geometry kernel,
                         # precomputed in data.py — same slot as W_atom.
@@ -1882,7 +1883,8 @@ class SNES:
                     _W_atom_cached = _cache.get(chunk_idx)
                 if _W_atom_cached is not None:
                     chunk["_W_atom"] = _W_atom_cached
-            if self.cfg.target_mode == 1 and "_W_atom" not in chunk:
+            if (self.cfg.target_mode == 1 and "_W_atom" not in chunk
+                    and self.model._nep_mode != "replace"):   # NEP-only μ: no SOAP kernel
                 if self.model._neighbor_readout:
                     # Neighbor readout: V [B,A,3] geometry kernel from
                     # data.py rides the batch — same slot as W_atom.
@@ -2057,7 +2059,8 @@ class SNES:
             # stashes it on batch_data["_W_atom"] per struct chunk so the pop
             # loop reuses it; inline fallback for other callers (score, etc.).
             W_atom = batch_data.get("_W_atom")
-            if W_atom is None and self.cfg.target_mode == 1:
+            if (W_atom is None and self.cfg.target_mode == 1
+                    and self.model._nep_mode != "replace"):   # NEP-only μ: no SOAP kernel
                 if self.model._neighbor_readout:
                     # Neighbor readout: V [B,A,3] geometry kernel from
                     # data.py — same slot as W_atom.

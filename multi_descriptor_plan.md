@@ -495,7 +495,12 @@ cutoff, image-exact): `nep_pair_atom [P] int32`, `nep_pair_gidx [P] int32`,
 `pad_and_stack`/`slice_and_complete_chunk` must slice it by structure like
 `grad_values` (CSR `struct_ptr` pattern) — read how `pair_struct`/`struct_ptr` are
 handled and mirror with a second pointer array `nep_struct_ptr`. Only built when
-`nep_descriptor != "off"` AND `descriptor_gradients_needed(cfg)`.
+`data.nep_pairs_needed(cfg)` (concat/replace + target_mode=1 + tnep readout);
+under "replace" the SOAP gradient stream is skipped (`data.soap_gradients_needed`).
+Each chunk (`gather_nep_pairs`) is bucket-padded to a power of two in both the
+pair count P and the angular count P_a with pairs placed beyond every cutoff
+(zero contribution), so the per-shape XLA pair kernels compile once per bucket
+instead of once per mini-batch.
 
 Per-pair basis values are computed IN-GRAPH from D (candidate-independent, once per
 chunk): `fn_all_tf`, `fn_and_fnp_tf` (port `find_fn_and_fnp`, nep_utilities.cuh:519–540),
