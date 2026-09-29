@@ -1925,8 +1925,9 @@ class DescriptorBuilderGPUTF:
                         "the learned radial basis are not implemented (PES / "
                         "tnep readout / polarizability). Use the neighbor "
                         "dipole readout, or set radial_basis_size=None.")
-                # Neighbor readout on the trajectory path: it needs the pair
-                # index stream (V is built in-graph) but no gradient values.
+                # Neighbor / bilinear readout on the trajectory path: it needs
+                # the pair index stream (V and the bilinear pair term are
+                # built in-graph) but no gradient values.
                 soap = fwd_only_fn(rjs, thetas, phis, pair_atom, pair_neigh,
                                    pair_central, pair_active, n_atoms)
                 return soap, tf.zeros([tf.shape(rjs)[0], 3, 0], soap.dtype)

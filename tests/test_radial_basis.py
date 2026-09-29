@@ -32,6 +32,7 @@ def _cfg(**kw):
     cfg = TNEPconfig()
     cfg.target_mode = 1
     cfg.dipole_readout = "neighbor"
+    cfg.dipole_pair_rank = 2
     cfg.descriptor_mode = 1
     cfg.l_max = 4
     cfg.alpha_max = 4
@@ -227,7 +228,8 @@ def _predict(model, data, M=None):
         data["pair_atom"], data["pair_gidx"], data["pair_struct"],
         data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
         model.W0, model.b0, model.W1, model.b1,
-        W_atom=data.get("V_atom"), M_radial=M).numpy()
+        W_atom=data.get("V_atom"), M_radial=M,
+        nbr_index=data.get("nbr_index"), nbr_G=data.get("nbr_G")).numpy()
 
 
 @pytest.mark.parametrize("K", [4, 8])
@@ -260,8 +262,10 @@ def test_learned_model_at_init_equals_fixed_model():
     np.testing.assert_allclose(_predict(m_l, d_l), _predict(m_f, d_f), rtol=1e-4, atol=1e-6)
 
 
-def test_candidates_match_single_candidate_predictions():
-    cfg = _cfg(radial_basis_size=6, dipole_species_pairs="symmetric")
+@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
+def test_candidates_match_single_candidate_predictions(readout):
+    cfg = _cfg(radial_basis_size=6, dipole_species_pairs="symmetric",
+               dipole_readout=readout)
     model = _model(cfg)
     data = _eval_data(cfg, _cho_frames(3))
     rng = np.random.default_rng(5)
@@ -274,7 +278,8 @@ def test_candidates_match_single_candidate_predictions():
     preds = model.predict_batch_candidates(
         data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
         tf.constant(W0), tf.constant(b0), tf.constant(W1), tf.constant(b1),
-        c_pair=tf.constant(cp), M_radial=tf.constant(Ms)).numpy()         # [C, B, 3]
+        c_pair=tf.constant(cp), M_radial=tf.constant(Ms),
+        nbr_index=data.get("nbr_index"), nbr_G=data.get("nbr_G")).numpy()  # [C, B, 3]
     for c in range(C):
         np.testing.assert_allclose(preds[c], _predict(model, data, tf.constant(Ms[c])),
                                    rtol=1e-4, atol=1e-6)

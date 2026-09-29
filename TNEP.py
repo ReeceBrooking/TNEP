@@ -134,12 +134,13 @@ class TNEP(layers.Layer):
                     f"cfg.radial_basis_size={K} must satisfy alpha_max="
                     f"{alpha} <= K <= 10 (the poly3 overlap matrix is SPD "
                     f"only up to ~10).")
-            if not (cfg.target_mode == 1
-                    and str(cfg.dipole_readout) == "neighbor"):
+            from data import descriptor_gradients_needed
+            if descriptor_gradients_needed(cfg):
                 raise NotImplementedError(
                     "cfg.radial_basis_size: descriptor gradients through the "
                     "learned radial basis are not implemented — only the "
-                    "neighbor dipole readout (target_mode=1) is supported.")
+                    "neighbor and bilinear dipole readouts (target_mode=1) "
+                    "are supported.")
             self._rb_species_sum = bool(cfg.radial_basis_species_sum)
             self._rb_per_l = bool(cfg.radial_basis_per_l)
             self._rb_norm = str(cfg.radial_basis_norm)
