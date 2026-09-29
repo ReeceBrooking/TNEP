@@ -156,8 +156,14 @@ def nep_raw_width(cfg):
 
 
 def nep_slices(cfg):
-    nr = cfg.nep_n_max_radial + 1
-    return {"radial": slice(0, nr), "angular": slice(nr, nep_dim(cfg))}
+    """Column ranges into the dim_nep vector: "radial", "angular" (all of it),
+    and its sub-blocks "L1".."L4", "four_body", "five_body" (when enabled)."""
+    nr, na = cfg.nep_n_max_radial + 1, cfg.nep_n_max_angular + 1
+    names = ["L1", "L2", "L3", "L4"] + (["four_body"] if cfg.nep_four_body else []) \
+        + (["five_body"] if cfg.nep_five_body else [])
+    out = {"radial": slice(0, nr), "angular": slice(nr, nep_dim(cfg))}
+    out.update({k: slice(nr + l * na, nr + (l + 1) * na) for l, k in enumerate(names)})
+    return out
 
 
 # ── raw builder ────────────────────────────────────────────────────────────
@@ -218,6 +224,10 @@ def read_nep_txt(path):
         elif ln[0] in ("cutoff", "n_max", "basis_size", "l_max", "ANN"):
             head[ln[0]] = [float(v) for v in ln[1:]]
         else:
+            try:
+                float(ln[0])
+            except ValueError:
+                raise ValueError(f"{path}: unexpected header line {ln!r}") from None
             break
         n_head += 1
     vals = np.array([float(ln[0]) for ln in lines[n_head:]], dtype=np.float64)
