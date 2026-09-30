@@ -139,6 +139,33 @@ Still not done: trajectory
 inference, PES / polarisability (forces on both atoms, virials), and
 "sum"+tnep. No accuracy comparison has been run.
 
+GAP 2b/3b inputs (2026-09-30). `nep_descriptor="gap_sum"` is the "sum" mode
+with TurboGAP's distance-only descriptors as the two experts: s_i =
+ANN_soap(𝒟_i) + ANN_2b(q2_i) + ANN_3b(q3_i), the expert W1 zero at
+generation 0 (so generation 0 is again identical to the SOAP-only model).
+q2/q3 are per-atom neighbour sums over FIXED centres Q_s — no learned
+contraction: q2[i,t′,s] = Σ_{j∈t′} f(r_ij)·exp(−(r_ij − Q_s)²/2σ²) per
+neighbour species t′, and q3[i,p,s] = Σ_{j<k∈p} f(r_ij) f(r_ik)·
+exp(−½|q_jk − Q_s|²_σ) over unordered neighbour pairs p = {t_j,t_k} with
+q_jk = [r_ij + r_ik, (r_ij − r_ik)², r_jk], using GAP's buffered-cosine
+cutoff on the two centre bonds only (none on r_jk) and the exp kernel only
+(`pol` / cov_pp not implemented). Centres are auto-selected once at fit
+time (2b: uniform grid on [0.5 Å, rc2]; 3b: σ-scaled farthest-point
+sampling over training triplets) and stored in the config, so they travel
+with the model like `q_scale`. With a linear readout these descriptors ARE
+TurboGAP's 2b and 3b site energies: asserted against NumPy transcriptions
+of `gapf90/gap.f90`'s energy loops — E2b = Σ_s α_s(…) and E3b = 2 Σ_s α_s
+q3, the 2 being the Fortran `pref` at gap.f90:563 — to rtol 1e-6. In GAP
+mode (§5) the same descriptors enter as `gap_2b`/`gap_3b`: additive
+linear column blocks (per centre species) appended to the sparse-kernel
+design, fit and predict sharing one contraction; predictions are recovered
+to the ridge floor, but the block is rank-deficient — an unpopulated 3b
+species-pair slot contributes identically-zero columns (warned about at
+fit) — so the fitted coefficients are NOT interpretable per-centre
+weights. Not done: the `pol` kernel, learned centres/σ, `gap_sum` under the
+tnep readout or in trajectory inference. No accuracy comparison has been
+run.
+
 ## 3. Exact properties (theory)
 
 1. **Translation invariance / acoustic sum rule.** Only displacements d

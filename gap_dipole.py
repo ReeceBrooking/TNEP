@@ -62,7 +62,14 @@ class GapDipoleModel:
     block is [len(xi)·M_t·K] flat, ξ-major. The scale-2 fields are None
     unless cfg.gap_extra_rcut is set. Then the additive TurboGAP blocks
     (gap_descriptor_plan.md §0.3): alpha_gap2b / alpha_gap3b per species t,
-    [W2·K] / [W3·K] flat (s-major), None unless cfg.gap_2b / gap_3b."""
+    [W2·K] / [W3·K] flat (s-major), None unless cfg.gap_2b / gap_3b.
+
+    The fitted alpha_gap* values are NOT interpretable per-centre weights.
+    The gap block is rank-deficient and badly conditioned (unpopulated
+    species-pair slots give identically-zero columns; cond ~1e18 raw, ~1e6
+    after column normalisation on the test cfg), so predictions are
+    recovered to the ridge floor while α itself wanders along a near-null
+    space — measured |Δα| ~0.8 between fits even at 200 frames."""
     cfg: TNEPconfig
     builder: object                   # descriptor builder from the fitting cfg
     sparse_desc: list[np.ndarray]     # per type t: [M_t, Q] unit-norm rows
@@ -209,6 +216,8 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
                             .reshape(3, -1))            # [3, M_t·K]
     for q in gap_q or ():
         if q is not None:
+            # scales[0][1] is the scale-1 sparse list: exactly one entry per
+            # species (_fps_per_species loops range(cfg.num_types)).
             for t in range(len(scales[0][1])):
                 sel = ti == t
                 cols.append(np.einsum("ns,nxk->xsk", q[sel], v[sel])
@@ -253,6 +262,10 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     """Fit the sparse-kernel dipole model on cfg.data_path; evaluate
     cfg.test_data_path when set; write a run record JSON to GAP/.
 
+    MUTATES cfg in place: `seed` (when None) and `gap2b_centres`/
+    `gap3b_centres` (when auto-selected) are filled in, because they must
+    travel with the model for `predict` and into the run record.
+
     Solver memory (cfg.gap_solver): "primal" builds the dense augmented
     [3F + n_columns, n_columns] — ~0.6 GB at 8k columns, n_columns² scaling,
     ~18 GB (OOM) at the 48k columns a 2-scale × 3-ξ config reaches; "dual"
@@ -263,19 +276,25 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     _validate(cfg)
     t0 = time.time()
 
+    # As MasterTNEP (~418): resolve the seed BEFORE any RNG is constructed —
+    # the subsample draw, FPS and centre selection all consume it, so a seed
+    # generated after cfg.randomise would not replay the recorded config.
+    if cfg.seed is None:
+        cfg.seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
+
     dataset, types_int = tnep_data.collect(cfg)
     if cfg.total_N is not None:
         cfg.randomise(dataset)
         dataset = [dataset[k] for k in cfg.indices]
         types_int = [types_int[k] for k in cfg.indices]
     tis = [np.asarray(t) for t in types_int]
-    if cfg.seed is None:               # as MasterTNEP: FPS / centres reproducible
-        cfg.seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
+    # Mutating cfg (here and the seed above) is deliberate: the centres are
+    # part of the descriptor definition, so they must travel with the model
+    # (model.cfg → predict) and into the run record's "config" block.
     if (cfg.gap_2b or cfg.gap_3b) and (cfg.gap2b_centres is None
                                        or cfg.gap3b_centres is None):
         c2, c3 = select_centres(dataset, cfg)
         cfg.gap2b_centres, cfg.gap3b_centres = c2.tolist(), c3.tolist()
-    gap_qs = [_gap_q(at, ti, cfg) for at, ti in zip(dataset, tis)]
 
     builder = make_descriptor_builder(cfg)
     descs = _descriptors(builder, dataset)
@@ -326,9 +345,9 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     # additive GAP blocks, one per species: W2·K (gap_2b) and W3·K (gap_3b).
     sl = gap_slices(cfg)
     T = cfg.num_types
-    w_gap = {"two_body": (sl["two_body"].stop if cfg.gap_2b else 0) * n_vcols,
-             "three_body": ((sl["three_body"].stop - sl["two_body"].stop)
-                            if cfg.gap_3b else 0) * n_vcols}
+    w_gap = {k: (sl[k].stop - sl[k].start) * n_vcols if on else 0
+             for k, on in (("two_body", cfg.gap_2b),
+                           ("three_body", cfg.gap_3b))}
     blocks = ([n * len(xis) * n_vcols for sz in sizes for n in sz]
               + [w for w in w_gap.values() if w for _ in range(T)])
     n_columns = sum(blocks)
@@ -340,8 +359,21 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         scales = [(descs[f], sparse_desc)]
         if descs2 is not None:
             scales.append((descs2[f], sparse_desc2))
-        Phi[f] = _phi_frame(scales, vs[f], tis[f], xis, gap_qs[f])
+        Phi[f] = _phi_frame(scales, vs[f], tis[f], xis,
+                            _gap_q(dataset[f], tis[f], cfg))
     Phi_flat = Phi.reshape(3 * F, n_columns)
+
+    # An unpopulated species-pair slot (or a centre no triplet reaches) gives
+    # identically-zero gap columns: those coefficients are unidentifiable.
+    n_gap = sum(w * T for w in w_gap.values())
+    if n_gap:
+        dead = int(np.count_nonzero(~Phi_flat[:, -n_gap:].any(axis=0)))
+        if dead:
+            warnings.warn(
+                f"{dead}/{n_gap} GAP 2b/3b columns are identically zero "
+                f"(unpopulated species-pair slots or unreached centres): "
+                f"those coefficients are unidentifiable — the ridge leaves "
+                f"them at ~0 and predictions are unaffected")
 
     # Explicit ridge solve, λ_eff relative to mean(diag(ΦᵀΦ)) so λ is
     # dimensionless. Two mathematically identical routes (cfg.gap_solver):

@@ -562,6 +562,13 @@ def test_gapmode_validate():
         gap_dipole._validate(_dip_cfg(gap_2b=True, nep_descriptor="gap_sum"))
 
 
-def test_gapmode_flags_off_no_blocks(gap_fitted):
+def test_gapmode_flags_off_alpha_gap_fields_are_none(gap_fitted):
     base, _, _ = gap_fitted
     assert base.alpha_gap2b is None and base.alpha_gap3b is None
+
+
+def test_gapmode_zero_columns_warn(tmp_path):
+    """A 3b cutoff short enough to leave species-pair slots unpopulated gives
+    identically-zero gap columns — unidentifiable coefficients, warned about."""
+    with _chdir(tmp_path), pytest.warns(UserWarning, match="identically zero"):
+        gap_dipole.fit_gap_dipole(_dip_cfg(**{**GAP_KW, "gap3b_rcut": 1.2}))

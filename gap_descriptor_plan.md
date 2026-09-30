@@ -84,4 +84,4 @@ Same machinery as "sum": SOAP ANN + ANN_2b + ANN_3b with zero-init heads. Differ
 
 ## Task 4: docs + memory
 
-- [ ] `neighbor_dipole_method.md` §2.5: one paragraph on `gap_sum` and the GAP-mode blocks (forms, fixed centres, exactness vs gap.f90, no accuracy claims). Memory note by the coordinator.
+- [x] `neighbor_dipole_method.md` §2.5: one paragraph on `gap_sum` and the GAP-mode blocks (forms, fixed centres, exactness vs gap.f90, no accuracy claims). Memory note by the coordinator.
