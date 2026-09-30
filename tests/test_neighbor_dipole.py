@@ -66,6 +66,8 @@ def _cfg(**kw):
     # user tunes in the working tree; pin them so a live TNEPconfig default
     # cannot change dim_q underneath every suite that imports this helper.
     cfg.nep_descriptor = "off"
+    cfg.sum_delta = [1.0, 1.0, 1.0]
+    cfg.sum_delta_learn = False
     cfg.gap_2b = False
     cfg.gap_3b = False
     for k, v in kw.items():

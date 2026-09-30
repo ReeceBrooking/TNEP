@@ -36,7 +36,8 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     Tail order: W0,b0,W1,b1 | +experts (nep_descriptor="sum" / "gap_sum") | +c_pair
     (neighbor readout, _c_learnable) | +pol ANN (mode 2) | +U_pair (mixing)
     | +M_radial (learned radial basis) | +c_r, +c_a (NEP contraction
-    coefficients).
+    coefficients) | +sum_delta (cfg.sum_delta_learn, 3 unpenalised per-expert
+    amplitudes at the very end).
     """
     params = list(params)
     idx = 0
@@ -64,6 +65,8 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     if idx < len(params) and getattr(model, "c_r", None) is not None:
         model.c_r.assign(params[idx]); idx += 1
         model.c_a.assign(params[idx]); idx += 1
+    if idx < len(params) and getattr(model, "sum_delta", None) is not None:
+        model.sum_delta.assign(params[idx]); idx += 1
 
 class SNES:
     """Separable NES optimizer for TNEP.
@@ -283,8 +286,14 @@ class SNES:
         self.n_c_a = (int(np.prod(model.c_a.shape))
                       if getattr(model, "c_a", None) is not None else 0)
         self.n_nep = self.n_c_r + self.n_c_a
+        # Per-expert amplitude tail: δ = (δ_soap, δ_2b, δ_3b), the very LAST 3
+        # entries. Outside n_anns_total, so the L1/L2 penalty never sees them
+        # (that exclusion is the whole point of δ — see cfg.sum_delta).
+        self.n_sum_delta = (3 if (bool(getattr(cfg, "sum_delta_learn", False))
+                                  and getattr(model, "sum_delta", None) is not None)
+                            else 0)
         self.dim = (self.n_anns_total + self.n_U_pair
-                    + self.n_radial + self.n_nep)
+                    + self.n_radial + self.n_nep + self.n_sum_delta)
 
         # Search distribution params as tf.Variables (stay on GPU). μ init
         # is Glorot (W0/W1 scaled by sqrt(6/(fan_in+fan_out)), biases zero);
@@ -480,7 +489,8 @@ class SNES:
         off = self.n_anns_total + self.n_U_pair
         for var, n in ((self.model.M_radial, self.n_radial),
                        (self.model.c_r, self.n_c_r),
-                       (self.model.c_a, self.n_c_a)):
+                       (self.model.c_a, self.n_c_a),
+                       (self.model.sum_delta, self.n_sum_delta)):
             if n > 0:
                 mu[off:off + n] = var.numpy().reshape(-1); off += n
         return mu
@@ -629,6 +639,10 @@ class SNES:
             if n_c > 0:
                 tail_labels_parts.append(
                     np.repeat(np.arange(T, dtype=np.int32), n_c // T))
+        # δ amplitudes are global (one per expert, not per centre type): label T.
+        if self.n_sum_delta > 0:
+            tail_labels_parts.append(
+                np.full(self.n_sum_delta, T, dtype=np.int32))
         if tail_labels_parts:
             tail_labels = np.concatenate(tail_labels_parts)
             return np.concatenate([ann_tov, tail_labels])
@@ -1230,6 +1244,7 @@ class SNES:
             M_val = named.get("M_radial")
             c_r_val = named.get("c_r"); c_a_val = named.get("c_a")
             experts_val = self._experts_of(named)
+            sd_val = named.get("sum_delta")
             # Centring fold (needs the stored W0), then absorb U_pair^T.
             b0 = self.model._b0_eff(b0, W0)
             if W0p is not None:
@@ -1241,17 +1256,18 @@ class SNES:
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
                 "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val,
-                         c_r_val, c_a_val, experts_val),
+                         c_r_val, c_a_val, experts_val, sd_val),
             }
         elif _cache_hit:
             (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val,
-             c_r_val, c_a_val, experts_val) = _cache["fold"]
+             c_r_val, c_a_val, experts_val, sd_val) = _cache["fold"]
         else:
             W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
             c_pair_val = None  # predict_batch falls back to model.c_pair
             M_val = None       # predict_batch falls back to model.M_radial
             c_r_val = c_a_val = None   # ... and to model.c_r / c_a
             experts_val = None         # ... and to the model's expert weights
+            sd_val = None              # ... and to model.sum_delta
             W0p = getattr(self.model, 'W0_pol', None)
             b0p = getattr(self.model, 'b0_pol', None)
             W1p = getattr(self.model, 'W1_pol', None)
@@ -1314,6 +1330,7 @@ class SNES:
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
                 W_atom=W_atom_v, c_pair=c_pair_val, M_radial=M_val,
                 c_r=c_r_val, c_a=c_a_val, experts=experts_val,
+                sum_delta=sd_val,
                 nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk),
             )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
@@ -1360,10 +1377,11 @@ class SNES:
 
         Tail order: W0,b0,W1,b1 | W0_r..W1_a (nep_descriptor="sum" / "gap_sum") | c_pair
         (neighbor readout, _c_learnable) | W0_pol.. (mode 2) | U_pair (mixing)
-        | M_radial (learned radial basis) | c_r, c_a (NEP).
+        | M_radial (learned radial basis) | c_r, c_a (NEP)
+        | sum_delta (cfg.sum_delta_learn; the last 3).
         """
-        out: dict = {"U_pair": None, "c_pair": None,
-                     "M_radial": None, "c_r": None, "c_a": None}
+        out: dict = {"U_pair": None, "c_pair": None, "M_radial": None,
+                     "c_r": None, "c_a": None, "sum_delta": None}
         idx = 0
         out["W0"] = params[idx]; idx += 1
         out["b0"] = params[idx]; idx += 1
@@ -1386,6 +1404,8 @@ class SNES:
         if self.n_nep > 0 and idx < len(params):
             out["c_r"] = params[idx]; idx += 1
             out["c_a"] = params[idx]; idx += 1
+        if self.n_sum_delta > 0 and idx < len(params):
+            out["sum_delta"] = params[idx]; idx += 1
         return out
 
     def reconstruct_params_tf(self, param_vectors: tf.Tensor) -> tuple:
@@ -1465,6 +1485,13 @@ class SNES:
                                ([-1] + shape) if is_batched else shape)
                 offset += n_c
                 tail = tail + (c,)
+
+        # Per-expert amplitude tail: δ [3] (+ leading C when batched).
+        if self.n_sum_delta > 0:
+            d = tf.reshape(param_vectors[..., offset:offset + self.n_sum_delta],
+                           [-1, 3] if is_batched else [3])
+            offset += self.n_sum_delta
+            tail = tail + (d,)
 
         return tail
 
@@ -1935,6 +1962,7 @@ class SNES:
                 M_radial=named.get("M_radial"),
                 c_r=named.get("c_r"), c_a=named.get("c_a"),
                 experts=self._experts_of(named),
+                sum_delta=named.get("sum_delta"),
                 nep_raw=batch_data.get("nep_raw"),
                 **nep_pair_kwargs(batch_data))  # [C, B, T_dim]
 

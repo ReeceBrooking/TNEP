@@ -46,6 +46,9 @@ def _trainable(model) -> dict:
                   W1_pol=model.W1_pol, b1_pol=model.b1_pol)
     if model.M_radial is not None:
         vs["M_radial"] = model.M_radial
+    if (getattr(model, "sum_delta", None) is not None
+            and bool(getattr(model.cfg, "sum_delta_learn", False))):
+        vs["sum_delta"] = model.sum_delta          # δ: unpenalised (_ann_core skips it)
     if model.c_r is not None:
         vs["c_r"] = model.c_r
         vs["c_a"] = model.c_a
@@ -124,6 +127,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
             c_r=named.get("c_r"), c_a=named.get("c_a"),
             experts=(tuple(map(_tf_var, model.expert_weights))   # Keras vars → tf.Variables
                      if model._experts_on else None),
+            sum_delta=named.get("sum_delta"),
             nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk))
         if scale_preds:
             num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)

@@ -1449,3 +1449,187 @@ def test_replace_tnep_skips_soap_gradients_and_w_atom(monkeypatch, tmp_path):
     _, preds = m.score_from_file(str(tmp_path / "f.xyz"), plot=False)
     _, preds_d = m.score(d)                            # same consumer, empty-stream dict
     np.testing.assert_allclose(preds.numpy(), preds_d.numpy(), atol=1e-5 * np.abs(preds_d).max())
+
+
+# ── Per-expert amplitudes δ (cfg.sum_delta / sum_delta_learn) ───────────────
+# δ multiplying an expert's head output is EXACTLY redundant with rescaling
+# that expert's W1; it matters only because it is EXCLUDED from the L1/L2
+# penalty that acts on W1 (an unpenalised gate on each body order).
+
+def _delta_cfg(mode, **kw):
+    """A sum-mode cfg for either expert flavour. gap_sum comes from
+    test_gap_descriptor, imported lazily (that module imports this one)."""
+    if mode == "gap_sum":
+        from test_gap_descriptor import _gap_cfg
+        return _gap_cfg(**kw)
+    return _sum_cfg(**kw)
+
+
+def _mu_delta(m, d, delta=None):
+    """μ through predict_batch with an explicit sum_delta (None → the model's)."""
+    return m.predict_batch(
+        *_forward_args(m, d), W_atom=d["V_atom"], nep_raw=d["nep_raw"],
+        sum_delta=None if delta is None
+        else tf.constant(delta, tf.float32))[0].numpy()
+
+
+@pytest.mark.parametrize("mode", ["sum", "gap_sum"])
+def test_sum_delta_scales_expert_contribution(mode):
+    """δ_2b = 0 removes exactly the 2b expert (== that expert's W1 zeroed);
+    δ_2b = 2 doubles its contribution. Randomised experts: the gen-0
+    W1_r = W1_a = 0 would make every δ indistinguishable."""
+    cfg = _delta_cfg(mode); m = _model(cfg); atoms = _bulk_frame()
+    _randomise_experts(m)
+    d = prepare_eval_data([atoms], cfg)
+    np.testing.assert_array_equal(m.sum_delta.numpy(), [1.0, 1.0, 1.0])
+    mu_all = _mu_delta(m, d)
+    # Reference: the 2b expert's head silenced through its W1 instead of δ.
+    W1_r = m.W1_r.numpy().copy()
+    m.W1_r.assign(np.zeros_like(W1_r))
+    mu_ref = _mu_delta(m, d)
+    m.W1_r.assign(W1_r)
+    contrib = mu_all - mu_ref
+    assert np.linalg.norm(contrib) > 1e-6 and np.linalg.norm(mu_ref) > 1e-6
+    np.testing.assert_allclose(_mu_delta(m, d, [1.0, 0.0, 1.0]), mu_ref,
+                               rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_mu_delta(m, d, [1.0, 2.0, 1.0]),
+                               mu_ref + 2.0 * contrib, rtol=1e-5, atol=1e-6)
+    # Same through the model's own Variable (the kwarg-None path).
+    m.sum_delta.assign([1.0, 0.0, 1.0])
+    np.testing.assert_allclose(_mu_delta(m, d), mu_ref, rtol=1e-5, atol=1e-6)
+    # δ_soap scales the SOAP head: δ = 0 leaves only the two experts.
+    m.sum_delta.assign([1.0, 1.0, 1.0])
+    mu_experts = _mu_delta(m, d, [0.0, 1.0, 1.0])
+    np.testing.assert_allclose(_mu_delta(m, d, [2.0, 1.0, 1.0]),
+                               2.0 * (mu_all - mu_experts) + mu_experts,
+                               rtol=1e-5, atol=1e-6)
+
+
+def test_sum_delta_gen0_identity_preserved():
+    """δ = [1, 1, 1] (the default) with zero expert heads still equals the
+    SOAP-only model; δ_soap is nonetheless live at gen 0."""
+    atoms = _bulk_frame()
+    cfg_off, cfg_sum = _cfg(), _sum_cfg()
+    m_off, m_sum = _model(cfg_off), _model(cfg_sum)
+    assert m_off.sum_delta is None                     # experts off → no δ anywhere
+    np.testing.assert_array_equal(m_sum.sum_delta.numpy(), [1.0, 1.0, 1.0])
+    d_off, d_sum = prepare_eval_data([atoms], cfg_off), prepare_eval_data([atoms], cfg_sum)
+    mu_off = _predict_eff(m_off, d_off)
+    np.testing.assert_allclose(_predict_eff(m_sum, d_sum), mu_off, rtol=1e-6)
+    np.testing.assert_allclose(_mu_delta(m_sum, d_sum, [2.0, 1.0, 1.0]),
+                               2.0 * np.asarray(mu_off)[0], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("mode", ["sum", "gap_sum"])
+def test_sum_delta_snes_tail_layout_and_liveness(mode):
+    """dim gains exactly 3 when learned and 0 when not; μ-init carries cfg's
+    δ; reconstruct → assign → predict_batch == predict_batch_candidates; and
+    two candidates differing ONLY in the last 3 μ entries must give different
+    fitness AND different validate (drop either `sum_delta=` kwarg at the SNES
+    call sites and this fails)."""
+    from SNES import SNES, _set_model_params
+    atoms = _bulk_frame()
+    opt_off = SNES(_model(_delta_cfg(mode)))
+    assert opt_off.n_sum_delta == 0
+    cfg = _delta_cfg(mode, sum_delta_learn=True, sum_delta=[1.0, 0.7, 1.3])
+    m = _model(cfg); opt = SNES(m)
+    assert opt.n_sum_delta == 3 and opt.dim == opt_off.dim + 3
+    np.testing.assert_allclose(opt.mu.numpy()[-3:], [1.0, 0.7, 1.3])   # μ-init = cfg
+    named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
+    np.testing.assert_allclose(named["sum_delta"].numpy(), [1.0, 0.7, 1.3])
+    nb0 = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu[tf.newaxis]))
+    assert tuple(nb0["sum_delta"].shape) == (1, 3)                     # per-candidate
+    tov = np.asarray(opt._type_of_variable)                            # global label T
+    assert tov.shape == (opt.dim,)
+    np.testing.assert_array_equal(tov[-3:], cfg.num_types)
+
+    # Live μ (the gen-0 expert W1 = 0 would hide δ_2b / δ_3b entirely).
+    mu_a = (opt.mu + 0.3 * tf.random.stateless_normal(opt.mu.shape, [3, 4])).numpy()
+    t_a = tf.constant(mu_a)
+    _set_model_params(m, *opt.reconstruct_params_tf(t_a))
+    np.testing.assert_allclose(m.sum_delta.numpy(), mu_a[-3:], rtol=1e-6)
+    d1 = prepare_eval_data([atoms], cfg)
+    single = m.predict_batch(*_forward_args(m, d1), W_atom=d1["V_atom"],
+                             nep_raw=d1["nep_raw"])[0].numpy()
+    nb = opt._split_reconstructed(opt.reconstruct_params_tf(t_a[tf.newaxis]))
+    cand = m.predict_batch_candidates(
+        d1["descriptors"], d1["V_atom"], d1["Z_int"], d1["atom_mask"],
+        nb["W0"], nb["b0"], nb["W1"], nb["b1"], c_pair=nb["c_pair"],
+        c_r=nb["c_r"], c_a=nb["c_a"], experts=opt._experts_of(nb),
+        sum_delta=nb["sum_delta"], nep_raw=d1["nep_raw"])[0, 0].numpy()
+    np.testing.assert_allclose(cand, single, rtol=1e-5, atol=1e-6)
+    assert np.any(np.abs(single) > 1e-6)
+    # A different δ in the candidate path must move μ (the kwarg is live).
+    cand2 = m.predict_batch_candidates(
+        d1["descriptors"], d1["V_atom"], d1["Z_int"], d1["atom_mask"],
+        nb["W0"], nb["b0"], nb["W1"], nb["b1"], c_pair=nb["c_pair"],
+        c_r=nb["c_r"], c_a=nb["c_a"], experts=opt._experts_of(nb),
+        sum_delta=2.0 * nb["sum_delta"], nep_raw=d1["nep_raw"])[0, 0].numpy()
+    np.testing.assert_allclose(cand2, 2.0 * single, rtol=1e-5, atol=1e-6)
+
+    # The fit and validate call sites forward δ: μ vectors that differ ONLY
+    # in the last 3 entries must score differently through both.
+    mu_b = mu_a.copy(); mu_b[-3:] *= 2.0
+    t_b = tf.constant(mu_b)
+    d2 = prepare_eval_data([atoms, atoms], cfg)
+    fit = opt.evaluate_population(tf.stack([t_a, t_b]), d2).numpy()
+    assert np.all(np.isfinite(fit)) and fit[0] != fit[1]
+    v_a, v_b = opt.validate(d2, t_a), opt.validate(d2, t_b)
+    assert np.isfinite(v_a) and np.isfinite(v_b) and v_a != v_b
+
+
+@pytest.mark.parametrize("types", [[8, 1], [8]])
+def test_sum_delta_excluded_from_regularisation(types):
+    """The whole point of δ: the L1/L2 penalty must not see it."""
+    from SNES import SNES
+    kw = dict(sum_delta_learn=True, lambda_1=0.1, lambda_2=0.1)
+    if len(types) == 1:
+        kw.update(types=[8], num_types=1, type_map={8: 0})
+    cfg = _sum_cfg(**kw); opt = SNES(_model(cfg))
+    assert opt.n_sum_delta == 3
+    mu = opt.mu.numpy().copy()
+    mu2 = mu.copy(); mu2[-3:] *= 10.0
+    assert opt.compute_regularization(mu) == opt.compute_regularization(mu2)
+    l1, l2, _ = opt.compute_regularization(mu)
+    assert l1 > 0 and l2 > 0
+    np.testing.assert_allclose(opt.compute_regularization_tf(tf.constant(mu[None])).numpy(),
+                               opt.compute_regularization_tf(tf.constant(mu2[None])).numpy())
+
+
+def test_save_load_roundtrip_sum_delta(tmp_path):
+    import h5py, model_io
+    cfg = _sum_cfg(sum_delta=[0.5, 2.0, 1.5], sum_delta_learn=True)
+    m = _model(cfg); atoms = _bulk_frame()
+    _randomise_experts(m)
+    m.sum_delta.assign([0.4, 1.7, 0.9])                # as training would leave it
+    mu0 = _mu_nep(m, atoms, cfg)
+    p = str(tmp_path / "sd.h5")
+    model_io.save_model(m, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert list(loaded.cfg.sum_delta) == [0.5, 2.0, 1.5]
+    assert loaded.cfg.sum_delta_learn is True
+    np.testing.assert_allclose(loaded.sum_delta.numpy(), [0.4, 1.7, 0.9])
+    np.testing.assert_allclose(_mu_nep(loaded, atoms, loaded.cfg), mu0, atol=1e-6)
+    # A save without sum_delta must not silently reset δ to cfg's values.
+    with h5py.File(p, "a") as f:
+        del f["weights"]["sum_delta"]
+    with pytest.raises(ValueError, match="sum_delta"):
+        model_io.load_model(p)
+
+
+def test_adam_trains_sum_delta():
+    from adam import _trainable
+    cfg = _sum_cfg(optimizer="adam", adam_lr=1e-2, num_generations=2,
+                   val_interval=1, batch_chunk_size=1, sum_delta_learn=True)
+    m = _model(cfg); atoms = _bulk_frame()
+    _randomise_experts(m)
+    d = prepare_eval_data([atoms, atoms], cfg)
+    assert "sum_delta" in _trainable(m)
+    d0 = m.sum_delta.numpy().copy()
+    history, final, best = m.fit(d, d)
+    assert np.all(np.isfinite(history["train_loss"]))
+    assert np.all(np.isfinite(final.sum_delta.numpy()))
+    assert not np.array_equal(final.sum_delta.numpy(), d0)
+    # sum_delta_learn=False keeps δ fixed; experts off has no δ at all.
+    assert "sum_delta" not in _trainable(_model(_sum_cfg(optimizer="adam")))
+    assert "sum_delta" not in _trainable(_model(_cfg(nep_descriptor="off")))

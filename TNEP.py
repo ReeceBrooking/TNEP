@@ -200,6 +200,20 @@ class TNEP(layers.Layer):
         # "sum" / "gap_sum": ANN_2b + ANN_3b experts added to the SOAP ANN;
         # their inputs are the NEP contraction or the GAP q2 ‖ q3 raw slot.
         self._experts_on = self._nep_mode in ("sum", "gap_sum")
+        # Per-expert amplitudes δ = (δ_soap, δ_2b, δ_3b) on the summed head.
+        # Exactly redundant with rescaling each expert's W1 — meaningful only
+        # because δ is excluded from the L1/L2 penalty on W1 (cfg.sum_delta).
+        # Non-trainable tf.Variable like M_radial / c_r: SNES assigns it,
+        # Adam tape-watches it. None (and a no-op everywhere) when experts off.
+        self.sum_delta = None
+        if self._experts_on:
+            _d = np.asarray(getattr(cfg, "sum_delta", [1.0, 1.0, 1.0]),
+                            dtype=np.float32).reshape(-1)
+            if _d.size != 3:
+                raise ValueError(
+                    f"cfg.sum_delta has {_d.size} entries, expected 3 "
+                    f"(δ_soap, δ_2b, δ_3b).")
+            self.sum_delta = tf.Variable(_d, trainable=False, name="sum_delta")
         # Phase B: dipole via per-candidate NEP pair forces (plan §B.2).
         self._nep_pair_forces_on = (self._nep_mode in ("concat", "replace")
                                     and cfg.target_mode == 1
@@ -863,17 +877,41 @@ class TNEP(layers.Layer):
         out = tf.einsum('c...ah,c...ahk->c...ak', h, tf.gather(W1, Z, axis=1))
         return out if cand else out[0]
 
+    def _delta_scale(self, d: tf.Tensor | None, i: int, x: tf.Tensor) -> tf.Tensor:
+        """x · δ_i. d: [3] (shared) or [C, 3] per-candidate (x leads with C)."""
+        if d is None:
+            return x
+        if len(d.shape) == 1:
+            return x * d[i]
+        return x * tf.reshape(d[:, i], [-1] + [1] * (len(x.shape) - 1))
+
     def _expert_outputs(self, nep_raw: tf.Tensor, Z: tf.Tensor, atom_mask: tf.Tensor,
                         c_r: tf.Tensor | None = None, c_a: tf.Tensor | None = None,
-                        experts: tuple | None = None) -> tf.Tensor:
-        """ANN_2b(q_r) + ANN_3b(q_ang) head outputs [(C,) ..., A, head_slots]
-        under nep_descriptor="sum" / "gap_sum" (q2 / q3), added to the SOAP ANN's before
-        _split_head. experts: the six STORED tensors in EXPERT_WEIGHTS order
-        (optional leading candidate axis); None → the model's variables."""
+                        experts: tuple | None = None,
+                        sum_delta: tf.Tensor | None = None) -> tf.Tensor:
+        """δ_2b·ANN_2b(q_r) + δ_3b·ANN_3b(q_ang) head outputs
+        [(C,) ..., A, head_slots] under nep_descriptor="sum" / "gap_sum"
+        (q2 / q3), added to δ_soap·(the SOAP ANN's) before _split_head.
+        experts: the six STORED tensors in EXPERT_WEIGHTS order (optional
+        leading candidate axis); None → the model's variables. sum_delta:
+        [3] or per-candidate [C, 3]; None → self.sum_delta."""
         q = nep_raw if self._nep_mode == "gap_sum" else self.nep_from_raw(nep_raw, Z, c_r, c_a)
         w = self.expert_weights if experts is None else tuple(experts)
-        return tf.add_n([self._expert_ann(q, Z, atom_mask, *w[3 * i:3 * i + 3], *sl)
-                         for i, sl in enumerate(self._expert_in)])
+        d = self.sum_delta if sum_delta is None else sum_delta
+        return tf.add_n([
+            self._delta_scale(d, i + 1,
+                              self._expert_ann(q, Z, atom_mask, *w[3 * i:3 * i + 3], *sl))
+            for i, sl in enumerate(self._expert_in)])
+
+    def _head_with_experts(self, out: tf.Tensor, nep_raw: tf.Tensor, Z: tf.Tensor,
+                           atom_mask: tf.Tensor, c_r: tf.Tensor | None = None,
+                           c_a: tf.Tensor | None = None, experts: tuple | None = None,
+                           sum_delta: tf.Tensor | None = None) -> tf.Tensor:
+        """The summed head: δ_soap·ANN_soap + δ_2b·ANN_2b + δ_3b·ANN_3b.
+        Called at every forward site when self._experts_on."""
+        d = self.sum_delta if sum_delta is None else sum_delta
+        return (self._delta_scale(d, 0, out)
+                + self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts, d))
 
     def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,
                 positions: tf.Tensor, Z: tf.Tensor, box: tf.Tensor,
@@ -949,7 +987,7 @@ class TNEP(layers.Layer):
             # the exclusion is a modeling choice — keep it, don't "fix" it.
             out = tf.einsum('ah,ahk->ak', h, W1_t)                    # [A, S]
             if self._experts_on:
-                out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a)
+                out = self._head_with_experts(out, nep_raw, Z, atom_mask, c_r, c_a)
             s = self._split_head(out)                                 # [A, C]
             dr, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)          # dr = neighbor − center
@@ -1461,6 +1499,7 @@ class TNEP(layers.Layer):
                       c_r: tf.Tensor | None = None,
                       c_a: tf.Tensor | None = None,
                       experts: tuple | None = None,
+                      sum_delta: tf.Tensor | None = None,
                       nep_pair_atom: tf.Tensor | None = None,
                       nep_pair_gidx: tf.Tensor | None = None,
                       nep_pair_struct: tf.Tensor | None = None,
@@ -1496,6 +1535,8 @@ class TNEP(layers.Layer):
             c_r, c_a    : NEP contraction tensors (None → self.c_r / self.c_a)
             experts     : "sum" mode: the six STORED expert tensors
                           (EXPERT_WEIGHTS order; None → model variables)
+            sum_delta   : [3] per-expert amplitudes (δ_soap, δ_2b, δ_3b);
+                          None → self.sum_delta
             nep_pair_*  : image-exact NEP pair stream (data.py nep_pairs; the
                           tnep readout under NEP): atom/gidx/struct [P],
                           D [P, 3] = r_j − r_i incl. image, ang [P] bool
@@ -1547,7 +1588,8 @@ class TNEP(layers.Layer):
                 c_pair = self.c_pair  # model-weight callers (score, spectro)
             out = tf.einsum('bah,bahk->bak', h1, W1_t)               # [B, A, S]
             if self._experts_on:
-                out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts)
+                out = self._head_with_experts(out, nep_raw, Z, atom_mask, c_r, c_a,
+                                              experts, sum_delta)
             s = self._split_head(out)                                # [B, A, C]
             V = W_atom  # [B, A, 3, C, T] geometry kernel via the W_atom slot
             if V is None:
@@ -1627,6 +1669,7 @@ class TNEP(layers.Layer):
                                   c_r: tf.Tensor | None = None,
                                   c_a: tf.Tensor | None = None,
                                   experts: tuple | None = None,
+                                  sum_delta: tf.Tensor | None = None,
                                   nep_pair_atom: tf.Tensor | None = None,
                                   nep_pair_gidx: tf.Tensor | None = None,
                                   nep_pair_struct: tf.Tensor | None = None,
@@ -1664,6 +1707,8 @@ class TNEP(layers.Layer):
                           tensors (None → the model's shared c_r / c_a)
             experts     : "sum" mode: per-candidate [C, ...] STORED expert
                           tensors (EXPERT_WEIGHTS order; None → the model's)
+            sum_delta   : per-candidate [C, 3] amplitudes (δ_soap, δ_2b, δ_3b)
+                          or shared [3]; None → the model's self.sum_delta
             nep_pair_*  : image-exact NEP pair stream (see predict_batch); the
                           tnep readout under NEP contracts it per candidate
 
@@ -1746,7 +1791,8 @@ class TNEP(layers.Layer):
             # choice (kept deliberately) under "ordered" Ω.
             out = tf.einsum('cbah,cbahk->cbak', h1, W1_t_all)      # [C, B, A, S]
             if self._experts_on:
-                out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts)
+                out = self._head_with_experts(out, nep_raw, Z, atom_mask, c_r, c_a,
+                                              experts, sum_delta)
             s = self._split_head(out)                           # [C, B, A, Ch]
             if c_pair is None:
                 # Candidate-independent c (frozen c ≡ 1, or model weights):

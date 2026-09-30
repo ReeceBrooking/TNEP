@@ -289,6 +289,16 @@ class TNEPconfig:
     nep_rc_radial: float = 8.0
     nep_rc_angular: float = 4.0
     nep_num_neurons: int = 30            # "sum" mode only: width of ANN_2b / ANN_3b
+    # Per-expert amplitudes (δ_soap, δ_2b, δ_3b) for the summed head
+    #   out = δ_soap·ANN_soap + δ_2b·ANN_2b + δ_3b·ANN_3b
+    # Honest statement: δ multiplying an expert's head output is EXACTLY
+    # redundant with rescaling that expert's W1 — the model class is unchanged.
+    # δ is only meaningful because it is EXCLUDED from the L1/L2 regularisation
+    # that acts on W1: an unpenalised per-expert amplitude, i.e. a learned gate
+    # on each body order's influence. Ignored unless nep_descriptor is
+    # "sum" / "gap_sum".
+    sum_delta: list[float] = [1.0, 1.0, 1.0]
+    sum_delta_learn: bool = False        # True → the three δ join the trained params
     # TurboGAP 2-body / 3-body distance descriptors (gap_descriptor.py,
     # gap_descriptor_plan.md §0.1): GAP's neighbour sums with FIXED centres
     # (sparse points) and widths, "exp" kernel only (no "pol"). Used by the

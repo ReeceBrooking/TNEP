@@ -57,6 +57,9 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "q_shift": None,
     "descriptor_scale": "off",
     "q_scale": None,
+    # Pre-existence: the summed head had no per-expert amplitudes (δ ≡ 1).
+    "sum_delta": [1.0, 1.0, 1.0],
+    "sum_delta_learn": False,
 }
 
 
@@ -246,6 +249,8 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         if model._experts_on:
             for k in EXPERT_WEIGHTS:
                 wg.create_dataset(k, data=getattr(model, k).numpy())
+            # Per-expert amplitudes δ (cfg.sum_delta / sum_delta_learn).
+            wg.create_dataset("sum_delta", data=model.sum_delta.numpy())
 
         # Descriptor metadata
         dg = f.create_group("descriptor")
@@ -433,7 +438,8 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
                   U_pair=None, c_pair=None,
-                  M_radial=None, c_r=None, c_a=None, experts=None) -> None:
+                  M_radial=None, c_r=None, c_a=None, experts=None,
+                  sum_delta=None) -> None:
     if model._neighbor_readout:
         # Clean break: the multi-channel readout changed the tail layout
         # (W1 [T, H, C]; c_pair when dipole_species_pairs). Old neighbor-mode
@@ -500,6 +506,17 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                     f"{tuple(var.shape)} (nep_n_max / nep_basis_size / "
                     f"num_types changed).")
             var.assign(saved)
+    if getattr(model, "sum_delta", None) is not None:
+        if sum_delta is None:
+            raise ValueError(
+                f"cfg.nep_descriptor={model._nep_mode!r} but the save has no "
+                f"sum_delta dataset — the per-expert amplitudes δ would "
+                f"silently reset to cfg.sum_delta. Re-train.")
+        if tuple(np.shape(sum_delta)) != tuple(model.sum_delta.shape):
+            raise ValueError(
+                f"saved sum_delta shape {tuple(np.shape(sum_delta))} != model "
+                f"{tuple(model.sum_delta.shape)}.")
+        model.sum_delta.assign(sum_delta)
     if model._experts_on:
         experts = experts or {}
         for k in EXPERT_WEIGHTS:
@@ -559,6 +576,7 @@ def _load_model_h5(path: str) -> TNEP:
             "c_r": wg["c_r"][:] if "c_r" in wg else None,
             "c_a": wg["c_a"][:] if "c_a" in wg else None,
             "experts": {k: wg[k][:] for k in EXPERT_WEIGHTS if k in wg},
+            "sum_delta": wg["sum_delta"][:] if "sum_delta" in wg else None,
         }
 
     if "radial_basis_normalize" in config_dict:   # pre-2026-09-23 bool
@@ -643,6 +661,7 @@ def _load_model_npz(path: str) -> TNEP:
         U_pair=(data["U_pair"] if has_U_pair else None),
         M_radial=data.get("M_radial"),
         c_r=data.get("c_r"), c_a=data.get("c_a"),
+        sum_delta=data.get("sum_delta"),
     )
 
     _print_load_summary(path, cfg)

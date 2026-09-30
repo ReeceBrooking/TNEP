@@ -30,6 +30,8 @@ def main(argv=None) -> None:
     p.add_argument("--scale", choices=["off", "block", "channel", "minmax"], default="off")
     p.add_argument("--norm", choices=["l2", "none"], default="l2")
     p.add_argument("--optimizer", choices=["snes", "adam"], default="snes")
+    p.add_argument("--sum-delta-learn", action="store_true",
+                   help='sum / gap_sum: train the 3 per-expert amplitudes')
     p.add_argument("--generations", type=int, default=6)
     p.add_argument("--frames", type=int, default=12)
     p.add_argument("--pop", type=int, default=8)
@@ -56,6 +58,7 @@ def main(argv=None) -> None:
     cfg.dipole_readout = a.readout
     cfg.dipole_head = a.head
     cfg.nep_descriptor = a.nep
+    cfg.sum_delta_learn = a.sum_delta_learn
     cfg.descriptor_scale = a.scale
     cfg.radial_basis_norm = a.norm
     cfg.optimizer = a.optimizer

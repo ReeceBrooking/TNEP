@@ -45,6 +45,27 @@ def _cfg(**kw):
     cfg.dipole_gauss_sigma_scale = 1.0
     # gap_2b/gap_3b/nep_descriptor need no pinning: GAPconfig has no ANN
     # knobs at all, and its NEP-input fields are frozen constants.
+    # Descriptor geometry and compression are GAPconfig knobs the user tunes
+    # in the working tree (alpha_max, l_max, compress_mode, sigmas, cutoffs);
+    # pin them so a live default cannot change dim_q or the kernel under this
+    # suite. Same reason the dipole_* fields above are pinned.
+    cfg.alpha_max = 4
+    cfg.l_max = 4
+    cfg.compress_mode = "trivial"
+    cfg.atom_sigma_r = 0.5
+    cfg.atom_sigma_t = 0.5
+    cfg.rcut_hard, cfg.rcut_soft = 3.5, 3.0
+    cfg.gap_delta_soap = 1.0
+    cfg.gap_delta_2b = 1.0
+    cfg.gap_delta_3b = 1.0
+    # The GAP 2b/3b block too: centres, widths, cutoffs and the on/off flags.
+    cfg.gap_2b = False
+    cfg.gap_3b = False
+    cfg.gap2b_rcut, cfg.gap3b_rcut = 3.5, 3.5
+    cfg.gap_buffer = 0.5
+    cfg.gap2b_n_centres, cfg.gap2b_sigma = 20, 0.3
+    cfg.gap3b_n_centres, cfg.gap3b_sigma = 50, [0.5, 0.5, 0.5]
+    cfg.gap2b_centres = cfg.gap3b_centres = None
     cfg.gap_sparse_per_species = 40
     cfg.gap_kernel_power = 2
     cfg.gap_ridge_lambda = 1e-6

@@ -378,6 +378,8 @@ def _print_param_breakdown(model) -> None:
     if int(getattr(opt, "n_nep", 0)) > 0:
         rows.append(("NEP  c_r  [T·T·(n+1)·(K+1)]", int(opt.n_c_r)))
         rows.append(("NEP  c_a  [T·T·(n+1)·(K+1)]", int(opt.n_c_a)))
+    if int(getattr(opt, "n_sum_delta", 0)) > 0:
+        rows.append(("sum delta  [3]", int(opt.n_sum_delta)))
 
     accounted = sum(n for _, n in rows)
     if accounted != total:
@@ -501,6 +503,9 @@ def _train_model_inner(cfg: TNEPconfig,
               f"rcut=({cfg.gap2b_rcut}, {cfg.gap3b_rcut}), buffer={cfg.gap_buffer}, "
               f"sigma=({cfg.gap2b_sigma}, {cfg.gap3b_sigma}); ANN_2b(q2) + ANN_3b(q3) "
               f"(H_e = {cfg.nep_num_neurons}) + SOAP ANN, expert W1 = 0 at gen 0; "
+              f"delta (soap, 2b, 3b) = {list(cfg.sum_delta)}"
+              + (" (learned, excluded from L1/L2)" if cfg.sum_delta_learn else " (fixed)")
+              + "; "
               f"centres 2b={np.round(cfg.gap2b_centres, 3).tolist()}, "
               f"3b[0]={np.round(cfg.gap3b_centres[0], 3).tolist()}")
     elif cfg.nep_descriptor != "off":
@@ -512,7 +517,10 @@ def _train_model_inner(cfg: TNEPconfig,
               f"four_body={cfg.nep_four_body}, five_body={cfg.nep_five_body}; "
               f"c init U(−1,1) per GPUMD; c excluded from L1/L2 (GPUMD includes it)"
               + (f"; sum: ANN_2b + ANN_3b (H_e = {cfg.nep_num_neurons}) + SOAP ANN, "
-                 f"expert W1 = 0 at gen 0" if cfg.nep_descriptor == "sum" else "")
+                 f"expert W1 = 0 at gen 0, delta (soap, 2b, 3b) = "
+                 f"{list(cfg.sum_delta)}"
+                 + (" (learned, excluded from L1/L2)" if cfg.sum_delta_learn else " (fixed)")
+                 if cfg.nep_descriptor == "sum" else "")
               + ("; tnep readout: NEP pair forces per candidate (image-exact |r_ij|^"
                  f"{cfg.dipole_rij_power} weights)"
                  if cfg.target_mode == 1 and cfg.dipole_readout == "tnep" else ""))
