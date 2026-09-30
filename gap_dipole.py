@@ -26,6 +26,10 @@ pairs/channels — columns multiply as n_scales × len(ξ) × M_tot·K):
     KERNEL only (second builder + second FPS sparse sets; scales never
     cross). The geometry vectors v are UNCHANGED (Willatt/Musil/Ceriotti).
 
+Additive (not multiplicative) column blocks: gap_2b / gap_3b append TurboGAP's
+2b/3b distance descriptors (gap_descriptor.py, fixed centres auto-selected at
+fit) as per-species linear features — plan §0.3.
+
 Columns = M_tot·K can exceed the 3·F equations (underdetermined); the ridge
 handles it — train RMSE approaches 0 there and test RMSE is the metric.
 Still fixed: dipole_readout="neighbor", target_mode=1, scale_targets=False.
@@ -45,6 +49,7 @@ from ase.io import read
 
 import data as tnep_data
 from DescriptorBuilder import make_descriptor_builder
+from gap_descriptor import gap_raw_numpy, gap_slices, select_centres, validate_gap_cfg
 from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
 
 
@@ -55,7 +60,9 @@ class GapDipoleModel:
     Column/α block order (one contract, shared by fit + predict via
     _phi_frame): scale → species → ξ → (m, k). Per (scale, species) the
     block is [len(xi)·M_t·K] flat, ξ-major. The scale-2 fields are None
-    unless cfg.gap_extra_rcut is set."""
+    unless cfg.gap_extra_rcut is set. Then the additive TurboGAP blocks
+    (gap_descriptor_plan.md §0.3): alpha_gap2b / alpha_gap3b per species t,
+    [W2·K] / [W3·K] flat (s-major), None unless cfg.gap_2b / gap_3b."""
     cfg: TNEPconfig
     builder: object                   # descriptor builder from the fitting cfg
     sparse_desc: list[np.ndarray]     # per type t: [M_t, Q] unit-norm rows
@@ -64,6 +71,8 @@ class GapDipoleModel:
     builder2: object = None           # second-scale builder (gap_extra_rcut)
     sparse_desc2: list[np.ndarray] | None = None
     alpha2: list[np.ndarray] | None = None
+    alpha_gap2b: list[np.ndarray] | None = None
+    alpha_gap3b: list[np.ndarray] | None = None
 
 
 def _pair_columns(cfg: TNEPconfig) -> bool:
@@ -121,6 +130,8 @@ def _validate(cfg: TNEPconfig) -> None:
     bad = [msg for ok, msg in checks if not ok]
     if bad:
         raise ValueError("fit_gap_dipole config violation: " + "; ".join(bad))
+    if cfg.gap_2b or cfg.gap_3b:
+        validate_gap_cfg(cfg)          # centres may still be None: fit selects them
 
 
 def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
@@ -172,15 +183,21 @@ def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
 
 
 def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
-               v: np.ndarray, ti: np.ndarray,
-               xis: tuple[int, ...]) -> np.ndarray:
+               v: np.ndarray, ti: np.ndarray, xis: tuple[int, ...],
+               gap_q: tuple[np.ndarray | None, np.ndarray | None] | None = None,
+               ) -> np.ndarray:
     """[3, n_columns] design block for one frame — THE column contract for
     fit AND predict. scales = [(D, sparse_desc)] per length scale; each
     scale's kernels couple its own descriptors to its own sparse points ONLY
     (scales never cross, like species). Block order: scale → species → ξ →
     (m, k); the base Gram is computed once per (scale, species) and raised
     elementwise to each ξ (sum-of-kernels column blocks). The geometry
-    vectors v are scale-independent (bond basis, dipole_rc)."""
+    vectors v are scale-independent (bond basis, dipole_rc).
+
+    gap_q = (q2 [N, W2] | None, q3 [N, W3] | None) appends the additive
+    TurboGAP blocks AFTER all SOAP columns: gap2b (species → (s, k)) then
+    gap3b (species → (s, k)) — Σ_{i∈t} q[i, s]·v[i, x, k] — i.e. the 2b/3b
+    site energies with a linear readout, μ-weighted by the bond basis."""
     cols = []
     for D, sparse_desc in scales:
         for t, Dm in enumerate(sparse_desc):
@@ -190,7 +207,24 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
             for xi in xis:
                 cols.append(np.einsum("nm,nxk->xmk", G ** xi, vt)
                             .reshape(3, -1))            # [3, M_t·K]
+    for q in gap_q or ():
+        if q is not None:
+            for t in range(len(scales[0][1])):
+                sel = ti == t
+                cols.append(np.einsum("ns,nxk->xsk", q[sel], v[sel])
+                            .reshape(3, -1))            # [3, W·K]
     return np.concatenate(cols, axis=1)
+
+
+def _gap_q(atoms: Atoms, ti: np.ndarray, cfg: TNEPconfig):
+    """Per-frame (q2 | None, q3 | None) float64 for _phi_frame per the
+    cfg flags; None when both are off (shared by fit + predict)."""
+    if not (cfg.gap_2b or cfg.gap_3b):
+        return None
+    raw = gap_raw_numpy(atoms, ti, cfg).astype(np.float64)
+    sl = gap_slices(cfg)
+    return (raw[:, sl["two_body"]] if cfg.gap_2b else None,
+            raw[:, sl["three_body"]] if cfg.gap_3b else None)
 
 
 def _targets(frames: list[Atoms], cfg: TNEPconfig) -> np.ndarray:
@@ -235,6 +269,13 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         dataset = [dataset[k] for k in cfg.indices]
         types_int = [types_int[k] for k in cfg.indices]
     tis = [np.asarray(t) for t in types_int]
+    if cfg.seed is None:               # as MasterTNEP: FPS / centres reproducible
+        cfg.seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
+    if (cfg.gap_2b or cfg.gap_3b) and (cfg.gap2b_centres is None
+                                       or cfg.gap3b_centres is None):
+        c2, c3 = select_centres(dataset, cfg)
+        cfg.gap2b_centres, cfg.gap3b_centres = c2.tolist(), c3.tolist()
+    gap_qs = [_gap_q(at, ti, cfg) for at, ti in zip(dataset, tis)]
 
     builder = make_descriptor_builder(cfg)
     descs = _descriptors(builder, dataset)
@@ -281,8 +322,16 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
 
     scale_sparse = [sparse_desc] + ([sparse_desc2] if sparse_desc2 else [])
     sizes = [[len(s) for s in group] for group in scale_sparse]
-    # Columns multiply: n_scales × per-species M × len(ξ list) × K.
-    n_columns = sum(sum(sz) for sz in sizes) * len(xis) * n_vcols
+    # α block per (scale, species): M × len(ξ list) × K columns; then the
+    # additive GAP blocks, one per species: W2·K (gap_2b) and W3·K (gap_3b).
+    sl = gap_slices(cfg)
+    T = cfg.num_types
+    w_gap = {"two_body": (sl["two_body"].stop if cfg.gap_2b else 0) * n_vcols,
+             "three_body": ((sl["three_body"].stop - sl["two_body"].stop)
+                            if cfg.gap_3b else 0) * n_vcols}
+    blocks = ([n * len(xis) * n_vcols for sz in sizes for n in sz]
+              + [w for w in w_gap.values() if w for _ in range(T)])
+    n_columns = sum(blocks)
 
     # Φ frame-by-frame — the full N_envs × M kernel never exists.
     F = len(dataset)
@@ -291,7 +340,7 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         scales = [(descs[f], sparse_desc)]
         if descs2 is not None:
             scales.append((descs2[f], sparse_desc2))
-        Phi[f] = _phi_frame(scales, vs[f], tis[f], xis)
+        Phi[f] = _phi_frame(scales, vs[f], tis[f], xis, gap_qs[f])
     Phi_flat = Phi.reshape(3 * F, n_columns)
 
     # Explicit ridge solve, λ_eff relative to mean(diag(ΦᵀΦ)) so λ is
@@ -314,13 +363,19 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     else:
         raise ValueError(f"unknown gap_solver {solver!r} "
                          f"(expected 'primal' or 'dual')")
-    blocks = [n * len(xis) * n_vcols for sz in sizes for n in sz]
     parts = np.split(alpha_flat, np.cumsum(blocks)[:-1])
-    alpha, alpha2 = parts[:cfg.num_types], parts[cfg.num_types:] or None
+    # every α group is one block per species
+    groups = [parts[i:i + T] for i in range(0, len(parts), T)]
+    alpha = groups.pop(0)
+    alpha2 = groups.pop(0) if descs2 is not None else None
+    alpha_gap2b = groups.pop(0) if cfg.gap_2b else None
+    alpha_gap3b = groups.pop(0) if cfg.gap_3b else None
+    assert not groups
 
     model = GapDipoleModel(cfg=cfg, builder=builder, sparse_desc=sparse_desc,
                            alpha=alpha, xi=xis, builder2=builder2,
-                           sparse_desc2=sparse_desc2, alpha2=alpha2)
+                           sparse_desc2=sparse_desc2, alpha2=alpha2,
+                           alpha_gap2b=alpha_gap2b, alpha_gap3b=alpha_gap3b)
 
     train_rmse, train_r2 = _rmse_r2(
         (Phi_flat @ alpha_flat).reshape(F, 3), mu)
@@ -358,6 +413,13 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
                 "pair_columns": pair,
                 "extra_rcut": cfg.gap_extra_rcut,
                 "n_columns": n_columns,
+                # additive TurboGAP 2b/3b blocks (gap_descriptor.py)
+                "gap_2b": bool(cfg.gap_2b), "gap_3b": bool(cfg.gap_3b),
+                "n_gap_columns": {k: w * T for k, w in w_gap.items()},
+                **({k: getattr(cfg, k) for k in (
+                    "gap2b_centres", "gap3b_centres", "gap2b_sigma",
+                    "gap3b_sigma", "gap2b_rcut", "gap3b_rcut", "gap_buffer")}
+                   if cfg.gap_2b or cfg.gap_3b else {}),
                 "M_per_species": {str(z): n
                                   for z, n in zip(cfg.types, sizes[0])},
                 # scale-2 sparse-set sizes, only when gap_extra_rcut is set
@@ -390,15 +452,17 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
     descs = _descriptors(model.builder, frames)
     descs2 = (_descriptors(model.builder2, frames)
               if model.builder2 is not None else None)
-    alpha_flat = np.concatenate(model.alpha + list(model.alpha2 or []))
+    alpha_flat = np.concatenate(
+        model.alpha + list(model.alpha2 or []) + list(model.alpha_gap2b or [])
+        + list(model.alpha_gap3b or []))
     out = np.empty((len(frames), 3))
     for f, (atoms, ti, D) in enumerate(zip(frames, tis, descs)):
         ti = np.asarray(ti)
         scales = [(D, model.sparse_desc)]
         if descs2 is not None:
             scales.append((descs2[f], model.sparse_desc2))
-        out[f] = _phi_frame(scales, _v_atoms(atoms, ti, cfg), ti,
-                            model.xi) @ alpha_flat
+        out[f] = _phi_frame(scales, _v_atoms(atoms, ti, cfg), ti, model.xi,
+                            _gap_q(atoms, ti, cfg)) @ alpha_flat
     return out
 
 

@@ -416,3 +416,152 @@ def test_gap_sum_driver_centres():
     m = _model(cfg)
     d = prepare_eval_data([at], cfg)
     assert np.all(np.isfinite(_predict_eff(m, d)))
+
+
+# ── Task 3: GAP mode — gap_2b / gap_3b additive column blocks (gap_dipole) ──
+from dataclasses import replace
+from ase.io import read, write
+import json
+import gap_dipole
+from test_gap_dipole import _cfg as _dip_cfg, _chdir, WATER_XYZ
+
+GAP_KW = dict(gap_2b=True, gap_3b=True, gap2b_n_centres=4, gap3b_n_centres=6,
+              gap_sparse_per_species=8)
+
+
+def _six_frames(tmp_path, name="six.xyz", mu=None):
+    frames = read(WATER_XYZ, index="0:6")
+    for k, f in enumerate(frames):
+        f.calc = None
+        f.info["dipole"] = np.zeros(3) if mu is None else mu[k]
+    p = str(tmp_path / name)
+    write(p, frames)
+    return frames, p
+
+
+@pytest.fixture(scope="module")
+def gap_fitted(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("gapmode")
+    with _chdir(tmp):
+        base = gap_dipole.fit_gap_dipole(_dip_cfg(**{**GAP_KW, "gap_2b": False, "gap_3b": False}))
+        m = gap_dipole.fit_gap_dipole(_dip_cfg(**GAP_KW))
+        rec = json.load(open(os.path.join("GAP", sorted(os.listdir("GAP"))[-1])))
+    return base, m, rec
+
+
+def _frame_inputs(m, at):
+    ti = np.array([m.cfg.types.index(int(z)) for z in at.numbers])
+    D = np.asarray(m.builder.build_descriptors([at], calc_gradients=False)[0][0], dtype=np.float64)
+    v = gap_dipole._v_atoms(at, ti, m.cfg)
+    raw = gd.gap_raw_numpy(at, ti, m.cfg).astype(np.float64)
+    sl = gd.gap_slices(m.cfg)
+    return ti, D, v, raw[:, sl["two_body"]], raw[:, sl["three_body"]]
+
+
+def test_gapmode_column_count(gap_fitted):
+    base, m, _ = gap_fitted
+    cfg, T, K = m.cfg, m.cfg.num_types, 1
+    sl = gd.gap_slices(cfg)
+    W2, W3 = sl["two_body"].stop, sl["three_body"].stop - sl["two_body"].stop
+    n_soap = sum(len(a) for a in base.alpha)
+    assert [len(a) for a in m.alpha] == [len(a) for a in base.alpha]
+    assert [len(a) for a in m.alpha_gap2b] == [W2 * K] * T
+    assert [len(a) for a in m.alpha_gap3b] == [W3 * K] * T
+    assert cfg.gap2b_centres is not None and cfg.gap3b_centres is not None
+    at = read(WATER_XYZ, index="10")
+    ti, D, v, q2, q3 = _frame_inputs(m, at)
+    phi = gap_dipole._phi_frame([(D, m.sparse_desc)], v, ti, m.xi, (q2, q3))
+    assert phi.shape == (3, n_soap + T * W2 * K + T * W3 * K)
+
+
+def test_gapmode_phi_blocks_explicit_loop(gap_fitted):
+    _, m, _ = gap_fitted
+    at = read(WATER_XYZ, index="10")
+    ti, D, v, q2, q3 = _frame_inputs(m, at)
+    scales = [(D, m.sparse_desc)]
+    soap = gap_dipole._phi_frame(scales, v, ti, m.xi)
+    assert np.array_equal(soap, gap_dipole._phi_frame(scales, v, ti, m.xi, gap_q=None))
+    full = gap_dipole._phi_frame(scales, v, ti, m.xi, (q2, q3))
+    assert np.array_equal(full[:, :soap.shape[1]], soap)
+    blocks = []
+    for q in (q2, q3):
+        for t in range(m.cfg.num_types):
+            b = np.zeros((3, q.shape[1], v.shape[2]))
+            for i in np.flatnonzero(ti == t):
+                for s in range(q.shape[1]):
+                    for k in range(v.shape[2]):
+                        b[:, s, k] += q[i, s] * v[i, :, k]
+            blocks.append(b.reshape(3, -1))
+    assert np.allclose(full[:, soap.shape[1]:], np.concatenate(blocks, axis=1), rtol=1e-12, atol=1e-12)
+    # 2b-only / 3b-only drop the other block
+    only2 = gap_dipole._phi_frame(scales, v, ti, m.xi, (q2, None))
+    assert np.array_equal(only2, full[:, :soap.shape[1] + sum(b.shape[1] for b in blocks[:2])])
+
+
+@pytest.mark.parametrize("flags", [dict(gap_2b=True, gap_3b=False), dict(gap_2b=True, gap_3b=True)])
+def test_gapmode_exact_recovery_known_alpha(tmp_path, flags):
+    frames, p0 = _six_frames(tmp_path)
+    kw = dict(total_N=None, gap_ridge_lambda=1e-12, **{**GAP_KW, **flags})
+    with _chdir(tmp_path):
+        base = gap_dipole.fit_gap_dipole(_dip_cfg(data_path=p0, **kw))
+    assert (base.alpha_gap3b is None) == (not flags["gap_3b"])
+    rng = np.random.default_rng(0)
+    star = replace(base, alpha=[np.zeros_like(a) for a in base.alpha],
+                   alpha_gap2b=[rng.normal(size=len(a)) for a in base.alpha_gap2b],
+                   alpha_gap3b=None if base.alpha_gap3b is None
+                   else [rng.normal(size=len(a)) for a in base.alpha_gap3b])
+    mu_star = gap_dipole.predict(star, frames)
+    _, p1 = _six_frames(tmp_path, "synth.xyz", mu_star)
+    with _chdir(tmp_path):
+        refit = gap_dipole.fit_gap_dipole(_dip_cfg(data_path=p1, **kw))
+    assert np.allclose(gap_dipole.predict(refit, frames), mu_star,
+                       atol=1e-8 * max(np.abs(mu_star).max(), 1.0))
+
+
+def test_gapmode_predict_matches_fit_design(tmp_path):
+    """predict() on the TRAINING frames reproduces the fit's own Φα (its
+    recorded train RMSE) — guards the three coupled edits of plan §0.3."""
+    mu = np.random.default_rng(3).normal(size=(6, 3))
+    frames, p1 = _six_frames(tmp_path, "rand.xyz", mu)
+    cfg = _dip_cfg(data_path=p1, total_N=None, **GAP_KW)
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(cfg)
+        rec = json.load(open(os.path.join("GAP", os.listdir("GAP")[0])))
+    pred = gap_dipole.predict(m, frames)
+    rmse, _ = gap_dipole._rmse_r2(pred, gap_dipole._targets(frames, cfg))
+    assert np.isclose(rmse, rec["metrics"]["train_rmse"], rtol=1e-8, atol=1e-12)
+    # and the gap blocks are live: zeroing them changes the prediction
+    off = replace(m, alpha_gap2b=[np.zeros_like(a) for a in m.alpha_gap2b],
+                  alpha_gap3b=[np.zeros_like(a) for a in m.alpha_gap3b])
+    assert not np.allclose(gap_dipole.predict(off, frames), pred, atol=1e-8)
+
+
+def test_gapmode_run_record(gap_fitted):
+    _, m, rec = gap_fitted
+    g = rec["gap"]
+    assert g["gap_2b"] is True and g["gap_3b"] is True
+    assert g["gap2b_centres"] == m.cfg.gap2b_centres and len(g["gap2b_centres"]) == 4
+    assert g["gap3b_centres"] == m.cfg.gap3b_centres and np.shape(g["gap3b_centres"]) == (6, 3)
+    assert g["gap2b_sigma"] == m.cfg.gap2b_sigma and g["gap3b_sigma"] == list(m.cfg.gap3b_sigma)
+    assert g["gap2b_rcut"] == m.cfg.gap2b_rcut and g["gap3b_rcut"] == m.cfg.gap3b_rcut
+    assert g["gap_buffer"] == m.cfg.gap_buffer
+    T = m.cfg.num_types
+    assert g["n_gap_columns"] == {"two_body": T * 2 * 4, "three_body": T * 3 * 6}
+    assert g["n_columns"] == sum(len(a) for a in m.alpha + m.alpha_gap2b + m.alpha_gap3b)
+
+
+def test_gapmode_validate():
+    gap_dipole._validate(_dip_cfg(gap_2b=True))                    # centres None: filled in fit
+    gap_dipole._validate(_dip_cfg(gap_3b=True, gap2b_centres=[1.0] * 20))
+    gap_dipole._validate(_dip_cfg(gap2b_sigma=0.0))                # flags off: gap fields unused
+    with pytest.raises(ValueError, match="gap2b_sigma"):
+        gap_dipole._validate(_dip_cfg(gap_2b=True, gap2b_sigma=0.0))
+    with pytest.raises(ValueError, match="gap3b_centres"):
+        gap_dipole._validate(_dip_cfg(gap_3b=True, gap3b_centres=[[1.0, 2.0]]))
+    with pytest.raises(ValueError, match="nep_descriptor"):
+        gap_dipole._validate(_dip_cfg(gap_2b=True, nep_descriptor="gap_sum"))
+
+
+def test_gapmode_flags_off_no_blocks(gap_fitted):
+    base, _, _ = gap_fitted
+    assert base.alpha_gap2b is None and base.alpha_gap3b is None
