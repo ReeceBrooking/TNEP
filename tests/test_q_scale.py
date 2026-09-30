@@ -16,8 +16,7 @@ from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
 from TNEP import gen0_ann_inputs
 from test_radial_basis import _cfg, _cho_frames, _model, _eval_data, _predict
 
-FULL = dict(radial_basis_size=8, radial_basis_per_l=True, radial_basis_two_body=True,
-            radial_basis_four_body=True, radial_basis_five_body=True,
+FULL = dict(radial_basis_size=8, radial_basis_per_l=True,
             descriptor_mixing=True, descriptor_mixing_regularizer="expm",
             dipole_species_pairs="symmetric")
 
@@ -108,7 +107,7 @@ def _predict_eff(model, data):
 @pytest.mark.parametrize("norm", ["none", "sqrt"])
 def test_norm_options(norm):
     """none: same direction as l2, O(1) norms varying with environment.
-    sqrt: degree 1 (doubling the coefficients doubles q), O(1). Extras untouched."""
+    sqrt: degree 1 (doubling the coefficients doubles q), O(1)."""
     frames = _cho_frames(6)
     cfg_n = _cfg(**FULL)
     cfg_u = _cfg(radial_basis_norm=norm, **FULL)
@@ -116,18 +115,16 @@ def test_norm_options(norm):
     data = _eval_data(cfg_n, frames)
     qn = m_n.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
     qu = m_u.soap_from_raw(data["descriptors"], data["Z_int"]).numpy()
-    n_extra = 3 * 12
     mask = data["atom_mask"].numpy() > 0
-    soap_n, soap_u = qn[mask][:, :-n_extra], qu[mask][:, :-n_extra]
+    soap_n, soap_u = qn[mask], qu[mask]
     norms = np.linalg.norm(soap_u, axis=1)
     if norm == "none":
         np.testing.assert_allclose(soap_u / norms[:, None], soap_n, rtol=1e-4, atol=1e-6)
     else:
-        q2 = m_u.soap_from_raw(2.0 * data["descriptors"], data["Z_int"]).numpy()[mask][:, :-n_extra]
+        q2 = m_u.soap_from_raw(2.0 * data["descriptors"], data["Z_int"]).numpy()[mask]
         np.testing.assert_allclose(q2, 2.0 * soap_u, rtol=1e-4, atol=1e-6)      # degree 1
         np.testing.assert_allclose(np.sign(soap_u), np.sign(soap_n), atol=0)      # signs kept
     assert 1e-2 < np.median(norms) < 10.0 and norms.std() / norms.mean() > 0.03
-    np.testing.assert_allclose(qu[..., -n_extra:], qn[..., -n_extra:], rtol=1e-6)
     assert np.all(qu[~mask] == 0.0)
     m, mu = compute_q_scale(qu, data["atom_mask"].numpy(), _cfg(descriptor_scale="channel", radial_basis_norm=norm, **FULL))
     assert np.all(np.isfinite(m)) and np.all(np.isfinite(mu))

@@ -330,8 +330,7 @@ def compute_dim_q(cfg) -> int:
 
 
 def soap_dim(cfg) -> int:
-    """SOAP descriptor dimension n_compressed from cfg alone (closed-form),
-    plus the learned-basis extras (radial_extra_count).
+    """SOAP descriptor dimension n_compressed from cfg alone (closed-form).
 
     Depends only on (alpha_max, l_max, num_types, compress_mode); no
     neighbour-list build. compress_mode 'linear' is special-cased; others
@@ -340,17 +339,16 @@ def soap_dim(cfg) -> int:
     alpha_max = int(cfg.alpha_max)
     l_max = int(cfg.l_max)
     n_species = int(cfg.num_types)
-    two_body = radial_extra_count(cfg)
     if _radial_species_sum(cfg):
         # Species-summed learned basis: full (n <= n') spectrum over alpha channels.
-        return alpha_max * (alpha_max + 1) // 2 * (l_max + 1) + two_body
+        return alpha_max * (alpha_max + 1) // 2 * (l_max + 1)
     compress_mode = getattr(cfg, "compress_mode", "trivial")
     if compress_mode == "linear":
         # quippy linear default = 2 × n_species pivots × (l_max+1) features
         return int(2 * n_species * (l_max + 1))
     alpha_per_species = [alpha_max] * n_species
     mask_info = make_compress_mask_trivial(alpha_per_species, l_max)
-    return int(mask_info["n_compressed"]) + two_body
+    return int(mask_info["n_compressed"])
 
 
 def radial_basis_init(alpha_max: int, n_basis: int) -> np.ndarray:
@@ -376,36 +374,13 @@ def _radial_species_sum(cfg) -> bool:
             and bool(getattr(cfg, "radial_basis_species_sum", False)))
 
 
-def radial_extra_count(cfg) -> int:
-    """Channels appended after the SOAP block by the learned-basis extras
-    (radial_basis_two_body / four_body / five_body): n_max each (alpha_max
-    species-summed, S·alpha_max blocked), 0 when the knob is off."""
-    if getattr(cfg, "radial_basis_size", None) is None:
-        return 0
-    a = int(cfg.alpha_max)
-    return _radial_extras_on(cfg) * (a if _radial_species_sum(cfg) else a * int(cfg.num_types))
-
-
-def _radial_extras_on(cfg) -> int:
-    """How many learned-basis extra blocks (2-/4-/5-body) are switched on."""
-    return sum(bool(getattr(cfg, f, False)) for f in (
-        "radial_basis_two_body", "radial_basis_four_body", "radial_basis_five_body"))
-
-
 def extra_block_widths(cfg) -> list:
     """Widths of the blocks appended after the SOAP species-pair blocks, in
-    channel order: the learned-basis extras (2-/4-/5-body, one block each),
-    then under cfg.nep_descriptor in ("concat", "replace") the NEP sub-blocks
-    (radial, L1..L4, 4-body, 5-body from nep_slices)."""
-    mode = str(getattr(cfg, "nep_descriptor", "off"))
-    widths = []
-    n_extra = radial_extra_count(cfg)
-    if n_extra and mode != "replace":      # "replace" drops the whole SOAP output
-        n_on = _radial_extras_on(cfg)
-        widths += [n_extra // n_on] * n_on
-    if mode in ("concat", "replace"):
-        widths += nep_block_widths(cfg)
-    return widths
+    channel order: under cfg.nep_descriptor in ("concat", "replace") the NEP
+    sub-blocks (radial, L1..L4, 4-body, 5-body from nep_slices)."""
+    if str(getattr(cfg, "nep_descriptor", "off")) in ("concat", "replace"):
+        return nep_block_widths(cfg)
+    return []
 
 
 def nep_block_widths(cfg) -> list:
@@ -590,8 +565,7 @@ def descriptor_block_layout(cfg) -> dict:
             alpha_eff_per_pair={(0, 0): per_l},
             max_alpha_eff=per_l,
             N_per_l=per_l,
-            # Appended blocks (learned-basis extras, NEP) sit after the SOAP
-            # block, outside every pair.
+            # Appended NEP blocks sit after the SOAP block, outside every pair.
             dim_q=int(per_l * L) + sum(extra_block_widths(cfg)),
         )
     alpha_per_species = [alpha_max] * n_species
@@ -674,8 +648,7 @@ def descriptor_block_layout(cfg) -> dict:
         alpha_eff_per_pair=alpha_eff_per_pair,
         max_alpha_eff=max(alpha_eff_per_pair.values()) if alpha_eff_per_pair else 0,
         N_per_l=N_per_l,
-        # Appended blocks (learned-basis extras, NEP) sit after the SOAP
-        # block, outside every pair.
+        # Appended NEP blocks sit after the SOAP block, outside every pair.
         dim_q=int(q_counter) + sum(extra_block_widths(cfg)),
     )
 

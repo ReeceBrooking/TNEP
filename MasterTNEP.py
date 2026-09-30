@@ -492,9 +492,6 @@ def _train_model_inner(cfg: TNEPconfig,
               f"combinations of K={cfg.radial_basis_size} orthonormal poly3 "
               f"functions"
               + (", separate per l block" if cfg.radial_basis_per_l else "")
-              + (", + un-normalised 2-body block" if cfg.radial_basis_two_body else "")
-              + (", + 4-body (l=2 bispectrum) block" if cfg.radial_basis_four_body else "")
-              + (", + 5-body ((q^{l=1})²) block" if cfg.radial_basis_five_body else "")
               + {"l2": "", "none": "; per-atom L2 normalisation OFF (raw spectrum × scale²)",
                  "sqrt": "; per-atom L2 normalisation OFF (sign·√|q| × scale, degree 1)"}[cfg.radial_basis_norm]
               + f" (M_radial {_shape} in the SNES vector; init = fixed basis)")

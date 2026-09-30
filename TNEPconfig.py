@@ -238,37 +238,15 @@ class TNEPconfig:
     # NEP's separate angular c_nk. False shares one M across all l.
     # L× the radial coefficients; init still reproduces the fixed basis.
     radial_basis_per_l: bool = False
-    # Append NEP's 2-body radial descriptor (radial_basis_size only):
-    # q_n = Σ_j g_n(r_ij), i.e. the l = 0 centre coefficients of the learned
-    # radial functions, left UN-normalised (SOAP's per-atom L2 norm discards
-    # coordination/density; this block keeps it). Scaled by the fixed
-    # constant 1/(4π (rcut_hard/atom_sigma_t)²) (SOAP-turbo's angular
-    # amplitude) so the channels are O(1). dim_q grows by n_max (S·alpha_max
-    # blocked, alpha_max species-summed). Not combinable with
-    # descriptor_preprocess_contract; excluded from descriptor_mixing blocks.
-    radial_basis_two_body: bool = False
-    # Append NEP's 4-body descriptor (radial_basis_size only, l_max ≥ 2):
-    # per radial channel n, the l1=l2=l3=2 bispectrum invariant
-    # Σ_{m1+m2+m3=0} (2 2 2; m1 m2 m3)·c_{n2m1}c_{n2m2}c_{n2m3} of the
-    # learned functions, as a signed cube root so it sits on the SOAP
-    # channels' scale (the raw cubic is ~100× smaller). dim_q grows by
-    # n_max. Excluded from mixing blocks; not with preprocess contraction.
-    radial_basis_four_body: bool = False
-    # Append NEP's 5-body descriptor (radial_basis_size only, l_max ≥ 1):
-    # per channel n, Σ_m |c_{n1m}|² — NEP's C5B form is its square, i.e. a
-    # monotone transform of the l = 1 three-body invariant (no new
-    # information, kept for NEP parity; the un-squared form keeps the SOAP
-    # channels' scale). dim_q grows by n_max. Same exclusions as four_body.
-    radial_basis_five_body: bool = False
     # How the SOAP power spectrum is put on a common footing (radial_basis_size
-    # only; the extra blocks are always degree-1 in the coefficients):
+    # only):
     #   "l2"   : SOAP-turbo's per-atom projection q/‖q‖ — shape only, magnitude
     #            (coordination) discarded, channels coupled through the norm.
     #   "none" : raw spectrum × scale² — magnitude kept, channels independent,
     #            quadratic in the neighbour density (l=0 ≫ l=4, C ≫ H).
     #   "sqrt" : sign(q)·√|q| × scale — degree 1 in the density like NEP's
-    #            radial block and the extras; halves every log-spread of
-    #            "none" while keeping magnitude. Meant with descriptor_scale.
+    #            radial block; halves every log-spread of "none" while
+    #            keeping magnitude. Meant with descriptor_scale.
     radial_basis_norm: str = "l2"
     # Descriptor scale preconditioning (plan 2026-09-23). A per-channel scale
     # m and shift μ are folded into the input layer, W0_eff = Uᵀ·diag(m)·W0

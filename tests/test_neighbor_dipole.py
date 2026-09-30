@@ -57,9 +57,6 @@ def _cfg(**kw):
     cfg.radial_basis_size = None
     cfg.radial_basis_species_sum = False
     cfg.radial_basis_per_l = False
-    cfg.radial_basis_two_body = False
-    cfg.radial_basis_four_body = False
-    cfg.radial_basis_five_body = False
     cfg.radial_basis_norm = "l2"
     cfg.q_shift = None
     cfg.descriptor_scale = "off"

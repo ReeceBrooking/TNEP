@@ -499,10 +499,6 @@ def test_compute_dim_q_and_layout_per_mode():
     assert lo["dim_q"] == ds and lc["dim_q"] == ds + dn
     assert max(int(v.max()) for v in lc["pair_q_index"].values()) < ds   # NEP block outside the pairs
     assert lr["pair_keys"] == [] and lr["dim_q"] == nd.nep_dim(rp) and lr["max_block_size"] == 0
-    # "replace" drops the SOAP output, learned-basis extras included.
-    rp2 = _cfg(nep_descriptor="replace", radial_basis_size=4, radial_basis_two_body=True)
-    assert compute_dim_q(rp2) == descriptor_block_layout(rp2)["dim_q"] == nd.nep_dim(rp2)
-    covers(rp2, 1 + 4 + 1)
 
 
 # ── Task 5: nep_raw data plumbing + every forward call site ────────────────

@@ -204,50 +204,22 @@ class TNEP(layers.Layer):
                 raise ValueError(
                     f"cfg.radial_basis_norm={cfg.radial_basis_norm!r}; expected "
                     f"'l2', 'none' or 'sqrt'.")
-            self._rb_two_body = bool(cfg.radial_basis_two_body)
-            self._rb_four_body = bool(cfg.radial_basis_four_body)
-            self._rb_five_body = bool(cfg.radial_basis_five_body)
-            _extras = self._rb_two_body or self._rb_four_body or self._rb_five_body
-            if _extras and self.descriptor_preprocess_contract != "off":
-                raise NotImplementedError(
-                    "radial_basis_two/four/five_body append channels outside "
-                    "the species-pair blocks descriptor_preprocess_contract "
-                    "layouts assume; set descriptor_preprocess_contract='off'.")
-            if self._rb_four_body and int(cfg.l_max) < 2:
-                raise ValueError("radial_basis_four_body needs l_max >= 2.")
-            if self._rb_five_body and int(cfg.l_max) < 1:
-                raise ValueError("radial_basis_five_body needs l_max >= 1.")
-            # Fixed O(1) scale for the extra blocks: undo SOAP-turbo's 4π and
-            # angular amplitude (rcut/σ_t)² carried by the raw coefficients.
-            self._rb_two_body_scale = float(
+            # Fixed O(1) scale for the raw coefficients: undo SOAP-turbo's 4π
+            # and angular amplitude (rcut/σ_t)² they carry.
+            self._rb_coef_scale = float(
                 1.0 / (4.0 * np.pi * (float(cfg.rcut_hard) / float(cfg.atom_sigma_t)) ** 2))
-            if self._rb_four_body:
-                # (2 2 2; m1 m2 m3) triplets with m1+m2+m3 = 0, m ∈ [-2, 2],
-                # indexed into the full-m vector position m + 2.
-                from sympy.physics.wigner import wigner_3j
-                trip = [(m1 + 2, m2 + 2, -m1 - m2 + 2,
-                         float(wigner_3j(2, 2, 2, m1, m2, -m1 - m2)))
-                        for m1 in range(-2, 3) for m2 in range(-2, 3)
-                        if abs(m1 + m2) <= 2]
-                self._rb_3j_idx = [tf.constant([t[i] for t in trip], tf.int32)
-                                   for i in range(3)]
-                self._rb_3j_w = tf.constant([t[3] for t in trip], tf.float32)
             if (self._rb_species_sum
                     and self.descriptor_preprocess_contract != "off"):
                 raise NotImplementedError(
                     "cfg.radial_basis_species_sum=True has no species-pair "
                     "blocks, which descriptor_preprocess_contract layouts "
                     "assume; set descriptor_preprocess_contract='off'.")
-            from DescriptorBuilderGPU import radial_extra_count
             cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types,
                                           species_sum=self._rb_species_sum)
-            self._rb_n_extra = int(radial_extra_count(cfg))
-            if (int(cm["gather_idx"].size) + self._rb_n_extra
-                    != self._soap_dim):
+            if int(cm["gather_idx"].size) != self._soap_dim:
                 raise RuntimeError(
                     f"radial_basis_channel_map gives {cm['gather_idx'].size} "
-                    f"(+{self._rb_n_extra} extra) channels, "
-                    f"SOAP dim={self._soap_dim}.")
+                    f"channels, SOAP dim={self._soap_dim}.")
             L = int(cfg.l_max) + 1
             self._rb_alpha, self._rb_K = alpha, K
             self._rb_L, self._rb_kmax = L, L * (L + 1) // 2
@@ -270,9 +242,7 @@ class TNEP(layers.Layer):
                 np.broadcast_to(M0, M0_shape).astype(np.float32),
                 trainable=False, name="M_radial")
         else:
-            for f in ("radial_basis_species_sum", "radial_basis_per_l",
-                      "radial_basis_two_body", "radial_basis_four_body",
-                      "radial_basis_five_body"):
+            for f in ("radial_basis_species_sum", "radial_basis_per_l"):
                 if bool(getattr(cfg, f, False)):
                     raise ValueError(
                         f"cfg.{f}=True requires cfg.radial_basis_size (the "
@@ -1073,12 +1043,6 @@ class TNEP(layers.Layer):
         cfg.radial_basis_per_l gives each l block its own M[..., l].
         cfg.radial_basis_norm: "l2" per-atom projection; "none" raw × scale²;
         "sqrt" sign·√|q| × scale (degree 1). Pair the latter two with descriptor_scale.
-        Appended blocks (n_max channels each, in this order, on the
-        O(1)-scaled coefficients ĉ = c × scale, never L2-normalised):
-          radial_basis_two_body  : Re ĉ_{n00}                      (NEP 2-body)
-          radial_basis_four_body : cbrt Σ (2 2 2; m1 m2 m3) ĉ_{n2m1}ĉ_{n2m2}ĉ_{n2m3}
-                                   (l=2 bispectrum, NEP 4-body; signed cube root)
-          radial_basis_five_body : Σ_m |ĉ_{n1m}|²   (NEP 5-body is its square)
         Args:
             raw : [..., A, S·K·k_max·2]  builder output (species, κ, k, re/im)
             Z   : [..., A]               type indices
@@ -1139,52 +1103,21 @@ class TNEP(layers.Layer):
                 p_l = piv[:, :, :, k0:k0 + l + 1, :] * self._rb_mw[l]
                 c_l = cc[:, :, :, k0:k0 + l + 1, :]
             G_l.append(tf.einsum('cnpkr,cnmkr->cnpm', p_l, c_l))   # [C, N, R, n_max]
-            if l == 0 and self._rb_two_body:
-                c_00 = c_l[:, :, :, 0, 0]                         # [C, N, n_max] Re c_{n00}
-            if l == 1 and self._rb_five_body:
-                c_1 = c_l                                         # [C, N, n_max, 2, 2] m = 0, 1
-            if l == 2 and self._rb_four_body:
-                c_2 = c_l                                         # [C, N, n_max, 3, 2] m = 0..2
         G = tf.stack(G_l, axis=-1)                                # [C, N, R, n_max, L]
         G = tf.reshape(G, [-1, N, self._rb_n_rows * self._rb_n_max * L])
         q = tf.gather(G, self._rb_gather, axis=-1) * self._rb_scale
-        sc = self._rb_two_body_scale
+        sc = self._rb_coef_scale
         if self._rb_norm == "l2":
             norm = tf.norm(q, axis=-1, keepdims=True)
             q = q / tf.where(norm < 1e-5, tf.ones_like(norm), norm)
         elif self._rb_norm == "none":
             # NEP-like: no per-atom projection; the spectrum is quadratic in
-            # the coefficients, so scale² puts it on the extras' O(1) footing.
+            # the coefficients, so scale² puts it on an O(1) footing.
             q = q * (sc * sc)
         else:
-            # "sqrt": degree 1 in the coefficients (like NEP's radial block and
-            # the extras): halves every log-spread of "none", keeps magnitude.
+            # "sqrt": degree 1 in the coefficients (like NEP's radial block):
+            # halves every log-spread of "none", keeps magnitude.
             q = tf.math.sign(q) * tf.sqrt(tf.abs(q) + 1e-12) * sc
-        extras = []
-        if self._rb_two_body:
-            # NEP-style 2-body block, un-normalised (keeps density), O(1) scale.
-            extras.append(c_00 * sc)
-        if self._rb_four_body:
-            # Full m = -2..2 vector from the stored m >= 0 half:
-            # c_{l,-m} = (-1)^m conj(c_{lm}).
-            re, im = c_2[..., 0] * sc, c_2[..., 1] * sc            # [C, N, n_max, 3]
-            full = tf.complex(
-                tf.concat([re[..., 2:3], -re[..., 1:2], re[..., 0:1], re[..., 1:2], re[..., 2:3]], -1),
-                tf.concat([-im[..., 2:3], im[..., 1:2], im[..., 0:1], im[..., 1:2], im[..., 2:3]], -1))
-            prod = (tf.gather(full, self._rb_3j_idx[0], axis=-1)
-                    * tf.gather(full, self._rb_3j_idx[1], axis=-1)
-                    * tf.gather(full, self._rb_3j_idx[2], axis=-1))
-            b4 = tf.einsum('...t,t->...', tf.math.real(prod), self._rb_3j_w)
-            # Signed cube root: degree 1 in ĉ like the other blocks (the raw
-            # cubic is ~100× below the SOAP channels). ε keeps the gradient finite.
-            extras.append(tf.math.sign(b4) * tf.pow(tf.abs(b4) + 1e-9, 1.0 / 3.0))
-        if self._rb_five_body:
-            sq = tf.reduce_sum(tf.square(c_1 * sc), axis=-1)       # |ĉ_{1m}|² for m = 0, 1
-            # Σ_{m=-1..1} |ĉ_{n1m}|² — NEP's 5-body is its square; the
-            # degree-2 form keeps the block on the SOAP channels' scale.
-            extras.append(sq[..., 0] + 2.0 * sq[..., 1])
-        if extras:
-            q = tf.concat([q] + extras, axis=-1)
         out_shape = tf.concat([lead, [self._soap_dim]], axis=0)
         if per_cand:
             return tf.reshape(q, tf.concat([[-1], out_shape], axis=0))
