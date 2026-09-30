@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import warnings
 
 import numpy as np
 import tensorflow as tf
@@ -396,8 +397,28 @@ class TNEP(layers.Layer):
                 f"for the pair-term-free model.")
         # Head width C·(1+2K): s [C] | a [C·K] | b [C·K]. THE single source for
         # W1's last axis; SNES/model_io read it back from here.
-        self._head_width = (self._dipole_channels * (1 + 2 * self._pair_rank)
+        # dipole_head: "vector" = one head slot per radial channel, "scalar" =
+        # one slot broadcast over the channels (_split_head does the tiling).
+        self._dipole_head = str(getattr(cfg, "dipole_head", "vector"))
+        if self._dipole_head not in ("vector", "scalar"):
+            raise ValueError(
+                f"cfg.dipole_head must be 'vector' or 'scalar', "
+                f"got {cfg.dipole_head!r}.")
+        self._head_slots = (self._dipole_channels if self._dipole_head == "vector"
+                            else 1)
+        if (self._neighbor_readout and self._dipole_head == "scalar"
+                and self._species_pairs == "off"):
+            warnings.warn(
+                "dipole_head='scalar' with dipole_species_pairs='off': every "
+                "channel carries the same site value with c ≡ 1, so the C "
+                "radial channels collapse to Σ_n R_n — set "
+                "dipole_species_pairs='symmetric' to learn a radial profile.")
+        # Head width S·(1+2K): s [S] | a [S·K] | b [S·K], S = _head_slots.
+        # THE single source for W1's last axis; SNES/model_io read it back.
+        self._head_width = (self._head_slots * (1 + 2 * self._pair_rank)
                             if self._neighbor_readout else 1)
+        # Start of the b-slice inside the head (SNES zeroes it at gen 0).
+        self._head_b_start = self._head_slots * (1 + self._pair_rank)
         if self._neighbor_readout:
             if self._dipole_channels < 1:
                 raise ValueError(
@@ -2575,14 +2596,19 @@ class TNEP(layers.Layer):
         raise ValueError(f"unknown dipole_radial {rad!r}")
 
     def _split_head(self, out: tf.Tensor):
-        """Split the head output [.., C·(1+2K)] → s [.., C], a [.., C, K],
-        b [.., C, K]. K = 0 ⇒ a, b have a zero-width last axis (never
-        contracted)."""
-        C, K = self._dipole_channels, self._pair_rank
+        """Split the head output [.., S·(1+2K)] → s [.., C], a [.., C, K],
+        b [.., C, K], S = _head_slots (C for dipole_head="vector", 1 for
+        "scalar" — the single slot is broadcast over the C channels). K = 0 ⇒
+        a, b have a zero-width last axis (never contracted)."""
+        S, C, K = self._head_slots, self._dipole_channels, self._pair_rank
         lead = tf.shape(out)[:-1]
-        s = out[..., :C]
-        a = tf.reshape(out[..., C:C + C * K], tf.concat([lead, [C, K]], 0))
-        b = tf.reshape(out[..., C + C * K:], tf.concat([lead, [C, K]], 0))
+        s = out[..., :S]
+        a = tf.reshape(out[..., S:S + S * K], tf.concat([lead, [S, K]], 0))
+        b = tf.reshape(out[..., S + S * K:], tf.concat([lead, [S, K]], 0))
+        if S != C:
+            s = tf.broadcast_to(s, tf.concat([lead, [C]], 0))
+            a = tf.broadcast_to(a, tf.concat([lead, [C, K]], 0))
+            b = tf.broadcast_to(b, tf.concat([lead, [C, K]], 0))
         return s, a, b
 
     def _c_full(self, c_pair: tf.Tensor) -> tf.Tensor:

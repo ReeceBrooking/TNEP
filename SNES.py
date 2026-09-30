@@ -537,8 +537,7 @@ class SNES:
                     w1 = rng.uniform(-c_W1, c_W1, size=(T, Hb, self._Hw)).astype(np.float32)
                     if self.model._neighbor_readout and self.model._pair_rank > 0:
                         # Gen 0 == the difference model: b ≡ 0 kills the pair term.
-                        C, K = self._Ch, self.model._pair_rank
-                        w1[:, :, C + C * K:] = 0.0
+                        w1[:, :, self.model._head_b_start:] = 0.0
                     mu[off:off + n_W1] = w1.reshape(-1)
                 off += n_W1
             # b1 zero

@@ -131,6 +131,13 @@ class TNEPconfig:
     # Rank K of the bilinear pair term (dipole_readout="bilinear" only; head
     # width C·(1+2K)). Ignored by every other readout.
     dipole_pair_rank: int = 2
+    # Head output of the neighbor/bilinear readouts:
+    #   "vector" : one site value per radial channel — s [C] (and a, b [C, K])
+    #   "scalar" : one site value broadcast over the C channels — s [1]
+    #              (and a, b [1, K]); radial resolution then lives only in the
+    #              learned species-pair table c[n, pair], so pair it with
+    #              dipole_species_pairs != "off". Head width 1+2K vs C(1+2K).
+    dipole_head: str = "vector"
     # Neighbor-readout cutoff r_c (Å). None = inherit rcut_hard (resolved at
     # model init). Must be ≤ rcut_hard and satisfy dipole_rc + rcut_hard ≤
     # L_min for every training box (checked at data assembly). Note the

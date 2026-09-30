@@ -66,6 +66,7 @@ def _cfg(**kw):
     cfg.q_scale = None
     cfg.optimizer = "snes"
     cfg.dipole_pair_rank = 2
+    cfg.dipole_head = "vector"
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)
@@ -109,11 +110,11 @@ _MODE_KW = {
 
 
 @functools.lru_cache(maxsize=8)
-def _bulk_setup(mode="chebyshev", readout="neighbor"):
+def _bulk_setup(mode="chebyshev", readout="neighbor", head="vector"):
     """(cfg, model, atoms, padded-data) for the 96-atom water frame — shared.
     "ordered" gets a randomized ASYMMETRIC Ω (symmetric Ω would telescope
     back to the difference form and hide ordered-path bugs)."""
-    cfg = _cfg(dipole_readout=readout, **_MODE_KW[mode])
+    cfg = _cfg(dipole_readout=readout, dipole_head=head, **_MODE_KW[mode])
     model = _model(cfg)
     if mode == "ordered":
         rng = np.random.default_rng(11)
@@ -241,14 +242,15 @@ def test_single_atom_lattice_translation_invariance(mode):
 @pytest.mark.parametrize("mode", ["chebyshev", "screened", "chebyshev_warped",
                                   "gaussian", "cheb_tanh3"])
 @pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
-def test_four_path_consistency(mode, readout):
+@pytest.mark.parametrize("head", ["vector", "scalar"])
+def test_four_path_consistency(mode, readout, head):
     # The only test cross-checking all three radial dispatch sites (numpy
     # twin, predict inline, _neighbor_V_coo) against each other — catches a
     # ζ/radial mismatch between them. The in-graph/predict legs are the ONLY
     # automated execution of the TF _radial/_fc branches (every μ-comparing
     # test consumes the numpy-built V via W_atom), so the new radials and
     # the tanh3 cross MUST be parametrized here.
-    cfg, model, atoms, _ = _bulk_setup(mode, readout)
+    cfg, model, atoms, _ = _bulk_setup(mode, readout, head)
     # Full pair stream (self_pairs_only=False) so the in-graph V path has
     # the r_d COO list to build V from.
     types_int = assign_type_indices([atoms], cfg.types)
@@ -1037,3 +1039,87 @@ def test_save_load_roundtrip_bilinear(tmp_path):
     np.testing.assert_array_equal(loaded.W1.numpy(), model.W1.numpy())
     np.testing.assert_array_equal(loaded.c_pair.numpy(), model.c_pair.numpy())
     assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
+
+
+# ── Scalar head (dipole_head="scalar") ────────────────────────────────────────
+
+def _tile_scalar_head_into_vector(W1s, C, K):
+    """[T,H,1+2K] scalar-head weights → the equivalent vector-head [T,H,C(1+2K)]:
+    s repeated over channels, a/b repeated over channels per k."""
+    T, H, _ = W1s.shape
+    W1v = np.zeros((T, H, C * (1 + 2 * K)), np.float32)
+    W1v[:, :, :C] = W1s[:, :, :1]
+    for n in range(C):
+        for k in range(K):
+            W1v[:, :, C + n * K + k] = W1s[:, :, 1 + k]
+            W1v[:, :, C + C * K + n * K + k] = W1s[:, :, 1 + K + k]
+    return W1v
+
+
+@pytest.mark.parametrize("readout,K", [("neighbor", 0), ("bilinear", 2)])
+def test_scalar_head_equals_tiled_vector_head(readout, K):
+    kw = dict(dipole_channels=4, dipole_readout=readout, dipole_pair_rank=K,
+              dipole_species_pairs="symmetric")
+    cs = _cfg(dipole_head="scalar", **kw); ms = _model(cs)
+    cv = _cfg(dipole_head="vector", **kw); mv = _model(cv)
+    assert tuple(ms.W1.shape) == (2, 8, 1 + 2 * K)
+    assert tuple(mv.W1.shape) == (2, 8, 4 * (1 + 2 * K))
+    ms.W1.assign(tf.random.stateless_normal(ms.W1.shape, [7, 8]))
+    for src, dst in ((ms.W0, mv.W0), (ms.b0, mv.b0), (ms.c_pair, mv.c_pair)):
+        dst.assign(src)
+    mv.W1.assign(_tile_scalar_head_into_vector(ms.W1.numpy(), 4, K))
+    atoms = _bulk_frame()
+    mu_s = _mu(ms, atoms, cs); mu_v = _mu(mv, atoms, cv)
+    assert np.linalg.norm(mu_s) > 1e-3
+    np.testing.assert_allclose(mu_s, mu_v, rtol=1e-5, atol=1e-6)
+
+
+def test_scalar_head_snes_layout_and_gen0():
+    from SNES import SNES, _set_model_params
+    cfg = _cfg(dipole_channels=4, dipole_head="scalar", dipole_readout="bilinear",
+               dipole_pair_rank=2, dipole_species_pairs="symmetric")
+    model = _model(cfg); opt = SNES(model)
+    T, H, C, K = 2, 8, 4, 2
+    assert opt._n_W1 == T * H * (1 + 2 * K)
+    assert opt.n_c == C * (T * (T + 1) // 2)            # channels still in c_pair
+    named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
+    W1 = named["W1"].numpy()
+    assert tuple(W1.shape) == (T, H, 1 + 2 * K)
+    assert np.all(W1[:, :, 1 + K:] == 0.0)             # b-slice zero at gen 0
+    assert np.any(W1[:, :, 1:1 + K] != 0.0)            # a-slice Glorot
+    atoms = _bulk_frame()
+    d = prepare_eval_data([atoms], cfg)
+    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
+    _set_model_params(model, *opt.reconstruct_params_tf(mu_vec))
+    mu_model = _mu(model, atoms, cfg)
+    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
+    mu_cand = model.predict_batch_candidates(
+        d["descriptors"], d["V_atom"], d["Z_int"], d["atom_mask"],
+        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"],
+        nbr_index=d["nbr_index"], nbr_G=d["nbr_G"])[0, 0].numpy()
+    np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
+
+
+def test_scalar_head_save_load_roundtrip(tmp_path):
+    import model_io
+    cfg = _cfg(dipole_channels=4, dipole_head="scalar", dipole_readout="bilinear",
+               dipole_pair_rank=1, dipole_species_pairs="symmetric")
+    model = _model(cfg)
+    model.W1.assign(tf.random.stateless_normal(model.W1.shape, [5, 6]))
+    atoms = _bulk_frame()
+    mu0 = _mu(model, atoms, cfg)
+    p = str(tmp_path / "scalar.h5")
+    model_io.save_model(model, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.dipole_head == "scalar" and tuple(loaded.W1.shape) == (2, 8, 3)
+    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
+
+
+def test_scalar_head_validation_and_warning():
+    with pytest.raises(ValueError, match="dipole_head"):
+        _model(_cfg(dipole_head="bogus"))
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        _model(_cfg(dipole_head="scalar", dipole_species_pairs="off"))
+    assert any("dipole_head" in str(x.message) for x in w)

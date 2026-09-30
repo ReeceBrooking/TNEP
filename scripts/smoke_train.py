@@ -27,6 +27,7 @@ def main(argv=None) -> None:
     p.add_argument("--rij-power", type=int, default=2, help="tnep readout: |r_ij|^N weight")
     p.add_argument("--nep", choices=["off", "concat", "replace", "sum"], default="off")
     p.add_argument("--pair-rank", type=int, default=1)
+    p.add_argument("--head", choices=["vector", "scalar"], default="vector")
     p.add_argument("--scale", choices=["off", "block", "channel", "minmax"], default="off")
     p.add_argument("--norm", choices=["l2", "none"], default="l2")
     p.add_argument("--optimizer", choices=["snes", "adam"], default="snes")
@@ -55,6 +56,7 @@ def main(argv=None) -> None:
     cfg.descriptor_mode = 1                 # TF builder; radial_basis_norm="none" requires it
     cfg.dipole_readout = a.readout
     cfg.dipole_pair_rank = a.pair_rank
+    cfg.dipole_head = a.head
     cfg.nep_descriptor = a.nep
     cfg.descriptor_scale = a.scale
     cfg.radial_basis_norm = a.norm
