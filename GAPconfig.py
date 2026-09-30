@@ -57,8 +57,10 @@ class GAPconfig:
     # None = use the default for target_mode ("energy", "dipole", "pol").
     # Set to a custom string to support non-standard dataset labels (e.g. "mu", "alpha").
     target_key: str | None = None
-    # Scale dipole targets by atom count (per-atom dipole training)
-    scale_targets: bool = True
+    # Scale dipole targets by atom count (per-atom dipole training). Unlike
+    # the ANN default (True), the kernel fit requires total dipoles: it
+    # solves for μ itself, so a bare GAPconfig() must satisfy _validate.
+    scale_targets: bool = False
     # Native units of dipole targets in the dataset: "e*angstrom" (e·Å),
     # "e*bohr" (e·a₀, × 0.5292 → e·Å), "debye" (× 0.2082 → e·Å). Sets the
     # e·Å conversion factor and the plot/stats unit label.

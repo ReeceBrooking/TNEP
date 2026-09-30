@@ -557,6 +557,8 @@ def test_gapmode_validate():
         gap_dipole._validate(_dip_cfg(gap_2b=True, gap2b_sigma=0.0))
     with pytest.raises(ValueError, match="gap3b_centres"):
         gap_dipole._validate(_dip_cfg(gap_3b=True, gap3b_centres=[[1.0, 2.0]]))
+    with pytest.raises(ValueError, match="nep_descriptor"):
+        gap_dipole._validate(_dip_cfg(gap_2b=True, nep_descriptor="gap_sum"))
 
 
 def test_gapmode_flags_off_alpha_gap_fields_are_none(gap_fitted):

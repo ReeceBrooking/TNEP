@@ -128,6 +128,13 @@ def _validate(cfg: GAPconfig) -> None:
          f"dipole_channels must be 1 for the screened radial, got "
          f"{cfg.dipole_channels}"),
         (not cfg.scale_targets, "scale_targets must be False"),
+        # nep_descriptor is a frozen constant on GAPconfig, so this cannot
+        # fire from a class default — it catches INSTANCE mutation
+        # (cfg.nep_descriptor = "concat"), which would otherwise reach
+        # data.assemble_data_dict and build NEP inputs the fit never reads.
+        (str(cfg.nep_descriptor) == "off",
+         "GAP mode needs nep_descriptor='off' (NEP inputs are not part of "
+         "the kernel fit)"),
         # mirror the model-init r_c contract (no TNEP is ever constructed
         # on the GAP path, so it must be enforced here too).
         (0.0 < float(cfg.dipole_rc or cfg.rcut_hard) <= float(cfg.rcut_hard),
