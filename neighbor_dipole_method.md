@@ -91,8 +91,7 @@ Input modes (multi_descriptor_plan.md §0.3–0.4, Phase A):
 
 - "off"     : q_i = 𝒟_i (soap_turbo, as in §4).
 - "concat"  : q_i = [𝒟_i ‖ q_i^NEP].
-- "replace" : q_i = q_i^NEP (no SOAP blocks → descriptor_mixing /
-              preprocess_contract off).
+- "replace" : q_i = q_i^NEP (no SOAP blocks → descriptor_mixing off).
 - "sum"     : three experts summed into one head,
               s_i = ANN_soap(𝒟_i) + ANN_2b(q_i^rad) + ANN_3b(q_i^ang);
               W1 of the two NEP experts is zero at generation 0, so
@@ -124,8 +123,7 @@ Adam; save/load/score): per-candidate NEP pair forces ∂q^NEP/∂r through the
 factorised radial α / angular Gs kernels (multi_descriptor_plan.md §B.2),
 with image-exact |r_ij|² weights from the stored displacements (never MIC).
 For the faithful GPUMD configuration — "replace", `descriptor_scale=
-"minmax"`, tanh, `dipole_rij_power=2`, mixing / preprocess / learned SOAP
-basis off — the SNES parameter count equals GPUMD's `number_of_variables`
+"minmax"`, tanh, `dipole_rij_power=2`, mixing / learned SOAP basis off — the SNES parameter count equals GPUMD's `number_of_variables`
 exactly (`nep_descriptor.gpumd_num_params`, asserted by
 `test_parameter_count_matches_gpumd_formula` and by scripts/smoke_train.py):
 typed slab (dim+2)·H per species + one shared b1 + c_r/c_a. Under "concat"
@@ -288,37 +286,6 @@ single radial channel
   flow f_c r^(ζ−1)(s_i − s_j) is a screened charge transfer whose
   magnitude decays as a power of distance inside the cutoff.
 
-## 6b. Bilinear pair head (cfg.dipole_readout = "bilinear")
-
-Motivation (locality): with the difference form the charges are q = L s
-for a weighted graph Laplacian L fixed by geometry, so the site scalars
-the ANN must produce are s = L⁺ q — a non-local function of a local
-target. The bilinear head puts the learned quantity back on the bond so
-q_i is a sum of local terms (plan: `neighbor_dipole_bilinear_plan.md`).
-
-    μ = Σ_i Σ_n s_i^n Σ_t' c[n,p(t_i,t')] V_i[:,n,t']                    (unchanged)
-      + Σ_i Σ_{j≠i, r_ij<r_c} Σ_n c[n,p(t_i,t_j)] R_n(r_ij)(r_i − r_j) · Σ_k a_i^{n,k} b_j^{n,k}
-
-- The ANN head widens from C to C·(1+2K) outputs per atom: s [C], a [C,K],
-  b [C,K] (K = cfg.dipole_pair_rank ≥ 1). The pair sum runs over ORDERED
-  pairs; since the geometry factor is odd under i↔j the term is
-  antisymmetric by construction (tested: swapping a↔b negates it).
-- The same learned species-pair table c multiplies both terms; the radial
-  channels R_n and cutoff are shared. No new radial parameters.
-- The site-scalar term is the b ≡ 1 special case; it is kept as its own
-  slice so "neighbor" stays bit-identical and generation 0 of a bilinear
-  run equals the difference model exactly (SNES μ-init zeroes the b-slice).
-- The bilinear term has no per-frame gauge (a constant shift of s is
-  invisible; a shift of a or b is not) — intended, that is the locality gain.
-- Data: a padded per-centre pair table (nbr_index [S,A,M], nbr_G
-  [S,A,M,3,C] = R_n(r_ij)(r_i − r_j)) rides the dense per-structure keys
-  next to V_atom. The SNES candidates forward materialises [P_cand,B,A,M,C]
-  tensors; `population_chunk_size` is the memory knob.
-- GAP mode refuses this readout (μ is quadratic in the ANN outputs).
-- Status: implemented and tested (brute-force reference, antisymmetry,
-  four-path consistency at K=2, SNES tail sizing + gen-0 identity, save/
-  load); 8-generation smoke only. No accuracy claim yet.
-
 ## 7. Diagnostics: the rigid-LSQ floor theory
 
 Setting s to per-type constants makes (2) linear in ≤ T·C numbers — a
@@ -404,3 +371,17 @@ depart from the screened spec defaults (ζ=−2, cubic via None, False);
 any ANN run that does not pin these fields silently fits the drifted
 combination. GAP entry points pin their fields and reject
 scale_targets; the ANN path has no such protection.
+
+## 10. Removal record (2026-09-30)
+
+Three feature families were deleted from the code as unused (branch `Prune`,
+−1555 lines): the **bilinear pair head** (former §6b: `dipole_readout=
+"bilinear"`, `dipole_pair_rank`, the pair-term kernels and the nbr_index /
+nbr_G data stream), the **descriptor-preprocess contraction** (`W_pre_angular`,
+the NEP4 rank-1 fold and its eight config fields), and the **learned-basis NEP
+extras** (`radial_basis_two_body` / `_four_body` / `_five_body`). What remains
+of the readout is `dipole_readout` ∈ {"tnep", "neighbor"} with `dipole_head` ∈
+{"vector", "scalar"}; the learned SOAP radial basis, descriptor mixing,
+descriptor_scale, and the NEP / GAP input modes are untouched. A save from
+before the removal fails loudly: `W_pre_angular` in the file raises at load,
+and a stale `cfg.dim_q` raises at model construction naming both dims.
