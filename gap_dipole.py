@@ -198,6 +198,7 @@ def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
 def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
                v: np.ndarray, ti: np.ndarray, xis: tuple[int, ...],
                gap_q: tuple[np.ndarray | None, np.ndarray | None] | None = None,
+               deltas: tuple[float, float, float] = (1.0, 1.0, 1.0),
                ) -> np.ndarray:
     """[3, n_columns] design block for one frame — THE column contract for
     fit AND predict. scales = [(D, sparse_desc)] per length scale; each
@@ -210,7 +211,19 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
     gap_q = (q2 [N, W2] | None, q3 [N, W3] | None) appends the additive
     TurboGAP blocks AFTER all SOAP columns: gap2b (species → (s, k)) then
     gap3b (species → (s, k)) — Σ_{i∈t} q[i, s]·v[i, x, k] — i.e. the 2b/3b
-    site energies with a linear readout, μ-weighted by the bond basis."""
+    site energies with a linear readout, μ-weighted by the bond basis.
+
+    deltas = (δ_soap, δ_2b, δ_3b) scale each body order's columns by δ²,
+    GAP's amplitude convention (gap.f90: `delta**2 * alphas(s) * …` in both
+    the 2b and SOAP site energies), giving
+        U_i = δ_soap²·U_i(SOAP) + δ_2b²·U_i(2b) + δ_3b²·U_i(3b).
+    The span of the design is unchanged — a least-squares fit would absorb δ
+    into α — so δ acts through the RIDGE: λ_eff is one global number, so
+    scaling a block's columns changes how hard that block is penalised
+    relative to the others. That is exactly δ's role in GAP (a prior
+    amplitude per body order), and it is the knob for how much influence each
+    model is allowed over the prediction."""
+    d_soap, d_2b, d_3b = (float(d) ** 2 for d in deltas)
     cols = []
     for D, sparse_desc in scales:
         for t, Dm in enumerate(sparse_desc):
@@ -218,17 +231,24 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
             G = D[sel] @ Dm.T                           # [n_t, M_t] base Gram
             vt = v[sel]
             for xi in xis:
-                cols.append(np.einsum("nm,nxk->xmk", G ** xi, vt)
+                cols.append(d_soap * np.einsum("nm,nxk->xmk", G ** xi, vt)
                             .reshape(3, -1))            # [3, M_t·K]
-    for q in gap_q or ():
+    for q, d_q in zip(gap_q or (), (d_2b, d_3b)):
         if q is not None:
             # scales[0][1] is the scale-1 sparse list: exactly one entry per
             # species (_fps_per_species loops range(cfg.num_types)).
             for t in range(len(scales[0][1])):
                 sel = ti == t
-                cols.append(np.einsum("ns,nxk->xsk", q[sel], v[sel])
+                cols.append(d_q * np.einsum("ns,nxk->xsk", q[sel], v[sel])
                             .reshape(3, -1))            # [3, W·K]
     return np.concatenate(cols, axis=1)
+
+
+def _deltas(cfg: GAPconfig) -> tuple[float, float, float]:
+    """(δ_soap, δ_2b, δ_3b) — the ONE place the amplitudes are read, so fit
+    and predict cannot disagree about the column scaling."""
+    return (float(cfg.gap_delta_soap), float(cfg.gap_delta_2b),
+            float(cfg.gap_delta_3b))
 
 
 def _gap_q(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig):
@@ -358,12 +378,13 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     # Φ frame-by-frame — the full N_envs × M kernel never exists.
     F = len(dataset)
     Phi = np.empty((F, 3, n_columns))
+    deltas = _deltas(cfg)
     for f in range(F):
         scales = [(descs[f], sparse_desc)]
         if descs2 is not None:
             scales.append((descs2[f], sparse_desc2))
         Phi[f] = _phi_frame(scales, vs[f], tis[f], xis,
-                            _gap_q(dataset[f], tis[f], cfg))
+                            _gap_q(dataset[f], tis[f], cfg), deltas)
     Phi_flat = Phi.reshape(3 * F, n_columns)
 
     # An unpopulated species-pair slot (or a centre no triplet reaches) gives
@@ -427,6 +448,9 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
         "config": _serialize_config(cfg),
         "gap": {"sparse_per_species": M_req, "kernel_power": list(xis),
                 "ridge_lambda": lam, "lambda_eff": lam_eff,
+                "delta_soap": float(cfg.gap_delta_soap),
+                "delta_2b": float(cfg.gap_delta_2b),
+                "delta_3b": float(cfg.gap_delta_3b),
                 # zeta only where it is live — config.dipole_zeta is present
                 # in every record but decorative for non-screened radials.
                 **({"zeta": float(cfg.dipole_zeta)}
@@ -489,7 +513,7 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
         if descs2 is not None:
             scales.append((descs2[f], model.sparse_desc2))
         out[f] = _phi_frame(scales, _v_atoms(atoms, ti, cfg), ti, model.xi,
-                            _gap_q(atoms, ti, cfg)) @ alpha_flat
+                            _gap_q(atoms, ti, cfg), _deltas(cfg)) @ alpha_flat
     return out
 
 

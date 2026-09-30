@@ -571,3 +571,64 @@ def test_gapmode_zero_columns_warn(tmp_path):
     identically-zero gap columns — unidentifiable coefficients, warned about."""
     with _chdir(tmp_path), pytest.warns(UserWarning, match="identically zero"):
         gap_dipole.fit_gap_dipole(_dip_cfg(**{**GAP_KW, "gap3b_rcut": 1.2}))
+
+
+# ── Task 5: per-body-order amplitudes (gap_delta_*) ──────────────────────────
+
+def test_gap_deltas_scale_blocks_and_shift_influence(tmp_path):
+    """δ per body order enters as δ² on that block's columns (GAP's amplitude
+    convention). Two things must hold: fit and predict must agree on the
+    scaling (else predict is silently wrong), and δ must actually move
+    influence between the blocks through the single global ridge."""
+    import gap_dipole as gd_fit
+    from test_gap_dipole import _cfg as _gcfg, _chdir
+    frames = read(WATER_XYZ, index="0:4")
+
+    def _fit(**kw):
+        with _chdir(tmp_path):
+            return gd_fit.fit_gap_dipole(_gcfg(gap_2b=True, gap_3b=True, **kw))
+
+    # 1. δ=1 everywhere is the unscaled fit, and predict round-trips.
+    base = _fit()
+    p_base = gd_fit.predict(base, frames)
+    assert np.all(np.isfinite(p_base))
+
+    # 2. fit/predict consistency at non-unit δ: predict rebuilds the design
+    #    itself, so a mismatch in the column scaling shows up here.
+    m = _fit(gap_delta_2b=3.0, gap_delta_3b=0.5, gap_delta_soap=2.0)
+    Phi = np.stack([gd_fit._phi_frame(
+        [(gd_fit._descriptors(m.builder, [at])[0], m.sparse_desc)],
+        gd_fit._v_atoms(at, np.asarray(ti), m.cfg), np.asarray(ti), m.xi,
+        gd_fit._gap_q(at, np.asarray(ti), m.cfg), gd_fit._deltas(m.cfg))
+        for at, ti in zip(frames, assign_type_indices(frames, m.cfg.types))])
+    alpha = np.concatenate([a for a in (m.alpha, m.alpha2, m.alpha_gap2b,
+                                        m.alpha_gap3b) if a is not None
+                            for a in a])
+    np.testing.assert_allclose(gd_fit.predict(m, frames),
+                               (Phi @ alpha).reshape(len(frames), 3),
+                               rtol=1e-8, atol=1e-10 * np.abs(p_base).max())
+
+    # 3. δ shifts influence: killing the 2b amplitude must shrink that block's
+    #    share of the prediction relative to boosting it.
+    def _share(model):
+        """‖2b block contribution‖ / ‖total‖ on the training frames."""
+        tis = assign_type_indices(frames, model.cfg.types)
+        tot = n2b = 0.0
+        for at, ti in zip(frames, tis):
+            ti = np.asarray(ti)
+            d = gd_fit._descriptors(model.builder, [at])[0]
+            phi = gd_fit._phi_frame([(d, model.sparse_desc)],
+                                    gd_fit._v_atoms(at, ti, model.cfg), ti,
+                                    model.xi, gd_fit._gap_q(at, ti, model.cfg),
+                                    gd_fit._deltas(model.cfg))
+            n_soap = sum(a.size for a in model.alpha)
+            a2 = np.concatenate(model.alpha_gap2b)
+            n2b += np.linalg.norm(phi[:, n_soap:n_soap + a2.size] @ a2)
+            tot += np.linalg.norm(phi @ np.concatenate(
+                [a for g in (model.alpha, model.alpha_gap2b, model.alpha_gap3b)
+                 if g is not None for a in g]))
+        return n2b / tot
+
+    loud = _share(_fit(gap_delta_2b=10.0))
+    quiet = _share(_fit(gap_delta_2b=0.1))
+    assert loud > quiet, f"delta_2b did not shift influence: {loud} vs {quiet}"

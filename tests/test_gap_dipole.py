@@ -473,9 +473,15 @@ def test_configs_are_independent():
     assert not issubclass(GAPconfig, TNEPconfig)
     assert not issubclass(TNEPconfig, GAPconfig)
     assert GAPconfig.__bases__ == (object,) == TNEPconfig.__bases__
-    # every field GAPconfig declares also exists on TNEPconfig (duplicates,
-    # not renames) — except descriptor_self_batch_size, which data.py reads
-    # via getattr and TNEPconfig never declared.
-    missing = (set(GAPconfig.__annotations__) - set(TNEPconfig.__annotations__)
-               - {"descriptor_self_batch_size"})
+    # Every field GAPconfig declares also exists on TNEPconfig (duplicates,
+    # not renames), bar two deliberate exceptions: descriptor_self_batch_size,
+    # which data.py reads via getattr and TNEPconfig never declared, and the
+    # gap_delta_* amplitudes, which are GAP-only hyperparameters of the summed
+    # kernel model and have no ANN counterpart.
+    gap_only = {"descriptor_self_batch_size", "gap_delta_soap",
+                "gap_delta_2b", "gap_delta_3b"}
+    missing = (set(GAPconfig.__annotations__)
+               - set(TNEPconfig.__annotations__) - gap_only)
     assert not missing, missing
+    for f in ("gap_delta_soap", "gap_delta_2b", "gap_delta_3b"):
+        assert hasattr(GAPconfig, f) and not hasattr(TNEPconfig, f)
