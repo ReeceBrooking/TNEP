@@ -314,6 +314,25 @@ class TNEPconfig:
     nep_rc_radial: float = 8.0
     nep_rc_angular: float = 4.0
     nep_num_neurons: int = 30            # "sum" mode only: width of ANN_2b / ANN_3b
+    # TurboGAP 2-body / 3-body distance descriptors (gap_descriptor.py,
+    # gap_descriptor_plan.md §0.1): GAP's neighbour sums with FIXED centres
+    # (sparse points) and widths, "exp" kernel only (no "pol"). Used by the
+    # ANN nep_descriptor="gap_sum" experts and the GAP-mode column blocks.
+    gap2b_rcut: float = 3.5              # GAP rcut of the 2b term
+    gap3b_rcut: float = 3.5              # GAP rcut of the 3b term
+    gap_buffer: float = 0.5              # GAP buffer: cosine taper width inside rcut
+    gap2b_n_centres: int = 20            # M2 kernel centres on r
+    gap2b_sigma: float = 0.3             # 2b kernel width (Å)
+    gap3b_n_centres: int = 50            # M3 kernel centres on q = [r_ij+r_ik, (r_ij−r_ik)², r_jk]
+    gap3b_sigma: list[float] = [0.5, 0.5, 0.5]  # per q component
+    # Runtime: auto-selected by gap_descriptor.select_centres when None
+    # (2b uniform grid, 3b farthest-point sampling under cfg.seed) and saved
+    # with the model like q_scale; shapes [M2] and [M3, 3].
+    gap2b_centres: list[float] | None = None
+    gap3b_centres: list[list[float]] | None = None
+    # GAP-mode (gap_dipole.py) additive linear column blocks.
+    gap_2b: bool = False
+    gap_3b: bool = False
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. NETWORK ARCHITECTURE
