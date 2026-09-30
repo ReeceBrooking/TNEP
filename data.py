@@ -345,8 +345,7 @@ def assemble_data_dict(
             targets = [t * factor for t in targets]
     # Guards read TOTAL-cell dipoles (branch-gap quantum e·L), so run them
     # before any per-atom scaling.
-    if (cfg.target_mode == 1
-            and cfg.dipole_readout in ("neighbor", "bilinear")):
+    if cfg.target_mode == 1 and cfg.dipole_readout == "neighbor":
         _neighbor_dipole_guards(dataset, targets, cfg)
     if cfg.scale_targets and cfg.target_mode == 1:
         targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
@@ -362,8 +361,7 @@ def assemble_data_dict(
 
     # Neighbor-basis dipole readout: precompute the per-structure geometry
     # kernel V (data-static; delivered to the forwards via the W_atom slot).
-    if (cfg.target_mode == 1
-            and cfg.dipole_readout in ("neighbor", "bilinear")):
+    if cfg.target_mode == 1 and cfg.dipole_readout == "neighbor":
         from tqdm import tqdm
         data["V_atom"] = [
             _neighbor_dipole_V(s, t, float(cfg.dipole_rc or cfg.rcut_hard),
@@ -375,17 +373,6 @@ def assemble_data_dict(
             for s, t in tqdm(list(zip(dataset, types_int)),
                              desc="Building neighbor-readout V", unit="struct",
                              disable=len(dataset) < 50)]
-        if cfg.dipole_readout == "bilinear":
-            # Bilinear pair head: padded per-centre pair table (same pairs
-            # and R_n as V; plan neighbor_dipole_bilinear_plan.md).
-            _nbr = [_neighbor_dipole_nbr(
-                        s, float(cfg.dipole_rc or cfg.rcut_hard),
-                        int(cfg.dipole_channels), str(cfg.dipole_radial),
-                        float(cfg.dipole_zeta), resolved_dipole_cutoff(cfg),
-                        float(cfg.dipole_gauss_sigma_scale))
-                    for s in dataset]
-            data["nbr_index"] = [n for n, _ in _nbr]
-            data["nbr_G"] = [g for _, g in _nbr]
 
     # Raw expert input data["nep_raw"] [N, W_raw]: the GPUMD NEP per-atom
     # basis, contracted in-model by c_r/c_a (multi_descriptor_plan.md §0.3),
@@ -430,22 +417,21 @@ def assemble_data_dict(
 def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
     """True when mode-1 batches need only self descriptor gradients:
     dipole_rij_power=0 (self-pair readout) or a readout that reads no SOAP
-    descriptor gradients at all (neighbor/bilinear; tnep under
+    descriptor gradients at all (neighbor; tnep under
     nep_descriptor="replace")."""
     return cfg.target_mode == 1 and (
         int(cfg.dipole_rij_power) == 0 or not soap_gradients_needed(cfg))
 
 
 def descriptor_gradients_needed(cfg: TNEPconfig) -> bool:
-    """False only for the neighbor/bilinear dipole readouts, which read no
-    descriptor gradients — every other mode contracts ∂q/∂r (model-side
-    guards: learned basis, Phase B). NOTE: these readouts still need the PAIR
-    INDEX stream (pair_atom/pair_gidx) on the trajectory path, where V (and
-    the bilinear pair term) is built in-graph — that path keeps
-    calc_gradients=True and only the gradient VALUES are skipped (zero-width
-    under the learned basis)."""
+    """False only for the neighbor dipole readout, which reads no descriptor
+    gradients — every other mode contracts ∂q/∂r (model-side guards: learned
+    basis, Phase B). NOTE: that readout still needs the PAIR INDEX stream
+    (pair_atom/pair_gidx) on the trajectory path, where V is built in-graph
+    — that path keeps calc_gradients=True and only the gradient VALUES are
+    skipped (zero-width under the learned basis)."""
     return not (cfg.target_mode == 1
-                and cfg.dipole_readout in ("neighbor", "bilinear"))
+                and cfg.dipole_readout == "neighbor")
 
 
 def soap_gradients_needed(cfg: TNEPconfig) -> bool:
@@ -541,27 +527,6 @@ def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
     V = np.zeros((len(atoms), T, 3, C))
     np.add.at(V, (i, np.asarray(types_int)[j]), G)
     return V.transpose(0, 2, 3, 1).astype(np.float32)      # [N, 3, C, T]
-
-
-def _neighbor_dipole_nbr(atoms: Atoms, rc: float, C: int, radial: str,
-                         zeta: float, cutoff: str, gauss_sigma_scale: float):
-    """Padded per-centre pair table for the bilinear pair head:
-    nbr_index [N, M] int32 (padding 0), nbr_G [N, M, 3, C] float32
-    (padding 0), M = max neighbors of any centre in THIS frame (re-padded
-    across frames in pad_and_stack)."""
-    i, j, G = _neighbor_dipole_pairs(atoms, rc, C, radial, zeta, cutoff,
-                                     gauss_sigma_scale)
-    N = len(atoms)
-    order = np.argsort(i, kind="stable")
-    i, j, G = i[order], j[order], G[order]
-    counts = np.bincount(i, minlength=N)
-    M = int(counts.max()) if len(i) else 0
-    slot = np.arange(len(i)) - np.repeat(np.cumsum(counts) - counts, counts)
-    nbr_index = np.zeros((N, M), dtype=np.int32)
-    nbr_G = np.zeros((N, M, 3, C), dtype=np.float32)
-    nbr_index[i, slot] = j
-    nbr_G[i, slot] = G
-    return nbr_index, nbr_G
 
 
 def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
@@ -887,12 +852,6 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     if has_V:
         V_np = np.zeros((S, max_atoms) + data["V_atom"][0].shape[1:],
                         dtype=np.float32)
-    has_nbr = "nbr_index" in data  # bilinear pair head: padded pair table
-    if has_nbr:
-        max_nbr = max(int(n.shape[1]) for n in data["nbr_index"])
-        nbr_idx_np = np.zeros((S, max_atoms, max_nbr), dtype=np.int32)
-        nbr_G_np = np.zeros((S, max_atoms, max_nbr)
-                            + data["nbr_G"][0].shape[2:], dtype=np.float32)
     has_nep = "nep_raw" in data  # raw expert input [S, A, W_raw]: NEP basis, or GAP q2‖q3 under gap_sum
     if has_nep:
         nep_np = np.zeros((S, max_atoms, data["nep_raw"][0].shape[1]), dtype=np.float32)
@@ -934,10 +893,6 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             virial_np[s, :] = data["virials"][s].numpy()
         if has_V:
             V_np[s, :N_s] = data["V_atom"][s]
-        if has_nbr:
-            M_s = int(data["nbr_index"][s].shape[1])
-            nbr_idx_np[s, :N_s, :M_s] = data["nbr_index"][s]
-            nbr_G_np[s, :N_s, :M_s] = data["nbr_G"][s]
         if has_nep:
             nep_np[s, :N_s] = data["nep_raw"][s]
 
@@ -994,9 +949,6 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             result["virials"] = tf.constant(virial_np);      del virial_np
         if has_V:
             result["V_atom"]  = tf.constant(V_np);           del V_np
-        if has_nbr:
-            result["nbr_index"] = tf.constant(nbr_idx_np);   del nbr_idx_np
-            result["nbr_G"]     = tf.constant(nbr_G_np);     del nbr_G_np
         if has_nep:
             result["nep_raw"]   = tf.constant(nep_np);       del nep_np
         if has_nep_pairs:
@@ -1095,7 +1047,7 @@ def _is_contiguous_range(arr: np.ndarray) -> bool:
 # Structure-padded per-structure fields that ride every chunk.
 _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
                          "targets", "atom_mask", "types_contained",
-                         "forces", "virials", "V_atom", "nbr_index", "nbr_G", "nep_raw")
+                         "forces", "virials", "V_atom", "nep_raw")
 
 
 _NEP_PAIR_KEYS = ("nep_pair_atom", "nep_pair_gidx", "nep_pair_D", "nep_pair_ang")

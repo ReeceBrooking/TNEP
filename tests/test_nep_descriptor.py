@@ -532,9 +532,8 @@ def test_nep_raw_rides_data_dict_and_padding():
 
 
 @pytest.mark.parametrize("mode", ["concat", "replace"])
-@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
-def test_nep_four_path_consistency(mode, readout):
-    cfg = _cfg(nep_descriptor=mode, dipole_readout=readout)
+def test_nep_four_path_consistency(mode):
+    cfg = _cfg(nep_descriptor=mode, dipole_readout="neighbor")
     _check_four_path(cfg, _model(cfg))
 
 
@@ -547,8 +546,7 @@ def _check_four_path(cfg, m):
     desc, grads, gidx = builder.build_descriptors([atoms])
     d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
     full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=False)
-    kw = dict(nbr_index=full.get("nbr_index"), nbr_G=full.get("nbr_G"),
-              nep_raw=full["nep_raw"])
+    kw = dict(nep_raw=full["nep_raw"])
     args = _forward_args(m, full)
     mu_slot = m.predict_batch(*args, W_atom=full["V_atom"], **kw)[0].numpy()
     mu_ingraph = m.predict_batch(*args, W_atom=None, nep_raw=full["nep_raw"])[0].numpy()
@@ -624,14 +622,13 @@ def _mu_nep(model, atoms, cfg):
     """μ through predict_batch with nep_raw (the eval path for a NEP model)."""
     d = prepare_eval_data([atoms], cfg)
     return model.predict_batch(*_forward_args(model, d), W_atom=d.get("V_atom"),
-                               nbr_index=d.get("nbr_index"), nbr_G=d.get("nbr_G"),
                                nep_raw=d["nep_raw"])[0].numpy()
 
 
 def test_nep_c_tail_roundtrip_snes():
     from SNES import SNES, _set_model_params
     from data import assemble_data_dict, pad_and_stack
-    cfg = _cfg(nep_descriptor="concat", dipole_readout="bilinear", dipole_pair_rank=1)
+    cfg = _cfg(nep_descriptor="concat", dipole_readout="neighbor")
     m = _model(cfg); opt = SNES(m)
     n_c_r = int(np.prod(m.c_r.shape)); n_c_a = int(np.prod(m.c_a.shape)); n_c = n_c_r + n_c_a
     assert opt.n_nep == n_c
@@ -653,7 +650,7 @@ def test_nep_c_tail_roundtrip_snes():
     n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec))
     np.testing.assert_array_equal(m.c_r.numpy(), n["c_r"].numpy())
     assert not np.array_equal(m.c_r.numpy(), named["c_r"].numpy())        # assign actually moved c
-    kw = dict(nbr_index=full["nbr_index"], nbr_G=full["nbr_G"], nep_raw=full["nep_raw"])
+    kw = dict(nep_raw=full["nep_raw"])
     mu_model = m.predict_batch(*_forward_args(m, full), W_atom=full["V_atom"], **kw)[0].numpy()
     nb = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
     mu_cand = m.predict_batch_candidates(
@@ -823,7 +820,7 @@ EXPERTS = ("W0_r", "b0_r", "W1_r", "W0_a", "b0_a", "W1_a")
 
 
 def _sum_cfg(**kw):
-    return _cfg(**{"nep_descriptor": "sum", "nep_num_neurons": 6, "dipole_pair_rank": 2, **kw})
+    return _cfg(**{"nep_descriptor": "sum", "nep_num_neurons": 6, **kw})
 
 
 def _randomise_experts(m, seed=11):
@@ -843,7 +840,7 @@ def test_sum_mode_gen0_identity():
     assert cfg_sum.dim_q == cfg_off.dim_q                       # main ANN input = SOAP
     for k in ("W0", "b0", "W1"):
         np.testing.assert_array_equal(getattr(m_sum, k).numpy(), getattr(m_off, k).numpy())
-    sl = nd.nep_slices(cfg_sum); He, Hw, T = 6, m_sum._head_width, 2
+    sl = nd.nep_slices(cfg_sum); He, Hw, T = 6, m_sum._head_slots, 2
     assert tuple(m_sum.W0_r.shape) == (T, sl["radial"].stop, He)
     assert tuple(m_sum.W0_a.shape) == (T, sl["angular"].stop - sl["angular"].start, He)
     assert tuple(m_sum.W1_r.shape) == tuple(m_sum.W1_a.shape) == (T, He, Hw)
@@ -883,9 +880,8 @@ def test_sum_mode_experts_add():
     assert not np.allclose(mu_all, mu_soap, atol=1e-6)
 
 
-@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
-def test_sum_mode_four_path(readout):
-    cfg = _sum_cfg(dipole_readout=readout); m = _model(cfg)
+def test_sum_mode_four_path():
+    cfg = _sum_cfg(dipole_readout="neighbor"); m = _model(cfg)
     _randomise_experts(m)
     _check_four_path(cfg, m)
 
@@ -894,9 +890,9 @@ def test_sum_mode_snes_layout_and_roundtrip():
     """Typed slab [W0|b0|W1 | W0_r|b0_r|W1_r | W0_a|b0_a|W1_a], then b1, then c_pair."""
     from SNES import SNES, _set_model_params
     from data import assemble_data_dict, pad_and_stack
-    cfg = _sum_cfg(dipole_readout="bilinear", dipole_pair_rank=1, dipole_species_pairs="symmetric")
+    cfg = _sum_cfg(dipole_readout="neighbor", dipole_species_pairs="symmetric")
     m = _model(cfg); opt = SNES(m)
-    T, H, He, Hw, Q = 2, cfg.num_neurons, 6, m._head_width, cfg.dim_q
+    T, H, He, Hw, Q = 2, cfg.num_neurons, 6, m._head_slots, cfg.dim_q
     sl = nd.nep_slices(cfg); dr, da = sl["radial"].stop, sl["angular"].stop - sl["angular"].start
     n_main = T * (Q * H + H + H * Hw)
     n_r, n_a = T * (dr * He + He + He * Hw), T * (da * He + He + He * Hw)
@@ -936,7 +932,7 @@ def test_sum_mode_snes_layout_and_roundtrip():
     for k in EXPERTS:
         np.testing.assert_array_equal(getattr(m, k).numpy(), n[k].numpy())
     assert np.any(m.W1_r.numpy() != 0)
-    kw = dict(nbr_index=full["nbr_index"], nbr_G=full["nbr_G"], nep_raw=full["nep_raw"])
+    kw = dict(nep_raw=full["nep_raw"])
     mu_model = m.predict_batch(*_forward_args(m, full), W_atom=full["V_atom"], **kw)[0].numpy()
     nb = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
     experts = tuple(nb[k] for k in EXPERTS)
@@ -961,7 +957,7 @@ def test_sum_mode_regularisation_includes_experts():
         if len(types) == 1:
             kw.update(types=[8], num_types=1, type_map={8: 0})
         cfg = _sum_cfg(**kw); m = _model(cfg); opt = SNES(m)
-        T, H, Hw, Q = cfg.num_types, cfg.num_neurons, m._head_width, cfg.dim_q
+        T, H, Hw, Q = cfg.num_types, cfg.num_neurons, m._head_slots, cfg.dim_q
         n_main = T * (Q * H + H + H * Hw)
         mu = opt.mu.numpy().copy(); mu2 = mu.copy()
         mu2[n_main:n_main + T * m.W0_r.shape[1] * 6] *= 10.0     # W0_r slab

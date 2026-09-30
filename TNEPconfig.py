@@ -77,11 +77,6 @@ class TNEPconfig:
     #                  μ = Σ_{i<j} b_ij·(r_i − r_j)   (MIC displacements)
     #                R_n(r) = T_n(2r/r_c − 1)·f_c(r) (Chebyshev, 1st kind;
     #                f_c per dipole_cutoff)
-    #   "bilinear" : "neighbor" plus an antisymmetric bilinear pair term
-    #                (neighbor_dipole_bilinear_plan.md): the ANN also emits
-    #                a_i, b_i ∈ R^{C×K} (K = dipole_pair_rank) and
-    #                  μ += Σ_i Σ_j Σ_n c_n[p(t_i,t_j)]·R_n(r_ij)·(a_i^n·b_j^n)·(r_i − r_j)
-    #                so the flow on a bond depends on BOTH end environments.
     dipole_readout: str = "neighbor"
     # Number of Chebyshev radial channels C of the neighbor readout (n =
     # 0..C−1). C=1 with c≡1 reduces to the plain f_c single-channel form.
@@ -128,15 +123,12 @@ class TNEPconfig:
     #                 gauge invariance) across species.
     # Legacy bool: False→"off", True→"symmetric" (normalized at model init).
     dipole_species_pairs: str = "symmetric"
-    # Rank K of the bilinear pair term (dipole_readout="bilinear" only; head
-    # width C·(1+2K)). Ignored by every other readout.
-    dipole_pair_rank: int = 2
-    # Head output of the neighbor/bilinear readouts:
-    #   "vector" : one site value per radial channel — s [C] (and a, b [C, K])
-    #   "scalar" : one site value broadcast over the C channels — s [1]
-    #              (and a, b [1, K]); radial resolution then lives only in the
-    #              learned species-pair table c[n, pair], so pair it with
-    #              dipole_species_pairs != "off". Head width 1+2K vs C(1+2K).
+    # Head output of the neighbor readout:
+    #   "vector" : one site value per radial channel — s [C]
+    #   "scalar" : one site value broadcast over the C channels — s [1];
+    #              radial resolution then lives only in the learned
+    #              species-pair table c[n, pair], so pair it with
+    #              dipole_species_pairs != "off". Head width 1 vs C.
     dipole_head: str = "vector"
     # Neighbor-readout cutoff r_c (Å). None = inherit rcut_hard (resolved at
     # model init). Must be ≤ rcut_hard and satisfy dipole_rc + rcut_hard ≤

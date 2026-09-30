@@ -106,8 +106,8 @@ class SNES:
         # other mode).
         self._Ch = (int(model._dipole_channels)
                     if model._neighbor_readout else 1)      # channels → c_pair
-        # W1's last axis: C under "neighbor", C·(1+2K) under "bilinear".
-        self._Hw = (int(model._head_width)
+        # W1's last axis: C ("vector" head) or 1 ("scalar") under "neighbor".
+        self._Hw = (int(model._head_slots)
                     if model._neighbor_readout else 1)      # head width → W1
         _T = self.cfg.num_types
         self.n_c = (self._Ch * (_T * _T if model._species_pairs == "ordered"
@@ -535,9 +535,6 @@ class SNES:
                 n_W1 = T * Hb * self._Hw
                 if i == 0:
                     w1 = rng.uniform(-c_W1, c_W1, size=(T, Hb, self._Hw)).astype(np.float32)
-                    if self.model._neighbor_readout and self.model._pair_rank > 0:
-                        # Gen 0 == the difference model: b ≡ 0 kills the pair term.
-                        w1[:, :, self.model._head_b_start:] = 0.0
                     mu[off:off + n_W1] = w1.reshape(-1)
                 off += n_W1
             # b1 zero
@@ -1007,7 +1004,7 @@ class SNES:
                                "num_atoms", "targets", "atom_mask"]
                 if "types_contained" in train_data:
                     struct_keys.append("types_contained")
-                for _k in ("V_atom", "nbr_index", "nbr_G", "nep_raw"):
+                for _k in ("V_atom", "nep_raw"):
                     if _k in train_data:
                         struct_keys.append(_k)
                 batch_data = {
@@ -1431,7 +1428,6 @@ class SNES:
                 W0, b0, W1, b1, W0p, b0p, W1p, b1p,
                 W_atom=W_atom_v, c_pair=c_pair_val, M_radial=M_val,
                 c_r=c_r_val, c_a=c_a_val, experts=experts_val,
-                nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
                 nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk),
             )
             if self.cfg.scale_targets and self.cfg.target_mode == 1:
@@ -2086,8 +2082,6 @@ class SNES:
                 M_radial=named.get("M_radial"),
                 c_r=named.get("c_r"), c_a=named.get("c_a"),
                 experts=self._experts_of(named),
-                nbr_index=batch_data.get("nbr_index"),
-                nbr_G=batch_data.get("nbr_G"),
                 nep_raw=batch_data.get("nep_raw"),
                 **nep_pair_kwargs(batch_data))  # [C, B, T_dim]
 

@@ -232,7 +232,7 @@ _C3 = [[2.0, 0.1, 1.5], [3.0, 0.5, 2.0], [4.0, 1.0, 2.8], [5.0, 2.0, 3.1],
 
 def _gap_cfg(**kw):
     """gap_sum with explicit centres so no test needs the driver's selection."""
-    return _cfg(**{"nep_descriptor": "gap_sum", "nep_num_neurons": 6, "dipole_pair_rank": 2,
+    return _cfg(**{"nep_descriptor": "gap_sum", "nep_num_neurons": 6,
                    "gap2b_n_centres": 6, "gap3b_n_centres": 8,
                    "gap2b_centres": list(_C2), "gap3b_centres": [list(c) for c in _C3], **kw})
 
@@ -259,7 +259,7 @@ def test_gap_sum_gen0_identity():
     assert cfg_g.dim_q == cfg_off.dim_q and m_g.c_r is None and m_g.c_a is None
     for k in ("W0", "b0", "W1"):
         np.testing.assert_array_equal(getattr(m_g, k).numpy(), getattr(m_off, k).numpy())
-    T, He, Hw = 2, 6, m_g._head_width
+    T, He, Hw = 2, 6, m_g._head_slots
     assert tuple(m_g.W0_r.shape) == (T, 12, He) and tuple(m_g.W0_a.shape) == (T, 24, He)
     assert tuple(m_g.W1_r.shape) == tuple(m_g.W1_a.shape) == (T, He, Hw)
     assert np.all(m_g.W1_r.numpy() == 0) and np.all(m_g.W1_a.numpy() == 0)
@@ -293,18 +293,17 @@ def test_gap_sum_experts_add():
     np.testing.assert_allclose(mu_all, mu_soap + mu_2b + mu_3b, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
-def test_gap_sum_four_path(readout):
-    cfg = _gap_cfg(dipole_readout=readout); m = _model(cfg)
+def test_gap_sum_four_path():
+    cfg = _gap_cfg(dipole_readout="neighbor"); m = _model(cfg)
     _randomise_experts(m)
     _check_four_path(cfg, m)
 
 
 def test_gap_sum_snes_layout_and_roundtrip():
     from SNES import SNES, _set_model_params
-    cfg = _gap_cfg(dipole_readout="bilinear", dipole_pair_rank=1, dipole_species_pairs="symmetric")
+    cfg = _gap_cfg(dipole_readout="neighbor", dipole_species_pairs="symmetric")
     m = _model(cfg); opt = SNES(m); at, _ = _frame()
-    T, H, He, Hw, Q = 2, cfg.num_neurons, 6, m._head_width, cfg.dim_q
+    T, H, He, Hw, Q = 2, cfg.num_neurons, 6, m._head_slots, cfg.dim_q
     n_main = T * (Q * H + H + H * Hw)
     n_r, n_a = T * (12 * He + He + He * Hw), T * (24 * He + He + He * Hw)
     assert opt.n_typed == n_main + n_r + n_a and opt.n_nep == 0
@@ -318,7 +317,7 @@ def test_gap_sum_snes_layout_and_roundtrip():
         np.testing.assert_array_equal(getattr(m, k).numpy(), n[k].numpy())
     assert n["c_r"] is None and np.any(m.W1_r.numpy() != 0)
     full = prepare_eval_data([at], cfg)
-    kw = dict(nbr_index=full["nbr_index"], nbr_G=full["nbr_G"], nep_raw=full["nep_raw"])
+    kw = dict(nep_raw=full["nep_raw"])
     mu_model = m.predict_batch(*_forward_args(m, full), W_atom=full["V_atom"], **kw)[0].numpy()
     nb = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
     mu_cand = m.predict_batch_candidates(

@@ -7,7 +7,7 @@ The 5-frame test slice is frames 0-4 of the training file and may overlap
 the (shuffled) training frames, so its RMSE is not a held-out number.
 
     CUDA_VISIBLE_DEVICES='' python scripts/smoke_train.py \
-        --readout bilinear --pair-rank 1 --nep sum --optimizer adam --out /tmp/smoke
+        --readout neighbor --nep sum --optimizer adam --out /tmp/smoke
 """
 from __future__ import annotations
 
@@ -23,10 +23,9 @@ sys.path.insert(0, ROOT)
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--readout", choices=["neighbor", "bilinear", "tnep"], default="neighbor")
+    p.add_argument("--readout", choices=["neighbor", "tnep"], default="neighbor")
     p.add_argument("--rij-power", type=int, default=2, help="tnep readout: |r_ij|^N weight")
     p.add_argument("--nep", choices=["off", "concat", "replace", "sum", "gap_sum"], default="off")
-    p.add_argument("--pair-rank", type=int, default=1)
     p.add_argument("--head", choices=["vector", "scalar"], default="vector")
     p.add_argument("--scale", choices=["off", "block", "channel", "minmax"], default="off")
     p.add_argument("--norm", choices=["l2", "none"], default="l2")
@@ -55,7 +54,6 @@ def main(argv=None) -> None:
     cfg.total_N = a.frames
     cfg.descriptor_mode = 1                 # TF builder; radial_basis_norm="none" requires it
     cfg.dipole_readout = a.readout
-    cfg.dipole_pair_rank = a.pair_rank
     cfg.dipole_head = a.head
     cfg.nep_descriptor = a.nep
     cfg.descriptor_scale = a.scale

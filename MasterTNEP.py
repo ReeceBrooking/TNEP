@@ -346,8 +346,7 @@ def _print_param_breakdown(model) -> None:
     rows.append(("ANN  W0  [T·Q·H]", int(opt._n_W0)))
     rows.append(("ANN  b0  [T·H]",   int(opt._n_b0)))
     _S = "C" if model._dipole_head == "vector" else "1"
-    _w1_label = (f"ANN  W1  [T·H·{_S}(1+2K)]" if model._pair_rank > 0
-                 else f"ANN  W1  [T·H·{_S}]" if model._neighbor_readout
+    _w1_label = (f"ANN  W1  [T·H·{_S}]" if model._neighbor_readout
                  else "ANN  W1  [T·H]")
     rows.append((_w1_label,          int(opt._n_W1)))
     # b1 stays in the SNES tail for layout stability but cancels identically
@@ -460,7 +459,7 @@ def _train_model_inner(cfg: TNEPconfig,
         n_train_pairs = int(train_data["grad_values"].shape[0])
         n_val_pairs   = int(val_data["grad_values"].shape[0])
         _reason = ("neighbor readout"
-                   if cfg.dipole_readout in ("neighbor", "bilinear")
+                   if cfg.dipole_readout == "neighbor"
                    else "dipole_rij_power=0")
         print(f"  {_reason}: COO restricted to self-pairs only "
               f"(train P={n_train_pairs}, val P={n_val_pairs})")
@@ -589,9 +588,7 @@ def _train_model_inner(cfg: TNEPconfig,
               f"μ = Σ_pairs b_ij·(r_i − r_j); {_r_desc}, {_fc_desc}, "
               f"C = {model._dipole_channels} channels, {_c_desc}, "
               f"r_c = {cfg.dipole_rc} Å"
-              + f"; head = {model._dipole_head}"
-              + (f"; bilinear pair term, rank K = {model._pair_rank}"
-                 if model._pair_rank > 0 else ""))
+              + f"; head = {model._dipole_head}")
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")
     print("Parameter Natural Log: " + str(np.log(model.optimizer.dim)))
     print("Parameter Root: " + str(np.sqrt(model.optimizer.dim)))

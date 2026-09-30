@@ -129,7 +129,6 @@ def fit_adam(model, train_data: dict, val_data: dict,
             c_r=named.get("c_r"), c_a=named.get("c_a"),
             experts=(tuple(map(_tf_var, model.expert_weights))   # Keras vars → tf.Variables
                      if model._experts_on else None),
-            nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
             nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk))
         if scale_preds:
             num_atoms = tf.reduce_sum(chunk["atom_mask"], axis=1)

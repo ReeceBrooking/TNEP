@@ -420,8 +420,8 @@ def test_dual_solver_matches_primal(tmp_path):
     assert np.allclose(p, d, rtol=1e-8, atol=1e-10 * np.abs(p).max())
 
 
-def test_gap_rejects_bilinear_readout():
-    # The convex fit needs μ linear in the site scalars; the bilinear pair
-    # term is quadratic in the ANN outputs, so GAP mode must refuse it.
+def test_gap_rejects_non_neighbor_readout():
+    # The convex fit needs μ linear in the site scalars, which only the
+    # neighbour readout gives, so GAP mode must refuse every other readout.
     with pytest.raises(ValueError, match="dipole_readout"):
-        gap_dipole._validate(_cfg(dipole_readout="bilinear", dipole_pair_rank=1))
+        gap_dipole._validate(_cfg(dipole_readout="tnep"))

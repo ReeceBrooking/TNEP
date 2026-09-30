@@ -259,7 +259,7 @@ def validate_nep_cfg(cfg):
             raise NotImplementedError(
                 f"cfg.nep_descriptor={mode!r}: descriptor gradients are implemented "
                 "only for target_mode=1 with dipole_readout='tnep' (concat/replace); "
-                "the neighbor/bilinear readouts need none.")
+                "the neighbor readout needs none.")
         if int(cfg.dipole_rij_power) < 1:
             raise ValueError(
                 "cfg.dipole_rij_power=0 (self-pairs only) has no NEP pair stream; "

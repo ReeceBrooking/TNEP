@@ -866,7 +866,7 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         )
 
     if mode == "nep4_radial":
-        # NEP4 learned-basis fold: rank-1 bilinear weighting
+        # NEP4 learned-basis fold: rank-1 weighting
         #   g[t, n'', l] = Σ_{n,n'} c[t,s(n),n'',k(n)]·c[t,s(n'),n'',k(n')]·p[n,n',l]
         # (same indexing as NEP4's c^{Z_i,Z_j}_{n'',k}). Adds nep4_* layout
         # fields (n_max_out, l_of_q, n_global, np_global, n_to_species,
@@ -946,7 +946,7 @@ def descriptor_preprocess_layout(cfg, layout: dict, mode: str) -> dict:
         init_norm = float(np.sqrt(1.0 / fan_in))
         return dict(
             dim_q_new=Q_new,
-            q_raw_to_q_new=None,           # not used by the bilinear fold
+            q_raw_to_q_new=None,           # not used by the rank-1 fold
             coef_shape=coef_shape,
             coef_init_norm=init_norm,
             coef_init_per_q_raw=None,

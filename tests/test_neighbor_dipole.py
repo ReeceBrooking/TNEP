@@ -19,7 +19,6 @@ from ase import Atoms
 from ase.io import read
 from ase.neighborlist import neighbor_list
 
-import data as tnep_data
 from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
 from TNEP import TNEP
 from DescriptorBuilder import make_descriptor_builder
@@ -62,7 +61,6 @@ def _cfg(**kw):
     cfg.descriptor_scale = "off"
     cfg.q_scale = None
     cfg.optimizer = "snes"
-    cfg.dipole_pair_rank = 2
     cfg.dipole_head = "vector"
     for k, v in kw.items():
         setattr(cfg, k, v)
@@ -89,8 +87,7 @@ def _mu(model, atoms, cfg):
         data["pair_atom"], data["pair_gidx"], data["pair_struct"],
         data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
         model.W0, model.b0, model.W1, model.b1,
-        W_atom=data.get("V_atom"), nbr_index=data.get("nbr_index"),
-        nbr_G=data.get("nbr_G"))[0].numpy()
+        W_atom=data.get("V_atom"))[0].numpy()
 
 
 # Readout variants shared across the parametrized suites. "screened" is the
@@ -107,11 +104,11 @@ _MODE_KW = {
 
 
 @functools.lru_cache(maxsize=8)
-def _bulk_setup(mode="chebyshev", readout="neighbor", head="vector"):
+def _bulk_setup(mode="chebyshev", head="vector"):
     """(cfg, model, atoms, padded-data) for the 96-atom water frame — shared.
     "ordered" gets a randomized ASYMMETRIC Ω (symmetric Ω would telescope
     back to the difference form and hide ordered-path bugs)."""
-    cfg = _cfg(dipole_readout=readout, dipole_head=head, **_MODE_KW[mode])
+    cfg = _cfg(dipole_head=head, **_MODE_KW[mode])
     model = _model(cfg)
     if mode == "ordered":
         rng = np.random.default_rng(11)
@@ -238,16 +235,15 @@ def test_single_atom_lattice_translation_invariance(mode):
 
 @pytest.mark.parametrize("mode", ["chebyshev", "screened", "chebyshev_warped",
                                   "gaussian", "cheb_tanh3"])
-@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
 @pytest.mark.parametrize("head", ["vector", "scalar"])
-def test_four_path_consistency(mode, readout, head):
+def test_four_path_consistency(mode, head):
     # The only test cross-checking all three radial dispatch sites (numpy
     # twin, predict inline, _neighbor_V_coo) against each other — catches a
     # ζ/radial mismatch between them. The in-graph/predict legs are the ONLY
     # automated execution of the TF _radial/_fc branches (every μ-comparing
     # test consumes the numpy-built V via W_atom), so the new radials and
     # the tanh3 cross MUST be parametrized here.
-    cfg, model, atoms, _ = _bulk_setup(mode, readout, head)
+    cfg, model, atoms, _ = _bulk_setup(mode, head)
     # Full pair stream (self_pairs_only=False) so the in-graph V path has
     # the r_d COO list to build V from.
     types_int = assign_type_indices([atoms], cfg.types)
@@ -260,14 +256,13 @@ def test_four_path_consistency(mode, readout, head):
             full["pair_atom"], full["pair_gidx"], full["pair_struct"],
             full["positions"], full["Z_int"], full["boxes"], full["atom_mask"],
             model.W0, model.b0, model.W1, model.b1)
-    nbr = dict(nbr_index=full.get("nbr_index"), nbr_G=full.get("nbr_G"))
-    mu_slot = model.predict_batch(*args, W_atom=full["V_atom"], **nbr)[0].numpy()
+    mu_slot = model.predict_batch(*args, W_atom=full["V_atom"])[0].numpy()
     mu_ingraph = model.predict_batch(*args, W_atom=None)[0].numpy()   # COO legs
 
     mu_cand = model.predict_batch_candidates(
         full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
         model.W0[tf.newaxis], model.b0[tf.newaxis],
-        model.W1[tf.newaxis], model.b1[tf.newaxis], **nbr)[0, 0].numpy()
+        model.W1[tf.newaxis], model.b1[tf.newaxis])[0, 0].numpy()
 
     # Single-structure predict(): dense [A, M] neighbor table from the builder.
     gi = gidx[0]
@@ -859,142 +854,42 @@ def test_neighbor_pairs_fast_path_matches_ase():
         assert np.all(L[at.pbc] >= 2 * rc)
 
 
-# ── Bilinear pair head (neighbor_dipole_bilinear_plan.md) ─────────────────────
+# ── Site head width (dipole_head) ──────────────────────────────────
 
-def test_pair_rank_head_width():
-    # "neighbor": head width == C whatever dipole_pair_rank says (K forced 0).
-    cfg = _cfg(dipole_channels=4, dipole_pair_rank=3)
+def test_head_slots_width():
+    # "vector": one head slot per radial channel; _split_head is the identity.
+    cfg = _cfg(dipole_channels=4)
     m = _model(cfg)
-    assert m._pair_rank == 0
-    assert m._head_width == 4 and tuple(m.W1.shape) == (2, 8, 4)
-    # "bilinear", K=2: C·(1+2K) = 4·5 = 20.
-    cfg = _cfg(dipole_channels=4, dipole_readout="bilinear", dipole_pair_rank=2)
-    m = _model(cfg)
-    assert m._head_width == 20 and tuple(m.W1.shape) == (2, 8, 20)
-    # _split_head slices: s [.., C], a/b [.., C, K].
-    out = tf.reshape(tf.range(20, dtype=tf.float32), [1, 20])
-    s, a, b = m._split_head(out)
-    assert tuple(s.shape) == (1, 4)
-    assert tuple(a.shape) == (1, 4, 2) and tuple(b.shape) == (1, 4, 2)
-    np.testing.assert_array_equal(s.numpy()[0], [0, 1, 2, 3])
-    np.testing.assert_array_equal(a.numpy()[0, 0], [4, 5])
-    np.testing.assert_array_equal(b.numpy()[0, 0], [12, 13])
+    assert m._head_slots == 4 and tuple(m.W1.shape) == (2, 8, 4)
+    out = tf.reshape(tf.range(4, dtype=tf.float32), [1, 4])
+    np.testing.assert_array_equal(m._split_head(out).numpy()[0], [0, 1, 2, 3])
+    # "scalar": one slot, broadcast over the C channels by _split_head.
+    m = _model(_cfg(dipole_channels=4, dipole_head="scalar",
+                    dipole_species_pairs="symmetric"))
+    assert m._head_slots == 1 and tuple(m.W1.shape) == (2, 8, 1)
+    s_ = m._split_head(tf.constant([[2.5]]))
+    assert tuple(s_.shape) == (1, 4)
+    np.testing.assert_array_equal(s_.numpy()[0], [2.5] * 4)
 
 
-def test_bilinear_readout_needs_rank():
-    cfg = _cfg(dipole_readout="bilinear", dipole_pair_rank=0)
-    with pytest.raises(ValueError, match="dipole_pair_rank"):
-        _model(cfg)
+def test_unknown_readout_raises_at_init():
     with pytest.raises(ValueError, match="dipole_readout"):
         _model(_cfg(dipole_readout="bogus"))
 
 
-def test_nbr_table_matches_ase_pairs():
-    """nbr_index / nbr_G reproduce the ase pair list (padding zero, G = R_n·d)."""
-    cfg = _cfg(dipole_channels=4, dipole_readout="bilinear", dipole_pair_rank=1)
-    atoms = _bulk_frame()
-    types_int = assign_type_indices([atoms], cfg.types)
-    builder = make_descriptor_builder(cfg)
-    desc, grads, gidx = builder.build_descriptors([atoms])
-    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
-    assert "nbr_index" in d and "nbr_G" in d
-    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
-    idx, G = full["nbr_index"][0].numpy(), full["nbr_G"][0].numpy()   # [A,M], [A,M,3,C]
-    # Reference: V_i = Σ_j G_ij (V's definition) — ties the table to the V kernel.
-    V_ref = full["V_atom"][0].numpy().sum(-1)                           # [A,3,C]
-    np.testing.assert_allclose(G.sum(1), V_ref, rtol=1e-5, atol=1e-6)
-    # Padding rows carry zero G and index 0; real rows match the ase pair set.
-    i, j, D = neighbor_list("ijD", atoms, cfg.dipole_rc)
-    counts = np.bincount(i[i != j], minlength=len(atoms))
-    for a_ in range(len(atoms)):
-        assert np.all(G[a_, counts[a_]:] == 0.0)
-        assert np.all(idx[a_, counts[a_]:] == 0)
-        assert set(idx[a_, :counts[a_]]) == set(j[(i == a_) & (i != j)])
-
-
-def test_nbr_table_absent_for_neighbor_readout():
-    cfg = _cfg(dipole_channels=4, dipole_pair_rank=2)   # "neighbor": K ignored
-    atoms = _bulk_frame()
-    types_int = assign_type_indices([atoms], cfg.types)
-    builder = make_descriptor_builder(cfg)
-    desc, grads, gidx = builder.build_descriptors([atoms])
-    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
-    assert "nbr_index" not in d and "nbr_G" not in d
-
-
-def _bilinear_reference(model, atoms, cfg, h):
-    """Brute-force μ_bl from the ase pair list and the ANN head outputs h·W1[t]."""
-    types_int = np.asarray(assign_type_indices([atoms], cfg.types)[0])
-    out = np.einsum('ah,ahk->ak', h, model.W1.numpy()[types_int])
-    C, K = cfg.dipole_channels, cfg.dipole_pair_rank
-    a = out[:, C:C + C * K].reshape(-1, C, K)
-    b = out[:, C + C * K:].reshape(-1, C, K)
-    c_full = model._c_full(model.c_pair).numpy()            # [C, T, T]
-    i, j, G = tnep_data._neighbor_dipole_pairs(
-        atoms, cfg.dipole_rc, C, cfg.dipole_radial, cfg.dipole_zeta,
-        resolved_dipole_cutoff(cfg), cfg.dipole_gauss_sigma_scale)   # [P,3,C]
-    mu = np.zeros(3)
-    for p in range(len(i)):
-        ab = (a[i[p]] * b[j[p]]).sum(-1)                     # [C]
-        mu += G[p] @ (c_full[:, types_int[i[p]], types_int[j[p]]] * ab)
-    return mu
-
-
-def test_bilinear_matches_bruteforce_and_is_antisymmetric():
-    cfg = _cfg(dipole_channels=3, dipole_readout="bilinear", dipole_pair_rank=2,
-               dipole_species_pairs="symmetric")
-    model = _model(cfg)
-    # Randomise c so the species-pair coupling is actually exercised.
-    model.c_pair.assign(tf.random.stateless_uniform(model.c_pair.shape, [1, 2], 0.5, 1.5))
-    atoms = _bulk_frame()
-    types_int = assign_type_indices([atoms], cfg.types)
-    builder = make_descriptor_builder(cfg)
-    desc, grads, gidx = builder.build_descriptors([atoms])
-    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
-    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
-    args = (full["descriptors"], full["grad_values"], full["pair_atom"],
-            full["pair_gidx"], full["pair_struct"], full["positions"],
-            full["Z_int"], full["boxes"], full["atom_mask"],
-            model.W0, model.b0)
-    kw = dict(W_atom=full["V_atom"], nbr_index=full["nbr_index"], nbr_G=full["nbr_G"])
-    mu_full = model.predict_batch(*args, model.W1, model.b1, **kw)[0].numpy()
-    # s-term alone: zero the a/b slices of W1.
-    C, K = cfg.dipole_channels, cfg.dipole_pair_rank
-    W1_s = model.W1.numpy().copy(); W1_s[:, :, C:] = 0.0
-    mu_s = model.predict_batch(*args, tf.constant(W1_s), model.b1, **kw)[0].numpy()
-    # Hidden activations for the reference (same arithmetic as predict_batch;
-    # mixing is off in _cfg so raw W0 == W0_eff).
-    Zn = full["Z_int"][0].numpy()
-    z = (np.einsum('aq,aqh->ah', full["descriptors"][0].numpy(), model.W0.numpy()[Zn])
-         + model.b0.numpy()[Zn])
-    h = model.activation(tf.constant(z)).numpy()
-    mu_ref = _bilinear_reference(model, atoms, cfg, h)
-    assert np.linalg.norm(mu_ref) > 1e-3          # the term is not trivially zero
-    np.testing.assert_allclose(mu_full - mu_s, mu_ref, rtol=1e-4, atol=1e-5)
-    # Antisymmetry: swapping the a and b slices negates the pair term.
-    W1_sw = model.W1.numpy().copy()
-    W1_sw[:, :, C:C + C * K] = model.W1.numpy()[:, :, C + C * K:]
-    W1_sw[:, :, C + C * K:] = model.W1.numpy()[:, :, C:C + C * K]
-    mu_sw = model.predict_batch(*args, tf.constant(W1_sw), model.b1, **kw)[0].numpy()
-    np.testing.assert_allclose(mu_sw - mu_s, -(mu_full - mu_s), rtol=1e-4, atol=1e-5)
-
-
-def test_pair_rank_snes_tail_and_gen0_identity():
-    """W1 block = T·H·C(1+2K); c_pair block unchanged (C·pairs); μ-init zeroes
-    the b-slice so gen 0 equals the difference model with the same s-slice."""
+def test_head_snes_tail_and_gen0_identity():
+    """W1 block = T·H·C; c_pair block C·pairs; reconstruct → assign →
+    predict_batch agrees with predict_batch_candidates on the same μ."""
     from SNES import SNES, _set_model_params
-    cfg = _cfg(dipole_channels=4, dipole_readout="bilinear", dipole_pair_rank=2,
-               dipole_species_pairs="symmetric")
+    cfg = _cfg(dipole_channels=4, dipole_species_pairs="symmetric")
     model = _model(cfg); opt = SNES(model)
-    T, H, C, K = 2, 8, 4, 2
-    assert opt._n_W1 == T * H * C * (1 + 2 * K)
+    T, H, C = 2, 8, 4
+    assert opt._n_W1 == T * H * C
     assert opt.n_c == C * (T * (T + 1) // 2)
     named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
     W1 = named["W1"].numpy()
-    assert tuple(W1.shape) == (T, H, C * (1 + 2 * K))
-    assert np.all(W1[:, :, C + C * K:] == 0.0)            # b-slice zero at gen 0
-    assert np.any(W1[:, :, C:C + C * K] != 0.0)           # a-slice Glorot
-    # Round trip: reconstruct → assign → predict_batch == predict_batch_candidates(mu).
+    assert tuple(W1.shape) == (T, H, C)
+    assert np.any(W1 != 0.0)                              # Glorot, not zeros
     atoms = _bulk_frame()
     types_int = assign_type_indices([atoms], cfg.types)
     builder = make_descriptor_builder(cfg)
@@ -1008,63 +903,28 @@ def test_pair_rank_snes_tail_and_gen0_identity():
         full["descriptors"], full["grad_values"], full["pair_atom"], full["pair_gidx"],
         full["pair_struct"], full["positions"], full["Z_int"], full["boxes"],
         full["atom_mask"], model.W0, model.b0, model.W1, model.b1,
-        W_atom=full["V_atom"], nbr_index=full["nbr_index"], nbr_G=full["nbr_G"])[0].numpy()
+        W_atom=full["V_atom"])[0].numpy()
     n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
     mu_cand = model.predict_batch_candidates(
         full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
-        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"],
-        nbr_index=full["nbr_index"], nbr_G=full["nbr_G"])[0, 0].numpy()
+        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"])[0, 0].numpy()
     np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
     assert np.any(mu_cand != 0.0)
 
 
-def test_save_load_roundtrip_bilinear(tmp_path):
-    # Same pattern as test_save_load_roundtrip_ordered_omega: a miskeyed
-    # save/load of the widened W1 or the readout string would change μ silently.
-    import model_io
-    cfg = _cfg(dipole_channels=4, dipole_readout="bilinear", dipole_pair_rank=2,
-               dipole_species_pairs="symmetric")
-    model = _model(cfg)
-    model.W1.assign(tf.random.stateless_normal(model.W1.shape, [5, 6]))
-    atoms = _bulk_frame()
-    mu0 = _mu(model, atoms, cfg)
-    p = str(tmp_path / "bilinear.h5")
-    model_io.save_model(model, cfg, path=p)
-    loaded = model_io.load_model(p)
-    assert loaded.cfg.dipole_readout == "bilinear" and loaded._pair_rank == 2
-    assert tuple(loaded.W1.shape) == tuple(model.W1.shape)
-    np.testing.assert_array_equal(loaded.W1.numpy(), model.W1.numpy())
-    np.testing.assert_array_equal(loaded.c_pair.numpy(), model.c_pair.numpy())
-    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
+# ── Scalar head (dipole_head="scalar") ───────────────────────────
 
-
-# ── Scalar head (dipole_head="scalar") ────────────────────────────────────────
-
-def _tile_scalar_head_into_vector(W1s, C, K):
-    """[T,H,1+2K] scalar-head weights → the equivalent vector-head [T,H,C(1+2K)]:
-    s repeated over channels, a/b repeated over channels per k."""
-    T, H, _ = W1s.shape
-    W1v = np.zeros((T, H, C * (1 + 2 * K)), np.float32)
-    W1v[:, :, :C] = W1s[:, :, :1]
-    for n in range(C):
-        for k in range(K):
-            W1v[:, :, C + n * K + k] = W1s[:, :, 1 + k]
-            W1v[:, :, C + C * K + n * K + k] = W1s[:, :, 1 + K + k]
-    return W1v
-
-
-@pytest.mark.parametrize("readout,K", [("neighbor", 0), ("bilinear", 2)])
-def test_scalar_head_equals_tiled_vector_head(readout, K):
-    kw = dict(dipole_channels=4, dipole_readout=readout, dipole_pair_rank=K,
-              dipole_species_pairs="symmetric")
+def test_scalar_head_equals_tiled_vector_head():
+    kw = dict(dipole_channels=4, dipole_species_pairs="symmetric")
     cs = _cfg(dipole_head="scalar", **kw); ms = _model(cs)
     cv = _cfg(dipole_head="vector", **kw); mv = _model(cv)
-    assert tuple(ms.W1.shape) == (2, 8, 1 + 2 * K)
-    assert tuple(mv.W1.shape) == (2, 8, 4 * (1 + 2 * K))
+    assert tuple(ms.W1.shape) == (2, 8, 1)
+    assert tuple(mv.W1.shape) == (2, 8, 4)
     ms.W1.assign(tf.random.stateless_normal(ms.W1.shape, [7, 8]))
     for src, dst in ((ms.W0, mv.W0), (ms.b0, mv.b0), (ms.c_pair, mv.c_pair)):
         dst.assign(src)
-    mv.W1.assign(_tile_scalar_head_into_vector(ms.W1.numpy(), 4, K))
+    # The scalar head's single slot repeated over the C channels.
+    mv.W1.assign(np.tile(ms.W1.numpy(), (1, 1, 4)))
     atoms = _bulk_frame()
     mu_s = _mu(ms, atoms, cs); mu_v = _mu(mv, atoms, cv)
     assert np.linalg.norm(mu_s) > 1e-3
@@ -1073,17 +933,16 @@ def test_scalar_head_equals_tiled_vector_head(readout, K):
 
 def test_scalar_head_snes_layout_and_gen0():
     from SNES import SNES, _set_model_params
-    cfg = _cfg(dipole_channels=4, dipole_head="scalar", dipole_readout="bilinear",
-               dipole_pair_rank=2, dipole_species_pairs="symmetric")
+    cfg = _cfg(dipole_channels=4, dipole_head="scalar",
+               dipole_species_pairs="symmetric")
     model = _model(cfg); opt = SNES(model)
-    T, H, C, K = 2, 8, 4, 2
-    assert opt._n_W1 == T * H * (1 + 2 * K)
+    T, H, C = 2, 8, 4
+    assert opt._n_W1 == T * H
     assert opt.n_c == C * (T * (T + 1) // 2)            # channels still in c_pair
     named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
     W1 = named["W1"].numpy()
-    assert tuple(W1.shape) == (T, H, 1 + 2 * K)
-    assert np.all(W1[:, :, 1 + K:] == 0.0)             # b-slice zero at gen 0
-    assert np.any(W1[:, :, 1:1 + K] != 0.0)            # a-slice Glorot
+    assert tuple(W1.shape) == (T, H, 1)
+    assert np.any(W1 != 0.0)
     atoms = _bulk_frame()
     d = prepare_eval_data([atoms], cfg)
     mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
@@ -1092,15 +951,14 @@ def test_scalar_head_snes_layout_and_gen0():
     n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
     mu_cand = model.predict_batch_candidates(
         d["descriptors"], d["V_atom"], d["Z_int"], d["atom_mask"],
-        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"],
-        nbr_index=d["nbr_index"], nbr_G=d["nbr_G"])[0, 0].numpy()
+        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"])[0, 0].numpy()
     np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
 
 
 def test_scalar_head_save_load_roundtrip(tmp_path):
     import model_io
-    cfg = _cfg(dipole_channels=4, dipole_head="scalar", dipole_readout="bilinear",
-               dipole_pair_rank=1, dipole_species_pairs="symmetric")
+    cfg = _cfg(dipole_channels=4, dipole_head="scalar",
+               dipole_species_pairs="symmetric")
     model = _model(cfg)
     model.W1.assign(tf.random.stateless_normal(model.W1.shape, [5, 6]))
     atoms = _bulk_frame()
@@ -1108,7 +966,7 @@ def test_scalar_head_save_load_roundtrip(tmp_path):
     p = str(tmp_path / "scalar.h5")
     model_io.save_model(model, cfg, path=p)
     loaded = model_io.load_model(p)
-    assert loaded.cfg.dipole_head == "scalar" and tuple(loaded.W1.shape) == (2, 8, 3)
+    assert loaded.cfg.dipole_head == "scalar" and tuple(loaded.W1.shape) == (2, 8, 1)
     assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
 
 

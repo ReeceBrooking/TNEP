@@ -28,31 +28,6 @@ class AnnBlock(NamedTuple):
 
 
 @tf.function(jit_compile=True)
-def _bilinear_padded_xla(a, b, c_full, Z, nbr_index, nbr_G, T, C, K):
-    """XLA body of TNEP._bilinear_padded (T, C, K static Python ints)."""
-    Cc = tf.shape(a)[0]
-    B = tf.shape(Z)[0]
-    A = tf.shape(Z)[1]
-    M = tf.shape(nbr_index)[2]
-    # One gather over the flattened (B·A) atom axis — no batch_dims bookkeeping.
-    flat_j = tf.reshape(
-        nbr_index + (tf.range(B) * A)[:, tf.newaxis, tf.newaxis], [-1])
-    t_j = tf.reshape(tf.gather(tf.reshape(Z, [-1]), flat_j), [B, A, M])
-    slot = Z[:, :, tf.newaxis] * T + t_j                              # [B,A,M] into T·T
-    c_flat = tf.reshape(tf.transpose(c_full, [0, 2, 3, 1]), [Cc, T * T, C])
-    b_flat = tf.reshape(b, [Cc, B * A, C, K])
-    mu = tf.zeros([Cc, B, 3], a.dtype)
-    for n in range(C):                                                # static C
-        b_j = tf.reshape(tf.gather(b_flat[:, :, n, :], flat_j, axis=1),
-                         [Cc, B, A, M, K])
-        ab = tf.reduce_sum(a[:, :, :, n, tf.newaxis, :] * b_j, axis=-1)  # [Cc,B,A,M]
-        w = ab * tf.gather(c_flat[:, :, n], slot, axis=1)             # × c[n, t_i t_j]
-        mu += tf.reduce_sum(w[..., tf.newaxis] * nbr_G[tf.newaxis, ..., n],
-                            axis=[2, 3])                              # [Cc,B,3]
-    return mu
-
-
-@tf.function(jit_compile=True)
 def _nep_radial_xla(alpha, slot, fnp, rhat, K):
     """F^r [Cc, P, 3] = (Σ_k α[c, slot_p, k] fnp[p, k]) r̂_p; k-loop so the largest
     live tensor is [Cc, P] (alpha [Cc, N·T, K] gathered by slot = i·T + t_j)."""
@@ -127,7 +102,7 @@ class TNEP(layers.Layer):
             if _cm != "trivial":
                 raise NotImplementedError(
                     f"descriptor_preprocess_contract='nep4_radial' requires "
-                    f"compress_mode='trivial' (got {_cm!r}); the bilinear "
+                    f"compress_mode='trivial' (got {_cm!r}); the rank-1 "
                     f"fold needs the (n, n', l) decomposition that only "
                     f"trivial compression preserves.")
             # nep4_radial collapses (n, n', species_pair) into a flat (n'', l)
@@ -195,8 +170,8 @@ class TNEP(layers.Layer):
                 raise NotImplementedError(
                     "cfg.radial_basis_size: descriptor gradients through the "
                     "learned radial basis are not implemented — only the "
-                    "neighbor and bilinear dipole readouts (target_mode=1) "
-                    "are supported.")
+                    "neighbor dipole readout (target_mode=1) "
+                    "is supported.")
             self._rb_species_sum = bool(cfg.radial_basis_species_sum)
             self._rb_per_l = bool(cfg.radial_basis_per_l)
             self._rb_norm = str(cfg.radial_basis_norm)
@@ -351,9 +326,8 @@ class TNEP(layers.Layer):
         # Neighbor-basis dipole readout: decided before W1 so the site head
         # can carry its channel axis.
         _readout = str(cfg.dipole_readout)
-        # "bilinear" is the neighbor readout plus the bilinear pair term.
         self._neighbor_readout = (cfg.target_mode == 1
-                                  and _readout in ("neighbor", "bilinear"))
+                                  and _readout == "neighbor")
         self._dipole_channels = int(cfg.dipole_channels)
         self._dipole_radial = str(cfg.dipole_radial)
         self._dipole_zeta = float(cfg.dipole_zeta)
@@ -364,19 +338,6 @@ class TNEP(layers.Layer):
         self._species_pairs = str(cfg.dipole_species_pairs)
         # THE learnability flag: every save/load/SNES-tail site keys on this.
         self._c_learnable = self._species_pairs != "off"
-        # Bilinear pair head rank K (neighbor_dipole_bilinear_plan.md):
-        # active only under dipole_readout="bilinear"; 0 elsewhere so every
-        # K-keyed site reduces to the plain neighbor readout.
-        self._pair_rank = (int(cfg.dipole_pair_rank)
-                           if self._neighbor_readout and _readout == "bilinear"
-                           else 0)
-        if _readout == "bilinear" and self._pair_rank < 1:
-            raise ValueError(
-                f"dipole_readout='bilinear' needs cfg.dipole_pair_rank ≥ 1 "
-                f"(got {cfg.dipole_pair_rank}); use dipole_readout='neighbor' "
-                f"for the pair-term-free model.")
-        # Head width C·(1+2K): s [C] | a [C·K] | b [C·K]. THE single source for
-        # W1's last axis; SNES/model_io read it back from here.
         # dipole_head: "vector" = one head slot per radial channel, "scalar" =
         # one slot broadcast over the channels (_split_head does the tiling).
         self._dipole_head = str(getattr(cfg, "dipole_head", "vector"))
@@ -384,8 +345,12 @@ class TNEP(layers.Layer):
             raise ValueError(
                 f"cfg.dipole_head must be 'vector' or 'scalar', "
                 f"got {cfg.dipole_head!r}.")
-        self._head_slots = (self._dipole_channels if self._dipole_head == "vector"
-                            else 1)
+        # THE single source for W1's last axis; SNES/model_io read it back.
+        # C slots under the vector head, 1 (broadcast in _split_head) under
+        # "scalar"; 1 for every non-neighbour readout (the head is a scalar).
+        self._head_slots = (self._dipole_channels
+                            if self._neighbor_readout
+                            and self._dipole_head == "vector" else 1)
         if (self._neighbor_readout and self._dipole_head == "scalar"
                 and self._species_pairs == "off"):
             warnings.warn(
@@ -393,12 +358,6 @@ class TNEP(layers.Layer):
                 "channel carries the same site value with c ≡ 1, so the C "
                 "radial channels collapse to Σ_n R_n — set "
                 "dipole_species_pairs='symmetric' to learn a radial profile.")
-        # Head width S·(1+2K): s [S] | a [S·K] | b [S·K], S = _head_slots.
-        # THE single source for W1's last axis; SNES/model_io read it back.
-        self._head_width = (self._head_slots * (1 + 2 * self._pair_rank)
-                            if self._neighbor_readout else 1)
-        # Start of the b-slice inside the head (SNES zeroes it at gen 0).
-        self._head_b_start = self._head_slots * (1 + self._pair_rank)
         if self._neighbor_readout:
             if self._dipole_channels < 1:
                 raise ValueError(
@@ -432,7 +391,7 @@ class TNEP(layers.Layer):
         # radial-channel axis [T, H_final, C] under the neighbor readout.
         self.W1 = self.add_weight(
             name="W1",
-            shape=((cfg.num_types, self._H_final, self._head_width)
+            shape=((cfg.num_types, self._H_final, self._head_slots)
                    if self._neighbor_readout
                    else (cfg.num_types, self._H_final)),
             initializer="glorot_uniform",
@@ -486,10 +445,9 @@ class TNEP(layers.Layer):
                     f"2 = |r|²·F (Xu et al. JCTC 2024 default), "
                     f"≥3 = higher radial moments."
                 )
-            if _readout not in ("tnep", "neighbor", "bilinear"):
+            if _readout not in ("tnep", "neighbor"):
                 raise ValueError(
-                    f"cfg.dipole_readout must be 'tnep', 'neighbor' or "
-                    f"'bilinear', "
+                    f"cfg.dipole_readout must be 'tnep' or 'neighbor', "
                     f"got {_readout!r}.")
             if self._neighbor_readout:
                 if cfg.dipole_rc is None:
@@ -554,7 +512,7 @@ class TNEP(layers.Layer):
             self._ann_blocks.append(AnnBlock(suf, d_in, He, sl_m))
             for name, shape, init in (("W0", (cfg.num_types, d_in, He), "glorot_uniform"),
                                       ("b0", (cfg.num_types, He), "zeros"),
-                                      ("W1", (cfg.num_types, He, self._head_width), "zeros")):
+                                      ("W1", (cfg.num_types, He, self._head_slots), "zeros")):
                 setattr(self, name + suf, self.add_weight(
                     name=name + suf, shape=shape, initializer=init, trainable=True))
 
@@ -651,14 +609,14 @@ class TNEP(layers.Layer):
             if self.descriptor_preprocess_contract == "nep4_radial":
                 # c tensor rank-4 [T_centre, T_neighbour, n_max_out, α]. The
                 # linear-fold tail machinery below doesn't apply; allocate c and
-                # precompute the bilinear-fold gather indices for _W0_preprocess_eff.
+                # precompute the rank-1-fold gather indices for _W0_preprocess_eff.
                 _lay = self._preprocess_layout
                 n_max_out = int(_lay["nep4_n_max_out"])
                 alpha_max = int(_lay["nep4_alpha_max"])
                 coef_shape = tuple(_lay["coef_shape"])
                 full_coef_size = int(_lay["nep4_full_coef_size"])
                 # Init: Glorot with fan_in=α (each c contracts α primitives);
-                # per-element σ gives a roughly unit-scale bilinear product.
+                # per-element σ gives a roughly unit-scale rank-1 product.
                 init_norm = float(_lay["coef_init_norm"])
                 if init_scheme == "glorot":
                     fan_in = max(1, alpha_max)
@@ -693,7 +651,7 @@ class TNEP(layers.Layer):
                 self._preprocess_summed_scatter_M = tf.constant(
                     _M_np, dtype=tf.float32)
                 self._preprocess_kept_template_size = full_coef_size
-                # Precomputed gather indices for the NEP4 bilinear fold.
+                # Precomputed gather indices for the NEP4 rank-1 fold.
                 self._nep4_n_max_out = n_max_out
                 self._nep4_alpha_max = alpha_max
                 self._nep4_L = int(_lay["L"])
@@ -949,7 +907,7 @@ class TNEP(layers.Layer):
 
     def _W0_preprocess_eff_nep4(self, W0: tf.Tensor,
                                  c: tf.Tensor) -> tf.Tensor:
-        """NEP4 bilinear (rank-1 outer-product) fold of W0.
+        """NEP4 rank-1 (outer-product) fold of W0.
 
         Implements g[t, n'', l] = Σ_{n,n'} c[t,s(n),n'',k(n)] · c[t,s(n'),n'',k(n')]
         · p[n,n',l], transforming W0 from [n'',l] storage at Q_new = n_max_out·L
@@ -1242,7 +1200,7 @@ class TNEP(layers.Layer):
     def _expert_outputs(self, nep_raw: tf.Tensor, Z: tf.Tensor, atom_mask: tf.Tensor,
                         c_r: tf.Tensor | None = None, c_a: tf.Tensor | None = None,
                         experts: tuple | None = None) -> tf.Tensor:
-        """ANN_2b(q_r) + ANN_3b(q_ang) head outputs [(C,) ..., A, head_width]
+        """ANN_2b(q_r) + ANN_3b(q_ang) head outputs [(C,) ..., A, head_slots]
         under nep_descriptor="sum" / "gap_sum" (q2 / q3), added to the SOAP ANN's before
         _split_head. experts: the six STORED tensors in EXPERT_WEIGHTS order
         (optional leading candidate axis); None → the model's variables."""
@@ -1326,10 +1284,10 @@ class TNEP(layers.Layer):
             # symmetric a per-channel uniform shift of s^n is exact gauge;
             # under dipole_species_pairs="ordered" that identity breaks and
             # the exclusion is a modeling choice — keep it, don't "fix" it.
-            out = tf.einsum('ah,ahk->ak', h, W1_t)               # [A, C(1+2K)]
+            out = tf.einsum('ah,ahk->ak', h, W1_t)                    # [A, S]
             if self._experts_on:
                 out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a)
-            s, a, b = self._split_head(out)                          # [A, C], [A, C, K] ×2
+            s = self._split_head(out)                                 # [A, C]
             dr, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)          # dr = neighbor − center
             rc = float(self.cfg.dipole_rc)
@@ -1347,15 +1305,6 @@ class TNEP(layers.Layer):
             c_at = tf.gather(c_full, Z, axis=1)                       # [C, A, T]
             mu = tf.einsum('an,nat,adnt->d',
                            s, c_at, tf.cast(V, s.dtype))                 # [3]
-            if self._pair_rank > 0:
-                # Same [A, M] table as V: G = Rw·(−dr) per slot; padding and
-                # out-of-r_c slots are already zero through w.
-                G = tf.cast(Rw[:, :, tf.newaxis, :]
-                            * (-dr)[:, :, :, tf.newaxis], s.dtype)     # [A, M, 3, C]
-                mu += self._bilinear_padded(
-                    a[tf.newaxis, tf.newaxis], b[tf.newaxis, tf.newaxis],
-                    c_full[tf.newaxis], Z[tf.newaxis],
-                    grad_index[tf.newaxis], G[tf.newaxis])[0, 0]
             return mu
 
         # Modes 1 and 2 need forces
@@ -1556,7 +1505,6 @@ class TNEP(layers.Layer):
                 getattr(self, 'W1_pol', None),
                 getattr(self, 'b1_pol', None),
                 W_atom=chunk.get("V_atom"),  # neighbor readout: [B,A,3] kernel
-                nbr_index=chunk.get("nbr_index"), nbr_G=chunk.get("nbr_G"),
                 nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk),
             ))
             del chunk
@@ -1744,7 +1692,7 @@ class TNEP(layers.Layer):
         # Build descriptors using the model's training-time SOAP layout.
         print(f"  building descriptors for {len(dataset)} structures ...")
         # Same gradient gating as data.materialize_test_data (score() is the
-        # same consumer): no SOAP gradients for the neighbour/bilinear readouts
+        # same consumer): no SOAP gradients for the neighbour readout
         # or tnep under nep_descriptor="replace".
         from data import soap_gradients_needed, dipole_self_pairs_only
         builder = make_descriptor_builder(cfg_for_load)
@@ -1854,8 +1802,6 @@ class TNEP(layers.Layer):
                       W_atom: tf.Tensor | None = None,
                       c_pair: tf.Tensor | None = None,
                       M_radial: tf.Tensor | None = None,
-                      nbr_index: tf.Tensor | None = None,
-                      nbr_G: tf.Tensor | None = None,
                       nep_raw: tf.Tensor | None = None,
                       c_r: tf.Tensor | None = None,
                       c_a: tf.Tensor | None = None,
@@ -1890,9 +1836,6 @@ class TNEP(layers.Layer):
             c_pair      : [C, T(T+1)/2] species-pair coefficients (neighbor
                           readout; None → self.c_pair)
             M_radial    : [T, S, α, K] learned radial basis (None → self.M_radial)
-            nbr_index   : [B, A, M] padded neighbor table (bilinear readout;
-                          None → build the pair term from the COO stream)
-            nbr_G       : [B, A, M, 3, C] per-slot R_n(r_ij)(r_i − r_j)
             nep_raw     : [B, A, W_raw] raw expert input (cfg.nep_descriptor
                           != "off"): the NEP basis, or GAP q2‖q3 under gap_sum
             c_r, c_a    : NEP contraction tensors (None → self.c_r / self.c_a)
@@ -1947,10 +1890,10 @@ class TNEP(layers.Layer):
             # choice (kept deliberately) under "ordered" Ω.
             if c_pair is None:
                 c_pair = self.c_pair  # model-weight callers (score, spectro)
-            out = tf.einsum('bah,bahk->bak', h1, W1_t)          # [B, A, C(1+2K)]
+            out = tf.einsum('bah,bahk->bak', h1, W1_t)               # [B, A, S]
             if self._experts_on:
                 out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts)
-            s, a, b = self._split_head(out)
+            s = self._split_head(out)                                # [B, A, C]
             V = W_atom  # [B, A, 3, C, T] geometry kernel via the W_atom slot
             if V is None:
                 # Full-pair callers (spectroscopy fused / legacy pack):
@@ -1962,17 +1905,6 @@ class TNEP(layers.Layer):
             c_full = self._c_full(c_pair)                         # [C, T, T]
             c_at = tf.gather(c_full, Z, axis=1)                   # [C, B, A, T]
             mu = tf.einsum('ban,nbat,badnt->bd', s, c_at, V)      # [B, 3]
-            if self._pair_rank > 0:
-                if nbr_index is not None:
-                    # Padded pair table from data.py (SNES validate / score).
-                    mu += self._bilinear_padded(
-                        a[tf.newaxis], b[tf.newaxis], c_full[tf.newaxis],
-                        Z, nbr_index, nbr_G)[0]
-                else:
-                    # Full r_d COO stream (in-graph, like V above).
-                    mu += self._bilinear_coo(
-                        a, b, c_full, Z, pair_struct, pair_atom, pair_gidx,
-                        positions, boxes, box_inv, tf.shape(descriptors)[0])
             return mu
 
         # Single-hidden backward chain (∂U/∂q):
@@ -2037,8 +1969,6 @@ class TNEP(layers.Layer):
                                   W_pre_angular: tf.Tensor | None = None,
                                   c_pair: tf.Tensor | None = None,
                                   M_radial: tf.Tensor | None = None,
-                                  nbr_index: tf.Tensor | None = None,
-                                  nbr_G: tf.Tensor | None = None,
                                   nep_raw: tf.Tensor | None = None,
                                   c_r: tf.Tensor | None = None,
                                   c_a: tf.Tensor | None = None,
@@ -2074,8 +2004,6 @@ class TNEP(layers.Layer):
             M_radial    : [C, T, S, α, K] per-candidate learned radial basis
                           (required under cfg.radial_basis_size; descriptors
                           are then raw centre coefficients [B, A, W_in])
-            nbr_index   : [B, A, M], nbr_G [B, A, M, 3, Ch] — padded pair
-                          table of the bilinear readout (candidate-independent)
             nep_raw     : [B, A, W_raw] raw expert input (cfg.nep_descriptor
                           != "off"): the NEP basis, or GAP q2‖q3 under gap_sum
             c_r, c_a    : per-candidate [C, T, T, n+1, K+1] NEP contraction
@@ -2147,7 +2075,7 @@ class TNEP(layers.Layer):
         # tf.gather along T axis: b0[C,T,H] gathered by Z_flat[B*A] → [C,B*A,H]
         Z_flat   = tf.reshape(Z, [B * A])
         b0_t_all = tf.reshape(tf.gather(b0, Z_flat, axis=1), [C, B, A, H])
-        _w1_shape = ([C, B, A, H_final, self._head_width]
+        _w1_shape = ([C, B, A, H_final, self._head_slots]
                      if self._neighbor_readout else [C, B, A, H_final])
         W1_t_all = tf.reshape(tf.gather(W1, Z_flat, axis=1), _w1_shape)
 
@@ -2169,10 +2097,10 @@ class TNEP(layers.Layer):
             # backward matmul — the readout reads no descriptor gradients.
             # b1 stays excluded: exact gauge with c symmetric; a modeling
             # choice (kept deliberately) under "ordered" Ω.
-            out = tf.einsum('cbah,cbahk->cbak', h1, W1_t_all)   # [C, B, A, Ch(1+2K)]
+            out = tf.einsum('cbah,cbahk->cbak', h1, W1_t_all)      # [C, B, A, S]
             if self._experts_on:
                 out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts)
-            s, a, b = self._split_head(out)
+            s = self._split_head(out)                           # [C, B, A, Ch]
             if c_pair is None:
                 # Candidate-independent c (frozen c ≡ 1, or model weights):
                 # tile once so ONE einsum serves both cases. (Symbolic C —
@@ -2183,8 +2111,6 @@ class TNEP(layers.Layer):
                 c_full = self._c_full(c_pair)                      # [C, Ch, T, T]
             c_at = tf.gather(c_full, Z, axis=2)                    # [C, Ch, B, A, T]
             mu = tf.einsum('cban,cnbat,badnt->cbd', s, c_at, W_atom)   # [C, B, 3]
-            if self._pair_rank > 0:
-                mu += self._bilinear_padded(a, b, c_full, Z, nbr_index, nbr_G)
             return mu
 
         # ── Dipole: backward matmul ───────────────────────────────────────────
@@ -2542,20 +2468,12 @@ class TNEP(layers.Layer):
         raise ValueError(f"unknown dipole_radial {rad!r}")
 
     def _split_head(self, out: tf.Tensor):
-        """Split the head output [.., S·(1+2K)] → s [.., C], a [.., C, K],
-        b [.., C, K], S = _head_slots (C for dipole_head="vector", 1 for
-        "scalar" — the single slot is broadcast over the C channels). K = 0 ⇒
-        a, b have a zero-width last axis (never contracted)."""
-        S, C, K = self._head_slots, self._dipole_channels, self._pair_rank
-        lead = tf.shape(out)[:-1]
-        s = out[..., :S]
-        a = tf.reshape(out[..., S:S + S * K], tf.concat([lead, [S, K]], 0))
-        b = tf.reshape(out[..., S + S * K:], tf.concat([lead, [S, K]], 0))
-        if S != C:
-            s = tf.broadcast_to(s, tf.concat([lead, [C]], 0))
-            a = tf.broadcast_to(a, tf.concat([lead, [C, K]], 0))
-            b = tf.broadcast_to(b, tf.concat([lead, [C, K]], 0))
-        return s, a, b
+        """Head output [.., S] → site values s [.., C], S = _head_slots (C for
+        dipole_head="vector"; 1 for "scalar", broadcast over the C channels)."""
+        if self._head_slots == self._dipole_channels:
+            return out
+        return tf.broadcast_to(
+            out, tf.concat([tf.shape(out)[:-1], [self._dipole_channels]], 0))
 
     def _c_full(self, c_pair: tf.Tensor) -> tf.Tensor:
         """Packed c_pair [..., C, n_pairs] → [..., C, T, T] via _pair_idx
@@ -2593,52 +2511,6 @@ class TNEP(layers.Layer):
             tf.reshape(contrib, [-1, 3 * C]), seg, num_segments=B * A * T)
         V = tf.reshape(tf.cast(V, dr.dtype), [B, A, T, 3, C])
         return tf.transpose(V, [0, 1, 3, 4, 2])                  # [B,A,3,C,T]
-
-    def _bilinear_padded(self, a: tf.Tensor, b: tf.Tensor, c_full: tf.Tensor,
-                         Z: tf.Tensor, nbr_index: tf.Tensor,
-                         nbr_G: tf.Tensor) -> tf.Tensor:
-        """Bilinear pair term from the padded neighbor table (data.py
-        _neighbor_dipole_nbr):
-            μ_bl[c,b] = Σ_{a,m,n} c_full[c,n,t_a,t_j]·nbr_G[b,a,m,:,n]·(a[c,b,a,n,:]·b[c,b,j,n,:])
-        a, b     : [Cc, B, A, C, K]  (Cc candidates; predict_batch passes Cc=1)
-        c_full   : [Cc, C, T, T]
-        Z        : [B, A] int; nbr_index [B, A, M] int; nbr_G [B, A, M, 3, C]
-        Returns [Cc, B, 3]. Padding slots carry nbr_G = 0, so no mask.
-
-        Memory-bound (one candidate-dependent gather per pair per channel),
-        so it runs as an XLA cluster: measured per 10-candidate chunk on 500
-        frames, M=32, C=20, K=2 — 70 ms eager loop → 24 ms XLA, peak 3.5 →
-        1.5 GB. No einsum inside: XLA lowers einsum to dots that use TF32
-        (3e-4 error); multiply + reduce_sum stay fp32-exact (4e-7)."""
-        return _bilinear_padded_xla(a, b, c_full, Z, nbr_index,
-                                    tf.cast(nbr_G, a.dtype), self.num_types,
-                                    self._dipole_channels, self._pair_rank)
-
-    def _bilinear_coo(self, a: tf.Tensor, b: tf.Tensor, c_full: tf.Tensor,
-                      Z: tf.Tensor, pair_struct: tf.Tensor,
-                      pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
-                      positions: tf.Tensor, boxes: tf.Tensor,
-                      box_inv: tf.Tensor, B: tf.Tensor) -> tf.Tensor:
-        """Bilinear pair term from the full r_d COO pair stream (single weight
-        set; legacy full-pair callers). a, b : [B, A, C, K]; c_full [C, T, T].
-        Returns [B, 3]. Mirrors _neighbor_V_coo's pair filtering and sign."""
-        dr, rij2 = self._neighbor_displacements_coo(
-            positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
-        r = tf.sqrt(rij2)
-        keep = tf.logical_and(r < float(self.cfg.dipole_rc),
-                              tf.not_equal(pair_atom, pair_gidx))
-        Rw = self._radial(r) * tf.cast(keep, r.dtype)[:, tf.newaxis]   # [P, C]
-        G = (-dr)[:, :, tf.newaxis] * Rw[:, tf.newaxis, :]              # [P, 3, C]
-        ii = tf.stack([pair_struct, pair_atom], axis=1)
-        jj = tf.stack([pair_struct, pair_gidx], axis=1)
-        ab = tf.reduce_sum(tf.gather_nd(a, ii) * tf.gather_nd(b, jj), axis=-1)  # [P, C]
-        t_i = tf.gather_nd(Z, ii)
-        t_j = tf.gather_nd(Z, jj)
-        T = self.num_types
-        c_flat = tf.reshape(tf.transpose(c_full, [1, 2, 0]), [T * T, -1])   # [T·T, C]
-        c_ij = tf.gather(c_flat, t_i * T + t_j)                              # [P, C]
-        per_pair = tf.einsum('pn,pn,pdn->pd', ab, c_ij, tf.cast(G, ab.dtype))  # [P, 3]
-        return tf.math.unsorted_segment_sum(per_pair, pair_struct, num_segments=B)
 
     def _dipole_coo(self, forces_per_pair: tf.Tensor, pair_struct: tf.Tensor,
                     pair_atom: tf.Tensor, pair_gidx: tf.Tensor,

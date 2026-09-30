@@ -1955,9 +1955,9 @@ class DescriptorBuilderGPUTF:
                         "the learned radial basis are not implemented (PES / "
                         "tnep readout / polarizability). Use the neighbor "
                         "dipole readout, or set radial_basis_size=None.")
-                # Neighbor / bilinear readout on the trajectory path: it needs
-                # the pair index stream (V and the bilinear pair term are
-                # built in-graph) but no gradient values.
+                # Neighbor readout on the trajectory path: it needs the
+                # pair index stream (V is built in-graph) but no gradient
+                # values.
                 soap = fwd_only_fn(rjs, thetas, phis, pair_atom, pair_neigh,
                                    pair_central, pair_active, n_atoms)
                 return soap, tf.zeros([tf.shape(rjs)[0], 3, 0], soap.dtype)
@@ -2368,9 +2368,9 @@ class DescriptorBuilderGPUTF:
     def build_descriptors_self_only(self, dataset: list, batch_size=None,
                                     **build_kwargs):
         """Same triple as `build_descriptors`, reduced to what mode-1 self-only
-        callers read: nothing when no SOAP gradients are read (neighbor /
-        bilinear readouts; tnep under nep_descriptor="replace"), the
-        self-pair row ∂q_i/∂r_i otherwise.
+        callers read: nothing when no SOAP gradients are read (neighbor
+        readout; tnep under nep_descriptor="replace"), the self-pair row
+        ∂q_i/∂r_i otherwise.
         `batch_size` is accepted for API parity with the quippy builder (this
         backend already batches by cfg.descriptor_batch_frames)."""
         from data import soap_gradients_needed
