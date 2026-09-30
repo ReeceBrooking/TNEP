@@ -9,7 +9,7 @@ transcriptions of those loops (delta = 1, cutoff(s) = 1, e0 = 0):
     E2b(sp1, sp2)      = Σ_s α_s (Σ_{i∈sp1} q2[i, sp2, s] + [sp1≠sp2] Σ_{i∈sp2} q2[i, sp1, s])
     E3b(sp0; sp1, sp2) = 2 Σ_s α_s Σ_{i∈sp0} q3[i, pair_index[sp1, sp2], s]
 
-(the 2 is gap.f90's 3b prefactor `pref = 2 δ² α cutoff`, line 566 — q3 does
+(the 2 is gap.f90's 3b prefactor `pref = 2 δ² α cutoff`, line 563 — q3 does
 NOT absorb it). Cutoffs as in the Fortran: 2b f(r_ij); 3b f(r_ij)·f(r_ik),
 both r < rcut strict, no cutoff on r_jk = |D_ik − D_ij| (image-exact).
 
@@ -82,20 +82,27 @@ def _pairs(atoms, rcut):
     return i[keep][order], j[keep][order], D[keep][order], r[keep][order]
 
 
-def _triplets(atoms, rcut, buffer):
+def _within(pairs, rcut):
+    """Subset of a _pairs() tuple with r < rcut (order preserved)."""
+    keep = pairs[3] < rcut
+    return tuple(x[keep] for x in pairs)
+
+
+def _triplets(N, pairs, rcut, buffer):
     """All unordered neighbour pairs j < k centred on each atom, both within
-    rcut. Returns (centre [P], ja [P], jb [P], q [P, 3], w [P]) with ja/jb the
-    neighbour atom indices, q = [r_ij + r_ik, (r_ij − r_ik)², r_jk] and
-    w = f(r_ij) f(r_ik). Vectorised over a padded [N, M] neighbour table."""
-    N = len(atoms)
-    i, j, D, r = _pairs(atoms, rcut)
+    rcut (pairs = _pairs() at any cutoff ≥ rcut). Returns (centre [P], ja [P],
+    jb [P], q [P, 3], w [P]) with ja/jb the neighbour atom indices,
+    q = [r_ij + r_ik, (r_ij − r_ik)², r_jk] and w = f(r_ij) f(r_ik).
+    Vectorised over a padded [N, M] neighbour table."""
+    i, j, D, r = _within(pairs, rcut)
     counts = np.bincount(i, minlength=N)
     M = int(counts.max()) if len(i) else 0
     table = np.full((N, M), -1, dtype=np.int64)
+    # pairs are sorted by centre: rank within its centre's run = pair index − run start
     table[i, np.arange(len(i)) - np.repeat(np.cumsum(counts) - counts, counts)] = np.arange(len(i))
     mask = table >= 0
-    t = np.where(mask, table, 0)
-    rt, Dt = r[t] * mask, D[t] * mask[..., None]           # [N, M], [N, M, 3]
+    t = np.where(mask, table, 0)                # padded slots point at pair 0; masked out by `valid`
+    rt, Dt = r[t], D[t]                         # [N, M], [N, M, 3]
     valid = mask[:, :, None] & mask[:, None, :] & np.triu(np.ones((M, M), dtype=bool), k=1)
     ci, a, b = np.nonzero(valid)
     ra, rb = rt[ci, a], rt[ci, b]
@@ -117,14 +124,18 @@ def gap_raw_numpy(atoms, types_int, cfg):
     Q3 = np.asarray(cfg.gap3b_centres, dtype=np.float64)
     s3 = np.asarray(cfg.gap3b_sigma, dtype=np.float64)
 
-    i, j, _, r = _pairs(atoms, cfg.gap2b_rcut)
+    pairs = _pairs(atoms, max(cfg.gap2b_rcut, cfg.gap3b_rcut))
+    i, j, _, r = _within(pairs, cfg.gap2b_rcut)
     k2 = f_cut(r, cfg.gap2b_rcut, cfg.gap_buffer)[:, None] * np.exp(
         -0.5 * ((r[:, None] - Q2[None]) / cfg.gap2b_sigma) ** 2)
     q2 = np.zeros((N, T, len(Q2)))
     np.add.at(q2, (i, types_int[j]), k2)
 
-    ci, ja, jb, q, w = _triplets(atoms, cfg.gap3b_rcut, cfg.gap_buffer)
-    k3 = w[:, None] * np.exp(-0.5 * (((q[:, None, :] - Q3[None]) / s3) ** 2).sum(-1))
+    ci, ja, jb, q, w = _triplets(N, pairs, cfg.gap3b_rcut, cfg.gap_buffer)
+    # ponytail: per-dimension accumulation keeps the peak at one [P, M3] (P ≈ N·M²/2
+    # triplets per frame, ~11k×50 for water at 3.5 Å); chunk over P if frames get large
+    d2 = sum(((q[:, d, None] - Q3[None, :, d]) / s3[d]) ** 2 for d in range(3))
+    k3 = w[:, None] * np.exp(-0.5 * d2)
     slot = pair_index(T)[types_int[ja], types_int[jb]]
     q3 = np.zeros((N, T * (T + 1) // 2, len(Q3)))
     np.add.at(q3, (ci, slot), k3)
@@ -138,10 +149,12 @@ def select_centres(frames, cfg):
     training triplets. Deterministic under cfg.seed."""
     rng = np.random.default_rng(cfg.seed)
     c2 = np.linspace(0.5, cfg.gap2b_rcut, cfg.gap2b_n_centres)
-    q = np.concatenate([_triplets(at, cfg.gap3b_rcut, cfg.gap_buffer)[3] for at in frames])
-    if len(q) > MAX_FPS_SAMPLES:
-        q = q[rng.choice(len(q), MAX_FPS_SAMPLES, replace=False)]
-    q = np.unique(q, axis=0)
+    per = -(-MAX_FPS_SAMPLES // len(frames))        # ceil: memory bounded by the cap, not the dataset
+    qs = []
+    for at in frames:
+        qi = _triplets(len(at), _pairs(at, cfg.gap3b_rcut), cfg.gap3b_rcut, cfg.gap_buffer)[3]
+        qs.append(qi[rng.choice(len(qi), min(per, len(qi)), replace=False)])
+    q = np.unique(np.concatenate(qs), axis=0)
     M3 = cfg.gap3b_n_centres
     if len(q) < M3:
         raise ValueError(f"only {len(q)} distinct triplets for {M3} 3b centres")

@@ -20,7 +20,7 @@ Cutoff (`gap.f90:270-275`): f(r) = 1 for r < r_cut − buffer; ½(1 + cos(π (r 
 
     q2[i, t′, s] = Σ_{j: t_j = t′, r_ij < rc2} f(r_ij; rc2, buf) · exp(−(r_ij − Q2_s)² / (2 σ2²))
 
-GAP's per-species-pair term (sp1, sp2) equals Σ_s α_s (Σ_{i∈sp1} q2[i, sp2, s] + [sp1 ≠ sp2]·Σ_{i∈sp2} q2[i, sp1, s]) — for sp1 == sp2 the Fortran filter collapses to ONE clause (no mirrored term). Our layout keeps the centre species implicit (the ANN is per type; in GAP mode the columns are per centre species) and the neighbour species explicit; GAP's symmetric term is the tied-α special case. Width W2 = T·M2. NOTE the 2b Fortran prefactor is δ²·α (no 2), the 3b prefactor is 2·δ²·α (`gap.f90:566`): the exactness identities are E2b = Σ_s α_s (…) and E3b = 2·Σ_s α_s q3 — do NOT insert a 2 into q3.
+GAP's per-species-pair term (sp1, sp2) equals Σ_s α_s (Σ_{i∈sp1} q2[i, sp2, s] + [sp1 ≠ sp2]·Σ_{i∈sp2} q2[i, sp1, s]) — for sp1 == sp2 the Fortran filter collapses to ONE clause (no mirrored term). Our layout keeps the centre species implicit (the ANN is per type; in GAP mode the columns are per centre species) and the neighbour species explicit; GAP's symmetric term is the tied-α special case. Width W2 = T·M2. NOTE the 2b Fortran prefactor is δ²·α (no 2), the 3b prefactor is 2·δ²·α (`gap.f90:563`): the exactness identities are E2b = Σ_s α_s (…) and E3b = 2·Σ_s α_s q3 — do NOT insert a 2 into q3.
 
 3-body (`gap.f90:571-647`, kernel_type "exp"): triplets centred on i over unordered neighbour pairs j < k, both within rc3, cutoff f(r_ij)·f(r_ik) only (no cutoff on r_jk), descriptor q = [r_ij + r_ik, (r_ij − r_ik)², r_jk] (symmetric in j↔k), per unordered neighbour-species pair p = {t_j, t_k} (packed like `TNEP._pair_idx` symmetric: T(T+1)/2 slots), per centre s:
 

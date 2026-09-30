@@ -43,6 +43,7 @@ def _random_centres(rng, cfg):
 # ── gap.f90 transcriptions (delta = 1, cutoff(s) = 1, e0 = 0, exp kernel) ──
 
 def _fcut_f90(r, rcut, buffer):
+    # No r ≥ rcut branch: callers gate on r < rcut first, as gap.f90:271/604 do.
     if r < rcut - buffer:
         return 1.0
     return (np.cos(np.pi * (r - rcut + buffer) / buffer) + 1.0) / 2.0
@@ -51,6 +52,7 @@ def _fcut_f90(r, rcut, buffer):
 def _pairs(atoms, rcut):
     i, j, D = neighbor_list("ijD", atoms, rcut)
     r = np.linalg.norm(D, axis=1)
+    # r > 0 drops the self entry — the Fortran's `k = k + 1` before `do j = 2, n_neigh(i)`.
     keep = r > 0
     return i[keep], j[keep], D[keep], r[keep]
 
