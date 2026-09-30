@@ -71,10 +71,10 @@ Same machinery as "sum": SOAP ANN + ANN_2b + ANN_3b with zero-init heads. Differ
 
 ## Task 2: ANN `gap_sum`
 
-- [ ] Tests: gen-0 identity vs "off" (same seed); experts add (zero SOAP W1 → expert-only); four-path consistency (neighbor + bilinear); SNES layout (n_typed includes experts, no c tail: `n_nep == 0`), candidates == assign+predict_batch, evaluate/validate liveness when only expert weights differ; save/load round trip (centres in cfg round-trip); `descriptor_scale="block"` reparameterisation identity at gen 0 via `gen0_ann_inputs`; `gap_sum` + tnep rejected; Adam 2 steps move W1_r.
-- [ ] Implement per §0.2 (`_experts_on` flag everywhere; grep `== "sum"`); MasterTNEP centre auto-selection + info line; `scripts/smoke_train.py --nep gap_sum`.
-- [ ] Full suite alone (233 + new, 1 skipped) and a CPU smoke `--readout neighbor --nep gap_sum` and `--readout bilinear --pair-rank 1 --nep gap_sum --scale block`.
-- [ ] Commit: `feat: nep_descriptor="gap_sum" — GAP 2b/3b distance descriptors as the sum-model experts`.
+- [x] Tests: gen-0 identity vs "off" (same seed); experts add (zero SOAP W1 → expert-only); four-path consistency (neighbor + bilinear); SNES layout (n_typed includes experts, no c tail: `n_nep == 0`), candidates == assign+predict_batch, evaluate/validate liveness when only expert weights differ; save/load round trip (centres in cfg round-trip); `descriptor_scale="block"` reparameterisation identity at gen 0 via `gen0_ann_inputs`; `gap_sum` + tnep rejected; Adam 2 steps move W1_r.
+- [x] Implement per §0.2 (`_experts_on` flag everywhere; grep `== "sum"`); MasterTNEP centre auto-selection + info line; `scripts/smoke_train.py --nep gap_sum`.
+- [x] Full suite alone (233 + new, 1 skipped) and a CPU smoke `--readout neighbor --nep gap_sum` and `--readout bilinear --pair-rank 1 --nep gap_sum --scale block`.
+- [x] Commit: `feat: nep_descriptor="gap_sum" — GAP 2b/3b distance descriptors as the sum-model experts`.
 
 ## Task 3: GAP mode column blocks
 

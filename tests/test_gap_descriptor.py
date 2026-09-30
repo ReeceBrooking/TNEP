@@ -215,3 +215,204 @@ def test_validate_rejects(bad):
 def test_validate_accepts_default_and_with_centres():
     gd.validate_gap_cfg(_cfg())
     gd.validate_gap_cfg(_random_centres(np.random.default_rng(0), _cfg()))
+
+
+# ── Task 2: nep_descriptor="gap_sum" — q2 ‖ q3 as the sum-model experts ─────
+import tensorflow as tf
+from data import prepare_eval_data
+from test_neighbor_dipole import _model
+from test_nep_descriptor import (EXPERTS, _check_four_path, _forward_args,
+                                 _randomise_experts)
+from test_q_scale import _predict_eff
+
+_C2 = [0.6, 1.1, 1.6, 2.1, 2.7, 3.3]
+_C3 = [[2.0, 0.1, 1.5], [3.0, 0.5, 2.0], [4.0, 1.0, 2.8], [5.0, 2.0, 3.1],
+       [3.5, 0.2, 2.5], [4.5, 1.5, 3.4], [2.5, 0.3, 1.0], [5.5, 3.0, 2.2]]
+
+
+def _gap_cfg(**kw):
+    """gap_sum with explicit centres so no test needs the driver's selection."""
+    return _cfg(**{"nep_descriptor": "gap_sum", "nep_num_neurons": 6, "dipole_pair_rank": 2,
+                   "gap2b_n_centres": 6, "gap3b_n_centres": 8,
+                   "gap2b_centres": list(_C2), "gap3b_centres": [list(c) for c in _C3], **kw})
+
+
+def test_gap_sum_widths_and_data_dict():
+    import nep_descriptor as nd
+    from DescriptorBuilderGPU import nep_block_widths
+    cfg = _gap_cfg(); at, ti = _frame()
+    W2, W3 = 2 * 6, 3 * 8
+    assert gd.gap_dim(cfg) == W2 + W3 == nd.nep_raw_width(cfg)
+    assert nep_block_widths(cfg) == [W2, W3]
+    d = prepare_eval_data([at, at[:12]], cfg)
+    assert tuple(d["nep_raw"].shape) == (2, len(at), W2 + W3)
+    np.testing.assert_array_equal(d["nep_raw"][0].numpy(), gd.gap_raw_numpy(at, ti, cfg))
+    assert np.all(d["nep_raw"][1, 12:].numpy() == 0.0)
+    assert "nep_pairs" not in d
+
+
+def test_gap_sum_gen0_identity():
+    from SNES import SNES
+    at, _ = _frame()
+    cfg_off, cfg_g = _cfg(), _gap_cfg()
+    m_off, m_g = _model(cfg_off), _model(cfg_g)
+    assert cfg_g.dim_q == cfg_off.dim_q and m_g.c_r is None and m_g.c_a is None
+    for k in ("W0", "b0", "W1"):
+        np.testing.assert_array_equal(getattr(m_g, k).numpy(), getattr(m_off, k).numpy())
+    T, He, Hw = 2, 6, m_g._head_width
+    assert tuple(m_g.W0_r.shape) == (T, 12, He) and tuple(m_g.W0_a.shape) == (T, 24, He)
+    assert tuple(m_g.W1_r.shape) == tuple(m_g.W1_a.shape) == (T, He, Hw)
+    assert np.all(m_g.W1_r.numpy() == 0) and np.all(m_g.W1_a.numpy() == 0)
+    d_off, d_g = prepare_eval_data([at], cfg_off), prepare_eval_data([at], cfg_g)
+    np.testing.assert_allclose(_predict_eff(m_g, d_g), _predict_eff(m_off, d_off), rtol=1e-6)
+    o_off, o_g = SNES(m_off), SNES(m_g)
+    assert o_g.n_nep == 0
+    n_off, n_g = (o._split_reconstructed(o.reconstruct_params_tf(o.mu)) for o in (o_off, o_g))
+    for k in ("W0", "b0", "W1", "b1"):
+        np.testing.assert_array_equal(n_g[k].numpy(), n_off[k].numpy())
+    assert np.all(n_g["W1_r"].numpy() == 0) and np.all(n_g["W1_a"].numpy() == 0)
+    np.testing.assert_allclose(o_g.validate(d_g, o_g.mu), o_off.validate(d_off, o_off.mu), rtol=1e-5)
+
+
+def test_gap_sum_experts_add():
+    cfg = _gap_cfg(); m = _model(cfg); at, _ = _frame()
+    _randomise_experts(m)
+    d = prepare_eval_data([at], cfg)
+    W1, W1_r, W1_a = (getattr(m, k).numpy().copy() for k in ("W1", "W1_r", "W1_a"))
+
+    def mu_with(**on):
+        for k, v in (("W1", W1), ("W1_r", W1_r), ("W1_a", W1_a)):
+            getattr(m, k).assign(v if on.get(k, True) else np.zeros_like(v))
+        return _predict_eff(m, d)[0]
+
+    mu_all = mu_with()
+    mu_soap, mu_2b, mu_3b = (mu_with(W1_r=False, W1_a=False), mu_with(W1=False, W1_a=False),
+                             mu_with(W1=False, W1_r=False))
+    for v in (mu_soap, mu_2b, mu_3b):
+        assert np.linalg.norm(v) > 1e-6
+    np.testing.assert_allclose(mu_all, mu_soap + mu_2b + mu_3b, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("readout", ["neighbor", "bilinear"])
+def test_gap_sum_four_path(readout):
+    cfg = _gap_cfg(dipole_readout=readout); m = _model(cfg)
+    _randomise_experts(m)
+    _check_four_path(cfg, m)
+
+
+def test_gap_sum_snes_layout_and_roundtrip():
+    from SNES import SNES, _set_model_params
+    cfg = _gap_cfg(dipole_readout="bilinear", dipole_pair_rank=1, dipole_species_pairs="symmetric")
+    m = _model(cfg); opt = SNES(m); at, _ = _frame()
+    T, H, He, Hw, Q = 2, cfg.num_neurons, 6, m._head_width, cfg.dim_q
+    n_main = T * (Q * H + H + H * Hw)
+    n_r, n_a = T * (12 * He + He + He * Hw), T * (24 * He + He + He * Hw)
+    assert opt.n_typed == n_main + n_r + n_a and opt.n_nep == 0
+    assert opt._n_per_type == opt.n_typed // T
+    assert opt.dim == opt.n_anns_total
+    assert int(opt._extract_type_params(opt.mu, 0).shape[0]) == opt._n_per_type
+    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
+    _set_model_params(m, *opt.reconstruct_params_tf(mu_vec))
+    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec))
+    for k in EXPERTS:
+        np.testing.assert_array_equal(getattr(m, k).numpy(), n[k].numpy())
+    assert n["c_r"] is None and np.any(m.W1_r.numpy() != 0)
+    full = prepare_eval_data([at], cfg)
+    kw = dict(nbr_index=full["nbr_index"], nbr_G=full["nbr_G"], nep_raw=full["nep_raw"])
+    mu_model = m.predict_batch(*_forward_args(m, full), W_atom=full["V_atom"], **kw)[0].numpy()
+    nb = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
+    mu_cand = m.predict_batch_candidates(
+        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
+        nb["W0"], nb["b0"], nb["W1"], nb["b1"], c_pair=nb["c_pair"],
+        experts=tuple(nb[k] for k in EXPERTS), **kw)[0, 0].numpy()
+    np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
+    assert np.any(mu_cand != 0.0)
+    d = prepare_eval_data([at, at], cfg)
+    mu_e = mu_vec.numpy().copy(); mu_e[n_main:opt.n_typed] *= 3.0
+    fit = opt.evaluate_population(tf.stack([mu_vec, tf.constant(mu_e)]), d).numpy()
+    assert np.all(np.isfinite(fit)) and fit[0] != fit[1]
+    assert opt.validate(d, tf.constant(mu_e)) != opt.validate(d, mu_vec)
+
+
+def test_gap_sum_save_load(tmp_path):
+    import model_io
+    cfg = _gap_cfg(); m = _model(cfg); at, _ = _frame()
+    _randomise_experts(m)
+    mu0 = _predict_eff(m, prepare_eval_data([at], cfg))
+    p = str(tmp_path / "gap_sum.h5")
+    model_io.save_model(m, cfg, path=p)
+    loaded = model_io.load_model(p)
+    lc = loaded.cfg
+    assert lc.nep_descriptor == "gap_sum" and loaded.c_r is None
+    np.testing.assert_allclose(lc.gap2b_centres, _C2)
+    np.testing.assert_allclose(lc.gap3b_centres, _C3)
+    for k in EXPERTS:
+        np.testing.assert_array_equal(getattr(loaded, k).numpy(), getattr(m, k).numpy())
+    np.testing.assert_allclose(_predict_eff(loaded, prepare_eval_data([at], lc)), mu0, atol=1e-6)
+
+
+def test_gap_sum_scaled_block_is_gen0_reparameterisation():
+    from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
+    from TNEP import gen0_ann_inputs
+    at, _ = _frame(); small = at[:12]; small.info["dipole"] = np.zeros(3)
+    cfg_off, cfg_on = _gap_cfg(), _gap_cfg(descriptor_scale="block")
+    d = prepare_eval_data([at, small], cfg_off)
+    ds, W2, W3 = cfg_off.dim_q, 12, 24
+    q0 = gen0_ann_inputs(cfg_on, d)
+    assert q0.shape == (2, len(at), ds + W2 + W3)
+    np.testing.assert_array_equal(q0[:, :, ds:], d["nep_raw"].numpy())
+    groups = q_scale_groups(cfg_on)
+    assert sorted(np.concatenate(groups).tolist()) == list(range(ds + W2 + W3))
+    assert len(groups) == len(q_scale_groups(_cfg(descriptor_scale="block"))) + 2
+    m_np, mu_np = compute_q_scale(q0, d["atom_mask"].numpy(), cfg_on)
+    cfg_on.q_scale, cfg_on.q_shift = [float(v) for v in m_np], [float(v) for v in mu_np]
+    m_off, m_on = _model(cfg_off), _model(cfg_on)
+    sl = gd.gap_slices(cfg_on); m_r, m_a = m_np[ds:][sl["two_body"]], m_np[ds:][sl["three_body"]]
+    np.testing.assert_allclose(m_on.W0.numpy() * m_np[None, :ds, None], m_off.W0.numpy(), rtol=1e-6)
+    for m in (m_off, m_on):
+        _randomise_experts(m)
+    for k, mk, s in (("r", m_r, sl["two_body"]), ("a", m_a, sl["three_body"])):
+        getattr(m_on, f"W0_{k}").assign(getattr(m_off, f"W0_{k}").numpy() / mk[None, :, None])
+        mu_k = (m_np * mu_np)[ds:][s]
+        getattr(m_on, f"b0_{k}").assign(getattr(m_off, f"b0_{k}").numpy()
+                                        + np.einsum('q,tqh->th', mu_k, getattr(m_on, f"W0_{k}").numpy()))
+    np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
+    assert np.abs(_predict_eff(m_on, d)).max() > 0
+
+
+def test_gap_sum_guards():
+    from TNEP import TNEP
+    with pytest.raises(NotImplementedError, match="descriptor gradients"):
+        TNEP(_gap_cfg(dipole_readout="tnep"))
+    with pytest.raises(ValueError, match="select_centres"):
+        TNEP(_gap_cfg(gap2b_centres=None))
+    with pytest.raises(ValueError, match="select_centres"):
+        TNEP(_gap_cfg(gap3b_centres=None))
+    with pytest.raises(ValueError, match="gap2b_sigma"):
+        TNEP(_gap_cfg(gap2b_sigma=0.0))
+
+
+def test_gap_sum_adam_smoke():
+    from adam import _trainable, _ann_core
+    cfg = _gap_cfg(optimizer="adam", adam_lr=1e-2, num_generations=2, val_interval=1,
+                   batch_chunk_size=1, dipole_species_pairs="symmetric")
+    m = _model(cfg); at, _ = _frame()
+    keys = list(_trainable(m))
+    assert all(k in keys for k in EXPERTS) and "c_r" not in keys
+    assert len(_ann_core(m)) == 9
+    d = prepare_eval_data([at, at], cfg)
+    history, final, best = m.fit(d, d)
+    assert np.all(np.isfinite(history["train_loss"]))
+    for mdl in (final, best):
+        assert np.any(mdl.W1_r.numpy() != 0) and np.any(mdl.W1_a.numpy() != 0)
+
+
+def test_gap_sum_driver_centres():
+    """select_centres → cfg → model: the driver's path without MasterTNEP."""
+    cfg = _gap_cfg(gap2b_centres=None, gap3b_centres=None, seed=5)
+    at, _ = _frame()
+    c2, c3 = gd.select_centres([at, at[:12]], cfg)
+    cfg.gap2b_centres, cfg.gap3b_centres = c2.tolist(), c3.tolist()
+    m = _model(cfg)
+    d = prepare_eval_data([at], cfg)
+    assert np.all(np.isfinite(_predict_eff(m, d)))

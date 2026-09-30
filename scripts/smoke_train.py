@@ -25,7 +25,7 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--readout", choices=["neighbor", "bilinear", "tnep"], default="neighbor")
     p.add_argument("--rij-power", type=int, default=2, help="tnep readout: |r_ij|^N weight")
-    p.add_argument("--nep", choices=["off", "concat", "replace", "sum"], default="off")
+    p.add_argument("--nep", choices=["off", "concat", "replace", "sum", "gap_sum"], default="off")
     p.add_argument("--pair-rank", type=int, default=1)
     p.add_argument("--head", choices=["vector", "scalar"], default="vector")
     p.add_argument("--scale", choices=["off", "block", "channel", "minmax"], default="off")

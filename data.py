@@ -391,7 +391,11 @@ def assemble_data_dict(
     # in-model by c_r/c_a (multi_descriptor_plan.md §0.3).
     # Phase B adds the image-exact pair stream (plan §B.3) when ∂q/∂r is
     # needed; both consume one ase pair list per frame.
-    if cfg.nep_descriptor != "off":
+    if cfg.nep_descriptor == "gap_sum":
+        # GAP 2b/3b distance descriptors (fixed centres) in the raw slot.
+        from gap_descriptor import gap_raw_numpy
+        data["nep_raw"] = [gap_raw_numpy(s, t, cfg) for s, t in zip(dataset, types_int)]
+    elif cfg.nep_descriptor != "off":
         need_pairs = nep_pairs_needed(cfg)
         data["nep_raw"] = []
         if need_pairs:

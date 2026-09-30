@@ -292,11 +292,18 @@ class TNEP(layers.Layer):
         # Adam tape-watches). "off": None, and dim_q is the SOAP width.
         self.c_r = self.c_a = None
         self._nep_dim = 0
+        # "sum" / "gap_sum": ANN_2b + ANN_3b experts added to the SOAP ANN;
+        # their inputs are the NEP contraction or the GAP q2 ‖ q3 raw slot.
+        self._experts_on = self._nep_mode in ("sum", "gap_sum")
+        self._expert_source = "gap" if self._nep_mode == "gap_sum" else "nep"
         # Phase B: dipole via per-candidate NEP pair forces (plan §B.2).
         self._nep_pair_forces_on = (self._nep_mode in ("concat", "replace")
                                     and cfg.target_mode == 1
                                     and str(cfg.dipole_readout) == "tnep")
-        if self._nep_mode != "off":
+        if self._nep_mode == "gap_sum":
+            from gap_descriptor import gap_dim
+            self._nep_dim = self._nep_raw_width = int(gap_dim(cfg))
+        elif self._nep_mode != "off":
             self._nep_dim = int(nep_dim(cfg))
             self._nep_raw_width = int(nep_raw_width(cfg))
             T = int(cfg.num_types)
@@ -313,11 +320,15 @@ class TNEP(layers.Layer):
         self._sl_main = slice(0, int(self.dim_q_forward))
         self._scale_width = int(self.dim_q_forward)
         self._expert_in = ()      # (input slice of q_nep, slice of q_scale) per expert
-        if self._nep_mode == "sum":
-            nsl, ds = nep_slices(cfg), self._scale_width
+        if self._experts_on:
+            if self._expert_source == "gap":
+                from gap_descriptor import gap_slices
+                nsl, keys = gap_slices(cfg), ("two_body", "three_body")
+            else:
+                nsl, keys = nep_slices(cfg), ("radial", "angular")
+            ds = self._scale_width
             self._expert_in = tuple(
-                (nsl[k], slice(ds + nsl[k].start, ds + nsl[k].stop))
-                for k in ("radial", "angular"))
+                (nsl[k], slice(ds + nsl[k].start, ds + nsl[k].stop)) for k in keys)
             self._scale_width += self._nep_dim
         # Descriptor scale preconditioning: m folded into W0 (see _W0_eff);
         # the Keras W0 init is divided by m so the initial function is the
@@ -1243,7 +1254,7 @@ class TNEP(layers.Layer):
             raise ValueError(
                 f"nep_raw missing: cfg.nep_descriptor={self._nep_mode!r} needs "
                 f"the raw NEP basis at every forward site.")
-        if self._nep_mode == "sum":       # experts read nep_raw in _expert_outputs
+        if self._experts_on:              # experts read nep_raw in _expert_outputs
             return descriptors, None
         q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a, return_s=True)
         if self._nep_mode == "replace":
@@ -1302,7 +1313,7 @@ class TNEP(layers.Layer):
         under nep_descriptor="sum", added to the SOAP ANN's before
         _split_head. experts: the six STORED tensors in EXPERT_WEIGHTS order
         (optional leading candidate axis); None → the model's variables."""
-        q = self.nep_from_raw(nep_raw, Z, c_r, c_a)
+        q = nep_raw if self._expert_source == "gap" else self.nep_from_raw(nep_raw, Z, c_r, c_a)
         w = self.expert_weights if experts is None else tuple(experts)
         return tf.add_n([self._expert_ann(q, Z, atom_mask, *w[3 * i:3 * i + 3], *sl)
                          for i, sl in enumerate(self._expert_in)])
@@ -1383,7 +1394,7 @@ class TNEP(layers.Layer):
             # under dipole_species_pairs="ordered" that identity breaks and
             # the exclusion is a modeling choice — keep it, don't "fix" it.
             out = tf.einsum('ah,ahk->ak', h, W1_t)               # [A, C(1+2K)]
-            if self._nep_mode == "sum":
+            if self._experts_on:
                 out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a)
             s, a, b = self._split_head(out)                          # [A, C], [A, C, K] ×2
             dr, rij = self._neighbor_displacements_single(
@@ -2003,7 +2014,7 @@ class TNEP(layers.Layer):
             if c_pair is None:
                 c_pair = self.c_pair  # model-weight callers (score, spectro)
             out = tf.einsum('bah,bahk->bak', h1, W1_t)          # [B, A, C(1+2K)]
-            if self._nep_mode == "sum":
+            if self._experts_on:
                 out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts)
             s, a, b = self._split_head(out)
             V = W_atom  # [B, A, 3, C, T] geometry kernel via the W_atom slot
@@ -2224,7 +2235,7 @@ class TNEP(layers.Layer):
             # b1 stays excluded: exact gauge with c symmetric; a modeling
             # choice (kept deliberately) under "ordered" Ω.
             out = tf.einsum('cbah,cbahk->cbak', h1, W1_t_all)   # [C, B, A, Ch(1+2K)]
-            if self._nep_mode == "sum":
+            if self._experts_on:
                 out += self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts)
             s, a, b = self._split_head(out)
             if c_pair is None:
@@ -2814,7 +2825,9 @@ def gen0_ann_inputs(cfg, data) -> np.ndarray:
             d = m0.soap_from_raw(d, z)
         raw = None if nep_raw is None else nep_raw[s:s + step]
         x = m0._ann_inputs(d, raw, z, **c)[0]
-        if m0._nep_mode == "sum":
+        if m0._nep_mode == "gap_sum":
+            x = tf.concat([x, raw], axis=-1)
+        elif m0._nep_mode == "sum":
             x = tf.concat([x, m0.nep_from_raw(raw, z, **c)], axis=-1)
         out.append(x)
     return tf.concat(out, axis=0).numpy()

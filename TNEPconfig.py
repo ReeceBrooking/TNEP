@@ -303,6 +303,8 @@ class TNEPconfig:
     #   "concat"  : q = [q_soap ‖ q_nep]
     #   "replace" : q = q_nep (descriptor_mixing / preprocess_contract off)
     #   "sum"     : summed experts (§0.4)
+    #   "gap_sum" : summed experts on the GAP 2b/3b distance descriptors
+    #               (gap_descriptor_plan.md §0.2; no NEP header, no c tensors)
     nep_descriptor: str = "off"
     nep_n_max_radial: int = 6            # q_n, n = 0..n_max
     nep_n_max_angular: int = 6

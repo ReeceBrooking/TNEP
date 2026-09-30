@@ -409,7 +409,11 @@ def extra_block_widths(cfg) -> list:
 
 
 def nep_block_widths(cfg) -> list:
-    """NEP sub-block widths in channel order: radial, L1..L4, 4-body, 5-body."""
+    """NEP sub-block widths in channel order: radial, L1..L4, 4-body, 5-body;
+    under "gap_sum" the two GAP blocks (two_body, three_body)."""
+    if str(getattr(cfg, "nep_descriptor", "off")) == "gap_sum":
+        from gap_descriptor import gap_slices
+        return [sl.stop - sl.start for sl in gap_slices(cfg).values()]
     from nep_descriptor import nep_slices
     return [sl.stop - sl.start for k, sl in nep_slices(cfg).items() if k != "angular"]
 
@@ -471,14 +475,14 @@ def q_scale_groups(cfg) -> list:
     """Channel groups for descriptor_scale="block": each SOAP l group (union
     over species pairs; none under nep_descriptor="replace") then each
     appended block (extra_block_widths), covering every channel exactly once.
-    Under "sum" the scaler sees [q_soap ‖ q_nep] (gen0_ann_inputs) although
-    the main ANN's layout is SOAP only, so the NEP sub-blocks follow."""
+    Under "sum" / "gap_sum" the scaler sees [q_soap ‖ q_experts] (gen0_ann_inputs)
+    although the main ANN's layout is SOAP only, so the expert blocks follow."""
     lay = descriptor_block_layout(cfg)
     groups = [np.asarray(v, dtype=np.int32) for _, v in sorted(lay["l_index"].items())
               if len(v)]
     start = sum(len(g) for g in groups)
     widths = extra_block_widths(cfg)
-    if str(getattr(cfg, "nep_descriptor", "off")) == "sum":
+    if str(getattr(cfg, "nep_descriptor", "off")) in ("sum", "gap_sum"):
         widths = widths + nep_block_widths(cfg)
     for w in widths:
         groups.append(np.arange(start, start + w, dtype=np.int32))

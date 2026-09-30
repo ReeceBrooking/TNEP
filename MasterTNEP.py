@@ -427,6 +427,15 @@ def _train_model_inner(cfg: TNEPconfig,
     else:
         cfg.randomise(dataset)
 
+    if cfg.nep_descriptor == "gap_sum" and (cfg.gap2b_centres is None
+                                            or cfg.gap3b_centres is None):
+        # GAP 2b/3b kernel centres from the frames in cfg.indices (train+val;
+        # the val frames only shape the descriptor, not any fitted weight).
+        # Stored as lists so they serialise with the model.
+        from gap_descriptor import select_centres
+        c2, c3 = select_centres([dataset[i] for i in cfg.indices], cfg)
+        cfg.gap2b_centres, cfg.gap3b_centres = c2.tolist(), c3.tolist()
+
     # Split into train/val (built now) and a deferred test placeholder; test
     # descriptors are built lazily on first scoring (materialize_test_data).
     train_data, test_pending, val_data = split(dataset, dataset_types_int, cfg)
@@ -487,7 +496,18 @@ def _train_model_inner(cfg: TNEPconfig,
               + {"l2": "", "none": "; per-atom L2 normalisation OFF (raw spectrum × scale²)",
                  "sqrt": "; per-atom L2 normalisation OFF (sign·√|q| × scale, degree 1)"}[cfg.radial_basis_norm]
               + f" (M_radial {_shape} in the SNES vector; init = fixed basis)")
-    if cfg.nep_descriptor != "off":
+    if cfg.nep_descriptor == "gap_sum":
+        from gap_descriptor import gap_slices
+        gs = gap_slices(cfg)
+        print(f"GAP descriptor (gap_sum): W2={gs['two_body'].stop - gs['two_body'].start}, "
+              f"W3={gs['three_body'].stop - gs['three_body'].start}, "
+              f"M2={cfg.gap2b_n_centres}, M3={cfg.gap3b_n_centres}, "
+              f"rcut=({cfg.gap2b_rcut}, {cfg.gap3b_rcut}), buffer={cfg.gap_buffer}, "
+              f"sigma=({cfg.gap2b_sigma}, {cfg.gap3b_sigma}); ANN_2b(q2) + ANN_3b(q3) "
+              f"(H_e = {cfg.nep_num_neurons}) + SOAP ANN, expert W1 = 0 at gen 0; "
+              f"centres 2b={np.round(cfg.gap2b_centres, 3).tolist()}, "
+              f"3b[0]={np.round(cfg.gap3b_centres[0], 3).tolist()}")
+    elif cfg.nep_descriptor != "off":
         from nep_descriptor import nep_dim
         print(f"NEP descriptor ({cfg.nep_descriptor}): dim_nep={nep_dim(cfg)}, "
               f"rc_radial={cfg.nep_rc_radial}, rc_angular={cfg.nep_rc_angular}, "

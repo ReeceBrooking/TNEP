@@ -260,7 +260,7 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         if getattr(model, "c_r", None) is not None:
             wg.create_dataset("c_r", data=model.c_r.numpy())
             wg.create_dataset("c_a", data=model.c_a.numpy())
-        if model._nep_mode == "sum":
+        if model._experts_on:
             for k in EXPERT_WEIGHTS:
                 wg.create_dataset(k, data=getattr(model, k).numpy())
 
@@ -529,7 +529,7 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                     f"{tuple(var.shape)} (nep_n_max / nep_basis_size / "
                     f"num_types changed).")
             var.assign(saved)
-    if model._nep_mode == "sum":
+    if model._experts_on:
         experts = experts or {}
         for k in EXPERT_WEIGHTS:
             if k not in experts:

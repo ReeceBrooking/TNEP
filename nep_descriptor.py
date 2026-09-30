@@ -232,11 +232,23 @@ def validate_nep_cfg(cfg):
         if int(getattr(cfg, k)) < 0:
             raise ValueError(f"cfg.{k} must be >= 0.")
     mode = str(getattr(cfg, "nep_descriptor", "off"))
-    if mode not in ("off", "concat", "replace", "sum"):
+    if mode not in ("off", "concat", "replace", "sum", "gap_sum"):
         raise ValueError(
-            f"cfg.nep_descriptor={mode!r}; expected 'off', 'concat', 'replace' or 'sum'.")
+            f"cfg.nep_descriptor={mode!r}; expected 'off', 'concat', 'replace', "
+            f"'sum' or 'gap_sum'.")
     if mode == "off":
         return mode
+    if mode == "gap_sum":
+        # GAP 2b/3b distance descriptors as the two experts (gap_descriptor.py):
+        # no NEP header, no c tensors; the centres must be resolved before
+        # the model is built (MasterTNEP selects them on the training frames).
+        from gap_descriptor import validate_gap_cfg
+        validate_gap_cfg(cfg)
+        if cfg.gap2b_centres is None or cfg.gap3b_centres is None:
+            raise ValueError(
+                "cfg.nep_descriptor='gap_sum' needs cfg.gap2b_centres / gap3b_centres "
+                "(gap_descriptor.select_centres on the training frames; the "
+                "training driver does this when they are None).")
     from data import descriptor_gradients_needed   # lazy: data imports nep_descriptor (Task 5)
     if descriptor_gradients_needed(cfg):
         # Phase B (plan §B.2/§B.4): per-candidate NEP pair forces exist for the
@@ -297,6 +309,10 @@ def gpumd_num_params(cfg, soap_dim=0):
 
 
 def nep_raw_width(cfg):
+    """Width of data["nep_raw"]: the NEP basis, or q2 ‖ q3 under "gap_sum"."""
+    if str(getattr(cfg, "nep_descriptor", "off")) == "gap_sum":
+        from gap_descriptor import gap_dim
+        return int(gap_dim(cfg))
     T = int(cfg.num_types)
     return T * (cfg.nep_basis_size_radial + 1) + T * (cfg.nep_basis_size_angular + 1) * NUM_ABC
 
