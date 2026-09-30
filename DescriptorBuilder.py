@@ -264,7 +264,13 @@ class DescriptorBuilder(layers.Layer):
             f"basis={cfg.basis} scaling_mode={cfg.scaling_mode} "
             f"add_species=F "
             f"radial_enhancement={cfg.radial_enhancement} "
-            f"compress_mode={cfg.compress_mode} "
+            # compress_mode="none" is TurboGAP's "compression off": the
+            # keyword is OMITTED, not passed through — soap_turbo's
+            # get_compress_indices rejects the literal "none"
+            # (soap_turbo_compress.f90:292), which is why TurboGAP gates it
+            # behind its own compress_soap flag (read_files.f90:2607/2646).
+            + (f"compress_mode={cfg.compress_mode} "
+               if str(cfg.compress_mode) != "none" else "")
         )
 
         alpha_max = " alpha_max={"

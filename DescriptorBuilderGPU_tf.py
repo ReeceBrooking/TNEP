@@ -1722,7 +1722,10 @@ class DescriptorBuilderGPUTF:
             )
         if getattr(cfg, "compress_mode", "trivial") != "trivial":
             raise NotImplementedError(
-                f"DescriptorBuilderGPUTF only supports compress_mode='trivial', got '{cfg.compress_mode}'"
+                f"DescriptorBuilderGPUTF only supports "
+                f"compress_mode='trivial', got '{cfg.compress_mode}'. "
+                f"compress_mode='none' (the uncompressed power spectrum) is "
+                f"implemented on the quippy path only — set descriptor_mode=0"
             )
         self.cfg = cfg
         # Use cfg.types verbatim (do NOT sort): quippy assigns species indices

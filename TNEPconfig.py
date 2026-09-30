@@ -168,6 +168,17 @@ class TNEPconfig:
     basis: str = "poly3"
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 0
+    # "trivial" : soap_turbo's traditional compression recipe (the only mode
+    #             the GPU builder, descriptor_mode=1, implements).
+    # "none"    : the uncompressed power spectrum, N(N+1)/2*(l_max+1) over the
+    #             N = num_types*alpha_max radial channels. This is what
+    #             TurboGAP's soap_turbo type defaults to (types.f90 keeps
+    #             compress_mode="none" behind its own compress_soap flag).
+    #             quippy path only (descriptor_mode=0): the keyword is OMITTED
+    #             from the descriptor string, because soap_turbo's
+    #             get_compress_indices rejects the literal "none"
+    #             (soap_turbo_compress.f90:292).
+    # "linear"  : quippy's linear compression, dim = 2*num_types*(l_max+1).
     compress_mode: str = "trivial"
     atom_sigma_r: float = 0.5
     atom_sigma_t: float = 0.5
@@ -656,6 +667,17 @@ class GAPconfig:
     basis: str = "poly3"
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 0
+    # "trivial" : soap_turbo's traditional compression recipe (the only mode
+    #             the GPU builder, descriptor_mode=1, implements).
+    # "none"    : the uncompressed power spectrum, N(N+1)/2*(l_max+1) over the
+    #             N = num_types*alpha_max radial channels. This is what
+    #             TurboGAP's soap_turbo type defaults to (types.f90 keeps
+    #             compress_mode="none" behind its own compress_soap flag).
+    #             quippy path only (descriptor_mode=0): the keyword is OMITTED
+    #             from the descriptor string, because soap_turbo's
+    #             get_compress_indices rejects the literal "none"
+    #             (soap_turbo_compress.f90:292).
+    # "linear"  : quippy's linear compression, dim = 2*num_types*(l_max+1).
     compress_mode: str = "trivial"
     atom_sigma_r: float = 0.5
     atom_sigma_t: float = 0.5

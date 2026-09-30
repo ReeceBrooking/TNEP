@@ -49,8 +49,9 @@ def _build_soap_string(species_Z: list[int], **soap_params) -> str:
         f"rcut_hard={soap_params['rcut_hard']} rcut_soft={soap_params['rcut_soft']} "
         f"basis={soap_params['basis']} scaling_mode={soap_params['scaling_mode']} "
         f"add_species=F radial_enhancement={soap_params['radial_enhancement']} "
-        f"compress_mode={soap_params['compress_mode']} "
-        f"n_species={n} "
+        + (f"compress_mode={soap_params['compress_mode']} "
+           if str(soap_params['compress_mode']) != "none" else "")
+        + f"n_species={n} "
         f"species_Z={{{' '.join(str(z) for z in species_Z)}}} "
         f"alpha_max={{{' '.join([str(soap_params['alpha_max'])] * n)}}} "
         f"atom_sigma_r={{{' '.join([str(soap_params['atom_sigma_r'])] * n)}}} "
@@ -343,6 +344,13 @@ def soap_dim(cfg) -> int:
         # Species-summed learned basis: full (n <= n') spectrum over alpha channels.
         return alpha_max * (alpha_max + 1) // 2 * (l_max + 1)
     compress_mode = getattr(cfg, "compress_mode", "trivial")
+    if compress_mode == "none":
+        # Uncompressed power spectrum over the N = num_types*alpha_max radial
+        # channels: unordered (n, n') pairs x (l_max + 1). Verified against
+        # quippy for (alpha, l, T) = (4,4,2) 180, (6,3,2) 312, (4,4,1) 50,
+        # (3,2,3) 135.
+        N = n_species * alpha_max
+        return int(N * (N + 1) // 2 * (l_max + 1))
     if compress_mode == "linear":
         # quippy linear default = 2 × n_species pivots × (l_max+1) features
         return int(2 * n_species * (l_max + 1))
