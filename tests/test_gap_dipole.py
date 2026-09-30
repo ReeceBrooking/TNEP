@@ -17,7 +17,7 @@ from ase.neighborlist import neighbor_list
 
 import data
 import gap_dipole
-from GAPconfig import GAPconfig
+from TNEPconfig import GAPconfig
 
 WATER_XYZ = os.path.join(ROOT, "datasets", "train_waterbulk.xyz")
 

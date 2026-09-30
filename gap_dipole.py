@@ -32,7 +32,7 @@ fit) as per-species linear features — plan §0.3.
 
 Columns = M_tot·K can exceed the 3·F equations (underdetermined); the ridge
 handles it — train RMSE approaches 0 there and test RMSE is the metric.
-Takes its own GAPconfig (GAPconfig.py), never TNEPconfig: the ANN-input modes
+Takes its own GAPconfig (declared in TNEPconfig.py), never TNEPconfig: the ANN modes
 are frozen constants there, so no ANN experiment can reach the fit.
 Still fixed: dipole_readout="neighbor", target_mode=1, scale_targets=False.
 NO model persistence — fit writes a config+metrics run record JSON to GAP/."""
@@ -52,8 +52,7 @@ from ase.io import read
 import data as tnep_data
 from DescriptorBuilder import make_descriptor_builder
 from gap_descriptor import gap_raw_numpy, gap_slices, select_centres, validate_gap_cfg
-from GAPconfig import GAPconfig
-from TNEPconfig import resolved_dipole_cutoff
+from TNEPconfig import GAPconfig, resolved_dipole_cutoff
 
 
 @dataclass
