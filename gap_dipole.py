@@ -32,6 +32,8 @@ fit) as per-species linear features — plan §0.3.
 
 Columns = M_tot·K can exceed the 3·F equations (underdetermined); the ridge
 handles it — train RMSE approaches 0 there and test RMSE is the metric.
+Takes its own GAPconfig (GAPconfig.py), never TNEPconfig: the ANN-input modes
+are frozen constants there, so no ANN experiment can reach the fit.
 Still fixed: dipole_readout="neighbor", target_mode=1, scale_targets=False.
 NO model persistence — fit writes a config+metrics run record JSON to GAP/."""
 from __future__ import annotations
@@ -50,7 +52,8 @@ from ase.io import read
 import data as tnep_data
 from DescriptorBuilder import make_descriptor_builder
 from gap_descriptor import gap_raw_numpy, gap_slices, select_centres, validate_gap_cfg
-from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
+from GAPconfig import GAPconfig
+from TNEPconfig import resolved_dipole_cutoff
 
 
 @dataclass
@@ -70,7 +73,7 @@ class GapDipoleModel:
     after column normalisation on the test cfg), so predictions are
     recovered to the ridge floor while α itself wanders along a near-null
     space — measured |Δα| ~0.8 between fits even at 200 frames."""
-    cfg: TNEPconfig
+    cfg: GAPconfig
     builder: object                   # descriptor builder from the fitting cfg
     sparse_desc: list[np.ndarray]     # per type t: [M_t, Q] unit-norm rows
     alpha: list[np.ndarray]           # per type t: [len(xi)·M_t·K] flat
@@ -82,14 +85,14 @@ class GapDipoleModel:
     alpha_gap3b: list[np.ndarray] | None = None
 
 
-def _pair_columns(cfg: TNEPconfig) -> bool:
+def _pair_columns(cfg: GAPconfig) -> bool:
     """True when the neighbor-type axis of V becomes design columns
     (any dipole_species_pairs but "off"/legacy False)."""
     sp = cfg.dipole_species_pairs
     return not (sp == "off" or sp is False)
 
 
-def _xi_tuple(cfg: TNEPconfig) -> tuple[int, ...]:
+def _xi_tuple(cfg: GAPconfig) -> tuple[int, ...]:
     """Normalize cfg.gap_kernel_power (int | list[int]) to a tuple.
     Each entry contributes one column block per sparse point (sum-of-kernels:
     the ridge learns the implicit mixture of (D̂·D̂_m)^ξ kernels)."""
@@ -102,7 +105,7 @@ def _xi_tuple(cfg: TNEPconfig) -> tuple[int, ...]:
     return tuple(int(x) for x in xis)
 
 
-def _validate(cfg: TNEPconfig) -> None:
+def _validate(cfg: GAPconfig) -> None:
     """Raise unless cfg is a GAP-fittable configuration. Runs FIRST in fit."""
     _xi_tuple(cfg)
     extra = cfg.gap_extra_rcut
@@ -125,9 +128,6 @@ def _validate(cfg: TNEPconfig) -> None:
          f"dipole_channels must be 1 for the screened radial, got "
          f"{cfg.dipole_channels}"),
         (not cfg.scale_targets, "scale_targets must be False"),
-        (str(cfg.nep_descriptor) == "off",
-         "GAP mode needs nep_descriptor='off' (NEP inputs are not part of "
-         "the kernel fit)"),
         # mirror the model-init r_c contract (no TNEP is ever constructed
         # on the GAP path, so it must be enforced here too).
         (0.0 < float(cfg.dipole_rc or cfg.rcut_hard) <= float(cfg.rcut_hard),
@@ -166,7 +166,7 @@ def _collapse_V(V: np.ndarray, pair_columns: bool) -> np.ndarray:
     return V.sum(axis=-1)
 
 
-def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: TNEPconfig) -> np.ndarray:
+def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
     """Per-atom geometry vectors v_i [N, 3, K] per the cfg's radial/cutoff/
     channels and pair-column mode."""
     V = tnep_data._neighbor_dipole_V(
@@ -225,7 +225,7 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
     return np.concatenate(cols, axis=1)
 
 
-def _gap_q(atoms: Atoms, ti: np.ndarray, cfg: TNEPconfig):
+def _gap_q(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig):
     """Per-frame (q2 | None, q3 | None) float64 for _phi_frame per the
     cfg flags; None when both are off (shared by fit + predict)."""
     if not (cfg.gap_2b or cfg.gap_3b):
@@ -236,7 +236,7 @@ def _gap_q(atoms: Atoms, ti: np.ndarray, cfg: TNEPconfig):
             raw[:, sl["three_body"]] if cfg.gap_3b else None)
 
 
-def _targets(frames: list[Atoms], cfg: TNEPconfig) -> np.ndarray:
+def _targets(frames: list[Atoms], cfg: GAPconfig) -> np.ndarray:
     """Dipole targets [F, 3], unit-converted per cfg (matches assemble).
 
     NOTE: unlike the training path (assemble_data_dict), this applies NO
@@ -258,7 +258,7 @@ def _rmse_r2(pred: np.ndarray, mu: np.ndarray) -> tuple[float, float]:
     return rmse, r2
 
 
-def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
+def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     """Fit the sparse-kernel dipole model on cfg.data_path; evaluate
     cfg.test_data_path when set; write a run record JSON to GAP/.
 
@@ -490,11 +490,11 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
 if __name__ == "__main__":
     # IDE / CLI entry: fit on cfg.data_path, evaluate cfg.test_data_path,
     # print metrics, write the GAP/ run record. The GAP-relevant readout
-    # fields are pinned HERE rather than read from TNEPconfig class defaults,
-    # so working-tree experiment values cannot leak into the fit.
+    # fields are pinned HERE rather than read from GAPconfig class defaults,
+    # so a working-tree default edit cannot leak into the fit.
     os.chdir(os.path.dirname(os.path.abspath(__file__)))  # datasets/, GAP/
 
-    cfg = TNEPconfig()
+    cfg = GAPconfig()
     cfg.target_mode = 1
     cfg.scale_targets = False
     cfg.dipole_readout = "neighbor"

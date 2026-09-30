@@ -17,13 +17,13 @@ from ase.neighborlist import neighbor_list
 
 import data
 import gap_dipole
-from TNEPconfig import TNEPconfig
+from GAPconfig import GAPconfig
 
 WATER_XYZ = os.path.join(ROOT, "datasets", "train_waterbulk.xyz")
 
 
 def _cfg(**kw):
-    cfg = TNEPconfig()
+    cfg = GAPconfig()
     cfg.data_path = WATER_XYZ
     cfg.test_data_path = None
     cfg.target_mode = 1
@@ -43,13 +43,8 @@ def _cfg(**kw):
     cfg.dipole_cutoff = None                     # resolves to "cubic"
     cfg.dipole_species_pairs = "off"
     cfg.dipole_gauss_sigma_scale = 1.0
-    # Pin every field the GAP fit validates, so working-tree experiment
-    # values in TNEPconfig cannot break this suite (the ANN-side knobs the
-    # user tunes — nep_descriptor, num_neurons, activation, mixing — are not
-    # read by the kernel fit except through _validate).
-    cfg.nep_descriptor = "off"
-    cfg.gap_2b = False
-    cfg.gap_3b = False
+    # gap_2b/gap_3b/nep_descriptor need no pinning: GAPconfig has no ANN
+    # knobs at all, and its NEP-input fields are frozen constants.
     cfg.gap_sparse_per_species = 40
     cfg.gap_kernel_power = 2
     cfg.gap_ridge_lambda = 1e-6
@@ -372,7 +367,6 @@ def test_multiscale_off_default_bitcompat(tmp_path):
     (dict(gap_kernel_power=[0]), "gap_kernel_power"),
     (dict(gap_kernel_power=[]), "gap_kernel_power"),
     (dict(gap_extra_rcut=-1.0), "gap_extra_rcut"),
-    (dict(nep_descriptor="concat"), "nep_descriptor"),
 ])
 def test_validation_raises(kw, msg):
     cfg = _cfg(data_path="/nonexistent.xyz", **kw)  # raise happens FIRST
@@ -459,3 +453,27 @@ def test_gap_rejects_non_neighbor_readout():
     # neighbour readout gives, so GAP mode must refuse every other readout.
     with pytest.raises(ValueError, match="dipole_readout"):
         gap_dipole._validate(_cfg(dipole_readout="tnep"))
+
+
+# ── the split: GAPconfig and TNEPconfig are independent classes ────────────
+
+def test_configs_are_independent():
+    """GAPconfig carries no ANN-only field (so an ANN experiment cannot reach
+    the kernel fit), TNEPconfig still carries everything the ANN needs, and
+    neither is a subclass of the other — shared fields are duplicated."""
+    from TNEPconfig import TNEPconfig
+    ann_only = ("num_neurons", "activation", "optimizer", "pop_size",
+                "descriptor_mixing", "dipole_head")
+    for f in ann_only:
+        assert not hasattr(GAPconfig, f), f"GAPconfig must not carry {f}"
+        assert hasattr(TNEPconfig, f), f"TNEPconfig lost {f}"
+    # no inheritance in either direction, and no shared base but object
+    assert not issubclass(GAPconfig, TNEPconfig)
+    assert not issubclass(TNEPconfig, GAPconfig)
+    assert GAPconfig.__bases__ == (object,) == TNEPconfig.__bases__
+    # every field GAPconfig declares also exists on TNEPconfig (duplicates,
+    # not renames) — except descriptor_self_batch_size, which data.py reads
+    # via getattr and TNEPconfig never declared.
+    missing = (set(GAPconfig.__annotations__) - set(TNEPconfig.__annotations__)
+               - {"descriptor_self_batch_size"})
+    assert not missing, missing

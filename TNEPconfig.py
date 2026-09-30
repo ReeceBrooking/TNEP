@@ -485,10 +485,13 @@ class TNEPconfig:
             self.indices = indices
 
 
-def resolved_dipole_cutoff(cfg: TNEPconfig) -> str:
+def resolved_dipole_cutoff(cfg: TNEPconfig | "GAPconfig") -> str:
     """Active neighbor-readout cutoff name — THE dipole_cutoff=None rule
     (None → the radial family's traditional form). Single source: data
     assembly builds V before the model exists, so both TNEP.__init__ and
-    data._neighbor_dipole_V resolve through here."""
+    data._neighbor_dipole_V resolve through here.
+
+    Accepts EITHER config (TNEPconfig or GAPconfig) — it reads only
+    dipole_cutoff/dipole_radial, which both carry, so it is not duplicated."""
     return cfg.dipole_cutoff or (
         "cubic" if cfg.dipole_radial == "screened" else "cosine2")

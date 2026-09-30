@@ -13,6 +13,10 @@ transcriptions of those loops (delta = 1, cutoff(s) = 1, e0 = 0):
 NOT absorb it). Cutoffs as in the Fortran: 2b f(r_ij); 3b f(r_ij)·f(r_ik),
 both r < rcut strict, no cutoff on r_jk = |D_ik − D_ij| (image-exact).
 
+`cfg` here is duck-typed: either a GAPconfig (the gap_dipole kernel fit) or a
+TNEPconfig (the ANN nep_descriptor="gap_sum" experts). Only the gap2b_*/gap3b_*
+/gap_buffer/num_types/seed fields are read, and both configs carry them.
+
 Layout of gap_raw_numpy's [N, W2 + W3] output:
     q2 [N, T·M2]          neighbour species-major, then centre
     q3 [N, T(T+1)/2·M3]   unordered neighbour-species pair slot (pair_index), then centre
