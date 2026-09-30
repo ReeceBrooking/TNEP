@@ -628,14 +628,16 @@ class GAPconfig:
     gap_extra_rcut: float | None = None
     # Ridge strength λ, applied RELATIVE to mean(diag(ΦᵀΦ)) — dimensionless
     # (λ_eff = λ · mean_m ‖Φ[:,m]‖²), so its scale is data-independent.
-    # Amplitude δ per body order of the summed model, GAP's convention
-    # (gap.f90 uses δ² on the kernel in both the 2b and SOAP site energies):
-    #     U_i = δ_soap²·U_i(SOAP) + δ_2b²·U_i(2b) + δ_3b²·U_i(3b)
+    # Amplitude δ per body order of the summed model:
+    #     U_i = δ_soap·U_i(SOAP) + δ_2b·U_i(2b) + δ_3b·U_i(3b)
     # Each δ scales that block's design columns, so it does NOT change what
     # the model can represent (least squares would absorb it into α) — it
-    # changes how hard the single global ridge λ_eff penalises that block
-    # relative to the others. That is δ's role in GAP: a prior amplitude, and
-    # here the knob for how much influence each body order has on the fit.
+    # changes how hard the single global ridge λ_eff penalises that block:
+    # scaling by δ is equivalent to penalising that block's contribution by
+    # λ_eff/δ², so δ² is the block's prior variance. That is what GAP's δ
+    # means; gap.f90 carries δ² on the kernel because its δ is an amplitude
+    # and δ² the variance, so the multiplier HERE is δ (squaring as well
+    # would make the penalty 1/δ⁴ and the knob the square of GAP's).
     # 1.0 = unweighted (the 2b/3b blocks are inert unless gap_2b/gap_3b).
     gap_delta_soap: float = 1.0
     gap_delta_2b: float = 1.0

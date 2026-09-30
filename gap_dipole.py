@@ -213,17 +213,19 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
     gap3b (species → (s, k)) — Σ_{i∈t} q[i, s]·v[i, x, k] — i.e. the 2b/3b
     site energies with a linear readout, μ-weighted by the bond basis.
 
-    deltas = (δ_soap, δ_2b, δ_3b) scale each body order's columns by δ²,
-    GAP's amplitude convention (gap.f90: `delta**2 * alphas(s) * …` in both
-    the 2b and SOAP site energies), giving
-        U_i = δ_soap²·U_i(SOAP) + δ_2b²·U_i(2b) + δ_3b²·U_i(3b).
+    deltas = (δ_soap, δ_2b, δ_3b) scale each body order's columns LINEARLY,
+        U_i = δ_soap·U_i(SOAP) + δ_2b·U_i(2b) + δ_3b·U_i(3b).
     The span of the design is unchanged — a least-squares fit would absorb δ
-    into α — so δ acts through the RIDGE: λ_eff is one global number, so
-    scaling a block's columns changes how hard that block is penalised
-    relative to the others. That is exactly δ's role in GAP (a prior
-    amplitude per body order), and it is the knob for how much influence each
-    model is allowed over the prediction."""
-    d_soap, d_2b, d_3b = (float(d) ** 2 for d in deltas)
+    into α — so δ acts through the RIDGE. With one global λ_eff, scaling a
+    block's columns by δ is equivalent to penalising that block's
+    contribution by λ_eff/δ²: substituting β = δ·α_block turns
+    λ‖α_block‖² into λ‖β‖²/δ². So δ² is the block's prior variance, which is
+    what GAP's δ means (gap.f90 carries `delta**2` on the kernel because its
+    δ is an amplitude and δ² the variance). Squaring here as well would make
+    the penalty go as 1/δ⁴ — the knob would be the square of GAP's — so the
+    column multiplier is δ, not δ². This is the lever for how much influence
+    each model is allowed over the prediction."""
+    d_soap, d_2b, d_3b = (float(d) for d in deltas)
     cols = []
     for D, sparse_desc in scales:
         for t, Dm in enumerate(sparse_desc):
