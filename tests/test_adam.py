@@ -68,13 +68,9 @@ def test_adam_fit_runs_and_trains_every_tail(kw):
     assert final_model.optimizer.validate(va) == pytest.approx(history["val_loss"][-1], abs=1e-6)
 
 
-def test_adam_rejects_preprocess_and_resume():
-    cfg = _cfg(optimizer="adam", descriptor_preprocess_contract="angular")
-    model = _model(cfg)
-    tr, va, _ = _train_val(cfg, 3, 2)
-    with pytest.raises(NotImplementedError):
-        model.fit(tr, va)
+def test_adam_rejects_resume_and_bad_optimizer():
     cfg = _cfg(optimizer="adam")
+    tr, va, _ = _train_val(cfg, 3, 2)
     model = _model(cfg)
     with pytest.raises(NotImplementedError):
         model.fit(tr, va, resume_state={"mu": None})

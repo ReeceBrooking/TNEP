@@ -9,6 +9,12 @@ from TNEP import TNEP
 from nep_descriptor import EXPERT_WEIGHTS
 
 
+_W_PRE_REMOVED = (
+    "Checkpoint at {path!r} has a W_pre_angular tensor: it was trained with "
+    "the descriptor-preprocess contraction, which has been removed from this "
+    "build. Its W0 lives at the contracted width and cannot be mapped onto "
+    "this model. The model must be retrained.")
+
 # Backward-compat: if a saved model predates a config field, the live
 # TNEPconfig class default may have drifted since it was trained, silently
 # changing behaviour on load. For each field here, when the saved config
@@ -33,16 +39,6 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "descriptor_mixing_regularizer": "off",
     # Pre-existence: no radial enhancement (class default now 1).
     "radial_enhancement": 0,
-    # Pre-existence: no preprocess contraction — W0 lives at raw Q.
-    "descriptor_preprocess_contract": "off",
-    "descriptor_preprocess_angular_l_keep": 1,
-    "descriptor_preprocess_per_type": True,
-    "descriptor_preprocess_init": "mean",
-    "descriptor_preprocess_lambda_1": 0.0,
-    "descriptor_preprocess_lambda_2": 0.0,
-    "preprocess_sigma_scale": 1.0,
-    # Pre-existence: not present; None preserves Q_raw (nep4_radial mode only).
-    "descriptor_nep4_n_max_out": None,
     # Pre-existence: only the Chebyshev radial existed; ζ unused there.
     "dipole_radial": "chebyshev",
     "dipole_zeta": -2.0,
@@ -239,16 +235,6 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         # V = U - I; loaders fall back to V=0 (U_full=I, no-op) when absent.
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             wg.create_dataset("U_pair", data=model.U_pair.numpy())
-
-        # Optional preprocess contraction tail, stored only when trained with
-        # cfg.descriptor_preprocess_contract != "off". Loaders fall back to
-        # None (W_pre kept at init values) when absent.
-        if (getattr(model, "descriptor_preprocess_contract", "off") != "off"
-                and getattr(model, "W_pre_angular", None) is not None):
-            wg.create_dataset(
-                "W_pre_angular", data=model.W_pre_angular.numpy())
-            wg.attrs["preprocess_contract"] = str(
-                model.descriptor_preprocess_contract)
         # Learned radial basis coefficients (cfg.radial_basis_size).
         if getattr(model, "M_radial", None) is not None:
             wg.create_dataset("M_radial", data=model.M_radial.numpy())
@@ -446,7 +432,7 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
-                  U_pair=None, W_pre_angular=None, c_pair=None,
+                  U_pair=None, c_pair=None,
                   M_radial=None, c_r=None, c_a=None, experts=None) -> None:
     if model._neighbor_readout:
         # Clean break: the multi-channel readout changed the tail layout
@@ -489,18 +475,6 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                 f"Re-train from scratch, or rebuild the cfg to match "
                 f"the saved model.")
         model.U_pair.assign(U_pair)
-    # Optional W_pre_angular restore. Absent in pre-preprocess checkpoints
-    # → keep init-time values.
-    if (W_pre_angular is not None
-            and getattr(model, "descriptor_preprocess_contract", "off") != "off"
-            and getattr(model, "W_pre_angular", None) is not None):
-        if tuple(W_pre_angular.shape) != tuple(model.W_pre_angular.shape):
-            raise ValueError(
-                f"saved W_pre_angular shape {tuple(W_pre_angular.shape)} != "
-                f"model.W_pre_angular shape {tuple(model.W_pre_angular.shape)}. "
-                f"descriptor_preprocess_contract mode or alpha_max likely "
-                f"changed between save and load.")
-        model.W_pre_angular.assign(W_pre_angular)
     if getattr(model, "M_radial", None) is not None:
         if M_radial is None:
             raise ValueError(
@@ -570,6 +544,8 @@ def _load_model_h5(path: str) -> TNEP:
                         for row in f["descriptor/z_to_type_index"][:]}
 
         wg = f["weights"]
+        if "W_pre_angular" in wg:
+            raise ValueError(_W_PRE_REMOVED.format(path=path))
         weights = {
             "W0": wg["W0"][:], "b0": wg["b0"][:],
             "W1": wg["W1"][:], "b1": wg["b1"][()],
@@ -579,8 +555,6 @@ def _load_model_h5(path: str) -> TNEP:
             "b1_pol": wg["b1_pol"][:] if "b1_pol" in wg else None,
             "U_pair": wg["U_pair"][:] if "U_pair" in wg else None,
             "c_pair": wg["c_pair"][:] if "c_pair" in wg else None,
-            "W_pre_angular": (wg["W_pre_angular"][:]
-                              if "W_pre_angular" in wg else None),
             "M_radial": wg["M_radial"][:] if "M_radial" in wg else None,
             "c_r": wg["c_r"][:] if "c_r" in wg else None,
             "c_a": wg["c_a"][:] if "c_a" in wg else None,
@@ -641,6 +615,8 @@ def _load_model_npz(path: str) -> TNEP:
     # Cross-check descriptor_mixing vs saved weights: mismatch (mixing on
     # but no U_pair, or vice versa) fails loud instead of silently
     # mis-predicting with random weights.
+    if "W_pre_angular" in data.files:
+        raise ValueError(_W_PRE_REMOVED.format(path=path))
     has_U_pair = "U_pair" in data.files
     if bool(getattr(cfg, "descriptor_mixing", False)) and not has_U_pair:
         raise ValueError(
@@ -665,7 +641,6 @@ def _load_model_npz(path: str) -> TNEP:
         data.get("W0_pol"), data.get("b0_pol"),
         data.get("W1_pol"), data.get("b1_pol"),
         U_pair=(data["U_pair"] if has_U_pair else None),
-        W_pre_angular=data.get("W_pre_angular"),
         M_radial=data.get("M_radial"),
         c_r=data.get("c_r"), c_a=data.get("c_a"),
     )

@@ -671,14 +671,6 @@ def _get_fused_predict(model: 'TNEP'):
                     else getattr(model, "W0_pol", None))
     b0p_eff_var = (model._b0_eff(model.b0_pol, model.W0_pol)
                     if cfg.target_mode == 2 else getattr(model, "b0_pol", None))
-    # Second fold: expand W0 Q_new → Q_raw when preprocess is on, so the forward
-    # matmul runs at raw descriptor width. Mirrors score() (TNEP.py:796-799);
-    # without this, a preprocess-contracted model mis-predicts/crashes in
-    # trajectory inference (spectra silently wrong).
-    if model.descriptor_preprocess_contract != "off":
-        W0_eff_var = model._W0_preprocess_eff(W0_eff_var)
-        if W0p_eff_var is not None:
-            W0p_eff_var = model._W0_preprocess_eff(W0p_eff_var)
     W0_t  = _to_tensor(W0_eff_var)
     b0_t  = _to_tensor(b0_eff_var)
     W1_t  = _to_tensor(model.W1)
@@ -966,11 +958,6 @@ def predict_trajectory_batch(
                      else getattr(model, "W0_pol", None))
         b0p_pred = (model._b0_eff(model.b0_pol, model.W0_pol)
                      if cfg.target_mode == 2 else getattr(model, 'b0_pol', None))
-        # Preprocess fold (Q_new → Q_raw), mirroring score() and the fused path.
-        if model.descriptor_preprocess_contract != "off":
-            W0_pred = model._W0_preprocess_eff(W0_pred)
-            if W0p_pred is not None:
-                W0p_pred = model._W0_preprocess_eff(W0p_pred)
 
         preds = model.predict_batch(
             batch["descriptors"], batch["grad_values"],

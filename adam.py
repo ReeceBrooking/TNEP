@@ -11,8 +11,7 @@ the same quantity SNES ranks on.
 
 Same (history, final_model, best_val_model) contract and history keys as
 SNES.fit so the driver, plots and save_history work unchanged (sigma
-columns are 0). Not supported: checkpoint/resume, dynamic lambda (-1),
-descriptor_preprocess_contract.
+columns are 0). Not supported: checkpoint/resume, dynamic lambda (-1).
 """
 from __future__ import annotations
 
@@ -68,10 +67,6 @@ def _ann_core(model) -> list:
 def fit_adam(model, train_data: dict, val_data: dict,
              plot_callback: Callable | None = None) -> tuple:
     cfg = model.cfg
-    if model.descriptor_preprocess_contract != "off":
-        raise NotImplementedError(
-            "optimizer='adam' does not support descriptor_preprocess_contract "
-            "(its summed-entry masking is SNES-specific); set it to 'off'.")
     if cfg.lambda_1 == -1 or cfg.lambda_2 == -1:
         raise NotImplementedError(
             "optimizer='adam' does not support dynamic lambda (-1); give "

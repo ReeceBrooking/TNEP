@@ -87,55 +87,21 @@ class TNEP(layers.Layer):
         # validate_nep_cfg owns every NEP cfg guard.
         self._nep_mode = validate_nep_cfg(cfg)
 
-        # Preprocess contraction phase 1/2: run guards, then override cfg.dim_q
-        # to the contracted dim BEFORE allocating W0. Phase 2 allocates W_pre_*.
-        self.descriptor_preprocess_contract = str(getattr(
-            cfg, "descriptor_preprocess_contract", "off"))
-        if self.descriptor_preprocess_contract not in (
-                "off", "angular", "species_pair", "both", "nep4_radial"):
+        # cfg.dim_q is the descriptor width the ANN is built for; nothing
+        # overrides it any more, so a saved config whose dim_q disagrees with
+        # this build's descriptor predates a descriptor change.
+        from DescriptorBuilderGPU import compute_dim_q, soap_dim
+        _dim_q_now = int(compute_dim_q(cfg))
+        if int(cfg.dim_q) != _dim_q_now:
             raise ValueError(
-                f"descriptor_preprocess_contract={self.descriptor_preprocess_contract!r} "
-                f"not recognised in this build; expected one of: "
-                f"'off', 'angular', 'species_pair', 'both', 'nep4_radial'.")
-        if self.descriptor_preprocess_contract == "nep4_radial":
-            _cm = str(getattr(cfg, "compress_mode", "trivial"))
-            if _cm != "trivial":
-                raise NotImplementedError(
-                    f"descriptor_preprocess_contract='nep4_radial' requires "
-                    f"compress_mode='trivial' (got {_cm!r}); the rank-1 "
-                    f"fold needs the (n, n', l) decomposition that only "
-                    f"trivial compression preserves.")
-            # nep4_radial collapses (n, n', species_pair) into a flat (n'', l)
-            # axis, so the block layout descriptor_mixing assumes is undefined.
-            if bool(getattr(cfg, "descriptor_mixing", False)):
-                raise NotImplementedError(
-                    "descriptor_preprocess_contract='nep4_radial' is "
-                    "mutually exclusive with descriptor_mixing in this "
-                    "build. Disable mixing or run nep4_radial standalone.")
-        if self.descriptor_preprocess_contract != "off":
-            from DescriptorBuilderGPU import (
-                descriptor_block_layout, descriptor_preprocess_layout)
-            _layout_pre = descriptor_block_layout(cfg)
-            self._preprocess_layout = descriptor_preprocess_layout(
-                cfg, _layout_pre, self.descriptor_preprocess_contract)
-            # Override cfg.dim_q so W0 is allocated at the contracted dim.
-            if not hasattr(cfg, "dim_q_raw") or cfg.dim_q_raw is None:
-                cfg.dim_q_raw = int(cfg.dim_q)
-            cfg.dim_q = int(self._preprocess_layout["dim_q_new"])
-        else:
-            self._preprocess_layout = None
-
+                f"cfg.dim_q={int(cfg.dim_q)} but this build's descriptor gives "
+                f"{_dim_q_now}. The saved config predates a descriptor change "
+                f"(removed learned-basis NEP extras / preprocess contraction); "
+                f"the model must be retrained.")
         self.dim_q = cfg.dim_q
         # SOAP-only width (the builder's output after soap_from_raw); under
-        # nep_descriptor="concat" dim_q_forward is wider by the NEP block.
-        from DescriptorBuilderGPU import soap_dim
+        # nep_descriptor="concat" dim_q is wider by the NEP block.
         self._soap_dim = int(soap_dim(cfg))
-        # With preprocess on, W0 stores at Q_new but the forward matmul folds
-        # the contraction in and operates on RAW descriptors at Q_raw; track it.
-        if self.descriptor_preprocess_contract != "off":
-            self.dim_q_forward = int(cfg.dim_q_raw)
-        else:
-            self.dim_q_forward = int(cfg.dim_q)
         self.num_types = cfg.num_types
         self.num_neurons = cfg.num_neurons
         self._H_final = cfg.num_neurons
@@ -183,12 +149,6 @@ class TNEP(layers.Layer):
             # and angular amplitude (rcut/σ_t)² they carry.
             self._rb_coef_scale = float(
                 1.0 / (4.0 * np.pi * (float(cfg.rcut_hard) / float(cfg.atom_sigma_t)) ** 2))
-            if (self._rb_species_sum
-                    and self.descriptor_preprocess_contract != "off"):
-                raise NotImplementedError(
-                    "cfg.radial_basis_species_sum=True has no species-pair "
-                    "blocks, which descriptor_preprocess_contract layouts "
-                    "assume; set descriptor_preprocess_contract='off'.")
             cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types,
                                           species_sum=self._rb_species_sum)
             if int(cm["gather_idx"].size) != self._soap_dim:
@@ -258,11 +218,11 @@ class TNEP(layers.Layer):
             self.c_a = tf.Variable(rng.uniform(-1.0, 1.0, (
                 T, T, cfg.nep_n_max_angular + 1, cfg.nep_basis_size_angular + 1)
             ).astype(np.float32), trainable=False, name="nep_c_a")
-        # descriptor_scale sees the main ANN's input (dim_q_forward) and,
-        # under "sum" / "gap_sum", the expert input after it ([q_soap ‖ q_nep], see
+        # descriptor_scale sees the main ANN's input (dim_q) and, under
+        # "sum" / "gap_sum", the expert input after it ([q_soap ‖ q_nep], see
         # gen0_ann_inputs): one slice of cfg.q_scale per typed ANN.
-        self._sl_main = slice(0, int(self.dim_q_forward))
-        self._scale_width = int(self.dim_q_forward)
+        self._sl_main = slice(0, int(self.dim_q))
+        self._scale_width = int(self.dim_q)
         self._expert_in = ()      # (input slice of q_nep, slice of q_scale) per expert
         if self._experts_on:
             if self._nep_mode == "gap_sum":
@@ -283,10 +243,6 @@ class TNEP(layers.Layer):
                 raise ValueError(
                     f"cfg.descriptor_scale={cfg.descriptor_scale!r}; expected "
                     f"'off', 'block', 'channel' or 'minmax'.")
-            if self.descriptor_preprocess_contract != "off":
-                raise NotImplementedError(
-                    "descriptor_scale is not combinable with "
-                    "descriptor_preprocess_contract (W0 is stored at Q_new there).")
             if cfg.q_scale is None:
                 raise ValueError(
                     "cfg.descriptor_scale is on but cfg.q_scale is None — the "
@@ -526,17 +482,8 @@ class TNEP(layers.Layer):
         self.descriptor_mixing_per_type = bool(
             getattr(cfg, "descriptor_mixing_per_type", False))
         if self.descriptor_mixing:
-            from DescriptorBuilderGPU import (
-                descriptor_block_layout,
-                descriptor_post_preprocess_block_layout)
-            # With preprocess on, mixing operates at Q_new so it needs the
-            # post-preprocess layout; else the raw SOAP-turbo layout at Q_raw.
-            if self.descriptor_preprocess_contract != "off":
-                _raw_layout = descriptor_block_layout(cfg)
-                self._mix_layout = descriptor_post_preprocess_block_layout(
-                    cfg, _raw_layout, self.descriptor_preprocess_contract)
-            else:
-                self._mix_layout = descriptor_block_layout(cfg)
+            from DescriptorBuilderGPU import descriptor_block_layout
+            self._mix_layout = descriptor_block_layout(cfg)
             self._mix_pair_keys = self._mix_layout["pair_keys"]
             self._mix_num_pairs = len(self._mix_pair_keys)
             self._mix_Q = int(self._mix_layout["dim_q"])
@@ -547,10 +494,7 @@ class TNEP(layers.Layer):
                 int(self._mix_layout["alpha_eff_per_pair"][k])
                 for k in self._mix_pair_keys]
             self._mix_max_alpha = int(self._mix_layout["max_alpha_eff"])
-            # L_eff when present (post-preprocess collapses l>l_keep to one slot);
-            # else cfg.l_max+1.
-            self._mix_L = int(self._mix_layout.get("L_eff",
-                                                   int(cfg.l_max) + 1))
+            self._mix_L = int(cfg.l_max) + 1
             # Per-(pair, l) placement matrices P_{p,l} ∈ R^{α_p × Q}.
             mix_P_ln: list[list[tf.Tensor]] = []
             for k in self._mix_pair_keys:
@@ -598,199 +542,6 @@ class TNEP(layers.Layer):
             )
         else:
             self.U_pair = None
-
-        # Preprocess contraction phase 2/2: W_pre_* allocation. cfg.dim_q was
-        # already overridden in phase 1 so W0 above is sized at Q_new.
-        if self.descriptor_preprocess_contract != "off":
-            init_scheme = str(getattr(cfg, "descriptor_preprocess_init", "mean"))
-            T_pre = int(cfg.num_types)
-            self.preprocess_per_type = bool(getattr(
-                cfg, "descriptor_preprocess_per_type", True))
-            if self.descriptor_preprocess_contract == "nep4_radial":
-                # c tensor rank-4 [T_centre, T_neighbour, n_max_out, α]. The
-                # linear-fold tail machinery below doesn't apply; allocate c and
-                # precompute the rank-1-fold gather indices for _W0_preprocess_eff.
-                _lay = self._preprocess_layout
-                n_max_out = int(_lay["nep4_n_max_out"])
-                alpha_max = int(_lay["nep4_alpha_max"])
-                coef_shape = tuple(_lay["coef_shape"])
-                full_coef_size = int(_lay["nep4_full_coef_size"])
-                # Init: Glorot with fan_in=α (each c contracts α primitives);
-                # per-element σ gives a roughly unit-scale rank-1 product.
-                init_norm = float(_lay["coef_init_norm"])
-                if init_scheme == "glorot":
-                    fan_in = max(1, alpha_max)
-                    fan_out = max(1, n_max_out)
-                    limit = float(np.sqrt(6.0 / (fan_in + fan_out)))
-                    rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
-                    init_np = rng.uniform(
-                        -limit, limit, size=coef_shape).astype(np.float32)
-                elif init_scheme in ("mean", "sum"):
-                    # Uniform fan-in normalised init; SNES searches from here.
-                    init_np = np.full(coef_shape, init_norm, dtype=np.float32)
-                else:
-                    raise ValueError(
-                        f"descriptor_preprocess_init={init_scheme!r} not "
-                        f"recognised; expected 'mean', 'sum', or 'glorot'.")
-                self.W_pre_angular = tf.Variable(
-                    init_np, trainable=False, name="W_pre_angular_nep4",
-                    dtype=tf.float32)
-                # All c entries are SNES μ-slots (no passthrough); layout mirrors
-                # the linear-fold tail so SNES wiring keeps working over full c.
-                smask_full = np.ones(coef_shape, dtype=bool)
-                self._preprocess_summed_mask = tf.constant(smask_full, dtype=tf.bool)
-                flat_idx = np.arange(full_coef_size, dtype=np.int32)
-                self._preprocess_summed_flat_idx = tf.constant(
-                    flat_idx, dtype=tf.int32)
-                self._preprocess_summed_count = int(full_coef_size)
-                # Kept-template zero (no passthrough); SNES scatters μ everywhere.
-                base_template = np.zeros(coef_shape, dtype=np.float32)
-                self._preprocess_kept_template = tf.constant(
-                    base_template, dtype=tf.float32)
-                _M_np = np.eye(full_coef_size, dtype=np.float32)
-                self._preprocess_summed_scatter_M = tf.constant(
-                    _M_np, dtype=tf.float32)
-                self._preprocess_kept_template_size = full_coef_size
-                # Precomputed gather indices for the NEP4 rank-1 fold.
-                self._nep4_n_max_out = n_max_out
-                self._nep4_alpha_max = alpha_max
-                self._nep4_L = int(_lay["L"])
-                # [n_max_out, L] mid-shape constant for reshaping W0 in
-                # _W0_preprocess_eff_nep4; precomputed to avoid a fresh
-                # tf.constant per call in the traced predict_batch path.
-                self._nep4_mid_shape = tf.constant(
-                    [self._nep4_n_max_out, self._nep4_L], dtype=tf.int32)
-                self._nep4_l_of_q = tf.constant(
-                    _lay["nep4_l_of_q"], dtype=tf.int32)
-                self._nep4_n_global = tf.constant(
-                    _lay["nep4_n_global"], dtype=tf.int32)
-                self._nep4_np_global = tf.constant(
-                    _lay["nep4_np_global"], dtype=tf.int32)
-                self._nep4_n_to_species = tf.constant(
-                    _lay["nep4_n_to_species"], dtype=tf.int32)
-                self._nep4_n_to_local = tf.constant(
-                    _lay["nep4_n_to_local"], dtype=tf.int32)
-                # Linear-fold-only attrs left None; branch-checked in _W0_preprocess_eff.
-                self._preprocess_q_to_q_new = None
-                self._preprocess_scatter = None
-                self.optimizer = SNES(self)
-                return
-            Q_raw_pre = int(self._preprocess_layout["coef_shape"][0])
-
-            # Per-q_raw classification from the layout. summed_mask: True where
-            # q_raw feeds a SUMMED channel (learnable W_pre); False for KEPT
-            # passthrough (W_pre fixed 1.0). Shape 1-D [Q_raw] (angular) or
-            # 2-D [T, Q_raw] (species_pair/both).
-            _summed = self._preprocess_layout.get("summed_q_raw_mask")
-            if _summed is None:
-                _summed = np.zeros((Q_raw_pre,), dtype=bool)
-            _per_q = self._preprocess_layout.get("coef_init_per_q_raw")
-            if _per_q is None:
-                _scalar = float(self._preprocess_layout["coef_init_norm"])
-                _per_q = np.full((Q_raw_pre,), _scalar, dtype=np.float32)
-
-            # W_pre init: kept entries start at 1.0 (passthrough); summed at the
-            # per-q_raw mean/sum/glorot value.
-            def _build_init_2d() -> np.ndarray:
-                """Return [T, Q_raw] init (source before squeezing T for per_type=False)."""
-                if _per_q.ndim == 1:
-                    init_2d = np.broadcast_to(
-                        _per_q[None, :], (T_pre, Q_raw_pre)).astype(np.float32)
-                else:
-                    init_2d = _per_q.astype(np.float32)
-                if _summed.ndim == 1:
-                    smask_2d = np.broadcast_to(
-                        _summed[None, :], (T_pre, Q_raw_pre))
-                else:
-                    smask_2d = _summed
-                if init_scheme == "mean":
-                    out = init_2d.copy()
-                elif init_scheme == "sum":
-                    out = np.where(smask_2d, 1.0, 1.0).astype(np.float32)
-                elif init_scheme == "glorot":
-                    fan_in = int(self._preprocess_layout["L"])
-                    fan_out = 1
-                    limit = float(np.sqrt(6.0 / (fan_in + fan_out)))
-                    rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
-                    rand = rng.uniform(
-                        -limit, limit, size=(T_pre, Q_raw_pre)).astype(np.float32)
-                    out = np.where(smask_2d, rand, 1.0).astype(np.float32)
-                else:
-                    raise ValueError(
-                        f"descriptor_preprocess_init={init_scheme!r} not recognised; "
-                        f"expected 'mean', 'sum', or 'glorot'.")
-                # Always force kept positions to 1.0 (identity passthrough).
-                out = np.where(smask_2d, out, 1.0).astype(np.float32)
-                return out
-
-            init_2d_np = _build_init_2d()
-            if self.preprocess_per_type:
-                # W_pre shape [T, Q_raw]
-                init_np = init_2d_np.astype(np.float32).copy()
-            else:
-                # Global W_pre [Q_raw]: collapse T. 1-D layouts identical across
-                # t; 2-D take max (ghost entries 0, active carry the init value).
-                init_np = np.max(init_2d_np, axis=0).astype(np.float32).copy()
-            self.W_pre_angular = tf.Variable(
-                init_np, trainable=False, name="W_pre_angular",
-                dtype=tf.float32)
-
-            # Summed mask for SNES (exposes only summed entries to μ); shape
-            # mirrors W_pre.
-            if self.preprocess_per_type:
-                if _summed.ndim == 1:
-                    smask_full = np.broadcast_to(
-                        _summed[None, :], (T_pre, Q_raw_pre)).copy()
-                else:
-                    smask_full = _summed.copy()
-            else:
-                if _summed.ndim == 1:
-                    smask_full = _summed.copy()
-                else:
-                    smask_full = np.any(_summed, axis=0)
-            self._preprocess_summed_mask = tf.constant(smask_full, dtype=tf.bool)
-            # Flat indices of summed entries; SNES scatters μ into W_pre by these.
-            flat_idx = np.flatnonzero(smask_full.reshape(-1)).astype(np.int32)
-            self._preprocess_summed_flat_idx = tf.constant(flat_idx, dtype=tf.int32)
-            self._preprocess_summed_count = int(flat_idx.size)
-            # Base template: kept positions keep init (e.g. 1.0), summed zeroed.
-            # tf.constant so candidate-path reconstruction needs only a
-            # tensor_scatter_nd_update, never a Variable read.
-            base_template = np.where(smask_full, 0.0, init_np).astype(np.float32)
-            self._preprocess_kept_template = tf.constant(
-                base_template, dtype=tf.float32)
-            # One-hot scatter matrix (n_summed × base_size) for SNES.
-            # reconstruct_params_tf. Built once here to avoid a per-chunk
-            # tf.one_hot kernel that fragmented the @tf.function trace.
-            _base_flat_size = int(base_template.size)
-            _M_np = np.zeros(
-                (flat_idx.size, _base_flat_size), dtype=np.float32)
-            _M_np[np.arange(flat_idx.size), flat_idx] = 1.0
-            self._preprocess_summed_scatter_M = tf.constant(
-                _M_np, dtype=tf.float32)
-            self._preprocess_kept_template_size = _base_flat_size
-            _map_np = self._preprocess_layout["q_raw_to_q_new"]
-            self._preprocess_q_to_q_new = tf.constant(_map_np, dtype=tf.int32)
-            # Per-type maps (species_pair): one-hot scatter M[T, Q_raw, Q_new]
-            # so _W0_preprocess_eff folds via einsum without per-type gather;
-            # map==-1 (q_raw not in type t) gives zero rows.
-            if _map_np.ndim == 2:
-                T_pre_m = int(_map_np.shape[0])
-                Q_raw_m = int(_map_np.shape[1])
-                Q_new_m = int(self._preprocess_layout["dim_q_new"])
-                valid = (_map_np >= 0)
-                safe_idx = np.where(valid, _map_np, 0)
-                M_np = np.zeros((T_pre_m, Q_raw_m, Q_new_m), dtype=np.float32)
-                ti = np.arange(T_pre_m)[:, None]
-                qi = np.arange(Q_raw_m)[None, :]
-                M_np[ti, qi, safe_idx] = valid.astype(np.float32)
-                self._preprocess_scatter = tf.constant(M_np, dtype=tf.float32)
-            else:
-                self._preprocess_scatter = None
-        else:
-            self.W_pre_angular = None
-            self._preprocess_q_to_q_new = None
-            self._preprocess_scatter = None
 
         if self._q_scale is not None:
             # Stored W0 = Glorot / m and b0 = (m∘μ)·W0_stored, so W0_eff / b0_eff
@@ -870,91 +621,6 @@ class TNEP(layers.Layer):
                 W0 = tf.einsum('...qp,...tqh->...tph', U_full, W0)
         return W0
 
-    def _W0_preprocess_eff(self, W0: tf.Tensor,
-                            W_pre_override: tf.Tensor | None = None) -> tf.Tensor:
-        """Fold the angular preprocess contraction into W0, giving raw-dim weights:
-            W0_eff[t, q_raw, h] = W_pre[t, q_raw] · W0[t, q_to_q_new[q_raw], h]
-        Keeps the matmul at Q_raw while W0 storage stays at Q_new (mirrors
-        _W0_eff); backward dq comes out at Q_raw for the raw-W_atom dipole sum.
-
-        Args:
-          W0:             [(C,) T, Q_new, H]  weights at contracted dim
-          W_pre_override: [(C,) T, Q_raw]     per-type coeffs; None → self.W_pre_angular
-        Returns:
-          W0_eff: [(C,) T, Q_raw, H]
-        """
-        if self.descriptor_preprocess_contract == "off":
-            return W0
-        W_pre = (W_pre_override if W_pre_override is not None
-                 else self.W_pre_angular)
-        if self.descriptor_preprocess_contract == "nep4_radial":
-            return self._W0_preprocess_eff_nep4(W0, W_pre)
-        # W0 storage: [(C,) T, Q_new, H]. Gather/scatter along Q_new to
-        # produce [(C,) T, Q_raw, H], then weight by W_pre.
-        if self._preprocess_scatter is None:
-            # 1-D map (angular): shared mapping across t.
-            W0_at_qraw = tf.gather(W0, self._preprocess_q_to_q_new, axis=-2)
-        else:
-            # 2-D map (species_pair / both): per-type scatter via einsum.
-            W0_at_qraw = tf.einsum(
-                'tqp,...tph->...tqh', self._preprocess_scatter, W0)
-        # Multiply by W_pre. per_type=False needs a T-axis singleton inserted
-        # (at rank-2) so the broadcast works with or without a candidate dim.
-        factor = W_pre[..., tf.newaxis]
-        if not self.preprocess_per_type:
-            factor = tf.expand_dims(factor, axis=factor.shape.rank - 2)
-        return W0_at_qraw * factor
-
-    def _W0_preprocess_eff_nep4(self, W0: tf.Tensor,
-                                 c: tf.Tensor) -> tf.Tensor:
-        """NEP4 rank-1 (outer-product) fold of W0.
-
-        Implements g[t, n'', l] = Σ_{n,n'} c[t,s(n),n'',k(n)] · c[t,s(n'),n'',k(n')]
-        · p[n,n',l], transforming W0 from [n'',l] storage at Q_new = n_max_out·L
-        to the [n,n',l] raw layout at Q_raw so the matmul stays against raw desc.
-
-        Args:
-          W0: [(C,) T, n_max_out · L, H]                   weights at Q_new
-          c:  [(C,) T_centre, T_neighbour, n_max_out, α]   NEP4 coeffs
-        Returns:
-          W0_eff: [(C,) T, Q_raw, H]
-        """
-        T_c = int(self.cfg.num_types)
-        T_n = T_c
-        n_max_out = int(self._nep4_n_max_out)
-        L_ = int(self._nep4_L)
-        alpha = int(self._nep4_alpha_max)
-        # Flatten (T_neighbour, α) → one axis aligned with nep4_n_global:
-        # c [..., T_c, T_n, n_max_out, α] → [..., T_c, T_n·α, n_max_out].
-        has_C = (c.shape.rank == 5)
-        if has_C:
-            c_perm = tf.transpose(c, perm=[0, 1, 2, 4, 3])
-            c_flat = tf.reshape(c_perm, [-1, T_c, T_n * alpha, n_max_out])
-        else:
-            c_perm = tf.transpose(c, perm=[0, 1, 3, 2])
-            c_flat = tf.reshape(c_perm, [T_c, T_n * alpha, n_max_out])
-        # Gather along the flattened (T_n, α) axis using global-n indices.
-        # A_a[..., t, q, n''] = c_flat[..., t, n_global(q), n'']
-        # A_b[..., t, q, n''] = c_flat[..., t, n'_global(q), n'']
-        A_a = tf.gather(c_flat, self._nep4_n_global, axis=-2)
-        A_b = tf.gather(c_flat, self._nep4_np_global, axis=-2)
-        AB = A_a * A_b   # [..., T_c, Q_raw, n_max_out]   (rank-1 outer product)
-        # Reshape W0 [..., T, n_max_out·L, H] to expose (n_max_out, L),
-        # preserving leading batch axes. _nep4_mid_shape is precomputed to avoid
-        # a fresh tf.constant per call in the traced path.
-        W0_shape = tf.shape(W0)
-        H_ = W0_shape[-1]
-        leading = W0_shape[:-2]
-        new_shape = tf.concat(
-            [leading, self._nep4_mid_shape, tf.reshape(H_, [1])], axis=0)
-        W0_NLH = tf.reshape(W0, new_shape)   # [..., T, n_max_out, L, H]
-        # Gather along the l axis using l_of_q:
-        # W0_at_q[..., t, n'', q, h] = W0_NLH[..., t, n'', l_of_q(q), h]
-        W0_at_q = tf.gather(W0_NLH, self._nep4_l_of_q, axis=-2)
-        # W0_eff[..., T, Q_raw, H] = Σ_{n''} AB[t,q,n''] · W0_at_q[t,n'',q,h].
-        W0_eff = tf.einsum('...tqN,...tNqh->...tqh', AB, W0_at_q)
-        return W0_eff
-
     def _b0_eff(self, b0: tf.Tensor, W0_stored: tf.Tensor) -> tf.Tensor:
         """Centring fold of descriptor_scale: the ANN sees m∘(q − μ), so
         b0_eff = b0 − (m∘μ)·W0_stored (W0 BEFORE _W0_eff; any leading
@@ -983,7 +649,7 @@ class TNEP(layers.Layer):
     def descriptor_input_width(self) -> int:
         """Width of the per-atom vector in the `descriptors` slot (see
         DescriptorBuilderGPU.descriptor_input_width). Distinct from
-        dim_q_forward, the width of the W0 matmul after the preprocess fold."""
+        cfg.dim_q, the width of the W0 matmul."""
         from DescriptorBuilderGPU import descriptor_input_width
         return descriptor_input_width(self.cfg)
 
@@ -1173,7 +839,7 @@ class TNEP(layers.Layer):
         """One summed expert: activation(q[.., sl_in]·W0[t] + b0[t])·W1[t] →
         [(C,) ..., A, head_width]. q [(C,) ..., A, dim_nep]; Z / atom_mask
         [..., A]; STORED weights [(C,) T, ...] — the descriptor_scale fold on
-        slice sl_m happens here (no mixing / preprocess reaches the experts,
+        slice sl_m happens here (no mixing reaches the experts,
         so no caller pre-folds). Type-mask sum, no [.., A, d, H] gather.
         Per-candidate q (c_r / c_a with a candidate axis) requires
         per-candidate experts with the same C: the einsum names both axes
@@ -1251,9 +917,6 @@ class TNEP(layers.Layer):
         # folded weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
         b0_eff = self._b0_eff(self.b0, self.W0)
-        # Expand W0 Q_new → Q_raw when preprocess is on (mirrors score()).
-        if self.descriptor_preprocess_contract != "off":
-            W0_eff = self._W0_preprocess_eff(W0_eff)
 
         # Gather per-type weights for each atom
         W0_t = tf.gather(W0_eff, Z)    # [A, dim_q, H]
@@ -1329,8 +992,6 @@ class TNEP(layers.Layer):
 
             # --- Scalar ANN (isotropic) ---
             W0_pol_eff = self._W0_eff(self.W0_pol)
-            if self.descriptor_preprocess_contract != "off":
-                W0_pol_eff = self._W0_preprocess_eff(W0_pol_eff)
             W0p_t = tf.gather(W0_pol_eff, Z)   # [A, dim_q, H]
             b0p_t = tf.gather(self.b0_pol, Z)  # [A, H]
             W1p_t = tf.gather(self.W1_pol, Z)  # [A, H]
@@ -1483,12 +1144,6 @@ class TNEP(layers.Layer):
                       else getattr(self, "W0_pol", None))
         b0_pol_eff = (self._b0_eff(self.b0_pol, self.W0_pol)
                       if self.cfg.target_mode == 2 else getattr(self, 'b0_pol', None))
-        # Second fold: with preprocess on, expand W0 Q_new → Q_raw before
-        # predict_batch's raw-dim einsum (mirrors validate()/_evaluate_chunk).
-        if self.descriptor_preprocess_contract != "off":
-            W0_eff = self._W0_preprocess_eff(W0_eff)
-            if W0_pol_eff is not None:
-                W0_pol_eff = self._W0_preprocess_eff(W0_pol_eff)
         ranges = [(s, min(s + chunk_sz, S_test)) for s in range(0, S_test, chunk_sz)]
         pred_parts: list = []
         for _, _, chunk in prefetched_chunks(
@@ -1966,7 +1621,6 @@ class TNEP(layers.Layer):
                                   W0: tf.Tensor, b0: tf.Tensor,
                                   W1: tf.Tensor, b1: tf.Tensor,
                                   U_pair: tf.Tensor | None = None,
-                                  W_pre_angular: tf.Tensor | None = None,
                                   c_pair: tf.Tensor | None = None,
                                   M_radial: tf.Tensor | None = None,
                                   nep_raw: tf.Tensor | None = None,
@@ -2016,8 +1670,7 @@ class TNEP(layers.Layer):
         Returns:
             predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
         """
-        # Q = dim seen by the matmul: Q_raw after the preprocess fold, else Q_new.
-        Q = self.dim_q_forward
+        Q = self.dim_q
         H = self.num_neurons
         H_final = self._H_final
         T = self.num_types
@@ -2036,12 +1689,6 @@ class TNEP(layers.Layer):
         # in raw-desc space (de_dq combines with raw grad_values). See _W0_eff.
         b0 = self._b0_eff(b0, W0)          # centring fold needs the STORED W0
         W0 = self._W0_eff(W0, U_pair)
-
-        # Preprocess fold: W0 Q_new → Q_raw so the matmul below is uniform at
-        # Q_raw and de_dq comes out at Q_raw for the raw-W_atom sum. Mutually
-        # exclusive with mixing.
-        if self.descriptor_preprocess_contract != "off":
-            W0 = self._W0_preprocess_eff(W0, W_pre_override=W_pre_angular)
 
         # ── Forward: input→hidden ─────────────────────────────────────────────
         pre_h_terms = []

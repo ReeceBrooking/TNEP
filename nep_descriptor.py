@@ -264,24 +264,16 @@ def validate_nep_cfg(cfg):
             raise ValueError(
                 "cfg.dipole_rij_power=0 (self-pairs only) has no NEP pair stream; "
                 "the faithful GPUMD tnep readout is dipole_rij_power=2.")
-    preprocess = str(getattr(cfg, "descriptor_preprocess_contract", "off"))
     if mode == "replace":
         if cfg.radial_basis_size is not None:
             raise ValueError(
                 "cfg.nep_descriptor='replace' drops the SOAP output: "
                 "radial_basis_size would ride the genome (M_radial) with its "
                 "output discarded; set radial_basis_size=None.")
-        for f, v in (("descriptor_mixing", bool(getattr(cfg, "descriptor_mixing", False))),
-                     ("descriptor_preprocess_contract", preprocess != "off")):
-            if v:
-                raise ValueError(
-                    f"cfg.nep_descriptor='replace' has no SOAP species-pair blocks; "
-                    f"set cfg.{f} off.")
-    if mode == "concat" and preprocess != "off":
-        raise NotImplementedError(
-            "descriptor_preprocess_contract layouts cover every channel with SOAP "
-            "pair blocks; the appended NEP block (nep_descriptor='concat') is not "
-            "plumbed through them.")
+        if bool(getattr(cfg, "descriptor_mixing", False)):
+            raise ValueError(
+                "cfg.nep_descriptor='replace' has no SOAP species-pair blocks; "
+                "set cfg.descriptor_mixing off.")
     return mode
 
 
@@ -298,7 +290,7 @@ def gpumd_num_params(cfg, soap_dim=0):
     NEP4 (one typed ANN per species), one hidden layer, no charge mode —
     ANN = T·(dim+2)·H + 1 shared bias, c = T²·[(n_r+1)(K_r+1) + (n_a+1)(K_a+1)].
     Equals SNES.dim for nep_descriptor="replace" + dipole_readout="tnep" with
-    mixing / preprocess / learned SOAP basis off (descriptor_scale is a pure W0
+    mixing / learned SOAP basis off (descriptor_scale is a pure W0
     reparameterisation: zero parameters, identity holds under minmax). soap_dim
     adds the SOAP columns of "concat" to dim (the ANN input width)."""
     T, H = int(cfg.num_types), int(cfg.num_neurons)

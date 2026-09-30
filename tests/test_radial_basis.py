@@ -42,7 +42,6 @@ def _cfg(**kw):
     cfg.num_neurons = 8
     cfg.activation = "tanh"
     cfg.descriptor_mixing = False
-    cfg.descriptor_preprocess_contract = "off"
     cfg.dipole_channels = 4
     cfg.dipole_species_pairs = "off"
     cfg.dipole_radial = "chebyshev"
@@ -301,7 +300,7 @@ def test_snes_tail_holds_M0_and_roundtrips(species_sum):
     snes = model.optimizer
     T, S, a, K = 3, 3, 4, 8
     assert snes.n_radial == T * S * a * K
-    assert snes.dim == snes.n_anns_total + snes.n_U_pair + snes.n_preprocess + snes.n_radial
+    assert snes.dim == snes.n_anns_total + snes.n_U_pair + snes.n_radial
     named = snes._split_reconstructed(snes.reconstruct_params_tf(snes.mu))
     np.testing.assert_allclose(named["M_radial"].numpy(), model.M_radial.numpy(), atol=1e-7)
     tov = snes._build_type_of_variable()
@@ -439,11 +438,8 @@ def test_species_sum_model_matches_numpy_reference(mixing):
         np.testing.assert_allclose(preds[c], single, rtol=1e-4, atol=1e-6)
 
 
-def test_species_sum_rejects_preprocess_and_roundtrips(tmp_path):
+def test_species_sum_roundtrips(tmp_path):
     from model_io import save_model, load_model
-    with pytest.raises(NotImplementedError):
-        _model(_cfg(radial_basis_size=8, radial_basis_species_sum=True,
-                    descriptor_preprocess_contract="angular"))
     cfg = _cfg(radial_basis_size=6, radial_basis_species_sum=True)
     model = _model(cfg)
     data = _eval_data(cfg, _cho_frames(2))
@@ -566,3 +562,15 @@ def test_learned_basis_is_rotation_invariant(species_sum, per_l):
     q_rot = model.soap_from_raw(d_rot["descriptors"], d_rot["Z_int"]).numpy()
     assert np.abs(q).max() > 1e-4
     np.testing.assert_allclose(q_rot, q, rtol=1e-4, atol=1e-5)
+
+
+def test_stale_dim_q_fails_at_construction():
+    """cfg.dim_q is no longer overwritten by anything, so a saved config whose
+    dim_q disagrees with this build's descriptor (removed learned-basis NEP
+    extras / preprocess contraction) must fail loudly, not in a cryptic
+    einsum deep in the forward."""
+    cfg = _cfg()
+    good = compute_dim_q(cfg)
+    cfg.dim_q = good + 7
+    with pytest.raises(ValueError, match=f"cfg.dim_q={good + 7}.*{good}"):
+        _model(cfg)

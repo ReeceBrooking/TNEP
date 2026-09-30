@@ -11,7 +11,7 @@ class TNEPconfig:
 
     Sections:
         1. Dataset & targets
-        2. Descriptor (SOAP-turbo: geometry, backend, preprocessing)
+        2. Descriptor (SOAP-turbo: geometry, backend)
         3. Network architecture
         4. Loss & regularisation
         5. SNES optimiser
@@ -222,8 +222,7 @@ class TNEPconfig:
     #           summed into alpha_max shared channels
     #           (c_n = Σ_s Σ_κ M[t,s,n,κ]·c_raw[s,κ]), full (n ≤ n') power
     #           spectrum, dim_q = alpha_max(alpha_max+1)/2·(l_max+1); species
-    #           information enters only through M. Not combinable with
-    #           descriptor_preprocess_contract.
+    #           information enters only through M.
     radial_basis_species_sum: bool = False
     # l-dependent learned radial functions (radial_basis_size only): each
     # angular block l = 0..l_max gets its own M[T, S, alpha_max, K, l] —
@@ -256,7 +255,6 @@ class TNEPconfig:
     #   "block"   : group factor only (SOAP l groups + each extra block, ≤ 9)
     #   "channel" : group factor × per-channel residual
     #   "minmax"  : GPUMD q_scaler — 1/(max−min) per channel, no centring
-    # Not combinable with descriptor_preprocess_contract.
     descriptor_scale: str = "off"
     # Runtime: the scale vector [dim_q], computed by the driver from the
     # training set and saved in the model's config (None = not yet computed).
@@ -271,7 +269,7 @@ class TNEPconfig:
     # Defaults = GPUMD's (parameters.cu:83-90, 118-119).
     #   "off"     : bit-identical to before
     #   "concat"  : q = [q_soap ‖ q_nep]
-    #   "replace" : q = q_nep (descriptor_mixing / preprocess_contract off)
+    #   "replace" : q = q_nep (descriptor_mixing off)
     #   "sum"     : summed experts (§0.4)
     #   "gap_sum" : summed experts on the GAP 2b/3b distance descriptors
     #               (gap_descriptor_plan.md §0.2; no NEP header, no c tensors)
@@ -333,37 +331,6 @@ class TNEPconfig:
     #   "expm"   : U = exp(A), surjective onto SO(n), bs·(bs−1)/2 params. RECOMMENDED.
     descriptor_mixing_regularizer: str = "expm"
 
-    # Descriptor preprocessing contraction, before the ANN W0 layer; a learned
-    # per-(centre type, raw channel) table contracts the raw SOAP descriptor
-    # (Q_raw = raw dim, L = l_max+1). Composes with descriptor_mixing.
-    #   "off"          : no preprocessing (W0 sees raw Q_raw)
-    #   "angular"      : contract over l per (pair, n_pair); see angular_l_keep
-    #   "species_pair" : per-type contraction into SELF vs OTHER pairs, Q_new = 2·max_α·L
-    #   "both"         : collapse both axes (smallest Q_new, most info loss)
-    #   "nep4_radial"  : NEP4-faithful learned-basis fold, Q_new = n_max_out·L;
-    #                    requires compress_mode='trivial'
-    descriptor_preprocess_contract: str = "off"
-    # NEP4 fold output radial-channel count (nep4_radial mode only). None =
-    # auto n_max_out = Q_raw/L so Q_new = Q_raw (dim preserved); small values
-    # (≈ α or 2α) match NEP4's compact-basis setting.
-    descriptor_nep4_n_max_out: int | None = None
-    # Preprocess coefficient init: "mean" (1/N, well-conditioned), "sum" (1.0),
-    # or "glorot" (Glorot-uniform).
-    descriptor_preprocess_init: str = "mean"
-    # Per-tail σ scaling for preprocess coefficients (1.0 = same as ANN; reduce
-    # if SNES sampling noise overwhelms the signal).
-    preprocess_sigma_scale: float = 1.0
-    # Angular contraction threshold (angular/both modes): l < angular_l_keep
-    # kept as passthrough channels, l ≥ it summed into one output channel.
-    descriptor_preprocess_angular_l_keep: int = 4
-    # True = W_pre coefficients per central-atom type; False = global across
-    # centre types (symmetric, smallest param count).
-    descriptor_preprocess_per_type: bool = False
-    # L1/L2 strengths on (coefficient − init): soft prior toward the chosen
-    # init, not zero. Both 0.0 = disable.
-    descriptor_preprocess_lambda_1: float = 0.0
-    descriptor_preprocess_lambda_2: float = 0.0
-
     # ═══════════════════════════════════════════════════════════════════
     # 4. LOSS & REGULARISATION
     # ═══════════════════════════════════════════════════════════════════
@@ -399,8 +366,8 @@ class TNEPconfig:
     # "adam" (gradient descent by autodiff through the forward — trains the
     # ANN, c_pair, the mixing residual U_pair as a dense V, and M_radial;
     # one Adam step per structure chunk (batch_size=None) or per sampled
-    # batch; no checkpoint/resume; descriptor_preprocess_contract must be
-    # "off"). num_generations, batch_size, val_interval, patience and the
+    # batch; no checkpoint/resume). num_generations, batch_size, val_interval,
+    # patience and the
     # L1/L2 settings apply to both.
     optimizer: str = "snes"
     # Adam learning rate (optimizer="adam" only).

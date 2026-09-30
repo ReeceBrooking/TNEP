@@ -374,8 +374,6 @@ def test_ann_inputs_modes():
             m._ann_inputs(desc, None, Zt)
     with pytest.raises(ValueError, match="descriptor_mixing"):
         _model(_cfg(nep_descriptor="replace", descriptor_mixing=True))
-    with pytest.raises(ValueError, match="descriptor_preprocess_contract"):
-        _model(_cfg(nep_descriptor="replace", descriptor_preprocess_contract="angular"))
     m = _model(_cfg(nep_descriptor="sum"))           # main ANN sees SOAP only
     raw, types = _nep_inputs(m.cfg, atoms)
     assert m._ann_inputs(desc, tf.constant(raw[None]), tf.constant(types[None]))[0] is desc
@@ -632,7 +630,7 @@ def test_nep_c_tail_roundtrip_snes():
     m = _model(cfg); opt = SNES(m)
     n_c_r = int(np.prod(m.c_r.shape)); n_c_a = int(np.prod(m.c_a.shape)); n_c = n_c_r + n_c_a
     assert opt.n_nep == n_c
-    assert opt.dim == opt.n_anns_total + opt.n_U_pair + opt.n_preprocess + opt.n_radial + n_c
+    assert opt.dim == opt.n_anns_total + opt.n_U_pair + opt.n_radial + n_c
     named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
     np.testing.assert_array_equal(named["c_r"].numpy(), m.c_r.numpy())   # μ-init carries the model's draw
     np.testing.assert_array_equal(named["c_a"].numpy(), m.c_a.numpy())
@@ -1204,8 +1202,7 @@ def test_parameter_count_matches_gpumd_formula():
     """SNES.dim for the faithful GPUMD TNEP configuration equals GPUMD's
     number_of_variables (parameters.cu:203-235): typed slab (dim+2)·H per
     type + shared b1 + c_r/c_a — no extra parameters anywhere."""
-    cfg = _tnep_cfg("replace", descriptor_mixing=False,
-                    descriptor_preprocess_contract="off", descriptor_scale="off",
+    cfg = _tnep_cfg("replace", descriptor_mixing=False, descriptor_scale="off",
                     nep_n_max_radial=6, nep_n_max_angular=6, nep_basis_size_radial=6,
                     nep_basis_size_angular=6, nep_four_body=True, nep_five_body=False)
     m = _model(cfg)

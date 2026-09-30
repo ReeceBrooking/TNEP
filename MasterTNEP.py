@@ -373,8 +373,6 @@ def _print_param_breakdown(model) -> None:
     # Optional add-ons.
     if int(opt.n_U_pair) > 0:
         rows.append(("input-side mixing  U_pair", int(opt.n_U_pair)))
-    if int(opt.n_preprocess) > 0:
-        rows.append(("preprocess  W_pre (summed only)", int(opt.n_preprocess)))
     if int(getattr(opt, "n_radial", 0)) > 0:
         rows.append(("radial basis  M_radial [T·S·α·K]", int(opt.n_radial)))
     if int(getattr(opt, "n_nep", 0)) > 0:
@@ -552,16 +550,6 @@ def _train_model_inner(cfg: TNEPconfig,
         del q0
 
     model = TNEP(cfg)
-    # With preprocess contraction on, cfg.dim_q is the contracted Q_new
-    # (raw at cfg.dim_q_raw); report the compression ratio.
-    if getattr(cfg, "descriptor_preprocess_contract", "off") != "off":
-        q_raw  = int(getattr(cfg, "dim_q_raw", cfg.dim_q))
-        q_new  = int(cfg.dim_q)
-        ratio  = q_raw / q_new if q_new else float("inf")
-        reduce = (1.0 - q_new / q_raw) * 100.0 if q_raw else 0.0
-        print(f"Preprocess contraction ({cfg.descriptor_preprocess_contract}): "
-              f"Q_raw={q_raw} → Q_new={q_new}  "
-              f"(×{ratio:.2f} compression, {reduce:.1f}% reduction)")
     if model._neighbor_readout:
         _c_desc = {
             "off": "c ≡ 1",

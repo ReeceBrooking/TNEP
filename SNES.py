@@ -35,8 +35,8 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
 
     Tail order: W0,b0,W1,b1 | +experts (nep_descriptor="sum" / "gap_sum") | +c_pair
     (neighbor readout, _c_learnable) | +pol ANN (mode 2) | +U_pair (mixing)
-    | +W_pre_angular (preprocess_contract != "off") | +M_radial (learned
-    radial basis) | +c_r, +c_a (NEP contraction coefficients).
+    | +M_radial (learned radial basis) | +c_r, +c_a (NEP contraction
+    coefficients).
     """
     params = list(params)
     idx = 0
@@ -58,10 +58,6 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
             and getattr(model, "U_pair", None) is not None
             and idx < len(params)):
         model.U_pair.assign(params[idx]); idx += 1
-    if (idx < len(params)
-            and getattr(model, "descriptor_preprocess_contract", "off") != "off"
-            and getattr(model, "W_pre_angular", None) is not None):
-        model.W_pre_angular.assign(params[idx]); idx += 1
     if (idx < len(params)
             and getattr(model, "M_radial", None) is not None):
         model.M_radial.assign(params[idx]); idx += 1
@@ -155,8 +151,7 @@ class SNES:
         # of the param vector, unpacked via reconstruct_params_tf.
         if getattr(self.cfg, "descriptor_mixing", False):
             # Reuse TNEP's mixing layout so SNES and the model agree on
-            # (num_pairs, L_eff, α_per_pair, block sizes). Post-preprocess
-            # layout collapses to L_eff < L; else raw SOAP-turbo layout.
+            # (num_pairs, L, α_per_pair, block sizes).
             # INVARIANT: must not recompute the raw layout here or SNES walks
             # dead params and runs expm at the wrong (larger) block size.
             from DescriptorBuilderGPU import descriptor_block_layout
@@ -191,9 +186,7 @@ class SNES:
             self._mix_alpha_per_pair = [
                 int(self._mix_layout["alpha_eff_per_pair"][k])
                 for k in self._mix_layout["pair_keys"]]
-            # L_eff from layout when present (post-preprocess collapses
-            # l > l_keep into one slot); else l_max+1 for raw layout.
-            L = int(self._mix_layout.get("L_eff", int(self.cfg.l_max) + 1))
+            L = int(self.cfg.l_max) + 1
             self._mix_L = L
             per_T_block = int(sum(L * _block_count(a)
                                    for a in self._mix_alpha_per_pair))
@@ -281,67 +274,6 @@ class SNES:
             self._cayley_scatter_cache = {}
             self.n_U_pair = 0
 
-        # Preprocessing contraction tail (descriptor_preprocess_contract):
-        # per-(centre type, raw channel) scalars folding into W0 via
-        # _W0_preprocess_eff. Sits at the end of the mu vector.
-        self._preprocess_mode = str(getattr(
-            self.cfg, "descriptor_preprocess_contract", "off"))
-        if self._preprocess_mode != "off":
-            # cfg.dim_q was overridden to Q_new by TNEP.__init__; dim_q_raw
-            # holds the original.
-            Q_raw_pre = int(getattr(self.cfg, "dim_q_raw", self.dim_q))
-            T_ = int(self.cfg.num_types)
-            self._preprocess_Q_raw = Q_raw_pre
-            self._preprocess_per_type = bool(
-                self.model.preprocess_per_type)
-            # NEP4 fold: override _preprocess_Q_raw to the slab-per-t-centre
-            # size so `flat_idx // _preprocess_Q_raw` yields t_centre for the
-            # rank-4 c[T_c, T_n, n_max_out, α] tensor.
-            if self._preprocess_mode == "nep4_radial":
-                _n_max_out = int(self.model._nep4_n_max_out)
-                _alpha = int(self.model._nep4_alpha_max)
-                self._preprocess_Q_raw = T_ * _n_max_out * _alpha
-            # n_preprocess counts ONLY the summed (learnable) W_pre entries;
-            # kept (passthrough) positions are fixed at 1.0 and don't move
-            # through SNES.
-            self.n_preprocess = int(
-                self.model._preprocess_summed_count)
-            # Init value (uniform across T, Q_raw) for mean/sum schemes;
-            # glorot init is set in mu_init directly.
-            init_scheme = str(getattr(
-                self.cfg, "descriptor_preprocess_init", "mean"))
-            if init_scheme == "mean":
-                # Prefer the layout's per-q_raw init vector when present
-                # (angular: l=0 → 1.0, l>0 → 1/(L-1)); scalar fallback below.
-                self._preprocess_init_per_q_raw = (
-                    self.model._preprocess_layout.get("coef_init_per_q_raw")
-                    if self.model._preprocess_layout is not None else None)
-                if self._preprocess_mode == "species_pair":
-                    self._preprocess_init_value = (
-                        1.0 / float(max(1, int(self.cfg.num_types) - 1)))
-                else:
-                    L_ = int(self.cfg.l_max) + 1
-                    self._preprocess_init_value = 1.0 / float(L_)
-            elif init_scheme == "sum":
-                self._preprocess_init_value = 1.0
-            elif init_scheme == "glorot":
-                # μ-init zero; Glorot spread applied via σ at gen 0.
-                self._preprocess_init_value = 0.0
-                self._preprocess_init_per_q_raw = None
-            else:
-                raise ValueError(
-                    f"descriptor_preprocess_init={init_scheme!r} not "
-                    f"recognised in SNES tail init.")
-            if init_scheme == "sum":
-                self._preprocess_init_per_q_raw = None
-            self._preprocess_init_scheme = init_scheme
-        else:
-            self.n_preprocess = 0
-            self._preprocess_Q_raw = 0
-            self._preprocess_init_value = 1.0
-            self._preprocess_init_scheme = "mean"
-            self._preprocess_init_per_q_raw = None
-
         # Learned radial basis tail: M_radial [T, S, α, K], centre-type-major.
         self.n_radial = (int(np.prod(model.M_radial.shape))
                          if getattr(model, "M_radial", None) is not None else 0)
@@ -352,7 +284,7 @@ class SNES:
         self.n_c_a = (int(np.prod(model.c_a.shape))
                       if getattr(model, "c_a", None) is not None else 0)
         self.n_nep = self.n_c_r + self.n_c_a
-        self.dim = (self.n_anns_total + self.n_U_pair + self.n_preprocess
+        self.dim = (self.n_anns_total + self.n_U_pair
                     + self.n_radial + self.n_nep)
 
         # Search distribution params as tf.Variables (stay on GPU). μ init
@@ -369,13 +301,6 @@ class SNES:
         if self.n_U_pair > 0 and mix_scale != 1.0:
             mix_start = self.n_anns_total
             sigma_init_vec[mix_start:mix_start + self.n_U_pair] *= mix_scale
-        # Per-block σ for the preprocess tail: decouples noise on
-        # coefficients near 1/L from the ANN σ.
-        preprocess_scale = float(getattr(
-            self.cfg, "preprocess_sigma_scale", 1.0))
-        if self.n_preprocess > 0 and preprocess_scale != 1.0:
-            pre_start = self.n_anns_total + self.n_U_pair
-            sigma_init_vec[pre_start:pre_start + self.n_preprocess] *= preprocess_scale
         self.sigma = tf.Variable(sigma_init_vec, trainable=False, name="snes_sigma")
 
         auto_pop = int(4 + (3 * np.log(self.dim)))
@@ -486,8 +411,7 @@ class SNES:
             l2 = total_l2 / T + self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed)) / n_typed_total)
         else:
             # Single-type: regularize ONLY the ANN weights — exclude the mixing
-            # V_pair tail (shrinking A → 0 collapses U → I) AND the preprocess
-            # tail (has its own init-prior, must not be pulled to 0), regardless
+            # V_pair tail (shrinking A → 0 collapses U → I), regardless
             # of the mixing parameterisation. pv[:n_anns_total] == pv when there
             # is no tail, so this reduces to the old behaviour in that case.
             ann = pv[:self.n_anns_total]
@@ -551,23 +475,10 @@ class SNES:
         # V_pair tail: zeroed so U_full = I at gen 0.
         if self.n_U_pair > 0:
             mu[self.n_anns_total:self.n_anns_total + self.n_U_pair] = 0.0
-        # Preprocess tail: init per descriptor_preprocess_init (mean → 1/L,
-        # sum → 1.0, glorot → 0.0 + σ spread). μ holds only the summed
-        # entries; per-summed init read off the model's W_pre Variable.
-        if self.n_preprocess > 0:
-            pre_start = self.n_anns_total + self.n_U_pair
-            W_pre_init = self.model.W_pre_angular.numpy().reshape(-1)
-            flat_idx = self.model._preprocess_summed_flat_idx.numpy()
-            summed_init = W_pre_init[flat_idx]
-            if self._preprocess_init_scheme == "glorot":
-                limit = 1e-3
-                summed_init = rng.uniform(
-                    -limit, limit, size=summed_init.size).astype(np.float32)
-            mu[pre_start:pre_start + self.n_preprocess] = summed_init
         # Learned radial basis M0 (reproduces the fixed descriptor at gen 0),
         # then NEP c_r, c_a (the model's uniform(−1, 1) draw, GPUMD
         # snes.cu:107-115): each copied from its model Variable in tail order.
-        off = self.n_anns_total + self.n_U_pair + self.n_preprocess
+        off = self.n_anns_total + self.n_U_pair
         for var, n in ((self.model.M_radial, self.n_radial),
                        (self.model.c_r, self.n_c_r),
                        (self.model.c_a, self.n_c_a)):
@@ -709,16 +620,6 @@ class SNES:
             else:
                 u_labels = np.full(self.n_U_pair, T, dtype=np.int32)
             tail_labels_parts.append(u_labels)
-        # Preprocess tail labels (μ holds only summed W_pre entries):
-        #   per_type=True : W_pre [T, Q_raw] t-major → t = flat_idx // Q_raw.
-        #   per_type=False: W_pre [Q_raw], global label T.
-        if self.n_preprocess > 0:
-            if self._preprocess_per_type:
-                flat_idx_np = self.model._preprocess_summed_flat_idx.numpy()
-                pre_labels = (flat_idx_np // int(self._preprocess_Q_raw)).astype(np.int32)
-            else:
-                pre_labels = np.full(self.n_preprocess, T, dtype=np.int32)
-            tail_labels_parts.append(pre_labels)
         # M_radial [T, S, α, K] is T-major: each centre type's radial functions
         # are ranked by that type's fitness.
         if self.n_radial > 0:
@@ -1326,7 +1227,6 @@ class SNES:
             W1p = named.get("W1_pol")
             b1p = named.get("b1_pol")
             U_pair_val = named.get("U_pair")
-            W_pre_angular_val = named.get("W_pre_angular")
             c_pair_val = named.get("c_pair")
             M_val = named.get("M_radial")
             c_r_val = named.get("c_r"); c_a_val = named.get("c_a")
@@ -1338,14 +1238,6 @@ class SNES:
             W0 = self.model._W0_eff(W0, U_pair_val)
             if W0p is not None:
                 W0p = self.model._W0_eff(W0p, U_pair_val)
-            # Preprocess fold (composes with mixing under l_aware).
-            if (getattr(self.model, "descriptor_preprocess_contract", "off")
-                    != "off"):
-                W0 = self.model._W0_preprocess_eff(
-                    W0, W_pre_override=W_pre_angular_val)
-                if W0p is not None:
-                    W0p = self.model._W0_preprocess_eff(
-                        W0p, W_pre_override=W_pre_angular_val)
             # Stash folded tensors for the next validate() call this gen.
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
@@ -1371,11 +1263,6 @@ class SNES:
             W0 = self.model._W0_eff(W0)
             if W0p is not None:
                 W0p = self.model._W0_eff(W0p)
-            if (getattr(self.model, "descriptor_preprocess_contract", "off")
-                    != "off"):
-                W0 = self.model._W0_preprocess_eff(W0)
-                if W0p is not None:
-                    W0p = self.model._W0_preprocess_eff(W0p)
 
         # Streaming chunk loop honours batch_chunk_size (bounded tensor
         # materialisation). Full-val (val_size=None) uses prefetched_chunks;
@@ -1474,10 +1361,9 @@ class SNES:
 
         Tail order: W0,b0,W1,b1 | W0_r..W1_a (nep_descriptor="sum" / "gap_sum") | c_pair
         (neighbor readout, _c_learnable) | W0_pol.. (mode 2) | U_pair (mixing)
-        | W_pre_angular (preprocess != "off") | M_radial (learned radial
-        basis) | c_r, c_a (NEP).
+        | M_radial (learned radial basis) | c_r, c_a (NEP).
         """
-        out: dict = {"U_pair": None, "W_pre_angular": None, "c_pair": None,
+        out: dict = {"U_pair": None, "c_pair": None,
                      "M_radial": None, "c_r": None, "c_a": None}
         idx = 0
         out["W0"] = params[idx]; idx += 1
@@ -1496,8 +1382,6 @@ class SNES:
             out["b1_pol"] = params[idx]; idx += 1
         if self.n_U_pair > 0 and idx < len(params):
             out["U_pair"] = params[idx]; idx += 1
-        if self.n_preprocess > 0 and idx < len(params):
-            out["W_pre_angular"] = params[idx]; idx += 1
         if self.n_radial > 0 and idx < len(params):
             out["M_radial"] = params[idx]; idx += 1
         if self.n_nep > 0 and idx < len(params):
@@ -1513,8 +1397,7 @@ class SNES:
         Args:
             param_vectors : [P, dim] or [dim] float32
         Returns:
-            tuple (W0,b0,W1,b1) + optional (pol ANN, U_pair, W_pre,
-            M_radial); each
+            tuple (W0,b0,W1,b1) + optional (pol ANN, U_pair, M_radial); each
             [P, ...] for batched input or [...] for single.
         """
         T = self.cfg.num_types
@@ -1565,33 +1448,6 @@ class SNES:
                 U_flat, is_batched, self._mix_per_type, T)
             offset += self.n_U_pair
             tail = tail + (U_pair_k,)
-
-        # Optional preprocess tail: μ holds only the summed coefficients.
-        # Rebuild full W_pre = base template (kept=1.0, summed=0) + scattered
-        # summed values. M and base are static, precomputed at TNEP.__init__:
-        #   M    : [n_summed, base_size] one-hot scatter
-        #   base : kept-template shape (kept=1.0, summed=0)
-        if self.n_preprocess > 0:
-            pre_flat = param_vectors[..., offset:offset + self.n_preprocess]
-            offset += self.n_preprocess
-            base = self.model._preprocess_kept_template
-            M = self.model._preprocess_summed_scatter_M
-            base_flat = tf.reshape(base, [-1])
-            base_static_shape = base.shape  # static — no tf.shape() call
-            if is_batched:
-                # pre_flat [C, n_summed] → summed_contrib [C, base_size].
-                summed_contrib = tf.matmul(pre_flat, M)
-                full_flat = base_flat[tf.newaxis, :] + summed_contrib
-                # STATIC base shape lets _W0_preprocess_eff constant-fold the
-                # gather/scatter; only the leading candidate dim stays dynamic.
-                W_pre = tf.reshape(
-                    full_flat,
-                    [-1] + base_static_shape.as_list())
-            else:
-                summed_contrib = tf.matmul(pre_flat[tf.newaxis, :], M)[0]
-                full_flat = base_flat + summed_contrib
-                W_pre = tf.reshape(full_flat, base_static_shape)
-            tail = tail + (W_pre,)
 
         # Learned radial basis tail: M_radial [T, S, α, K] (+ leading C).
         if self.n_radial > 0:
@@ -1784,7 +1640,7 @@ class SNES:
             reg = total_l1 / T + global_l1 + total_l2 / T + global_l2
         else:
             # Single-type: regularize ONLY the ANN weights — exclude the mixing
-            # V_pair tail (A → 0 collapses U → I) and the preprocess tail. Reduces
+            # V_pair tail (A → 0 collapses U → I). Reduces
             # to the whole vector when there is no tail (n_anns_total == dim).
             ann = param_vectors[:, :self.n_anns_total]
             ann_n = self.n_anns_total
@@ -2015,9 +1871,8 @@ class SNES:
         b0p = named.get("b0_pol")
         W1p = named.get("W1_pol")
         b1p = named.get("b1_pol")
-        # Per-candidate mixing / preprocess tensors (None when disabled).
+        # Per-candidate mixing tensor (None when disabled).
         U_pair_cand = named.get("U_pair")
-        W_pre_angular_cand = named.get("W_pre_angular")
 
         if self.cfg.target_mode == 2:
             pol_weights = self._pol_weights  # [6] component weights
@@ -2077,7 +1932,6 @@ class SNES:
             preds = self.model.predict_batch_candidates(
                 desc, W_atom, Z, amask, W0, b0, W1, b1,
                 U_pair=U_pair_cand,
-                W_pre_angular=W_pre_angular_cand,
                 c_pair=named.get("c_pair"),
                 M_radial=named.get("M_radial"),
                 c_r=named.get("c_r"), c_a=named.get("c_a"),
