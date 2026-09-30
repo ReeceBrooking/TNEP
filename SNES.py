@@ -33,7 +33,7 @@ def _format_duration(seconds: float) -> str:
 def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight tensors from reconstruct_params_tf into the model's Variables.
 
-    Tail order: W0,b0,W1,b1 | +experts (nep_descriptor="sum") | +c_pair
+    Tail order: W0,b0,W1,b1 | +experts (nep_descriptor="sum" / "gap_sum") | +c_pair
     (neighbor readout, _c_learnable) | +pol ANN (mode 2) | +U_pair (mixing)
     | +W_pre_angular (preprocess_contract != "off") | +M_radial (learned
     radial basis) | +c_r, +c_a (NEP contraction coefficients).
@@ -114,7 +114,7 @@ class SNES:
                                 else _T * (_T + 1) // 2)
                     if model._neighbor_readout and model._c_learnable else 0)
         # Typed ANN blocks (model._ann_blocks): the SOAP ANN and, under
-        # nep_descriptor="sum", the 2-body / 3-body experts — each
+        # nep_descriptor="sum" / "gap_sum", the 2-body / 3-body experts — each
         # [W0(T,Q,H) | b0(T,H) | W1(T,H·Hw)] laid end to end in the typed
         # slab; b1 follows the LAST block, so n_typed stays one contiguous
         # slice (_global_typed) and every "after b1" offset moves with it.
@@ -132,7 +132,7 @@ class SNES:
         self.n_typed = _T * per_type
         # The mode-2 polarizability ANN mirrors the SOAP block only.
         self.n_typed_pol = _T * _block_per_type(self._blocks[0])
-        # Per-expert counts (breakdown); n_expert = 0 outside "sum".
+        # Per-expert counts (breakdown); n_expert = 0 outside "sum" / "gap_sum".
         self._n_expert = [_T * _block_per_type(b) for b in self._blocks[1:]]
         self.n_expert = sum(self._n_expert)
         # Per-type param count (type t's rows of every block). target_mode==2
@@ -1469,14 +1469,14 @@ class SNES:
         return float(rmse)
 
     def _experts_of(self, named: dict) -> tuple | None:
-        """The six "sum" expert tensors of a _split_reconstructed dict, in
-        EXPERT_WEIGHTS order (None outside "sum"), for the forward sites."""
+        """The six "sum" / "gap_sum" expert tensors of a _split_reconstructed dict, in
+        EXPERT_WEIGHTS order (None outside them), for the forward sites."""
         return tuple(named[k] for k in EXPERT_WEIGHTS) if self.n_expert else None
 
     def _split_reconstructed(self, params: tuple) -> dict:
         """Parse the reconstruct_params_tf tuple into a named dict.
 
-        Tail order: W0,b0,W1,b1 | W0_r..W1_a (nep_descriptor="sum") | c_pair
+        Tail order: W0,b0,W1,b1 | W0_r..W1_a (nep_descriptor="sum" / "gap_sum") | c_pair
         (neighbor readout, _c_learnable) | W0_pol.. (mode 2) | U_pair (mixing)
         | W_pre_angular (preprocess != "off") | M_radial (learned radial
         basis) | c_r, c_a (NEP).

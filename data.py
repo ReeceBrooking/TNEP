@@ -387,8 +387,9 @@ def assemble_data_dict(
             data["nbr_index"] = [n for n, _ in _nbr]
             data["nbr_G"] = [g for _, g in _nbr]
 
-    # GPUMD NEP descriptor block: raw per-atom basis [N, W_raw], contracted
-    # in-model by c_r/c_a (multi_descriptor_plan.md §0.3).
+    # Raw expert input data["nep_raw"] [N, W_raw]: the GPUMD NEP per-atom
+    # basis, contracted in-model by c_r/c_a (multi_descriptor_plan.md §0.3),
+    # or the GAP q2‖q3 under nep_descriptor="gap_sum" (fixed centres).
     # Phase B adds the image-exact pair stream (plan §B.3) when ∂q/∂r is
     # needed; both consume one ase pair list per frame.
     if cfg.nep_descriptor == "gap_sum":
@@ -892,7 +893,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
         nbr_idx_np = np.zeros((S, max_atoms, max_nbr), dtype=np.int32)
         nbr_G_np = np.zeros((S, max_atoms, max_nbr)
                             + data["nbr_G"][0].shape[2:], dtype=np.float32)
-    has_nep = "nep_raw" in data  # raw NEP basis [S, A, W_raw]
+    has_nep = "nep_raw" in data  # raw expert input [S, A, W_raw]: NEP basis, or GAP q2‖q3 under gap_sum
     if has_nep:
         nep_np = np.zeros((S, max_atoms, data["nep_raw"][0].shape[1]), dtype=np.float32)
     has_nep_pairs = "nep_pairs" in data  # Phase B stream: concatenate, CSR by nep_struct_ptr

@@ -534,7 +534,7 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
         for k in EXPERT_WEIGHTS:
             if k not in experts:
                 raise ValueError(
-                    f"cfg.nep_descriptor='sum' but the save has no {k} dataset — "
+                    f"cfg.nep_descriptor={model._nep_mode!r} but the save has no {k} dataset — "
                     f"the expert ANN would silently reset to its init. Re-train.")
             var = getattr(model, k)
             if tuple(experts[k].shape) != tuple(var.shape):

@@ -295,7 +295,6 @@ class TNEP(layers.Layer):
         # "sum" / "gap_sum": ANN_2b + ANN_3b experts added to the SOAP ANN;
         # their inputs are the NEP contraction or the GAP q2 ‖ q3 raw slot.
         self._experts_on = self._nep_mode in ("sum", "gap_sum")
-        self._expert_source = "gap" if self._nep_mode == "gap_sum" else "nep"
         # Phase B: dipole via per-candidate NEP pair forces (plan §B.2).
         self._nep_pair_forces_on = (self._nep_mode in ("concat", "replace")
                                     and cfg.target_mode == 1
@@ -315,13 +314,13 @@ class TNEP(layers.Layer):
                 T, T, cfg.nep_n_max_angular + 1, cfg.nep_basis_size_angular + 1)
             ).astype(np.float32), trainable=False, name="nep_c_a")
         # descriptor_scale sees the main ANN's input (dim_q_forward) and,
-        # under "sum", the NEP vector after it ([q_soap ‖ q_nep], see
+        # under "sum" / "gap_sum", the expert input after it ([q_soap ‖ q_nep], see
         # gen0_ann_inputs): one slice of cfg.q_scale per typed ANN.
         self._sl_main = slice(0, int(self.dim_q_forward))
         self._scale_width = int(self.dim_q_forward)
         self._expert_in = ()      # (input slice of q_nep, slice of q_scale) per expert
         if self._experts_on:
-            if self._expert_source == "gap":
+            if self._nep_mode == "gap_sum":
                 from gap_descriptor import gap_slices
                 nsl, keys = gap_slices(cfg), ("two_body", "three_body")
             else:
@@ -1253,7 +1252,8 @@ class TNEP(layers.Layer):
         if nep_raw is None:
             raise ValueError(
                 f"nep_raw missing: cfg.nep_descriptor={self._nep_mode!r} needs "
-                f"the raw NEP basis at every forward site.")
+                f"the raw expert input [.., W_raw] (the NEP basis, or GAP q2‖q3 "
+                f"under gap_sum) at every forward site.")
         if self._experts_on:              # experts read nep_raw in _expert_outputs
             return descriptors, None
         q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a, return_s=True)
@@ -1310,10 +1310,10 @@ class TNEP(layers.Layer):
                         c_r: tf.Tensor | None = None, c_a: tf.Tensor | None = None,
                         experts: tuple | None = None) -> tf.Tensor:
         """ANN_2b(q_r) + ANN_3b(q_ang) head outputs [(C,) ..., A, head_width]
-        under nep_descriptor="sum", added to the SOAP ANN's before
+        under nep_descriptor="sum" / "gap_sum" (q2 / q3), added to the SOAP ANN's before
         _split_head. experts: the six STORED tensors in EXPERT_WEIGHTS order
         (optional leading candidate axis); None → the model's variables."""
-        q = nep_raw if self._expert_source == "gap" else self.nep_from_raw(nep_raw, Z, c_r, c_a)
+        q = nep_raw if self._nep_mode == "gap_sum" else self.nep_from_raw(nep_raw, Z, c_r, c_a)
         w = self.expert_weights if experts is None else tuple(experts)
         return tf.add_n([self._expert_ann(q, Z, atom_mask, *w[3 * i:3 * i + 3], *sl)
                          for i, sl in enumerate(self._expert_in)])
@@ -1960,7 +1960,8 @@ class TNEP(layers.Layer):
             nbr_index   : [B, A, M] padded neighbor table (bilinear readout;
                           None → build the pair term from the COO stream)
             nbr_G       : [B, A, M, 3, C] per-slot R_n(r_ij)(r_i − r_j)
-            nep_raw     : [B, A, W_raw] raw NEP basis (cfg.nep_descriptor != "off")
+            nep_raw     : [B, A, W_raw] raw expert input (cfg.nep_descriptor
+                          != "off"): the NEP basis, or GAP q2‖q3 under gap_sum
             c_r, c_a    : NEP contraction tensors (None → self.c_r / self.c_a)
             experts     : "sum" mode: the six STORED expert tensors
                           (EXPERT_WEIGHTS order; None → model variables)
@@ -2142,7 +2143,8 @@ class TNEP(layers.Layer):
                           are then raw centre coefficients [B, A, W_in])
             nbr_index   : [B, A, M], nbr_G [B, A, M, 3, Ch] — padded pair
                           table of the bilinear readout (candidate-independent)
-            nep_raw     : [B, A, W_raw] raw NEP basis (cfg.nep_descriptor != "off")
+            nep_raw     : [B, A, W_raw] raw expert input (cfg.nep_descriptor
+                          != "off"): the NEP basis, or GAP q2‖q3 under gap_sum
             c_r, c_a    : per-candidate [C, T, T, n+1, K+1] NEP contraction
                           tensors (None → the model's shared c_r / c_a)
             experts     : "sum" mode: per-candidate [C, ...] STORED expert
@@ -2803,8 +2805,8 @@ def gen0_ann_inputs(cfg, data) -> np.ndarray:
     compute_q_scale must see. The builder's `descriptors` slot is returned as
     is unless it needs finishing: a throwaway model (scaling off) applies
     soap_from_raw (learned basis) and _ann_inputs (NEP concat/replace) chunk by
-    chunk; under "sum" the NEP vector the experts read follows the SOAP block
-    ([q_soap ‖ q_nep]). "minmax" assembles the NEP block with c ≡ 1 like GPUMD's q_scaler
+    chunk; under "sum" / "gap_sum" the expert input follows the SOAP block
+    ([q_soap ‖ q_nep] or [q_soap ‖ q2‖q3]). "minmax" assembles the NEP block with c ≡ 1 like GPUMD's q_scaler
     (fitness.cu:165-175, initial_para = 1); block/channel use the real gen-0 c."""
     q0, Z = data["descriptors"], data["Z_int"]
     if cfg.radial_basis_size is None and str(getattr(cfg, "nep_descriptor", "off")) == "off":

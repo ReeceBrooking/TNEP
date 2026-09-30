@@ -358,9 +358,10 @@ def _print_param_breakdown(model) -> None:
     if opt.n_c > 0:
         rows.append(("c_pair  [C·T²]" if model._species_pairs == "ordered"
                      else "c_pair  [C·T(T+1)/2]", int(opt.n_c)))
-    # nep_descriptor="sum": the 2-body / 3-body experts (inside the typed slab).
-    for name, n in zip(("ANN_2b  [T·(d_r·H_e + H_e + H_e·Hw)]",
-                        "ANN_3b  [T·(d_a·H_e + H_e + H_e·Hw)]"), opt._n_expert):
+    # nep_descriptor="sum" / "gap_sum": the 2-body / 3-body experts (inside
+    # the typed slab); d_2b / d_3b = NEP radial / angular or GAP q2 / q3 widths.
+    for name, n in zip(("ANN_2b  [T·(d_2b·H_e + H_e + H_e·Hw)]",
+                        "ANN_3b  [T·(d_3b·H_e + H_e + H_e·Hw)]"), opt._n_expert):
         rows.append((name, int(n)))
 
     # Polarisability ANN — same per-layer shape, mirrored doubling.
@@ -429,8 +430,9 @@ def _train_model_inner(cfg: TNEPconfig,
 
     if cfg.nep_descriptor == "gap_sum" and (cfg.gap2b_centres is None
                                             or cfg.gap3b_centres is None):
-        # GAP 2b/3b kernel centres from the frames in cfg.indices (train+val;
-        # the val frames only shape the descriptor, not any fitted weight).
+        # GAP 2b/3b kernel centres from all of cfg.indices, including the
+        # internal test split (carved out later in split) — an unsupervised
+        # geometric leak only: no target touches the centres.
         # Stored as lists so they serialise with the model.
         from gap_descriptor import select_centres
         c2, c3 = select_centres([dataset[i] for i in cfg.indices], cfg)
