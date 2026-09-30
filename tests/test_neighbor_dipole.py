@@ -62,6 +62,12 @@ def _cfg(**kw):
     cfg.q_scale = None
     cfg.optimizer = "snes"
     cfg.dipole_head = "vector"
+    # The ANN-input mode and the GAP feature flags are experiment knobs the
+    # user tunes in the working tree; pin them so a live TNEPconfig default
+    # cannot change dim_q underneath every suite that imports this helper.
+    cfg.nep_descriptor = "off"
+    cfg.gap_2b = False
+    cfg.gap_3b = False
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)

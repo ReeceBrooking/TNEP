@@ -266,13 +266,10 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     `gap3b_centres` (when auto-selected) are filled in, because they must
     travel with the model for `predict` and into the run record.
 
-    Solver memory (cfg.gap_solver): "primal" builds the dense augmented
-    [3F + n_columns, n_columns] — ~0.6 GB at 8k columns, n_columns² scaling,
-    ~18 GB (OOM) at the 48k columns a 2-scale × 3-ξ config reaches; "dual"
-    solves the [3F, 3F] Gram instead — Φ itself then dominates (~1.7 GB at
-    F=1500, 48k columns), memory linear in columns, same α to numerical
-    precision. Multi-scale (gap_extra_rcut) ≈ 2× descriptor build time,
-    fit and predict."""
+    Solver memory: the dual ridge solves the [3F, 3F] Gram, so Φ itself
+    dominates (~1.7 GB at F=1500, 48k columns) and memory is linear in
+    columns. Multi-scale (gap_extra_rcut) ≈ 2× descriptor build time, fit
+    and predict."""
     _validate(cfg)
     t0 = time.time()
 
@@ -375,26 +372,19 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
                 f"those coefficients are unidentifiable — the ridge leaves "
                 f"them at ~0 and predictions are unaffected")
 
-    # Explicit ridge solve, λ_eff relative to mean(diag(ΦᵀΦ)) so λ is
-    # dimensionless. Two mathematically identical routes (cfg.gap_solver):
-    #   "primal": augmented [Φ; √λ_eff·I] lstsq — peak memory ~n_columns²
-    #             (the dense identity block + gelsd workspace).
-    #   "dual":   α = Φᵀ(ΦΦᵀ + λ_eff·I)⁻¹μ — the Gram is [3F, 3F]
-    #             regardless of n_columns; memory linear in columns.
+    # Explicit ridge solve in the dual form, λ_eff relative to
+    # mean(diag(ΦᵀΦ)) so λ is dimensionless:
+    #   α = Φᵀ(ΦΦᵀ + λ_eff·I)⁻¹μ — the Gram is [3F, 3F] regardless of
+    #   n_columns, so memory is linear in columns and Φ itself dominates.
+    # Note this squares the conditioning relative to an augmented
+    # [Φ; √λ_eff·I] least-squares solve (the normal-equations pitfall); the
+    # equivalence of the two is pinned by test_dual_solve_matches_augmented_lstsq,
+    # which carries the augmented route as a test-only oracle.
     lam = float(cfg.gap_ridge_lambda)
     lam_eff = lam * float(np.mean(np.sum(Phi_flat ** 2, axis=0)))
-    solver = str(getattr(cfg, "gap_solver", "primal"))
-    if solver == "primal":
-        A = np.vstack([Phi_flat, np.sqrt(lam_eff) * np.eye(n_columns)])
-        b = np.concatenate([mu.reshape(-1), np.zeros(n_columns)])
-        alpha_flat = np.linalg.lstsq(A, b, rcond=None)[0]
-    elif solver == "dual":
-        G = Phi_flat @ Phi_flat.T                        # [3F, 3F]
-        G[np.diag_indices_from(G)] += lam_eff
-        alpha_flat = Phi_flat.T @ np.linalg.solve(G, mu.reshape(-1))
-    else:
-        raise ValueError(f"unknown gap_solver {solver!r} "
-                         f"(expected 'primal' or 'dual')")
+    G = Phi_flat @ Phi_flat.T                            # [3F, 3F]
+    G[np.diag_indices_from(G)] += lam_eff
+    alpha_flat = Phi_flat.T @ np.linalg.solve(G, mu.reshape(-1))
     parts = np.split(alpha_flat, np.cumsum(blocks)[:-1])
     # every α group is one block per species
     groups = [parts[i:i + T] for i in range(0, len(parts), T)]
@@ -414,7 +404,7 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
     metrics = {"train_rmse": train_rmse, "train_r2": train_r2,
                "n_train_frames": F, "fit_seconds": time.time() - t0}
     print(f"[gap_dipole] fit M={sizes} xi={list(xis)} lambda={lam:g} "
-          f"n_columns={n_columns} solver={solver}: "
+          f"n_columns={n_columns}: "
           f"train RMSE {train_rmse:.4f}, R² {train_r2:.4f} "
           f"({metrics['fit_seconds']:.1f} s)")
 
@@ -431,7 +421,6 @@ def fit_gap_dipole(cfg: TNEPconfig) -> GapDipoleModel:
         "config": _serialize_config(cfg),
         "gap": {"sparse_per_species": M_req, "kernel_power": list(xis),
                 "ridge_lambda": lam, "lambda_eff": lam_eff,
-                "solver": solver,
                 # zeta only where it is live — config.dipole_zeta is present
                 # in every record but decorative for non-screened radials.
                 **({"zeta": float(cfg.dipole_zeta)}
@@ -506,7 +495,6 @@ if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))  # datasets/, GAP/
 
     cfg = TNEPconfig()
-    cfg.gap_solver = "dual"
     cfg.target_mode = 1
     cfg.scale_targets = False
     cfg.dipole_readout = "neighbor"

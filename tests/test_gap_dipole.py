@@ -15,6 +15,7 @@ import pytest
 from ase.io import read, write
 from ase.neighborlist import neighbor_list
 
+import data
 import gap_dipole
 from TNEPconfig import TNEPconfig
 
@@ -42,6 +43,13 @@ def _cfg(**kw):
     cfg.dipole_cutoff = None                     # resolves to "cubic"
     cfg.dipole_species_pairs = "off"
     cfg.dipole_gauss_sigma_scale = 1.0
+    # Pin every field the GAP fit validates, so working-tree experiment
+    # values in TNEPconfig cannot break this suite (the ANN-side knobs the
+    # user tunes — nep_descriptor, num_neurons, activation, mixing — are not
+    # read by the kernel fit except through _validate).
+    cfg.nep_descriptor = "off"
+    cfg.gap_2b = False
+    cfg.gap_3b = False
     cfg.gap_sparse_per_species = 40
     cfg.gap_kernel_power = 2
     cfg.gap_ridge_lambda = 1e-6
@@ -337,15 +345,20 @@ def test_multiscale_exact_recovery_known_alpha(tmp_path):
 
 
 def test_multiscale_off_default_bitcompat(tmp_path):
-    """gap_extra_rcut=None + single-int ξ bit-matches the pre-feature fit
-    on the small fixture (α hash captured before the feature landed)."""
+    """gap_extra_rcut=None + single-int ξ reproduces a frozen α on the small
+    fixture, so the single-scale path cannot drift.
+
+    The hash was re-captured on 2026-09-30 when the augmented-lstsq ("primal")
+    solver was removed: the dual ridge is the same estimator but differs in the
+    last bits, so the pre-removal baseline no longer applies. It therefore pins
+    stability from here forward, not equality with the pre-multiscale code."""
     import hashlib
     with _chdir(tmp_path):
         m = gap_dipole.fit_gap_dipole(_cfg())
     assert m.builder2 is None and m.sparse_desc2 is None and m.alpha2 is None
     h = hashlib.sha256(np.concatenate(m.alpha).tobytes()).hexdigest()
-    assert h == ("cb73b443bbdfa65f7abf151af7363c1e"
-                 "92e44a3de3aa1d5fe1d4ee2dc0a51917")
+    assert h == ("307cf80b358d1ddece1a767474aaeb48"
+                 "9856a6fd8883e4da8e61d0c71bc3d700")
 
 
 # ── config validation ──────────────────────────────────────────────────────
@@ -405,19 +418,40 @@ def test_run_record(tmp_path):
         assert key in rec["metrics"]
 
 
-def test_dual_solver_matches_primal(tmp_path):
-    """The dual ridge α = Φᵀ(ΦΦᵀ+λI)⁻¹μ is a matrix identity with the primal
-    augmented lstsq — predictions must agree to numerical precision."""
-    frames = read(WATER_XYZ, index="0:4")
+def test_dual_solve_matches_augmented_lstsq(tmp_path):
+    """The dual ridge α = Φᵀ(ΦΦᵀ+λI)⁻¹μ the fit uses is a matrix identity
+    with the augmented [Φ; √λ·I] least-squares solve. The augmented route is
+    no longer in the code (it peaked at ~n_columns² memory), so it lives here
+    as a test-only oracle: it is the better-conditioned of the two, and this
+    is what pins the production solve."""
     with _chdir(tmp_path):
-        models = []
-        for solver in ("primal", "dual"):
-            cfg = _cfg(**CHEB_PAIRS)
-            cfg.gap_solver = solver
-            models.append(gap_dipole.fit_gap_dipole(cfg))
-    p = gap_dipole.predict(models[0], frames)
-    d = gap_dipole.predict(models[1], frames)
-    assert np.allclose(p, d, rtol=1e-8, atol=1e-10 * np.abs(p).max())
+        model = gap_dipole.fit_gap_dipole(_cfg(**CHEB_PAIRS))
+    cfg = model.cfg
+    # Rebuild the same design the fit solved, frame by frame (the column
+    # contract lives in _phi_frame, so this cannot drift from the fit).
+    dataset = read(cfg.data_path, index=":")
+    dataset = [dataset[k] for k in cfg.indices]
+    tis = data.assign_type_indices(dataset, cfg.types)
+    descs = gap_dipole._descriptors(model.builder, dataset)
+    scales = [(descs, model.sparse_desc)]
+    Phi = np.stack([gap_dipole._phi_frame(
+        [(descs[f], model.sparse_desc)], gap_dipole._v_atoms(dataset[f], tis[f], cfg),
+        tis[f], model.xi) for f in range(len(dataset))])
+    Phi_flat = Phi.reshape(-1, Phi.shape[-1])
+    mu = gap_dipole._targets(dataset, cfg)
+    lam_eff = (float(cfg.gap_ridge_lambda)
+               * float(np.mean(np.sum(Phi_flat ** 2, axis=0))))
+    n_cols = Phi_flat.shape[1]
+    A = np.vstack([Phi_flat, np.sqrt(lam_eff) * np.eye(n_cols)])
+    b = np.concatenate([mu.reshape(-1), np.zeros(n_cols)])
+    alpha_aug = np.linalg.lstsq(A, b, rcond=None)[0]
+    alpha_fit = np.concatenate(model.alpha)
+    # Predictions must agree; the coefficients themselves need not (the
+    # design is ill-conditioned, see GapDipoleModel's docstring).
+    pred_aug = (Phi_flat @ alpha_aug).reshape(-1, 3)
+    pred_fit = (Phi_flat @ alpha_fit).reshape(-1, 3)
+    assert np.allclose(pred_aug, pred_fit,
+                       rtol=1e-6, atol=1e-8 * np.abs(pred_fit).max())
 
 
 def test_gap_rejects_non_neighbor_readout():
