@@ -103,8 +103,7 @@ class SNES:
         self._Ch = (int(model._dipole_channels)
                     if model._neighbor_readout else 1)      # channels → c_pair
         # W1's last axis: C ("vector" head) or 1 ("scalar") under "neighbor".
-        self._Hw = (int(model._head_slots)
-                    if model._neighbor_readout else 1)      # head width → W1
+        self._Hw = int(model._head_slots)      # head width → W1
         _T = self.cfg.num_types
         self.n_c = (self._Ch * (_T * _T if model._species_pairs == "ordered"
                                 else _T * (_T + 1) // 2)

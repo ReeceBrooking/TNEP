@@ -612,11 +612,11 @@ def _load_model_npz(path: str) -> TNEP:
 
     cfg.type_map = {int(row[0]): int(row[1]) for row in data["z_to_type_index"]}
 
+    if "W_pre_angular" in data.files:
+        raise ValueError(_W_PRE_REMOVED.format(path=path))
     # Cross-check descriptor_mixing vs saved weights: mismatch (mixing on
     # but no U_pair, or vice versa) fails loud instead of silently
     # mis-predicting with random weights.
-    if "W_pre_angular" in data.files:
-        raise ValueError(_W_PRE_REMOVED.format(path=path))
     has_U_pair = "U_pair" in data.files
     if bool(getattr(cfg, "descriptor_mixing", False)) and not has_U_pair:
         raise ValueError(

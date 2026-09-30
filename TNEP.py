@@ -20,7 +20,7 @@ from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices
 class AnnBlock(NamedTuple):
     """One typed single-hidden-layer ANN in the SNES typed slab: weights
     W0<suffix> [T, dim_in, hidden], b0<suffix> [T, hidden], W1<suffix>
-    [T, hidden, head_width]; scale_slice = its channels of cfg.q_scale."""
+    [T, hidden, head_slots]; scale_slice = its channels of cfg.q_scale."""
     suffix: str
     dim_in: int
     hidden: int
@@ -837,7 +837,7 @@ class TNEP(layers.Layer):
                     W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor,
                     sl_in: slice, sl_m: slice) -> tf.Tensor:
         """One summed expert: activation(q[.., sl_in]·W0[t] + b0[t])·W1[t] →
-        [(C,) ..., A, head_width]. q [(C,) ..., A, dim_nep]; Z / atom_mask
+        [(C,) ..., A, head_slots]. q [(C,) ..., A, dim_nep]; Z / atom_mask
         [..., A]; STORED weights [(C,) T, ...] — the descriptor_scale fold on
         slice sl_m happens here (no mixing reaches the experts,
         so no caller pre-folds). Type-mask sum, no [.., A, d, H] gather.
