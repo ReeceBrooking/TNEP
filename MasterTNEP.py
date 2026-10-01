@@ -557,6 +557,19 @@ def _train_model_inner(cfg: TNEPconfig,
                  + ", ".join(f"{np.abs(mu[g]).mean():.2e}" for g in q_scale_groups(cfg)) + ")"))
         del q0
 
+    # The NEP 3-body Gram path (nep_descriptor.nep_gram_on) reads the angular
+    # invariants off a geometry-only Gram matrix via one GEMM per centre type
+    # instead of rebuilding the [C, N, n+1, 24] s tensor per candidate. The
+    # algebra is a reassociation (fp32-exact to ~2e-7), but cuBLAS answers that
+    # GEMM in TensorFloat-32 by default, which would shift the DESCRIPTOR by
+    # ~2e-4 and make GPU disagree with CPU and with the s path. TF32 buys
+    # nothing here (the forward is bandwidth-bound — measured identical), so
+    # turn it off for these runs rather than accept a silent descriptor change.
+    from nep_descriptor import nep_gram_on
+    if nep_gram_on(cfg):
+        tf.config.experimental.enable_tensor_float_32_execution(False)
+        print("NEP 3-body Gram path active (no per-candidate s tensor); "
+              "TensorFloat-32 matmul disabled to keep the descriptor exact.")
     model = TNEP(cfg)
     if model._neighbor_readout:
         _c_desc = {

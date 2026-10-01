@@ -212,6 +212,44 @@ def find_q_tf(s, four_body, five_body):
     return tf.stack(q, -1)
 
 
+def q3b_from_gram_tf(G, c_a, Zf, num_types, p_idx, q_idx, n_pairs):
+    """The L = 1..4 block from the data-static Gram (see nep_gram_on).
+
+        q[c, a, L, n] = \u03a3_{p\u2264q} c_a[c, t_a, p, n]\u00b7c_a[c, t_a, q, n]\u00b7G[a, L, pq]
+
+    One GEMM per centre type over the packed pair axis — no [C, N, n, 24]
+    intermediate. The weights and the triangular multiplicity are already
+    folded into G by angular_gram_numpy.
+
+    Args:
+        G       : [N, 4\u00b7P] float32 Gram block of nep_raw
+        c_a     : [T, T, n+1, K+1] or per-candidate [C, T, T, n+1, K+1]
+        Zf      : [N] int centre types
+        p_idx, q_idx : [P] packed upper-triangular indices (gram_pairs)
+        n_pairs : P, static
+    Returns [(C,) N, 4, n+1] — l-major, ready to flatten like find_q's output.
+    """
+    per_cand = len(c_a.shape) == 5
+    if not per_cand:
+        c_a = c_a[tf.newaxis]
+    T, na = int(num_types), int(c_a.shape[3])
+    D = int(c_a.shape[2]) * int(c_a.shape[4])
+    # c_a [C, T_c, T, n, K] → [C, T_c, D, n] with D = (t\u2032, k) flattened.
+    cc = tf.reshape(tf.transpose(c_a, [0, 1, 2, 4, 3]), [-1, T, D, na])
+    cp = (tf.gather(cc, p_idx, axis=2) * tf.gather(cc, q_idx, axis=2))  # [C,T_c,P,n]
+    N = tf.shape(G)[0]
+    Gf = tf.reshape(G, [N * 4, n_pairs])
+    sel = tf.one_hot(Zf, T, dtype=G.dtype)                              # [N, T]
+    acc = None
+    for t in range(T):
+        rhs = tf.reshape(tf.transpose(cp[:, t], [1, 0, 2]), [n_pairs, -1])
+        qt = tf.reshape(tf.matmul(Gf, rhs), [N, 4, -1, na])             # [N,4,C,n]
+        qt = qt * sel[:, tf.newaxis, t, tf.newaxis, tf.newaxis]
+        acc = qt if acc is None else acc + qt
+    out = tf.transpose(acc, [2, 0, 1, 3])                               # [C,N,4,n]
+    return out if per_cand else out[0]
+
+
 # ── bookkeeping ────────────────────────────────────────────────────────────
 # nep_descriptor="sum": the two expert ANNs' weights (2-body on the radial
 # block, 3-body on the angular block), in SNES / Adam / save order.
@@ -301,12 +339,85 @@ def gpumd_num_params(cfg, soap_dim=0):
 
 
 def nep_raw_width(cfg):
-    """Width of data["nep_raw"]: the NEP basis, or q2 ‖ q3 under "gap_sum"."""
+    """Width of data["nep_raw"]: the NEP basis, or q2 ‖ q3 under "gap_sum".
+
+    Two NEP layouts, picked by nep_gram_on(cfg):
+        gram off : raw_r [T, K_r+1] ‖ raw_a [T, K_a+1, 24]
+        gram on  : raw_r [T, K_r+1] ‖ G [4, P]     (the 3-body Gram block)
+    They are mutually exclusive — when the Gram carries the angular
+    information the model never needs raw_a, and vice versa."""
     if str(getattr(cfg, "nep_descriptor", "off")) == "gap_sum":
         from gap_descriptor import gap_dim
         return int(gap_dim(cfg))
     T = int(cfg.num_types)
-    return T * (cfg.nep_basis_size_radial + 1) + T * (cfg.nep_basis_size_angular + 1) * NUM_ABC
+    w_r = T * (cfg.nep_basis_size_radial + 1)
+    if nep_gram_on(cfg):
+        return w_r + 4 * nep_gram_n_pairs(cfg)
+    return w_r + T * (cfg.nep_basis_size_angular + 1) * NUM_ABC
+
+
+def nep_gram_dim(cfg):
+    """D = T·(K_a+1), the angular contraction channels (t\u2032, k) that c_a sums."""
+    return int(cfg.num_types) * (int(cfg.nep_basis_size_angular) + 1)
+
+
+def gram_pairs(cfg):
+    """(p, q) upper-triangular index pairs over the D angular channels, and
+    the packing multiplicity (2 off the diagonal: G is symmetric)."""
+    iu = np.triu_indices(nep_gram_dim(cfg))
+    return iu[0], iu[1], np.where(iu[0] == iu[1], 1.0, 2.0)
+
+
+def nep_gram_on(cfg):
+    """True when the 3-body invariants can be read off a DATA-STATIC Gram
+    matrix instead of rebuilding the per-candidate s tensor.
+
+    q[.., L] = \u03a3_m w_m\u00b7s[.., m]\u00b2 is QUADRATIC in s, and s is linear in
+    c_a, so the whole L = 1..4 block factorises as
+
+        q[c, a, n, L] = \u03a3_{p\u2264q} c_a[c, t_a, p, n]\u00b7c_a[c, t_a, q, n]\u00b7G[a, L, pq],
+        G[a, L, pq]   = \u03a3_{m \u2208 block L} w_m\u00b7raw_a[a, p, m]\u00b7raw_a[a, q, m],
+
+    and G depends on geometry alone — it is built once with the descriptors
+    and the per-candidate cost collapses to one GEMM per centre type, with no
+    [C, N, n, 24] intermediate at all (that tensor is ~8\u00d7 the Gram block and
+    was the whole cost of the NEP path).
+
+    Not available when:
+      * nep_four_body / nep_five_body — those columns are cubic / quartic in
+        s, with no quadratic Gram form;
+      * the tnep pair-force readout, which needs s itself for the forces.
+    """
+    mode = str(getattr(cfg, "nep_descriptor", "off"))
+    if mode not in ("concat", "replace", "sum"):
+        return False
+    if bool(cfg.nep_four_body) or bool(cfg.nep_five_body):
+        return False
+    pair_forces = (mode in ("concat", "replace")
+                   and int(cfg.target_mode) == 1
+                   and str(getattr(cfg, "dipole_readout", "neighbor")) == "tnep")
+    return not pair_forces
+
+
+def nep_gram_n_pairs(cfg):
+    """P = D(D+1)/2, the packed pair count of the Gram block."""
+    D = nep_gram_dim(cfg)
+    return D * (D + 1) // 2
+
+
+def angular_gram_numpy(raw_a, cfg, dtype=np.float32):
+    """G[a, L, pq] packed to [N, 4\u00b7P] from raw_a [N, D, 24].
+    The find_q weights (C3B, doubled off m = 0) and the off-diagonal 2 of the
+    triangular packing are folded in, so the model side is a plain dot."""
+    p, q, mult = gram_pairs(cfg)
+    out = []
+    for L in range(1, 5):
+        i0 = L * L - 1
+        w = np.full(2 * L + 1, 2.0); w[0] = 1.0
+        blk = raw_a[:, :, i0:i0 + 2 * L + 1]
+        G = np.einsum("apm,aqm->apq", blk * (w * C3B[i0:i0 + 2 * L + 1]), blk)
+        out.append(G[:, p, q] * mult)
+    return np.concatenate(out, 1).astype(dtype)
 
 
 def nep_slices(cfg):
@@ -332,7 +443,8 @@ def nep_pair_list(atoms, cfg):
 
 
 def nep_raw_numpy(atoms, types_int, cfg, pairs=None, dtype=np.float32):
-    """[N, W_raw] float32 = flatten([raw_r [N,T,K_r+1] ‖ raw_a [N,T,K_a+1,24]])
+    """[N, W_raw] float32 = flatten([raw_r [N,T,K_r+1] ‖ raw_a [N,T,K_a+1,24]]),
+    or raw_r ‖ G when nep_gram_on(cfg) — see nep_raw_width for the two layouts.
     (dtype=np.float64 keeps the float64 accumulation — FD tests)."""
     N, T = len(atoms), int(cfg.num_types)
     Kr, Ka = int(cfg.nep_basis_size_radial), int(cfg.nep_basis_size_angular)
@@ -352,7 +464,15 @@ def nep_raw_numpy(atoms, types_int, cfg, pairs=None, dtype=np.float32):
     P = real_harmonics(u[:, 0], u[:, 1], u[:, 2])
     np.add.at(raw_a, (i[m], tj[m]), fn_all(r[m], rc_a, Ka)[:, :, None] * P[:, None, :])
 
-    return np.concatenate([raw_r.reshape(N, -1), raw_a.reshape(N, -1)], 1).astype(dtype)
+    if nep_gram_on(cfg):
+        # The 3-body Gram replaces the angular basis: same information for
+        # every consumer that exists in this mode, 1/8 of the per-candidate
+        # work (nep_gram_on). Built here, once per dataset.
+        ang = angular_gram_numpy(raw_a.reshape(N, T * (Ka + 1), NUM_ABC), cfg,
+                                 dtype=np.float64)
+    else:
+        ang = raw_a.reshape(N, -1)
+    return np.concatenate([raw_r.reshape(N, -1), ang], 1).astype(dtype)
 
 
 # The five per-pair keys every forward site threads (data dict → predict_batch

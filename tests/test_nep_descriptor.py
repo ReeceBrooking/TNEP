@@ -1111,9 +1111,16 @@ def test_nep_pairs_numpy_resums_to_raw_and_is_image_exact():
     a = p["nep_pair_ang"]; u = p["nep_pair_D"][a].astype(np.float64) / r[a][:, None]
     np.add.at(raw_a, (p["nep_pair_atom"][a], tj[a]),
               nd.fn_all(r[a], rc_a, Ka)[:, :, None] * nd.real_harmonics(*u.T)[:, None, :])
-    ours = np.concatenate([raw_r.reshape(N, -1), raw_a.reshape(N, -1)], 1)
+    # nep_raw stores the 3-body Gram in place of raw_a when nep_gram_on; the
+    # contract under test is "the stream resums to what data stores", so apply
+    # the same transform (this exercises angular_gram_numpy too).
+    ang = (nd.angular_gram_numpy(raw_a.reshape(N, T * (Ka + 1), 24), cfg,
+                                 dtype=np.float64)
+           if nd.nep_gram_on(cfg) else raw_a.reshape(N, -1))
+    ours = np.concatenate([raw_r.reshape(N, -1), ang], 1)
     # atol: the stream stores float32 D (raw sums float64 D) → ~5e-7 on cancelling sums.
-    np.testing.assert_allclose(ours, raw, rtol=1e-6, atol=2e-6)
+    np.testing.assert_allclose(ours, raw, rtol=1e-6,
+                               atol=2e-6 * (50.0 if nd.nep_gram_on(cfg) else 1.0))
 
 
 def test_nep_pair_stream_rides_data_dict_and_every_slicer():
@@ -1633,3 +1640,59 @@ def test_adam_trains_sum_delta():
     # sum_delta_learn=False keeps δ fixed; experts off has no δ at all.
     assert "sum_delta" not in _trainable(_model(_sum_cfg(optimizer="adam")))
     assert "sum_delta" not in _trainable(_model(_cfg(nep_descriptor="off")))
+
+
+# ── The 3-body Gram layout of nep_raw (nep_gram_on) ────────────────────────
+
+def test_nep_gram_layout_matches_the_s_path_exactly():
+    """q from the Gram layout == q from the raw_a / s layout, same geometry.
+
+    This is THE guard on the optimisation: the Gram form is a reassociation of
+    q[.., L] = Σ_m w_m·s[.., m]², so it must agree to fp32 round-off. Run on
+    CPU, where no TensorFloat-32 GEMM can mask a real discrepancy."""
+    atoms = _bulk_frame()
+    t = _types_int(atoms, ["O", "H"])
+    rng = np.random.default_rng(3)
+
+    # four_body=True turns the Gram OFF (its columns are cubic in s), so the
+    # two configs differ only in layout once the 4-body column is dropped.
+    cfg_gram = _cfg(nep_descriptor="replace", nep_four_body=False,
+                    nep_five_body=False, dipole_readout="neighbor")
+    cfg_s = _cfg(nep_descriptor="replace", nep_four_body=True,
+                 nep_five_body=False, dipole_readout="neighbor")
+    assert nd.nep_gram_on(cfg_gram) and not nd.nep_gram_on(cfg_s)
+    T = int(cfg_gram.num_types)
+    # ONE draw of the coefficients, shared by both layouts.
+    c_r = tf.constant(rng.normal(size=(T, T, cfg_gram.nep_n_max_radial + 1,
+                                       cfg_gram.nep_basis_size_radial + 1)).astype(np.float32))
+    c_a = tf.constant(rng.normal(size=(T, T, cfg_gram.nep_n_max_angular + 1,
+                                       cfg_gram.nep_basis_size_angular + 1)).astype(np.float32))
+    Z = tf.constant(np.asarray(t, np.int32))
+
+    def q_of(cfg):
+        return _model(cfg).nep_from_raw(
+            tf.constant(nd.nep_raw_numpy(atoms, t, cfg)), Z, c_r, c_a).numpy()
+
+    n3b = nd.nep_slices(cfg_gram)["L4"].stop             # radial ‖ L1..L4
+    a, b = q_of(cfg_gram)[:, :n3b], q_of(cfg_s)[:, :n3b]
+    np.testing.assert_allclose(a, b, rtol=2e-5, atol=2e-5)
+
+
+def test_nep_gram_width_and_pair_force_fallback():
+    """The Gram block is 4·D(D+1)/2 wide and replaces raw_a; it is refused for
+    the tnep pair-force readout, which is the only consumer of s."""
+    cfg = _cfg(nep_descriptor="replace", nep_four_body=False, nep_five_body=False,
+               dipole_readout="neighbor")
+    T = int(cfg.num_types)
+    D = T * (cfg.nep_basis_size_angular + 1)
+    assert nd.nep_gram_dim(cfg) == D and nd.nep_gram_n_pairs(cfg) == D * (D + 1) // 2
+    assert nd.nep_raw_width(cfg) == T * (cfg.nep_basis_size_radial + 1) \
+        + 4 * (D * (D + 1) // 2)
+    assert nd.nep_raw_numpy(_bulk_frame(), _types_int(_bulk_frame(), ["O", "H"]),
+                            cfg).shape[1] == nd.nep_raw_width(cfg)
+    # tnep pair forces need s → no Gram, raw_a kept.
+    cfg_t = _cfg(nep_descriptor="replace", nep_four_body=False,
+                 nep_five_body=False, dipole_readout="tnep", dipole_rij_power=2)
+    assert not nd.nep_gram_on(cfg_t)
+    assert nd.nep_raw_width(cfg_t) == T * (cfg.nep_basis_size_radial + 1) \
+        + T * (cfg.nep_basis_size_angular + 1) * 24

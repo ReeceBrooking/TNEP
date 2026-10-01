@@ -14,7 +14,8 @@ from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
 from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices,
                             find_q_tf, fn_and_fnp_tf, real_harmonics_tf,
                             real_harmonics_grad_tf, nep_pair_kwargs, NUM_ABC,
-                            EXPERT_WEIGHTS)
+                            EXPERT_WEIGHTS, nep_gram_on, nep_gram_n_pairs,
+                            gram_pairs, q3b_from_gram_tf)
 
 
 class AnnBlock(NamedTuple):
@@ -197,6 +198,7 @@ class TNEP(layers.Layer):
         # Adam tape-watches). "off": None, and dim_q is the SOAP width.
         self.c_r = self.c_a = None
         self._nep_dim = 0
+        self._nep_gram = False
         # "sum" / "gap_sum": ANN_2b + ANN_3b experts added to the SOAP ANN;
         # their inputs are the NEP contraction or the GAP q2 ‖ q3 raw slot.
         self._experts_on = self._nep_mode in ("sum", "gap_sum")
@@ -224,6 +226,15 @@ class TNEP(layers.Layer):
         elif self._nep_mode != "off":
             self._nep_dim = int(nep_dim(cfg))
             self._nep_raw_width = int(nep_raw_width(cfg))
+            # Data-static 3-body Gram block at the tail of nep_raw: it makes
+            # the per-candidate angular contraction one GEMM per centre type
+            # instead of a [C, N, n+1, 24] s tensor (nep_gram_on).
+            self._nep_gram = bool(nep_gram_on(cfg))
+            if self._nep_gram:
+                _p, _q, _ = gram_pairs(cfg)
+                self._gram_p = tf.constant(_p.astype(np.int32))
+                self._gram_q = tf.constant(_q.astype(np.int32))
+                self._gram_n_pairs = int(nep_gram_n_pairs(cfg))
             T = int(cfg.num_types)
             rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
             self.c_r = tf.Variable(rng.uniform(-1.0, 1.0, (
@@ -785,20 +796,35 @@ class TNEP(layers.Layer):
         lead = tf.shape(raw)[:-1]
         N = tf.reduce_prod(lead)
         raw = tf.reshape(raw, [N, self._nep_raw_width])
-        raw_r = tf.reshape(raw[:, :T * Kr], [N, T, Kr])
-        raw_a = tf.reshape(raw[:, T * Kr:], [N, T, Ka, NUM_ABC])
+        W_r = T * Kr
         Zf = tf.reshape(Z, [N])
         axis = 1 if per_cand else 0
-        c_r = tf.gather(c_r, Zf, axis=axis)                              # [(C,) N, T, n, k]
-        c_a = tf.gather(c_a, Zf, axis=axis)
+        raw_r = tf.reshape(raw[:, :W_r], [N, T, Kr])
+        c_r_g = tf.gather(c_r, Zf, axis=axis)                            # [(C,) N, T, n, k]
         if per_cand:
-            q_r = tf.einsum("atk,catnk->can", raw_r, c_r)                # [C, N, n]
-            s = tf.einsum("atkp,catnk->canp", raw_a, c_a)                # [C, N, n, 24]
+            q_r = tf.einsum("atk,catnk->can", raw_r, c_r_g)              # [C, N, n]
         else:
-            q_r = tf.einsum("atk,atnk->an", raw_r, c_r)
-            s = tf.einsum("atkp,atnk->anp", raw_a, c_a)
-        q_a = find_q_tf(s, cfg.nep_four_body, cfg.nep_five_body)        # [(C,) N, n, L]
-        q_a = tf.linalg.matrix_transpose(q_a)                           # [(C,) N, L, n] → l-major
+            q_r = tf.einsum("atk,atnk->an", raw_r, c_r_g)
+        if self._nep_gram:
+            # The angular block of nep_raw IS the 3-body Gram (nep_gram_on):
+            # one GEMM per centre type, no [C, N, n+1, 24] s tensor at all.
+            if return_s:
+                raise ValueError(
+                    "return_s with the NEP Gram layout: s is not recoverable "
+                    "from the Gram (nep_gram_on excludes the tnep pair-force "
+                    "path, which is the only consumer of s).")
+            s = None
+            q_a = q3b_from_gram_tf(raw[:, W_r:], c_a, Zf, T, self._gram_p,
+                                   self._gram_q, self._gram_n_pairs)     # [(C,) N, L, n]
+        else:
+            raw_a = tf.reshape(raw[:, W_r:], [N, T, Ka, NUM_ABC])
+            c_a_g = tf.gather(c_a, Zf, axis=axis)
+            if per_cand:
+                s = tf.einsum("atkp,catnk->canp", raw_a, c_a_g)          # [C, N, n, 24]
+            else:
+                s = tf.einsum("atkp,atnk->anp", raw_a, c_a_g)
+            q_a = find_q_tf(s, cfg.nep_four_body, cfg.nep_five_body)     # [(C,) N, n, L]
+            q_a = tf.linalg.matrix_transpose(q_a)                        # → l-major
         q_a = tf.reshape(q_a, tf.concat([tf.shape(q_a)[:-2], [-1]], 0))
         q = tf.concat([q_r, q_a], -1)
         out_shape = tf.concat([lead, [self._nep_dim]], 0)
@@ -827,7 +853,12 @@ class TNEP(layers.Layer):
                 f"under gap_sum) at every forward site.")
         if self._experts_on:              # experts read nep_raw in _expert_outputs
             return descriptors, None
-        q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a, return_s=True)
+        # s is consumed ONLY by the tnep pair-force contraction; asking for it
+        # elsewhere would force the slow path and build a [C, N, n, 24] tensor.
+        if self._nep_pair_forces_on:
+            q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a, return_s=True)
+        else:
+            q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a), None
         if self._nep_mode == "replace":
             return q_nep, s
         # One side may carry a candidate axis (learned SOAP basis with shared
