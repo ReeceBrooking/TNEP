@@ -1306,13 +1306,14 @@ class SNES:
                         _cache_top = self._W_atom_validate_cache
                     _sub = _cache_top.setdefault(_vd_id, {})
                     W_atom_v = _sub.get(chunk_idx)
-                # replace+tnep: μ is NEP-only, the SOAP kernel is never read.
-                if W_atom_v is None and self.model._nep_mode != "replace":
+                if W_atom_v is None:
                     if self.model._neighbor_readout:
                         # Neighbor readout: V [B,A,3] geometry kernel,
                         # precomputed in data.py — same slot as W_atom.
+                        # Independent of nep_descriptor ("replace" included).
                         W_atom_v = chunk["V_atom"]
-                    else:
+                    elif self.model._nep_mode != "replace":
+                        # replace+tnep: μ is NEP-only, no SOAP kernel read.
                         B_arg = chunk["descriptors"].shape[0]
                         A_arg = chunk["descriptors"].shape[1]
                         W_atom_v = self.model._precompute_dipole_kernel(
@@ -1760,13 +1761,16 @@ class SNES:
                     _W_atom_cached = _cache.get(chunk_idx)
                 if _W_atom_cached is not None:
                     chunk["_W_atom"] = _W_atom_cached
-            if (self.cfg.target_mode == 1 and "_W_atom" not in chunk
-                    and self.model._nep_mode != "replace"):   # NEP-only μ: no SOAP kernel
+            if self.cfg.target_mode == 1 and "_W_atom" not in chunk:
                 if self.model._neighbor_readout:
                     # Neighbor readout: V [B,A,3] geometry kernel from
-                    # data.py rides the batch — same slot as W_atom.
+                    # data.py rides the batch — same slot as W_atom. Staged
+                    # for EVERY nep_descriptor (data.py keys only on the
+                    # readout), so "replace" must not skip it: the readout
+                    # reads V, not the SOAP force kernel.
                     chunk["_W_atom"] = chunk["V_atom"]
-                else:
+                elif self.model._nep_mode != "replace":
+                    # replace+tnep: μ is NEP-only — no SOAP kernel to build.
                     _gv = chunk["grad_values"]
                     _ps = chunk["pair_struct"]
                     _pa = chunk["pair_atom"]
@@ -1781,7 +1785,9 @@ class SNES:
                     chunk["_W_atom"] = self.model._precompute_dipole_kernel(
                         _gv, _ps, _pa, _pg, _pos, _boxes, _B_arg, _A_arg)
                 # Write through to the static cache for reuse (full-batch only).
-                if (getattr(self.cfg, "batch_size", None) is None
+                # "_W_atom" can still be absent: replace+tnep builds no kernel.
+                if ("_W_atom" in chunk
+                        and getattr(self.cfg, "batch_size", None) is None
                         and getattr(self, "_W_atom_static_cache", None)
                             is not None
                         and self._W_atom_static_cache.get("_bd_id")
@@ -1935,13 +1941,14 @@ class SNES:
             # stashes it on batch_data["_W_atom"] per struct chunk so the pop
             # loop reuses it; inline fallback for other callers (score, etc.).
             W_atom = batch_data.get("_W_atom")
-            if (W_atom is None and self.cfg.target_mode == 1
-                    and self.model._nep_mode != "replace"):   # NEP-only μ: no SOAP kernel
+            if W_atom is None and self.cfg.target_mode == 1:
                 if self.model._neighbor_readout:
                     # Neighbor readout: V [B,A,3] geometry kernel from
-                    # data.py — same slot as W_atom.
+                    # data.py — same slot as W_atom. Independent of
+                    # nep_descriptor; "replace" must not skip it.
                     W_atom = batch_data["V_atom"]
-                else:
+                elif self.model._nep_mode != "replace":
+                    # replace+tnep: μ is NEP-only — no SOAP kernel to build.
                     B_static = desc.shape[0]
                     A_static = desc.shape[1]
                     B_arg = (B_static if B_static is not None
