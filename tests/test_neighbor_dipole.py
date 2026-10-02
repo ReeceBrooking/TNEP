@@ -479,16 +479,40 @@ def test_dipole_channels_lt_1_raises_at_init():
         _model(cfg)
 
 
-def test_dipole_rc_exceeding_rcut_raises_at_init():
+def test_dipole_rc_above_rcut_is_allowed_but_the_in_graph_v_refuses():
+    """Any positive dipole_rc is accepted: the STAGED V is built from an
+    image-exact neighbour list and is correct past rcut_hard. Only the in-graph
+    V fallback is limited, because it reads the SOAP pair stream, so that path
+    refuses rather than silently truncating the readout."""
     cfg = _cfg(dipole_rc=5.0)                            # > rcut_hard = 3.5
-    with pytest.raises(ValueError, match="dipole_rc"):
-        _model(cfg)
+    m = _model(cfg)                                      # no longer raises
+    assert cfg.dipole_rc == 5.0
+    atoms = _bulk_frame()
+    data = prepare_eval_data([atoms], cfg)
+    assert data.get("V_atom") is not None
+    _mu(m, atoms, cfg)                                   # staged V: fine
+    with pytest.raises(ValueError, match="in-graph V"):   # no V_atom → fallback
+        m.predict_batch(
+            data["descriptors"], data["grad_values"],
+            data["pair_atom"], data["pair_gidx"], data["pair_struct"],
+            data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
+            m.W0, m.b0, m.W1, m.b1, W_atom=None)
+    with pytest.raises(ValueError, match="must be > 0"):
+        _model(_cfg(dipole_rc=0.0))
 
 
-def test_dipole_rc_inherits_rcut_hard():
-    cfg = _cfg(dipole_rc=None)                           # default: inherit
+@pytest.mark.parametrize("mode,expect", [("off", "rcut_hard"), ("replace", "nep")])
+def test_dipole_rc_inherits_the_descriptor_that_feeds_the_model(mode, expect):
+    """dipole_rc=None follows whichever descriptor the ANN actually reads:
+    nep_rc_radial under "replace", where the SOAP block is dropped and
+    rcut_hard means nothing to the model, else rcut_hard."""
+    kw = dict(dipole_rc=None, nep_descriptor=mode)
+    if mode == "replace":
+        kw.update(nep_rc_radial=6.0, nep_rc_angular=4.0, descriptor_mixing=False)
+    cfg = _cfg(**kw)
     _model(cfg)
-    assert cfg.dipole_rc == cfg.rcut_hard
+    assert cfg.dipole_rc == (float(cfg.rcut_hard) if expect == "rcut_hard"
+                             else float(cfg.nep_rc_radial))
 
 
 def test_charge_aux_weight_raises_at_init():
@@ -498,13 +522,25 @@ def test_charge_aux_weight_raises_at_init():
         _model(cfg)
 
 
-def test_small_box_raises_at_data_assembly():
-    cfg = _cfg()                                         # rc + rcut = 6.5 Å
+@pytest.mark.parametrize("L,needle", [
+    (6.0, "half the smallest box height"),   # rc = 3.5 ≥ L/2 = 3.0: MIC paths
+    (3.0, "own periodic image"),             # rc = 3.5 ≥ L: self-images dropped
+    (100.0, None),                           # roomy: silent
+])
+def test_small_box_warns_at_data_assembly(capsys, L, needle):
+    """A small box is a WARNING now, not an error: the staged V is image-exact
+    (_neighbor_pairs falls back to ASE below 2·rc), so the result is computed
+    correctly — the warning says what it stops meaning."""
+    cfg = _cfg()                                         # dipole_rc → rcut_hard = 3.5
     at = Atoms("OHH",
                positions=[[1.0, 1.0, 1.0], [1.96, 1.0, 1.0], [0.76, 1.59, 1.0]],
-               cell=6.0 * np.eye(3), pbc=True)           # L = 6.0 < 6.5
-    with pytest.raises(ValueError, match="box height"):
-        _neighbor_dipole_guards([at], [np.zeros(3)], cfg)
+               cell=L * np.eye(3), pbc=True)
+    _neighbor_dipole_guards([at], [np.zeros(3)], cfg)    # never raises
+    out = capsys.readouterr().out
+    if needle is None:
+        assert "WARNING: dipole_rc" not in out
+    else:
+        assert needle in out
 
 
 # ── screened power-law radial ───────────────────────────────────────────────

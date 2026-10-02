@@ -130,10 +130,15 @@ class TNEPconfig:
     #              species-pair table c[n, pair], so pair it with
     #              dipole_species_pairs != "off". Head width 1 vs C.
     dipole_head: str = "vector"
-    # Neighbor-readout cutoff r_c (Å). None = inherit rcut_hard (resolved at
-    # model init). Must be ≤ rcut_hard and satisfy dipole_rc + rcut_hard ≤
-    # L_min for every training box (checked at data assembly). Note the
-    # "cosine2" cutoff narrows effective support vs the plain cosine.
+    # Neighbor-readout cutoff r_c (Å). None inherits the cutoff of whatever
+    # descriptor actually feeds the model: nep_rc_radial under
+    # nep_descriptor="replace", else rcut_hard (resolved_dipole_rc, applied at
+    # model init). ANY positive radius is allowed — the staged V is built from
+    # an image-exact neighbour list, so it is correct past rcut_hard and past
+    # L/2. Data assembly WARNS instead of refusing: at r_c ≥ L_min/2 the
+    # minimum-image paths (in-graph V, predict) double-count, and at r_c ≥ L_min
+    # self-image pairs are dropped so the neighbour sum truncates at the box
+    # scale. Note "cosine2" narrows effective support vs the plain cosine.
     dipole_rc: float | None = None
 
     # --- GAP-mode dipole fit (gap_dipole.py) -----------------------------
@@ -811,6 +816,24 @@ class GAPconfig:
             self.indices = indices[:self.total_N]
         else:
             self.indices = indices
+
+def resolved_dipole_rc(cfg: "TNEPconfig | GAPconfig") -> float:
+    """Active neighbour-readout radius — THE dipole_rc=None rule.
+
+    None inherits the cutoff of whatever descriptor actually feeds the model:
+    nep_rc_radial under nep_descriptor="replace", where the SOAP block is
+    dropped entirely and rcut_hard means nothing to the model, and rcut_hard
+    otherwise. Single source: data assembly builds V before the model exists,
+    so TNEP.__init__ and data._neighbor_dipole_V must resolve identically.
+
+    Accepts EITHER config — it reads only dipole_rc, nep_descriptor,
+    nep_rc_radial and rcut_hard, which both carry."""
+    if cfg.dipole_rc is not None:
+        return float(cfg.dipole_rc)
+    if str(getattr(cfg, "nep_descriptor", "off")) == "replace":
+        return float(cfg.nep_rc_radial)
+    return float(cfg.rcut_hard)
+
 
 def resolved_dipole_cutoff(cfg: TNEPconfig | "GAPconfig") -> str:
     """Active neighbor-readout cutoff name — THE dipole_cutoff=None rule

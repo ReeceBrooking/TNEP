@@ -10,7 +10,7 @@ from typing import Callable, NamedTuple
 
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
-from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
+from TNEPconfig import TNEPconfig, resolved_dipole_cutoff, resolved_dipole_rc
 from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices,
                             find_q_tf, fn_and_fnp_tf, real_harmonics_tf,
                             real_harmonics_grad_tf, nep_pair_kwargs, NUM_ABC,
@@ -431,15 +431,16 @@ class TNEP(layers.Layer):
                     f"cfg.dipole_readout must be 'tnep' or 'neighbor', "
                     f"got {_readout!r}.")
             if self._neighbor_readout:
-                if cfg.dipole_rc is None:
-                    cfg.dipole_rc = float(cfg.rcut_hard)  # inherit descriptor cutoff
+                # Any positive radius is allowed. The staged V is built from
+                # an image-exact neighbour list, so it is correct past L/2 and
+                # past rcut_hard; the box-size consequences are WARNED about at
+                # data assembly (_neighbor_dipole_guards), and the one path that
+                # genuinely cannot serve rc > rcut_hard — the in-graph V built
+                # from the SOAP pair stream — refuses in _neighbor_V_coo.
+                cfg.dipole_rc = resolved_dipole_rc(cfg)
                 _rc = float(cfg.dipole_rc)
-                if not 0.0 < _rc <= float(cfg.rcut_hard):
-                    raise ValueError(
-                        f"cfg.dipole_rc={_rc} must satisfy "
-                        f"0 < dipole_rc ≤ rcut_hard={cfg.rcut_hard} so bonded "
-                        f"pairs see each other in their descriptors (box-size "
-                        f"gates are checked at data assembly).")
+                if _rc <= 0.0:
+                    raise ValueError(f"cfg.dipole_rc={_rc} must be > 0.")
                 if self._dipole_radial == "gaussian":
                     # Gaussian window constants, fixed at init: μ_n = the C
                     # interior points of linspace(0, r_c, C+2); σ = σ-scale ×
@@ -2218,6 +2219,14 @@ class TNEP(layers.Layer):
         Returns:
             V : [B, A, 3, C, T]
         """
+        if float(self.cfg.dipole_rc) > float(self.cfg.rcut_hard):
+            raise ValueError(
+                f"in-graph V: dipole_rc={self.cfg.dipole_rc} > "
+                f"rcut_hard={self.cfg.rcut_hard}, but this path builds V from "
+                f"the SOAP descriptor pair stream, which only reaches "
+                f"rcut_hard — it would silently truncate the readout. Pass the "
+                f"staged V (data['V_atom']) instead; training, validation and "
+                f"score already do.")
         dr, rij2 = self._neighbor_displacements_coo(
             positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
         rc = float(self.cfg.dipole_rc)

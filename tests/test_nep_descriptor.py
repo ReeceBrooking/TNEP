@@ -1182,8 +1182,9 @@ def test_nep_pair_stream_rides_data_dict_and_every_slicer():
     np.testing.assert_array_equal(d["nep_pair_ang"].numpy()[P0:], p1["nep_pair_ang"])
 
     def check_frame1(ch):
-        n = int(ch["nep_pair_atom"].shape[0])                      # bucket-padded (power of two)
-        assert n >= P1 and n & (n - 1) == 0
+        n = int(ch["nep_pair_atom"].shape[0])                      # bucket-padded (data._bucket)
+        from data import _bucket, _PAIR_BUCKET_BITS
+        assert n >= P1 and n - P1 <= (P1 >> _PAIR_BUCKET_BITS) + P1 + 2
         np.testing.assert_array_equal(ch["nep_struct_ptr"].numpy(), [0, P1])   # real pairs only
         assert np.all(ch["nep_pair_struct"].numpy() == 0)          # chunk-local
         np.testing.assert_array_equal(ch["nep_pair_atom"].numpy()[:P1], p1["nep_pair_atom"])
@@ -1426,28 +1427,35 @@ def test_nep_tnep_guards():
 
 
 def test_nep_pair_padding_is_exact_and_bucketed():
-    """Chunks bucket-pad the pair stream (P and the angular count P_a to powers of
-    two) so the XLA kernels compile once per bucket: μ is unchanged, and two
-    mini-batches with different true pair counts share one bucket."""
-    from data import slice_and_complete_chunk
+    """Chunks bucket-pad the pair stream (P and the angular count P_a, see
+    data._bucket) so the XLA kernels compile once per bucket: μ is unchanged,
+    the padding sits at the tail with a beyond-cutoff displacement, and the
+    waste is bounded — it must NOT be the next power of two, which cost up to
+    2x on the largest tensors in the forward."""
+    from data import slice_and_complete_chunk, _bucket, _PAIR_BUCKET_BITS
     cfg = _tnep_cfg("concat"); m = _model(cfg); m.W1.assign(m.W1 + 0.5)
     d = prepare_eval_data(_small_frames(3, seed=5), cfg)          # full dict: unpadded
     ptr = d["nep_struct_ptr"].numpy(); P = int(ptr[-1]); P_a = int(d["nep_pair_ang"].numpy().sum())
     ch = slice_and_complete_chunk(d, [0, 1, 2])
     Pp = int(ch["nep_pair_D"].shape[0]); Pap = int(ch["nep_pair_ang"].numpy().sum())
-    assert Pp > P and Pp & (Pp - 1) == 0 and Pap > P_a and Pap & (Pap - 1) == 0
+    assert Pp >= P and Pap >= P_a
+    assert Pap == _bucket(P_a) and Pp == _bucket(P + Pap - P_a)
+    # Bounded waste: within one granule of the true count, never 2x.
+    assert Pp - P <= (P >> _PAIR_BUCKET_BITS) + (Pap - P_a) + 2
+    assert Pap <= P_a + (P_a >> _PAIR_BUCKET_BITS) + 2
     np.testing.assert_array_equal(ch["nep_pair_D"].numpy()[P:], np.tile([[cfg.nep_rc_radial + 1, 0, 0]], (Pp - P, 1)))
     assert np.all(ch["nep_pair_ang"].numpy()[P:P + Pap - P_a]) and not np.any(ch["nep_pair_ang"].numpy()[P + Pap - P_a:])
     mu, mu_pad = _mu_batch(m, d), _mu_batch(m, ch)
     assert np.abs(mu).max() > 1e-4
     np.testing.assert_allclose(mu_pad, mu, atol=1e-6)
-    # Different true pair counts (258 vs 256 here) → same bucket for P and P_a.
-    n0, n1 = ptr[1] - ptr[0], ptr[2] - ptr[1]
-    assert n0 != n1
-    c0, c1 = slice_and_complete_chunk(d, [0]), slice_and_complete_chunk(d, [1])
-    assert int(c0["nep_pair_D"].shape[0]) == int(c1["nep_pair_D"].shape[0])
-    assert int(c0["nep_pair_ang"].numpy().sum()) == int(c1["nep_pair_ang"].numpy().sum())
-    np.testing.assert_allclose(_mu_batch(m, c0)[0], mu[0], atol=1e-6)
+    # Re-slicing one structure re-pads to its own bucket; μ is still exact.
+    c0 = slice_and_complete_chunk(d, [0])
+    n0 = int(ptr[1] - ptr[0])
+    assert int(c0["nep_pair_D"].shape[0]) >= n0
+    assert int(c0["nep_pair_D"].shape[0]) - n0 <= (n0 >> _PAIR_BUCKET_BITS) + n0 + 2
+    # rtol, not atol: a different padding length reorders the float32 pair sum,
+    # which is ~3e-7 relative on a μ of order 1 — not a correctness difference.
+    np.testing.assert_allclose(_mu_batch(m, c0)[0], mu[0], rtol=1e-5, atol=1e-5)
 
 
 

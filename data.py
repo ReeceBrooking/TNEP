@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import tensorflow as tf
 import numpy as np
-from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
+from TNEPconfig import (TNEPconfig, resolved_dipole_cutoff,
+                        resolved_dipole_rc)
 from DescriptorBuilder import make_descriptor_builder
 from ase.io import read
 from ase import Atoms
@@ -364,7 +365,7 @@ def assemble_data_dict(
     if cfg.target_mode == 1 and cfg.dipole_readout == "neighbor":
         from tqdm import tqdm
         data["V_atom"] = [
-            _neighbor_dipole_V(s, t, float(cfg.dipole_rc or cfg.rcut_hard),
+            _neighbor_dipole_V(s, t, resolved_dipole_rc(cfg),
                                int(cfg.dipole_channels), int(cfg.num_types),
                                str(cfg.dipole_radial),
                                float(cfg.dipole_zeta),
@@ -538,26 +539,43 @@ def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
     warns on net-charged frames and on label distributions with ~e·L gaps
     (branch-inconsistent Berry-phase labels).
     """
-    rc, rd = float(cfg.dipole_rc or cfg.rcut_hard), float(cfg.rcut_hard)
+    rc, rd = resolved_dipole_rc(cfg), float(cfg.rcut_hard)
     L_min = np.inf
     for k, s in enumerate(dataset):
         if s.pbc.any():
             # Face-to-face cell heights: 1/‖column k of inv(cell)‖.
             h = 1.0 / np.linalg.norm(np.linalg.inv(s.cell[:]), axis=0)
             L = float(h[s.pbc].min())
-            if rc + rd > L or 2.0 * rc >= L:
-                raise ValueError(
-                    f"dipole_readout='neighbor': structure {k} has minimum "
-                    f"box height {L:.2f} Å but needs dipole_rc + rcut_hard "
-                    f"≤ L and dipole_rc < L/2 (dipole_rc={rc}, "
-                    f"rcut_hard={rd}); smaller boxes double-count bonds "
-                    f"whose second image MIC-maps to the same vector.")
             L_min = min(L_min, L)
         q = s.arrays.get("charges", s.arrays.get("initial_charges"))
         if q is not None and abs(float(np.sum(q))) > 1e-6 * len(s):
             print(f"  WARNING: structure {k} has net charge "
                   f"{float(np.sum(q)):+.3g}; the origin-free neighbor "
                   f"readout cannot fit its label convention.")
+    # Box-size consequences of dipole_rc. These are WARNINGS, not errors: the
+    # staged V comes from an image-exact neighbour list (_neighbor_pairs falls
+    # back to ASE whenever L < 2·rc), so a large radius is computed correctly —
+    # it just stops being the thing you may have intended.
+    if np.isfinite(L_min):
+        if rc >= L_min:
+            print(f"  WARNING: dipole_rc={rc} Å ≥ the smallest box height "
+                  f"{L_min:.2f} Å. An atom's own periodic image is inside the "
+                  f"readout radius, and the readout DROPS self-image pairs "
+                  f"(i == j), so those contributions are missing rather than "
+                  f"wrong — the neighbour sum is truncated at the box scale.")
+        elif 2.0 * rc >= L_min:
+            print(f"  WARNING: dipole_rc={rc} Å ≥ half the smallest box height "
+                  f"{L_min:.2f} Å. The staged V is image-exact and fine, but "
+                  f"the minimum-image paths — the in-graph V fallback and "
+                  f"TNEP.predict — double-count bonds whose second image maps "
+                  f"onto the same vector. Use the staged V (training and "
+                  f"score do); treat predict()/spectroscopy output with care.")
+        if rc > rd:
+            print(f"  WARNING: dipole_rc={rc} Å > rcut_hard={rd} Å, so a "
+                  f"readout neighbour can lie outside its partner's SOAP "
+                  f"descriptor. Intended under nep_descriptor='replace', "
+                  f"where the SOAP block is dropped; the in-graph V fallback "
+                  f"cannot serve this radius and will refuse.")
     # Branch consistency: per-component gaps ≳ the polarization quantum e·L
     # suggest branch-inconsistent Berry-phase labels (warning, not rejection).
     if np.isfinite(L_min) and len(targets) > 3:
@@ -1068,9 +1086,24 @@ _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
 _NEP_PAIR_KEYS = ("nep_pair_atom", "nep_pair_gidx", "nep_pair_D", "nep_pair_ang")
 
 
-def _pow2(n: int) -> int:
-    """Smallest power of two ≥ n (n ≥ 0; _pow2(0) = 1)."""
-    return 1 << max(n - 1, 0).bit_length()
+# Significant binary digits kept when bucketing the pair-stream length. The
+# bucket exists ONLY to keep the number of distinct shapes the XLA pair kernels
+# compile for small; it must not cost memory. Powers of two (the old rule) cost
+# up to 2x: a 500-frame water chunk has 4,209,650 radial pairs, just over 2^22,
+# so it padded to 2^23 and every per-pair tensor doubled. Keeping 6 significant
+# digits bounds the waste at 2^-6 of the octave (≤3%) while still collapsing
+# nearby counts onto at most 64 shapes per octave — and a full-batch run, where
+# the pair count never changes, compiles exactly once either way.
+_PAIR_BUCKET_BITS = 6
+
+
+def _bucket(n: int, bits: int = _PAIR_BUCKET_BITS) -> int:
+    """Smallest multiple of 2^(bitlen(n) − bits) that is ≥ n (n ≥ 0).
+    Exact for n ≤ 2^bits, where rounding would cost more than it saves."""
+    if n <= (1 << bits):
+        return max(n, 1)
+    g = 1 << (n.bit_length() - bits)
+    return ((n + g - 1) // g) * g
 
 
 def gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
@@ -1078,10 +1111,12 @@ def gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
     nep_pair_struct remapped chunk-local (mirrors the grad_values gather). No-op
     when the stream is absent. Eager only (int(...) on shapes sizes the padding).
 
-    The chunk stream is bucket-padded to a power of two — both the pair count P
-    and the angular count P_a — so the XLA pair kernels (TNEP._nep_radial_xla /
+    The chunk stream is bucket-padded — both the pair count P and the angular
+    count P_a, see _bucket — so the XLA pair kernels (TNEP._nep_radial_xla /
     _nep_angular_xla, compiled per shape) compile once per bucket instead of once
-    per mini-batch. Padding pairs are (atom 0, gidx 0, struct 0, D = nep_pad_D =
+    per mini-batch. The bucket keeps 6 significant digits, NOT a power of two:
+    the pair tensors are the largest in the whole forward, so rounding them up
+    to the next power of two was costing up to 2x in memory. Padding pairs are (atom 0, gidx 0, struct 0, D = nep_pad_D =
     (rc + 1, 0, 0)): fc = fn = fnp = 0 beyond the cutoff, so their radial and
     angular forces are exactly 0 and the |D|^N μ weight multiplies zero; the first
     pow2(P_a) − P_a of them carry nep_pair_ang=True to pad the angular subset.
@@ -1098,8 +1133,8 @@ def gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
     real["nep_pair_struct"] = tf.cast(rng.value_rowids(), tf.int32)
     P = int(flat.shape[0])
     P_a = int(tf.reduce_sum(tf.cast(real["nep_pair_ang"], tf.int32)))
-    n_ang = _pow2(P_a) - P_a
-    n_pad = _pow2(P + n_ang) - P
+    n_ang = _bucket(P_a) - P_a
+    n_pad = _bucket(P + n_ang) - P
     zeros = tf.zeros([n_pad], tf.int32)
     pad = dict(nep_pair_atom=zeros, nep_pair_gidx=zeros, nep_pair_struct=zeros,
                nep_pair_D=tf.tile(data["nep_pad_D"][tf.newaxis], [n_pad, 1]),
