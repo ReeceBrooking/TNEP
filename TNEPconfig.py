@@ -406,6 +406,14 @@ class TNEPconfig:
     # ranks and those utilities cancel, so σ barely adapts and stays near
     # init_sigma. Set False to reproduce GPUMD's sampler.
     mirrored_sampling: bool = True
+    # GPUMD's data procedure (fitness.cu report_error + snes.cu's loop):
+    # every frame of data_path trains, there is NO validation split, and the
+    # monitor loop runs on the EXTERNAL TEST SET purely to be reported. It
+    # never selects: GPUMD writes its potential from the current generation
+    # and tracks no best-ever model, so best_val_model == final_model here and
+    # cfg.patience is inert. That is what keeps monitoring the test set honest
+    # — selecting on it would leak. Requires cfg.test_data_path.
+    gpumd_path: bool = False
     # Lower bound on sigma after each SNES update, preventing σ→0 collapse of
     # the search distribution on long runs. None or 0 = disable; 1e-6 is
     # non-distorting (typical adapted σ is 1e-3 to 1e-1).

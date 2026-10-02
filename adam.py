@@ -203,7 +203,13 @@ def fit_adam(model, train_data: dict, val_data: dict,
                       f"val RMSE {val_rmse}); stopping — lower adam_lr. "
                       f"Returning the best-val weights so far.")
                 break
-            if val_rmse < best_val:
+            if getattr(snes, "_gpumd_path", False):
+                # GPUMD path: the monitor set IS the test set — report it, and
+                # never select on it (cfg.gpumd_path). The snapshot tracks the
+                # CURRENT step, so best == final and patience is inert.
+                best_val = val_rmse
+                best_snapshot = [v.numpy() for v in variables]
+            elif val_rmse < best_val:
                 best_val = val_rmse
                 best_snapshot = [v.numpy() for v in variables]
                 gens_without_improvement = 0
@@ -224,9 +230,11 @@ def fit_adam(model, train_data: dict, val_data: dict,
             history["timing"]["rank_update"].append(0.0)
             history["timing"]["validate"].append(t2 - t1)
             history["timing"]["overhead"].append(0.0)
+            _mon = "test" if getattr(snes, "_gpumd_path", False) else "val"
             print(f"gen {gen + 1}/{cfg.num_generations}  train RMSE: {train_rmse:.6f}"
-                  f"  val RMSE: {val_rmse:.6f}  best val RMSE: {best_val:.6f}"
-                  f"  L1: {gen_l1:.2e}  L2: {gen_l2:.2e}", flush=True)
+                  f"  {_mon} RMSE: {val_rmse:.6f}"
+                  + ("" if _mon == "test" else f"  best val RMSE: {best_val:.6f}")
+                  + f"  L1: {gen_l1:.2e}  L2: {gen_l2:.2e}", flush=True)
             # Fires on the val tick at/after each plot_interval boundary
             # (val_interval need not divide plot_interval).
             if (plot_callback is not None and cfg.plot_interval

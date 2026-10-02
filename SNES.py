@@ -318,6 +318,9 @@ class SNES:
         # sqrt(dim·1e-6/num_types) (GPUMD); -1 → dynamic (_maybe_adapt_lambda).
         # tf.Variable so per-gen updates don't retrace compute_regularization_tf.
         auto_lambda = float(np.sqrt(self.dim * 1e-6 / self.cfg.num_types))
+        # GPUMD path: the monitor set is the TEST set, so fit() must never
+        # select on it (see cfg.gpumd_path).
+        self._gpumd_path = bool(getattr(self.cfg, "gpumd_path", False))
         self._dyn_lambda_1 = (self.cfg.lambda_1 == -1)
         self._dyn_lambda_2 = (self.cfg.lambda_2 == -1)
         init_lambda_1 = (auto_lambda if (self.cfg.lambda_1 is None or self._dyn_lambda_1)
@@ -1074,11 +1077,13 @@ class SNES:
             eta = elapsed / frac * (1 - frac) if frac > 0 else 0
             elapsed_str = _format_duration(elapsed)
             eta_str = _format_duration(eta)
+            _mon = "test" if self._gpumd_path else "val"
             line = (f"\r{bar} {gen + 1}/{cfg.num_generations} "
                     f"train RMSE: {train_rmse:.6f}  "
-                    f"val RMSE: {val_fitness:.6f}  "
-                    f"best val RMSE: {best_val_loss:.6f}  "
-                    f"elapsed: {elapsed_str}  ETA: {eta_str}")
+                    f"{_mon} RMSE: {val_fitness:.6f}  "
+                    + ("" if self._gpumd_path
+                       else f"best val RMSE: {best_val_loss:.6f}  ")
+                    + f"elapsed: {elapsed_str}  ETA: {eta_str}")
             if cfg.debug:
                 line += f"  L1: {gen_l1:.6f}  L2: {gen_l2:.6f}"
                 line += f"  train obj(mse): {avg_fitness:.6f}"
@@ -1087,7 +1092,11 @@ class SNES:
             sys.stdout.flush()
 
             # Early stopping (val gens only; global best drives best_mu).
-            if _do_val:
+            # GPUMD path: report the monitor value but never select on it, so
+            # gens_without_improvement never moves and patience is inert.
+            if _do_val and self._gpumd_path:
+                best_val_loss = val_fitness
+            elif _do_val:
                 if val_fitness < best_val_loss:
                     best_val_loss = val_fitness
                     best_mu = tf.identity(self.mu)
@@ -1193,6 +1202,13 @@ class SNES:
         final_model = TNEP(self.cfg)
         final_params = self.reconstruct_params_tf(self.mu)
         _set_model_params(final_model, *final_params)
+
+        if self._gpumd_path:
+            # GPUMD tracks no best-ever model: the potential it writes is the
+            # CURRENT generation's. Pin "best" to the final μ so the two
+            # returned models agree and nothing is selected on the test set.
+            best_mu = tf.identity(self.mu)
+            best_sigma = tf.identity(self.sigma)
 
         # Build best-val model
         best_val_model = TNEP(self.cfg)

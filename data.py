@@ -616,9 +616,16 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
 
     builder = make_descriptor_builder(cfg)
 
+    gpumd_path = bool(getattr(cfg, "gpumd_path", False))
+    if gpumd_path and cfg.test_data_path is None:
+        raise ValueError(
+            "cfg.gpumd_path needs cfg.test_data_path: it trains on every frame "
+            "of data_path and uses the external test set as the report-only "
+            "monitor, which is GPUMD's procedure.")
     if cfg.test_data_path is not None:
-        # External test set: split data_path into train + val only.
-        n_val = int(cfg.test_ratio * n_structures)
+        # External test set: split data_path into train + val only. Under the
+        # GPUMD path there is no val split at all — every frame trains.
+        n_val = 0 if gpumd_path else int(cfg.test_ratio * n_structures)
         val_idx = indices[:n_val]
         train_idx = indices[n_val:]
 
@@ -643,6 +650,10 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         test_dataset = test_structures
         test_types_int = assign_type_indices(test_dataset, cfg.types)
         print(f"External test set: {len(test_dataset)} structures from {cfg.test_data_path}")
+        if gpumd_path:
+            # The monitor set IS the test set (report only — SNES.fit never
+            # selects on it under this flag).
+            val_dataset, val_types_int = test_dataset, test_types_int
     else:
         # Default: three-way split from data_path
         n_test = int(cfg.test_ratio * n_structures)
@@ -695,7 +706,11 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
     n_train = len(train_data["positions"])
     n_test  = len(test_dataset)
     n_val   = len(val_data["positions"])
-    if cfg.test_data_path is not None:
+    if gpumd_path:
+        print(f"GPUMD path: all {n_train} structures train (no val split); "
+              f"the {n_val}-structure monitor set IS the test set, reported "
+              f"every val_interval generations and never selected on.")
+    elif cfg.test_data_path is not None:
         print(f"{n_structures} structures split into train ({n_train}) + val ({n_val})")
         print(f"External test set: {n_test} structures from {cfg.test_data_path} (descriptors deferred to scoring)")
     else:

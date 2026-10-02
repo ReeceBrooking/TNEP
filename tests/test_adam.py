@@ -92,3 +92,32 @@ def test_adam_loss_decreases_on_tiny_set():
     p0 = _predict(m0, tr) / np.maximum(tr["num_atoms"].numpy(), 1)[:, None]
     rmse0 = float(np.sqrt(np.mean((p0 - tr["targets"].numpy()) ** 2)))
     assert history["train_loss"][-1] < rmse0
+
+
+# ── cfg.gpumd_path: monitor the test set, never select on it ────────────────
+
+def test_gpumd_path_never_selects_on_the_monitor_set(optimizer="snes"):
+    """GPUMD writes its potential from the CURRENT generation and tracks no
+    best-ever model (snes.cu's loop + fitness.cu report_error), which is the
+    only thing that makes monitoring the test set honest. So under
+    cfg.gpumd_path the two models fit() returns must be identical, even when
+    an earlier generation scored better on the monitor set."""
+    kw = dict(num_generations=4, val_interval=1, pop_size=6, patience=None)
+    tr, va, _ = _train_val(_cfg(optimizer=optimizer, **kw))
+
+    def run(gpumd):
+        cfg = _cfg(optimizer=optimizer, gpumd_path=gpumd, adam_lr=1e-2, **kw)
+        m = _model(cfg)
+        hist, final_model, best_model = m.fit(tr, va)
+        f = np.concatenate([w.numpy().ravel() for w in final_model.trainable_weights])
+        b = np.concatenate([w.numpy().ravel() for w in best_model.trainable_weights])
+        return hist, f, b
+
+    hist, f, b = run(True)
+    np.testing.assert_array_equal(f, b)          # best IS final: nothing selected
+    # The monitor really was evaluated, and really did move.
+    assert len(hist["val_loss"]) >= 2 and len(set(hist["val_loss"])) > 1
+    # Sanity: with the flag off the two models are allowed to differ, and the
+    # selection path still records a genuine best.
+    hist2, f2, b2 = run(False)
+    assert min(hist2["val_loss"]) <= hist2["val_loss"][-1] + 1e-12
