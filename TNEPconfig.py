@@ -397,6 +397,15 @@ class TNEPconfig:
     eta_sigma: float | None = None
     # Initial distribution standard deviation
     init_sigma: float = 0.1
+    # Antithetic (mirrored) sampling of the SNES population: candidates come
+    # in ± pairs. GPUMD does NOT do this — snes.cu gpu_create_population draws
+    # one independent normal per candidate. The pair halves the variance of
+    # the MEAN gradient, but both members carry the SAME s², so the σ natural
+    # gradient Σ u_p (s_p² − 1) collapses to Σ_pairs (s² − 1)(u₊ + u₋); where
+    # the loss is locally linear a good step and its mirror take opposite
+    # ranks and those utilities cancel, so σ barely adapts and stays near
+    # init_sigma. Set False to reproduce GPUMD's sampler.
+    mirrored_sampling: bool = True
     # Lower bound on sigma after each SNES update, preventing σ→0 collapse of
     # the search distribution on long runs. None or 0 = disable; 1e-6 is
     # non-distorting (typical adapted σ is 1e-3 to 1e-1).

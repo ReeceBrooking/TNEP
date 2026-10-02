@@ -454,6 +454,14 @@ Q_SCALE_ALPHA = 0.5    # equalisation exponent (0 = no scaling, 1 = full)
 Q_SCALE_CLAMP = 10.0   # max boost / damping of any channel
 
 
+def soap_scale_width(cfg) -> int:
+    """Number of leading SOAP channels in the assembled scaler vector, i.e.
+    the offset at which the appended NEP / GAP expert blocks start (0 under
+    nep_descriptor="replace", where the ANN input is the NEP block alone)."""
+    lay = descriptor_block_layout(cfg)
+    return int(sum(len(v) for v in lay["l_index"].values()))
+
+
 def q_scale_groups(cfg) -> list:
     """Channel groups for descriptor_scale="block": each SOAP l group (union
     over species pairs; none under nep_descriptor="replace") then each
@@ -489,6 +497,23 @@ def compute_q_scale(q: np.ndarray, atom_mask: np.ndarray, cfg) -> tuple:
     if str(cfg.descriptor_scale) == "minmax":
         rng = x.max(0) - x.min(0)
         m = 1.0 / np.where(rng > 0, rng, 1.0)
+        # GPUMD's q_scaler is defined on the NEP descriptor and nothing else
+        # (nep.cu / tnep.cu multiply q[d] by it for d < annmb.dim). The SOAP
+        # block arrives already normalised by the power-spectrum convention,
+        # and min-max-ing it on top is NOT part of the reference model, so
+        # pin those channels at 1. Under "replace" there is no SOAP block and
+        # this is a no-op; under "concat" / "sum" it confines the scaler to
+        # the appended NEP (or GAP expert) channels.
+        sw = soap_scale_width(cfg)
+        if sw >= Q:
+            raise ValueError(
+                "descriptor_scale='minmax' is GPUMD's q_scaler, which is "
+                "defined on the NEP descriptor only, but this config has no "
+                "NEP block (nep_descriptor="
+                f"{str(getattr(cfg, 'nep_descriptor', 'off'))!r}) — the "
+                "scaler would be a silent no-op. Use 'block' / 'channel' for "
+                "the SOAP input, or set nep_descriptor.")
+        m[:sw] = 1.0
         return m.astype(np.float32), np.zeros(Q, np.float32)
     mu = x.mean(axis=0)
     s = x.std(axis=0)

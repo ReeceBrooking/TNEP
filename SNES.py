@@ -759,7 +759,9 @@ class SNES:
         return tf.concat([s_half, -s_half, s_extra], axis=0)
 
     def ask(self) -> tuple[tf.Tensor, dict[str, tf.Tensor]]:
-        """Sample pop_size candidates via mirrored sampling (_mirrored_normal).
+        """Sample pop_size candidates; mirrored (antithetic) noise when
+        cfg.mirrored_sampling, else one i.i.d. normal per candidate as GPUMD
+        does (snes.cu gpu_create_population).
 
         Separable-NES: delta = sigma·s_iso per coord, samples = μ + delta.
 
@@ -768,7 +770,9 @@ class SNES:
             aux     : {"s_iso" [pop_size, dim] isotropic noise,
                        "delta" [pop_size, dim] displacement = sigma·s_iso}
         """
-        s_iso = self._mirrored_normal((self.pop_size, self.dim))
+        s_iso = (self._mirrored_normal((self.pop_size, self.dim))
+                 if bool(getattr(self.cfg, "mirrored_sampling", True))
+                 else self.tf_rng.normal(shape=(self.pop_size, self.dim)))
         delta = s_iso * self.sigma
         samples = self.mu + delta
         return samples, {"s_iso": s_iso, "delta": delta}

@@ -30,6 +30,8 @@ def main(argv=None) -> None:
     p.add_argument("--scale", choices=["off", "block", "channel", "minmax"], default="off")
     p.add_argument("--norm", choices=["l2", "none"], default="l2")
     p.add_argument("--optimizer", choices=["snes", "adam"], default="snes")
+    p.add_argument("--no-mirror", action="store_true",
+                   help="cfg.mirrored_sampling=False (GPUMD's i.i.d. sampler)")
     p.add_argument("--sum-delta-learn", action="store_true",
                    help='sum / gap_sum: train the 3 per-expert amplitudes')
     p.add_argument("--generations", type=int, default=6)
@@ -59,6 +61,7 @@ def main(argv=None) -> None:
     cfg.dipole_head = a.head
     cfg.nep_descriptor = a.nep
     cfg.sum_delta_learn = a.sum_delta_learn
+    cfg.mirrored_sampling = not a.no_mirror
     cfg.descriptor_scale = a.scale
     cfg.radial_basis_norm = a.norm
     cfg.optimizer = a.optimizer

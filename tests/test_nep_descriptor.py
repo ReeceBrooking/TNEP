@@ -111,7 +111,8 @@ def test_q_scale_minmax_is_gpumd_scaler():
     from DescriptorBuilderGPU import compute_q_scale
     q = np.random.default_rng(0).uniform(-3, 5, (50, 7)); mask = np.ones(50)
     q[:, 6] = 2.0                                                       # dead channel
-    cfg = _cfg(descriptor_scale="minmax")
+    # "replace": the ANN input IS the NEP block, so every channel is scaled.
+    cfg = _cfg(descriptor_scale="minmax", nep_descriptor="replace")
     m, mu = compute_q_scale(q, mask, cfg)
     np.testing.assert_allclose(m[:6], 1.0 / (q[:, :6].max(0) - q[:, :6].min(0)), rtol=1e-6)   # nep.cu:347
     assert m[6] == 1.0
@@ -119,13 +120,52 @@ def test_q_scale_minmax_is_gpumd_scaler():
     assert m.dtype == np.float32 and mu.dtype == np.float32
 
 
+def test_minmax_is_confined_to_the_nep_block():
+    """GPUMD's q_scaler acts on the NEP descriptor only (nep.cu:367), so the
+    leading SOAP channels stay at 1 under "concat" / "sum", and a config with
+    no NEP block at all is refused rather than silently scaling nothing."""
+    from DescriptorBuilderGPU import (compute_q_scale, soap_scale_width,
+                                      q_scale_groups)
+    for mode in ("concat", "sum"):
+        cfg = _cfg(descriptor_scale="minmax", nep_descriptor=mode)
+        W = sum(int(g.size) for g in q_scale_groups(cfg))
+        sw = soap_scale_width(cfg)
+        assert 0 < sw < W                       # both blocks present
+        rng = np.random.default_rng(1)
+        q = rng.normal(size=(200, W)) * np.linspace(1.0, 50.0, W)
+        m, mu = compute_q_scale(q, np.ones(200), cfg)
+        assert np.all(m[:sw] == 1.0)            # SOAP untouched
+        assert np.all(m[sw:] != 1.0)            # NEP scaled
+        np.testing.assert_allclose(
+            m[sw:], 1.0 / (q[:, sw:].max(0) - q[:, sw:].min(0)), rtol=1e-6)
+        assert np.all(mu == 0.0)
+    with pytest.raises(ValueError, match="no.*NEP block"):
+        compute_q_scale(np.random.default_rng(0).normal(size=(20, 75)),
+                        np.ones(20), _cfg(descriptor_scale="minmax"))
+
+
+def test_mirrored_sampling_switch():
+    """cfg.mirrored_sampling=False reproduces GPUMD's sampler: one i.i.d.
+    normal per candidate (snes.cu gpu_create_population), no ± pairs."""
+    for mirrored, expect_pairs in ((True, True), (False, False)):
+        cfg = _cfg(nep_descriptor="replace", mirrored_sampling=mirrored,
+                   pop_size=8)
+        opt = _model(cfg).optimizer
+        s = opt.ask()[1]["s_iso"].numpy()
+        half = s.shape[0] // 2
+        paired = np.allclose(s[:half], -s[half:2 * half], atol=0)
+        assert paired is expect_pairs, (mirrored, paired)
+        assert s.shape == (8, opt.dim)
+
+
 def test_minmax_threads_into_model_fold():
-    from DescriptorBuilderGPU import compute_q_scale
-    cfg = _cfg(descriptor_scale="minmax")
-    atoms = _bulk_frame()
-    q_np = _descriptors(cfg, atoms)
-    mask_np = np.ones(q_np.shape[0])
-    m, mu = compute_q_scale(q_np, mask_np, cfg)
+    from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
+    # "replace": the whole ANN input is the NEP block, which is what the
+    # GPUMD scaler is defined on.
+    cfg = _cfg(descriptor_scale="minmax", nep_descriptor="replace")
+    W = sum(int(g.size) for g in q_scale_groups(cfg))
+    q_np = np.random.default_rng(2).normal(size=(200, W)) * np.linspace(1.0, 20.0, W)
+    m, mu = compute_q_scale(q_np, np.ones(200), cfg)
     cfg.q_scale = [float(v) for v in m]
     cfg.q_shift = [float(v) for v in mu]
     model = _model(cfg)
