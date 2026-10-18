@@ -623,10 +623,43 @@ def test_pol_cross_group_identity_and_column_count(tmp_path):
 
 
 @pytest.mark.parametrize("kw,msg", [
-    (dict(target_mode=1, gap_cross_channels=2), "gap_cross_channels"),
+    (dict(target_mode=1, gap_cross_channels=-1), "gap_cross_channels"),
     (dict(target_mode=2, gap_group_delta=[1.0, 1.0]), "gap_group_delta"),
     (dict(target_mode=2, gap_lambda_shear=0.0), "gap_lambda_shear"),
 ])
 def test_pol_group_validation_raises(kw, msg):
     with pytest.raises(ValueError, match=msg):
         gap_dipole._validate(_cfg(**kw))
+
+
+def test_dipole_cross_group_identity_and_fit(tmp_path):
+    """_cross_group_dipole == hand-rolled (Σ_j R_a d dᵀ)·(Σ_k R_b d_k) over the
+    species-resolved channel grid; the dipole design gains K₁² columns and the
+    fit/predict round trip runs."""
+    at = read(WATER_XYZ, index="7")
+    cfg = _cfg(**CHEB_PAIRS, gap_cross_channels=2)
+    cfg.types, cfg.num_types = [8, 1], 2
+    ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
+    W = gap_dipole._cross_group_dipole(at, ti, cfg)                 # [N, 3, K₁²]
+    rc, Cx, T = float(cfg.dipole_rc), 2, 2
+    i, j, Dv = neighbor_list("ijD", at, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    x = 2.0 * r / rc - 1.0
+    fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    R = np.stack([np.ones_like(x), x], 1) * fc[:, None]              # [P, C_x]
+    v = np.zeros((len(at), 3, Cx, T)); Tn = np.zeros((len(at), 3, 3, Cx, T))
+    np.add.at(v, (i, slice(None), slice(None), ti[j]), d[:, :, None] * R[:, None, :])
+    np.add.at(Tn, (i, slice(None), slice(None), slice(None), ti[j]),
+              np.einsum("pi,pj,pa->pija", d, d, R))
+    v = v.reshape(len(at), 3, Cx * T); Tn = Tn.reshape(len(at), 3, 3, Cx * T)
+    ref = np.einsum("nija,njb->niab", Tn, v).reshape(len(at), 3, -1)
+    assert W.shape == ref.shape == (len(at), 3, (Cx * T) ** 2)
+    assert np.allclose(W, ref, atol=2e-5 * np.abs(ref).max())        # float32 staging
+    assert gap_dipole._n_vcols(cfg) == 3 * T + (Cx * T) ** 2
+    assert gap_dipole._v_atoms(at, ti, cfg).shape[2] == gap_dipole._n_vcols(cfg)
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(_cfg(**CHEB_PAIRS, gap_cross_channels=2,
+                                           gap_sparse_per_species=6))
+    assert gap_dipole.predict(m, [at]).shape == (1, 3)

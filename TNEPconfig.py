@@ -275,7 +275,7 @@ class TNEPconfig:
     #   "block"   : group factor only (SOAP l groups + each extra block, ≤ 9)
     #   "channel" : group factor × per-channel residual
     #   "minmax"  : GPUMD q_scaler — 1/(max−min) per channel, no centring
-    descriptor_scale: str = "block"
+    descriptor_scale: str = "off"
     # Runtime: the scale [num_types, dim_q] — one row per centre species,
     # each from that species' atoms — computed by the driver from the
     # training set and saved in the model's config (None = not yet computed).
@@ -353,7 +353,7 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # Hidden-layer width of the per-type ANN.
-    num_neurons: int = 15
+    num_neurons: int = 10
     # Hidden-layer activation (any tf.keras.activations name for the forward
     # pass). Dipole/polarisability training (target_mode 1/2) has a hand-coded
     # backward — only "tanh" and "swish" (alias "silu") supported there;
@@ -364,7 +364,7 @@ class TNEPconfig:
     # between the fixed SOAP-turbo descriptor and the ANN (U_pair shared
     # across central types, identity-init). Analog of NEP's trainable
     # radial-basis coefficients c_nk.
-    descriptor_mixing: bool = False
+    descriptor_mixing: bool = True
     # When True (with descriptor_mixing), U_pair becomes per-central-type
     # ([T, num_pairs, max_bs, max_bs]) — more expressive, T× the param count.
     descriptor_mixing_per_type: bool = False
@@ -714,12 +714,14 @@ class GAPconfig:
     # Off-diagonal observation weight (GPUMD's lambda_shear): the xy, yz, zx
     # rows are fitted with σ_obs / gap_lambda_shear.
     gap_lambda_shear: float = 1.0
-    # Third polarisability kernel group, GAP only. C_x radial channels of the
-    # dipole kernel v_i^a = Σ_j R_a(r_ij)·d_ij (species-resolved when
-    # dipole_species_pairs != "off"), combined as the traceless symmetric
-    # products sym(v^a ⊗ v^b), a ≤ b — the two-neighbour d_ij⊗d_ik tensors
-    # (bond-angle anisotropy) that GPUMD's angular forces supply and the
-    # bond-axis groups cannot. 0 = off.
+    # Cross (two-neighbour) kernel group, GAP only, C_x radial channels of
+    # the dipole kernel v_i^a = Σ_j R_a(r_ij)·d_ij (species-resolved when
+    # dipole_species_pairs != "off"); its amplitude is gap_group_delta[2].
+    #   target_mode=2: traceless sym(v^a ⊗ v^b), a ≤ b — the d_ij⊗d_ik
+    #                  bond-angle anisotropy GPUMD's angular forces supply.
+    #   target_mode=1: (Σ_j R_a d_ij d_ijᵀ)·v^b — the (d_ij·d_ik) d_ij
+    #                  bond-angle charge flux the one-hop difference form
+    #                  cannot carry. 0 = off.
     gap_cross_channels: int = 0
     # Regularisation, as gap_fit: the expected ABSOLUTE error of a dipole
     # component per √atom (gap_fit's default_sigma with

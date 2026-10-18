@@ -135,8 +135,6 @@ def _validate(cfg: GAPconfig) -> None:
          f"dipole_channels must be 1 for the screened radial, got "
          f"{cfg.dipole_channels}"),
         (not cfg.scale_targets, "scale_targets must be False"),
-        (int(cfg.gap_cross_channels) == 0 or int(cfg.target_mode) == 2,
-         "gap_cross_channels is a polarisability (target_mode=2) kernel group"),
         (int(cfg.gap_cross_channels) >= 0, "gap_cross_channels must be >= 0"),
         (len(cfg.gap_group_delta) == 3 and all(float(x) > 0 for x in cfg.gap_group_delta),
          "gap_group_delta needs 3 positive entries (isotropic, traceless, cross)"),
@@ -210,33 +208,65 @@ def _cross_group(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
                      sym[:, 0, 1], sym[:, 1, 2], sym[:, 2, 0]], axis=1)
 
 
+def _cross_group_dipole(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
+    """Dipole cross group [N, 3, K_x] (gap_cross_channels C_x): the bond-axis
+    tensor T_i^a = Σ_j R_a(r_ij) d_ij d_ijᵀ contracted with the dipole kernel
+    vector v_i^b = Σ_j R_b(r_ij) d_ij — w_i^{ab} = T^a·v^b, both species-
+    resolved under pair columns (K₁ = C_x·T′ each, K_x = K₁²). Expanded it is
+    Σ_j Σ_k R_a R_b (d_ij·d_ik) d_ij: the bond-angle charge flux the one-hop
+    difference form (s_i − s_j) d_ij cannot carry (the cocycle restriction of
+    neighbor_dipole_formulation.md). Odd under inversion, covariant,
+    image-exact, linear in the site coefficient."""
+    args = (atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard), int(cfg.gap_cross_channels),
+            int(cfg.num_types), str(cfg.dipole_radial), float(cfg.dipole_zeta),
+            resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale))
+    pair = _pair_columns(cfg)
+    V2 = tnep_data._neighbor_dipole_V(*args, rank=2)               # [N, 6, 2C_x, T]
+    Cx = int(cfg.gap_cross_channels)
+    # full d⊗d = traceless group + isotropic group / 3 (Voigt)
+    Tv = _collapse_V(V2[:, :, Cx:] + V2[:, :, :Cx] / 3.0, pair)     # [N, 6, K₁]
+    v = _collapse_V(tnep_data._neighbor_dipole_V(*args, rank=1), pair)   # [N, 3, K₁]
+    xx, yy, zz, xy, yz, zx = (Tv[:, k] for k in range(6))           # each [N, K₁]
+    # (T·v)_x = xx v_x + xy v_y + zx v_z, etc.; outer over (a, b) → [N, 3, K₁, K₁]
+    vx, vy, vz = v[:, 0], v[:, 1], v[:, 2]
+    o = lambda A, B: A[:, :, None] * B[:, None, :]
+    wx = o(xx, vx) + o(xy, vy) + o(zx, vz)
+    wy = o(xy, vx) + o(yy, vy) + o(yz, vz)
+    wz = o(zx, vx) + o(yz, vy) + o(zz, vz)
+    N = len(atoms)
+    return np.stack([wx, wy, wz], axis=1).reshape(N, 3, -1)         # [N, 3, K₁²]
+
+
 def _finish_v(V: np.ndarray, atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
     """Staged kernel [N, D, Ck, T] → design geometry v_i [N, D, K]: collapse
-    to pair columns, then (target_mode=2) scale each kernel group by its
-    gap_group_delta and append the cross group. THE one place fit and predict
-    both go through, so the column contract cannot drift."""
+    to pair columns, then scale each polarisability kernel group by its
+    gap_group_delta (target_mode=2) and append the cross group (dipole:
+    T·v vectors; polarisability: sym(v⊗v) tensors), scaled by
+    gap_group_delta[2]. THE one place fit and predict both go through, so
+    the column contract cannot drift."""
     v = _collapse_V(V, _pair_columns(cfg))
-    if int(cfg.target_mode) != 2:
-        return v
     d_iso, d_tr, d_x = (float(x) for x in cfg.gap_group_delta)
-    per_group = v.shape[2] // 2                                  # C·T′ channels per group
-    v = v.copy()
-    v[:, :, :per_group] *= d_iso
-    v[:, :, per_group:] *= d_tr
+    if int(cfg.target_mode) == 2:
+        per_group = v.shape[2] // 2                              # C·T′ channels per group
+        v = v.copy()
+        v[:, :, :per_group] *= d_iso
+        v[:, :, per_group:] *= d_tr
     if int(cfg.gap_cross_channels) > 0:
-        v = np.concatenate([v, d_x * _cross_group(atoms, ti, cfg)], axis=2)
+        cross = (_cross_group if int(cfg.target_mode) == 2 else _cross_group_dipole)
+        v = np.concatenate([v, d_x * cross(atoms, ti, cfg)], axis=2)
     return v
 
 
 def _n_vcols(cfg: GAPconfig) -> int:
     """K: design geometry columns per sparse point (kernel channels × pair
-    columns, + the cross group's K₁(K₁+1)/2 under target_mode=2)."""
+    columns, + the cross group: K₁(K₁+1)/2 symmetric tensor products under
+    target_mode=2, K₁² T·v vectors under target_mode=1; K₁ = C_x·T′)."""
     T_ = cfg.num_types if _pair_columns(cfg) else 1
     k = kernel_channels(cfg) * T_
     cx = int(cfg.gap_cross_channels)
-    if int(cfg.target_mode) == 2 and cx > 0:
+    if cx > 0:
         k1 = cx * T_
-        k += k1 * (k1 + 1) // 2
+        k += k1 * (k1 + 1) // 2 if int(cfg.target_mode) == 2 else k1 * k1
     return k
 
 
@@ -629,9 +659,9 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                 # columns; subsumes symmetric c AND ordered Ω (no distinction
                 # in the absorbed linear form).
                 "pair_columns": pair,
+                "cross_channels": int(cfg.gap_cross_channels),
                 **({"group_delta": [float(x) for x in cfg.gap_group_delta],
-                    "lambda_shear": float(cfg.gap_lambda_shear),
-                    "cross_channels": int(cfg.gap_cross_channels)}
+                    "lambda_shear": float(cfg.gap_lambda_shear)}
                    if int(cfg.target_mode) == 2 else {}),
                 "extra_rcut": cfg.gap_extra_rcut,
                 "n_columns": n_columns,
