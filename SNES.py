@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Callable
 
 from data import gather_nep_pairs
 from loss_functions import squared_error_per_structure
-from nep_descriptor import EXPERT_WEIGHTS, nep_pair_kwargs
+from nep_descriptor import nep_pair_kwargs
 
 if TYPE_CHECKING:
     from TNEP import TNEP
@@ -46,7 +46,7 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     model.W1.assign(params[idx]); idx += 1
     model.b1.assign(params[idx]); idx += 1
     if model.optimizer.n_expert > 0:
-        for k in EXPERT_WEIGHTS:
+        for k in model.expert_keys:
             getattr(model, k).assign(params[idx]); idx += 1
     if model._neighbor_readout and model._c_learnable:
         model.c_pair.assign(params[idx]); idx += 1
@@ -108,8 +108,9 @@ class SNES:
         # W1's last axis: C ("vector" head) or 1 ("scalar") under "neighbor".
         self._Hw = int(model._head_slots)      # head width → W1
         _T = self.cfg.num_types
+        # One table per model (model._models), side by side on the pair axis.
         self.n_c = (self._Ch * (_T * _T if model._species_pairs == "ordered"
-                                else _T * (_T + 1) // 2)
+                                else _T * (_T + 1) // 2) * len(model._models)
                     if model._neighbor_readout and model._c_learnable else 0)
         # Typed ANN blocks (model._ann_blocks): the SOAP ANN and, under
         # nep_descriptor="sum" / "gap_sum", the 2-body / 3-body experts — each
@@ -321,16 +322,29 @@ class SNES:
         # GPUMD path: the monitor set is the TEST set, so fit() must never
         # select on it (see cfg.gpumd_path).
         self._gpumd_path = bool(getattr(self.cfg, "gpumd_path", False))
-        self._dyn_lambda_1 = (self.cfg.lambda_1 == -1)
-        self._dyn_lambda_2 = (self.cfg.lambda_2 == -1)
-        init_lambda_1 = (auto_lambda if (self.cfg.lambda_1 is None or self._dyn_lambda_1)
-                         else float(self.cfg.lambda_1))
-        init_lambda_2 = (auto_lambda if (self.cfg.lambda_2 is None or self._dyn_lambda_2)
-                         else float(self.cfg.lambda_2))
-        self.lambda_1 = tf.Variable(init_lambda_1, dtype=tf.float32,
-                                    trainable=False, name="lambda_1")
-        self.lambda_2 = tf.Variable(init_lambda_2, dtype=tf.float32,
+        # One strength per model (model._models order): a scalar is shared,
+        # a list gives each model its own — like GAP's per-descriptor priors.
+        n_models = len(model._models)
+
+        def _lam(v, name):
+            if v is None or (np.isscalar(v) and v == -1):
+                return np.full(n_models, auto_lambda, dtype=np.float32)
+            a = np.atleast_1d(np.asarray(v, dtype=np.float32))
+            if a.size == 1:
+                return np.full(n_models, float(a[0]), dtype=np.float32)
+            if a.size != n_models:
+                raise ValueError(
+                    f"cfg.{name} has {a.size} entries but the model has "
+                    f"{n_models} ({', '.join(model._models)}): give one value, "
+                    f"or one per model in that order.")
+            return a
+        self._dyn_lambda_1 = bool(np.isscalar(self.cfg.lambda_1) and self.cfg.lambda_1 == -1)
+        self._dyn_lambda_2 = bool(np.isscalar(self.cfg.lambda_2) and self.cfg.lambda_2 == -1)
+        self.lambda_1 = tf.Variable(_lam(self.cfg.lambda_1, "lambda_1"),
+                                    trainable=False, name="lambda_1")     # [n_models]
+        self.lambda_2 = tf.Variable(_lam(self.cfg.lambda_2, "lambda_2"),
                                     trainable=False, name="lambda_2")
+        self._reg_layout = self._build_reg_layout()
 
         # V_pair regulariser mode: "off" | "cayley" | "expm". Non-off modes
         # are STRUCTURAL (U from skew A, orthogonal regardless of λ), so the
@@ -368,25 +382,48 @@ class SNES:
         recomb_w_np = self._recomb_w.numpy()
         self._mu_eff = float(1.0 / np.sum(recomb_w_np ** 2))
 
-    def _global_typed(self, pv):
-        """Global-reg parameter slice for batched [P, dim] vectors → (typed
-        [P, n], n). Typed ANN weights, plus c_pair (pair-indexed, rides the
-        global term) when present, plus the mode-2 second ANN (SOAP block
-        only: n_typed_pol). Excludes b1. Single source of truth for the
-        global-term slice; per-type slices live in _type_slices."""
-        typed = pv[:, :self.n_typed]
-        n = self.n_typed
-        if self.n_c > 0:
-            typed = tf.concat(
-                [typed, pv[:, self.n_typed + 1:self.n_typed + 1 + self.n_c]],
-                axis=1)
-            n += self.n_c
-        if self.cfg.target_mode == 2:
-            typed = tf.concat(
-                [typed, pv[:, self.n_primary:self.n_primary + self.n_typed_pol]],
-                axis=1)
-            n += self.n_typed_pol
-        return typed, n
+    def _build_reg_layout(self) -> list:
+        """Penalty layout, one row per model (model._models order):
+        (type_slices [T] of [(start, end)], n_type, global_slices, n_global).
+        A model owns its typed ANN block and its pair table. b1 and every other tail
+        (mixing, radial basis, NEP c, δ) are unpenalised. Each model is
+        normalised by ITS OWN parameter count, so adding a model never
+        dilutes another's penalty."""
+        T = self.cfg.num_types
+        n_tab = self.n_c // len(self.model._models) if self.n_c > 0 else 0
+        rows, off = [], 0
+        for k, b in enumerate(self._blocks):
+            start, tsl = off, [[] for _ in range(T)]
+            for n in (b.dim_in * b.hidden, b.hidden, b.hidden * self._Hw):
+                for t in range(T):
+                    tsl[t].append((off + t * n, off + (t + 1) * n))
+                off += T * n
+            n_type = b.dim_in * b.hidden + b.hidden + b.hidden * self._Hw
+            gsl = [(start, off)]
+            if n_tab:
+                c0 = self.n_typed + 1 + k * n_tab
+                gsl.append((c0, c0 + n_tab))
+            rows.append((tsl, n_type, gsl, sum(e - s0 for s0, e in gsl)))
+        return rows
+
+    def _reg_terms(self, pv: tf.Tensor) -> tuple:
+        """THE penalty: pv [P, dim] → (l1_type [P, T], l2_type [P, T],
+        l1_global [P], l2_global [P]), each summed over the models with that
+        model's own lambda_1[k] / lambda_2[k]. GPUMD NEP4 form per model:
+        L1 = λ1·Σ|θ|/n, L2 = λ2·sqrt(Σθ²/n)."""
+        T = self.cfg.num_types
+        l1_t, l2_t = [0.0] * T, [0.0] * T
+        l1_g = l2_g = 0.0
+        for k, (tsl, n_type, gsl, n_glob) in enumerate(self._reg_layout):
+            lam1, lam2 = self.lambda_1[k], self.lambda_2[k]
+            for t in range(T):
+                x = tf.concat([pv[:, s0:e] for s0, e in tsl[t]], axis=1)
+                l1_t[t] += lam1 * tf.reduce_sum(tf.abs(x), axis=1) / n_type
+                l2_t[t] += lam2 * tf.sqrt(tf.reduce_sum(tf.square(x), axis=1) / n_type)
+            g = tf.concat([pv[:, s0:e] for s0, e in gsl], axis=1)
+            l1_g += lam1 * tf.reduce_sum(tf.abs(g), axis=1) / n_glob
+            l2_g += lam2 * tf.sqrt(tf.reduce_sum(tf.square(g), axis=1) / n_glob)
+        return tf.stack(l1_t, axis=1), tf.stack(l2_t, axis=1), l1_g, l2_g
 
     def compute_regularization(self, param_vector: tf.Tensor | np.ndarray
                                ) -> tuple[float, float, float]:
@@ -404,22 +441,12 @@ class SNES:
         """
         pv = tf.cast(param_vector, tf.float32)
         T = self.cfg.num_types
-        n_per_type = self._n_per_type  # W0_t + b0_t (+ W0_2_t + b0_2_t) + W1_t
 
         if T > 1:
-            # Per-type: average L1/L2 across types + global term.
-            total_l1 = tf.constant(0.0)
-            total_l2 = tf.constant(0.0)
-
-            for t in range(T):
-                type_params = self._extract_type_params(pv, t)
-                total_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(type_params)) / n_per_type
-                total_l2 += self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(type_params)) / n_per_type)
-
-            # Global term over typed params only (excludes b1).
-            typed, n_typed_total = self._global_typed(pv[tf.newaxis])
-            l1 = total_l1 / T + self.lambda_1 * tf.reduce_sum(tf.abs(typed)) / n_typed_total
-            l2 = total_l2 / T + self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed)) / n_typed_total)
+            # Per-type terms averaged across types + the global term.
+            l1_t, l2_t, l1_g, l2_g = self._reg_terms(pv[tf.newaxis])
+            l1 = tf.reduce_mean(l1_t) + l1_g[0]
+            l2 = tf.reduce_mean(l2_t) + l2_g[0]
         else:
             # Single-type: regularize ONLY the ANN weights — exclude the mixing
             # V_pair tail (shrinking A → 0 collapses U → I), regardless
@@ -427,8 +454,10 @@ class SNES:
             # is no tail, so this reduces to the old behaviour in that case.
             ann = pv[:self.n_anns_total]
             ann_n = self.n_anns_total
-            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann)) / ann_n
-            l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(ann)) / ann_n)
+            # ponytail: single-type models use the first strength only;
+            # per-model lambdas need the multi-type path (_reg_terms).
+            l1 = self.lambda_1[0] * tf.reduce_sum(tf.abs(ann)) / ann_n
+            l2 = self.lambda_2[0] * tf.sqrt(tf.reduce_sum(tf.square(ann)) / ann_n)
 
         return float(l1), float(l2), 0.0
 
@@ -442,30 +471,20 @@ class SNES:
         # Activation-dependent Glorot gain (gain=1 → tanh init).
         gain = float(getattr(self.model, "_glorot_gain", 1.0))
 
-        q_scale = (self.model._q_scale.numpy() if self.model._q_scale is not None
-                   else None)
-        q_shift_m = (self.model._q_shift_m.numpy() if q_scale is not None else None)
-
         def _fill_ann(off: int, blocks: list) -> int:
             """Fill typed blocks [W0(T,Q,H) | b0(T,H) | W1(T,H·Hw)] each,
             then b1(1), starting at ``off``. Block i > 0 is a "sum" expert:
             W1 zero so generation 0 equals the SOAP-only model."""
             for i, b in enumerate(blocks):
-                Q, Hb, sl = b.dim_in, b.hidden, b.scale_slice
+                Q, Hb = b.dim_in, b.hidden
                 c_W0 = gain * float(np.sqrt(6.0 / (Q + Hb)))
                 c_W1 = gain * float(np.sqrt(6.0 / (Hb + self._Hw)))
                 n_W0 = T * Q * Hb
-                w0 = rng.uniform(-c_W0, c_W0, size=n_W0).astype(np.float32)
-                if q_scale is not None:
-                    # Stored weights = effective / m so W0_eff at gen 0 is the
-                    # unscaled Glorot init (descriptor_scale is a reparameterisation).
-                    w0 = (w0.reshape(T, Q, Hb) / q_scale[sl][None, :, None]).reshape(-1)
-                mu[off:off + n_W0] = w0
+                # Plain Glorot whether or not descriptor_scale is on: the
+                # stored weights act on the scaled, centred input.
+                mu[off:off + n_W0] = rng.uniform(-c_W0, c_W0, size=n_W0).astype(np.float32)
                 off += n_W0
-                # b0 zero — or (m∘μ)·W0_stored so b0_eff is zero under centring.
-                if q_shift_m is not None:
-                    mu[off:off + T * Hb] = np.einsum(
-                        'q,tqh->th', q_shift_m[sl], w0.reshape(T, Q, Hb)).reshape(-1)
+                # b0 zero
                 off += T * Hb
                 n_W1 = T * Hb * self._Hw
                 if i == 0:
@@ -526,12 +545,10 @@ class SNES:
         ref = max(float(data_loss), 1e-8)
         if self._dyn_lambda_1 and l1 > 1e-12:
             ratio = (target * ref) / float(l1)
-            new = float(self.lambda_1.numpy()) * (ratio ** damping)
-            self.lambda_1.assign(float(np.clip(new, lmin, lmax)))
+            self.lambda_1.assign(np.clip(self.lambda_1.numpy() * (ratio ** damping), lmin, lmax))
         if self._dyn_lambda_2 and l2 > 1e-12:
             ratio = (target * ref) / float(l2)
-            new = float(self.lambda_2.numpy()) * (ratio ** damping)
-            self.lambda_2.assign(float(np.clip(new, lmin, lmax)))
+            self.lambda_2.assign(np.clip(self.lambda_2.numpy() * (ratio ** damping), lmin, lmax))
 
     def _cayley_blocks_batched(self, A_upper_stacked: tf.Tensor,
                                 bs: int) -> tf.Tensor:
@@ -671,23 +688,13 @@ class SNES:
             s_sorted : [P, dim] composite noise (per-column type ranking)
         """
         T = self.cfg.num_types
-        n_per_type = self._n_per_type
 
-        # Add per-type regularization to per-type RMSE → [T+1] fitness values
-        fitness_per_type = []
-        for t in range(T):
-            type_params = self._extract_type_params_batched(samples, t)  # [P, n_per_type]
-            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(type_params), axis=1) / n_per_type
-            l2 = self.lambda_2 * tf.sqrt(
-                tf.reduce_sum(tf.square(type_params), axis=1) / n_per_type)
-            fitness_per_type.append(fitness_per_type_rmse[:, t] + l1 + l2)
-
-        # Global ranking (type T): regularize over all typed params, excluding b1
-        typed, n_typed_total = self._global_typed(samples)
-        global_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed), axis=1) / n_typed_total
-        global_l2 = self.lambda_2 * tf.sqrt(
-            tf.reduce_sum(tf.square(typed), axis=1) / n_typed_total)
-        fitness_per_type.append(fitness_per_type_rmse[:, T] + global_l1 + global_l2)
+        # Per-type penalty onto per-type RMSE, global penalty onto the global
+        # RMSE → [T+1] fitness values.
+        l1_t, l2_t, l1_g, l2_g = self._reg_terms(samples)
+        fitness_per_type = [fitness_per_type_rmse[:, t] + l1_t[:, t] + l2_t[:, t]
+                            for t in range(T)]
+        fitness_per_type.append(fitness_per_type_rmse[:, T] + l1_g + l2_g)
 
         # Sort each type's fitness independently → [T+1, P] rank indices
         # ranks_per_type[t] = indices that sort type t's fitness ascending
@@ -1042,9 +1049,12 @@ class SNES:
             _do_val = (gen % cfg.val_interval == 0) or (gen == cfg.num_generations - 1)
             if _do_val:
                 val_fitness = self.validate(val_data, self.mu)
-                # Train RMSE at μ, computed identically to val_fitness so both
-                # are directly comparable. One extra forward pass at μ at val
-                # ticks; reuses the fold via _validate_fold_cache.
+            # Train RMSE at μ, computed identically to val_fitness so both
+            # are directly comparable. One extra forward pass at μ; reuses
+            # the fold via _validate_fold_cache. Under the GPUMD path the
+            # monitor is the big external test set and stays on val_interval,
+            # but train RMSE refreshes every gen so the bar keeps moving.
+            if _do_val or self._gpumd_path:
                 train_rmse = self.validate(train_data, self.mu)
 
             t4 = time.perf_counter()
@@ -1391,7 +1401,7 @@ class SNES:
     def _experts_of(self, named: dict) -> tuple | None:
         """The six "sum" / "gap_sum" expert tensors of a _split_reconstructed dict, in
         EXPERT_WEIGHTS order (None outside them), for the forward sites."""
-        return tuple(named[k] for k in EXPERT_WEIGHTS) if self.n_expert else None
+        return tuple(named[k] for k in self.model.expert_keys) if self.n_expert else None
 
     def _split_reconstructed(self, params: tuple) -> dict:
         """Parse the reconstruct_params_tf tuple into a named dict.
@@ -1409,7 +1419,7 @@ class SNES:
         out["W1"] = params[idx]; idx += 1
         out["b1"] = params[idx]; idx += 1
         if self.n_expert:
-            for k in EXPERT_WEIGHTS:
+            for k in self.model.expert_keys:
                 out[k] = params[idx]; idx += 1
         if self.n_c > 0:
             out["c_pair"] = params[idx]; idx += 1
@@ -1669,30 +1679,16 @@ class SNES:
         T = self.cfg.num_types
 
         if T > 1:
-            n_per_type = self._n_per_type  # W0_t + b0_t (+ W0_2_t + b0_2_t) + W1_t
-
-            total_l1 = tf.zeros([tf.shape(param_vectors)[0]])
-            total_l2 = tf.zeros([tf.shape(param_vectors)[0]])
-
-            for t in range(T):
-                type_params = self._extract_type_params_batched(param_vectors, t)  # [P, n_per_type]
-                total_l1 += self.lambda_1 * tf.reduce_sum(tf.abs(type_params), axis=1) / n_per_type
-                total_l2 += self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(type_params), axis=1) / n_per_type)
-
-            # Global term over typed params only (excludes b1).
-            typed, n_typed_total = self._global_typed(param_vectors)
-            global_l1 = self.lambda_1 * tf.reduce_sum(tf.abs(typed), axis=1) / n_typed_total
-            global_l2 = self.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(typed), axis=1) / n_typed_total)
-
-            reg = total_l1 / T + global_l1 + total_l2 / T + global_l2
+            l1_t, l2_t, l1_g, l2_g = self._reg_terms(param_vectors)
+            reg = tf.reduce_mean(l1_t + l2_t, axis=1) + l1_g + l2_g
         else:
             # Single-type: regularize ONLY the ANN weights — exclude the mixing
             # V_pair tail (A → 0 collapses U → I). Reduces
             # to the whole vector when there is no tail (n_anns_total == dim).
             ann = param_vectors[:, :self.n_anns_total]
             ann_n = self.n_anns_total
-            l1 = self.lambda_1 * tf.reduce_sum(tf.abs(ann), axis=1) / ann_n
-            l2 = self.lambda_2 * tf.sqrt(
+            l1 = self.lambda_1[0] * tf.reduce_sum(tf.abs(ann), axis=1) / ann_n
+            l2 = self.lambda_2[0] * tf.sqrt(
                 tf.reduce_sum(tf.square(ann), axis=1) / ann_n)
             reg = l1 + l2
 

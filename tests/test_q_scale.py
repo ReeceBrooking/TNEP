@@ -26,56 +26,82 @@ def _q0(cfg, frames):
     return gen0_ann_inputs(cfg, d), d["atom_mask"].numpy(), d
 
 
+def _Z(d):
+    return d["Z_int"].numpy()
+
+
 def test_compute_q_scale_rules(monkeypatch):
     cfg = _cfg(descriptor_scale="channel", **FULL)
-    q, mask, _ = _q0(cfg, _cho_frames(6))
-    x = q[mask > 0]
-    m, mu = compute_q_scale(q, mask, cfg)
-    np.testing.assert_allclose(mu, x.mean(0), rtol=1e-5, atol=1e-7)          # centring = channel mean
+    q, mask, d = _q0(cfg, _cho_frames(6))
+    Z = _Z(d)
+    m, mu = compute_q_scale(q, Z, mask, cfg)
+    mb, _ = compute_q_scale(q, Z, mask, _cfg(descriptor_scale="block", **FULL))
+    assert m.shape == mu.shape == (cfg.num_types, cfg.dim_q)
     groups = q_scale_groups(cfg)
     assert sorted(np.concatenate(groups).tolist()) == list(range(cfg.dim_q))
-    s = x.std(0); s_ref = np.median(s[s > 0])
-    g = np.ones(cfg.dim_q)
-    for idx in groups:
-        g[idx] = s_ref / np.median(s[idx][s[idx] > 0])
-    r = m / g
-    assert np.all((r >= 0.1 - 1e-6) & (r <= 10.0 + 1e-6))                    # residual clamped
-    mb, _ = compute_q_scale(q, mask, _cfg(descriptor_scale="block", **FULL))
-    np.testing.assert_allclose(mb, g, rtol=1e-5)                               # block = unclamped group factor
+    present = [t for t in range(cfg.num_types) if np.any((mask > 0) & (Z == t))]
+    assert len(present) >= 2
+    for t in present:                       # each row from its own centre species only
+        x = q[(mask > 0) & (Z == t)]
+        np.testing.assert_allclose(mu[t], x.mean(0), rtol=1e-5, atol=1e-7)   # centring = channel mean
+        s = x.std(0)
+        g = np.ones(cfg.dim_q)
+        for idx in groups:
+            g[idx] = 1.0 / np.median(s[idx][s[idx] > 0])                     # group median std -> 1 ...
+        live = s > 0
+        kb = mb[t][live] / g[live]
+        np.testing.assert_allclose(kb, kb[0], rtol=1e-5)                     # ... block = that, times ONE constant
+        r = m[t][live] / g[live]; r = r / np.exp(np.median(np.log(r)))
+        assert np.all((r >= 0.1 / 10 - 1e-6) & (r <= 10.0 * 10 + 1e-6))      # residual bounded by the clamp
+        for mm in (m[t], mb[t]):                                             # unit-norm input for the ANN
+            np.testing.assert_allclose(np.median(np.linalg.norm((x - mu[t]) * mm, axis=1)), 1.0, rtol=1e-4)
+    assert not np.allclose(mb[present[0]], mb[present[1]])                   # species really differ
     # padded atoms ignored; zero-std channel -> 1; dust residual clamps at 10 on top of its group factor.
     q2 = q.copy(); q2[mask == 0] = 1e9
-    np.testing.assert_array_equal(compute_q_scale(q2, mask, cfg)[0], m)
+    np.testing.assert_array_equal(compute_q_scale(q2, Z, mask, cfg)[0], m)
     q3 = q.copy(); q3[..., 0] = 0.0
     q3[..., 1] = q3[..., 1].mean() + 1e-7 * np.random.default_rng(0).normal(size=q3[..., 1].shape)
-    m3, _ = compute_q_scale(q3, mask, cfg)
-    gb3, _ = compute_q_scale(q3, mask, _cfg(descriptor_scale="block", **FULL))   # group factor alone
-    assert m3[0] == 1.0
-    assert m3[1] / gb3[1] == pytest.approx(10.0, rel=1e-4)                       # residual at the clamp
-    print("\nblock scales:", np.round([mb[gr][0] for gr in groups], 3))
+    m3, _ = compute_q_scale(q3, Z, mask, cfg)
+    gb3, _ = compute_q_scale(q3, Z, mask, _cfg(descriptor_scale="block", **FULL))   # group factor alone
+    t = present[0]
+    assert m3[t, 0] == 1.0
+    # the dust channel is boosted far more than an ordinary one, limited by the clamp
+    # (compare ratios within each mode: both carry their own overall norm constant)
+    assert (m3[t, 1] / m3[t, 2]) / (gb3[t, 1] / gb3[t, 2]) > 5.0
+    # a species with no atoms keeps the identity row
+    absent = compute_q_scale(q, np.where(Z == present[0], present[1], Z), mask, cfg)
+    assert np.all(absent[0][present[0]] == 1.0) and np.all(absent[1][present[0]] == 0.0)
+    print("\nblock scales per species:", [np.round([mb[t][gr][0] for gr in groups], 3) for t in present])
 
 
-@pytest.mark.parametrize("mode", ["block", "channel", "minmax"])
-def test_scaling_is_a_reparameterisation_identical_at_gen0(mode):
+@pytest.mark.parametrize("mode", ["block", "channel"])   # minmax needs a NEP block: test_nep_descriptor
+def test_scaling_folds_into_W0_and_starts_unsaturated(mode):
     frames = _cho_frames(6)
     cfg_off = _cfg(**FULL)
     q, mask, data = _q0(cfg_off, frames)
     cfg_on = _cfg(descriptor_scale=mode, **FULL)
-    m_np, mu_np = compute_q_scale(q, mask, cfg_on)
-    cfg_on.q_scale, cfg_on.q_shift = [float(v) for v in m_np], [float(v) for v in mu_np]
+    m_np, mu_np = compute_q_scale(q, _Z(data), mask, cfg_on)
+    cfg_on.q_scale, cfg_on.q_shift = m_np.tolist(), mu_np.tolist()
     m_off, m_on = _model(cfg_off), _model(cfg_on)
     m = np.asarray(cfg_on.q_scale, np.float32)
-    # I3: same seed -> stored W0 differ by 1/m, b0 absorbs the shift; effective forward identical.
-    np.testing.assert_allclose(m_on.W0.numpy() * m[None, :, None], m_off.W0.numpy(), rtol=1e-6)
-    assert (np.abs(m_on.b0.numpy()).max() > 0) == (mode != "minmax") and np.abs(m_off.b0.numpy()).max() == 0
-    np.testing.assert_allclose(_predict_eff(m_on, data), _predict_eff(m_off, data), rtol=1e-4, atol=1e-6)
-    mu_on, mu_off = m_on.optimizer.mu.numpy(), m_off.optimizer.mu.numpy()
-    assert abs(m_on.optimizer.validate(data, tf.constant(mu_on)) - m_off.optimizer.validate(data, tf.constant(mu_off))) < 1e-5
+    # I3: the stored init is the plain Glorot / zero one whatever the scaler (never
+    # divided by m), in the Keras variables AND in the SNES mean; it acts on the
+    # scaled, centred input, so the tanh layer does not start saturated.
+    np.testing.assert_array_equal(m_on.W0.numpy(), m_off.W0.numpy())
+    assert np.abs(m_on.b0.numpy()).max() == 0 and np.abs(m_off.b0.numpy()).max() == 0
+    np.testing.assert_array_equal(m_on.optimizer.mu.numpy(), m_off.optimizer.mu.numpy())
+    real = mask > 0
+    x = (q[real] - mu_np[_Z(data)[real]]) * m_np[_Z(data)[real]]
+    g0 = m_on.optimizer._split_reconstructed(m_on.optimizer.reconstruct_params_tf(m_on.optimizer.mu))
+    pre = np.einsum('nq,nqh->nh', x, g0["W0"].numpy()[_Z(data)[real]])
+    assert np.mean(np.abs(np.tanh(pre)) > 0.99) < 0.2
+    assert 0.3 < np.median(np.linalg.norm(x, axis=1)) < 5.0      # the input vector has norm ~1
     # I2: any scaled model == unscaled model with W0' = m*W0, b0' = b0 - (m*mu).W0 (mixing on).
     rng = np.random.default_rng(1)
     W = rng.normal(size=m_on.W0.shape).astype(np.float32); B = rng.normal(size=m_on.b0.shape).astype(np.float32)
     V = 0.1 * rng.normal(size=m_on.U_pair.shape).astype(np.float32)
     m_on.W0.assign(W); m_on.b0.assign(B); m_on.U_pair.assign(V)
-    m_off.W0.assign(W * m[None, :, None]); m_off.b0.assign(B - np.einsum('q,tqh->th', m * mu_np, W)); m_off.U_pair.assign(V)
+    m_off.W0.assign(W * m[:, :, None]); m_off.b0.assign(B - np.einsum('tq,tqh->th', m * mu_np, W)); m_off.U_pair.assign(V)
     np.testing.assert_allclose(_predict_eff(m_on, data), _predict_eff(m_off, data), rtol=1e-4, atol=1e-6)
     # candidates path agrees with the single path on the scaled model.
     snes = m_on.optimizer
@@ -126,7 +152,7 @@ def test_norm_options(norm):
         np.testing.assert_allclose(np.sign(soap_u), np.sign(soap_n), atol=0)      # signs kept
     assert 1e-2 < np.median(norms) < 10.0 and norms.std() / norms.mean() > 0.03
     assert np.all(qu[~mask] == 0.0)
-    m, mu = compute_q_scale(qu, data["atom_mask"].numpy(), _cfg(descriptor_scale="channel", radial_basis_norm=norm, **FULL))
+    m, mu = compute_q_scale(qu, _Z(data), data["atom_mask"].numpy(), _cfg(descriptor_scale="channel", radial_basis_norm=norm, **FULL))
     assert np.all(np.isfinite(m)) and np.all(np.isfinite(mu))
     print(f"\n{norm}: SOAP norms median {np.median(norms):.3f} range {norms.min():.3f}-{norms.max():.3f}; l0/l4 mean|q| ratio "
           f"{np.abs(soap_u[:, :10]).mean() / np.abs(soap_u[:, 40:50]).mean():.1f}")

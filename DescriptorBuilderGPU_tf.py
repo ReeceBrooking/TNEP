@@ -19,6 +19,7 @@ from DescriptorBuilderGPU import (
     build_orthonormalization_matrix_poly3,
     build_neighbour_list_numpy,
     build_multiplicity_array,
+    make_compress_mask,
     make_compress_mask_trivial,
     _get_preflm,
     _N_a,
@@ -1280,7 +1281,8 @@ def _build_cfg_cache(species_Z: list[int], soap_params: dict) -> dict:
     n_species = len(species_Z)
     alpha_per_species = [alpha_max] * n_species
     n_max = sum(alpha_per_species)
-    mask_info = make_compress_mask_trivial(alpha_per_species, l_max)
+    mask_info = make_compress_mask(alpha_per_species, l_max,
+                                   soap_params.get("compress_mode", "trivial"))
     return dict(
         n_max=n_max,
         n_species=n_species,
@@ -1711,7 +1713,7 @@ class DescriptorBuilderGPUTF:
 
     Drop-in replacement for DescriptorBuilder (same build_descriptors_flat API).
     SOAP compute runs on GPU; the neighbour list stays on CPU (Python).
-    Restrictions: basis="poly3", compress_mode="trivial", uniform per-species
+    Restrictions: basis="poly3", compress_mode "trivial"/"none", uniform per-species
     hyperparameters.
     """
 
@@ -1720,12 +1722,10 @@ class DescriptorBuilderGPUTF:
             raise NotImplementedError(
                 f"DescriptorBuilderGPUTF only supports basis='poly3', got '{cfg.basis}'"
             )
-        if getattr(cfg, "compress_mode", "trivial") != "trivial":
+        if getattr(cfg, "compress_mode", "trivial") not in ("trivial", "none"):
             raise NotImplementedError(
-                f"DescriptorBuilderGPUTF only supports "
-                f"compress_mode='trivial', got '{cfg.compress_mode}'. "
-                f"compress_mode='none' (the uncompressed power spectrum) is "
-                f"implemented on the quippy path only — set descriptor_mode=0"
+                f"DescriptorBuilderGPUTF only supports compress_mode 'trivial' "
+                f"or 'none', got '{cfg.compress_mode}' — set descriptor_mode=0"
             )
         self.cfg = cfg
         # Use cfg.types verbatim (do NOT sort): quippy assigns species indices
@@ -1745,6 +1745,7 @@ class DescriptorBuilderGPUTF:
             central_weight=float(cfg.central_weight),
             radial_enhancement=int(cfg.radial_enhancement),
             radial_basis_size=getattr(cfg, "radial_basis_size", None),
+            compress_mode=str(getattr(cfg, "compress_mode", "trivial")),
         )
         self._learn_radial = self._soap_params["radial_basis_size"] is not None
         # Per-atom L2 normalisation of the fixed power spectrum ("l2") or the

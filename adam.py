@@ -22,7 +22,7 @@ import numpy as np
 import tensorflow as tf
 
 from loss_functions import squared_error_per_structure
-from nep_descriptor import EXPERT_WEIGHTS, nep_pair_kwargs
+from nep_descriptor import nep_pair_kwargs
 
 
 def _tf_var(v):
@@ -38,7 +38,7 @@ def _trainable(model) -> dict:
     explicitly."""
     vs = {"W0": model.W0, "b0": model.b0, "W1": model.W1, "b1": model.b1}
     if model._experts_on:
-        vs.update({k: getattr(model, k) for k in EXPERT_WEIGHTS})
+        vs.update({k: getattr(model, k) for k in model.expert_keys})
     if model._neighbor_readout and model._c_learnable:
         vs["c_pair"] = model.c_pair
     if model.cfg.target_mode == 2:
@@ -70,6 +70,10 @@ def _ann_core(model) -> list:
 def fit_adam(model, train_data: dict, val_data: dict,
              plot_callback: Callable | None = None) -> tuple:
     cfg = model.cfg
+    if isinstance(cfg.lambda_1, (list, tuple)) or isinstance(cfg.lambda_2, (list, tuple)):
+        raise NotImplementedError(
+            "optimizer='adam': per-model lambda_1/lambda_2 lists are SNES-only; "
+            "give a single value.")
     if cfg.lambda_1 == -1 or cfg.lambda_2 == -1:
         raise NotImplementedError(
             "optimizer='adam' does not support dynamic lambda (-1); give "
@@ -143,8 +147,10 @@ def fit_adam(model, train_data: dict, val_data: dict,
             l1 = l2 = tf.constant(0.0)
             if reg_on:
                 flat = tf.concat([tf.reshape(v, [-1]) for v in core], axis=0)
-                l1 = snes.lambda_1 * tf.reduce_sum(tf.abs(flat)) / n_core
-                l2 = snes.lambda_2 * tf.sqrt(tf.reduce_sum(tf.square(flat)) / n_core)
+                # ponytail: Adam penalises the pooled ANN weights with the first
+                # strength; per-model lambdas are SNES-only (SNES._reg_terms).
+                l1 = snes.lambda_1[0] * tf.reduce_sum(tf.abs(flat)) / n_core
+                l2 = snes.lambda_2[0] * tf.sqrt(tf.reduce_sum(tf.square(flat)) / n_core)
             # SNES ranks on RMSE + penalty; use the same objective so the
             # lambda scale means the same thing under both optimizers.
             loss = tf.sqrt(mse + 1e-12) + l1 + l2

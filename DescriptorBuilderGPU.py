@@ -327,6 +327,10 @@ def compute_dim_q(cfg) -> int:
     mode = str(getattr(cfg, "nep_descriptor", "off"))
     if mode == "replace":
         return int(nep_dim(cfg))
+    from gap_descriptor import gap_main_slice
+    sl = gap_main_slice(cfg)
+    if sl is not None:                       # gap_sum without "soap": main ANN = a GAP block
+        return sl.stop - sl.start
     return soap_dim(cfg) + (int(nep_dim(cfg)) if mode == "concat" else 0)
 
 
@@ -388,6 +392,10 @@ def extra_block_widths(cfg) -> list:
     sub-blocks (radial, L1..L4, 4-body, 5-body from nep_slices)."""
     if str(getattr(cfg, "nep_descriptor", "off")) in ("concat", "replace"):
         return nep_block_widths(cfg)
+    from gap_descriptor import gap_main_slice
+    sl = gap_main_slice(cfg)
+    if sl is not None:                       # the main ANN's GAP block, in SOAP's place
+        return [sl.stop - sl.start]
     return []
 
 
@@ -481,19 +489,60 @@ def q_scale_groups(cfg) -> list:
     return groups
 
 
-def compute_q_scale(q: np.ndarray, atom_mask: np.ndarray, cfg) -> tuple:
-    """Preconditioning (m [Q], μ [Q]) from the generation-0 descriptor
-    q [.., Q] over real atoms (atom_mask > 0). μ_k = channel mean. Scale in
-    two levels from the channel std s_k:
-        g_group = s_ref / median(s_group)                 (α = 1, unclamped)
-        r_k     = clip((s_ref' / (g·s_k))^ALPHA, 1/CLAMP, CLAMP)   ("channel")
+def q_scale_model_slices(cfg, Q: int) -> list:
+    """Scaler-vector slice of each ANN's input. One ANN → [0, Q). Under
+    nep_descriptor "sum" / "gap_sum" the vector is [main input ‖ extra-model
+    inputs]: the main ANN's slice, then one per extra model."""
+    mode = str(getattr(cfg, "nep_descriptor", "off"))
+    if mode not in ("sum", "gap_sum"):
+        return [slice(0, Q)]
+    dq = compute_dim_q(cfg)
+    if mode == "gap_sum":
+        from gap_descriptor import gap_slices
+        sls = list(gap_slices(cfg).values())
+    else:
+        from nep_descriptor import nep_slices
+        sls = [nep_slices(cfg)[k] for k in ("radial", "angular")]
+    return [slice(0, dq)] + [slice(dq + sl.start, dq + sl.stop) for sl in sls]
+
+
+def compute_q_scale(q: np.ndarray, Z: np.ndarray, atom_mask: np.ndarray,
+                    cfg) -> tuple:
+    """Preconditioning (m [T, Q], μ [T, Q]) from the generation-0 descriptor
+    q [.., Q] over real atoms (atom_mask > 0), one row per CENTRE species
+    (Z [..] type indices): each typed ANN has its own W0, and O- and
+    H-centred channels differ in spread by up to ~6x. Per species, μ_k =
+    channel mean and the scale has two levels from the channel std s_k:
+        g_group = 1 / median(s_group)                     (α = 1, unclamped)
+        r_k     = clip((1 / (g·s_k))^ALPHA, 1/CLAMP, CLAMP)        ("channel")
         m_k     = g_group · r_k   ("channel")  or  g_group   ("block")
-    s_ref = median live std, s_ref' the same after the group factor. Dead
-    channels (s_k = 0) keep m = 1.
+    then each ANN's slice (q_scale_model_slices) is divided by its median
+    input norm, so every network's scaled input vector has length 1 at the
+    median. Dead channels (s_k = 0)
+    and absent species keep m = 1, μ = 0.
     "minmax": GPUMD's q_scaler (nep.cu find_max_min) — m_k = 1/(max_k − min_k)
-    over all training atoms, no centring (μ = 0). Dead channels keep m = 1."""
+    over ALL training atoms (GPUMD's scaler is species-blind; the row is
+    repeated per species), no centring (μ = 0). Dead channels keep m = 1."""
+    T = int(cfg.num_types)
     Q = q.shape[-1]
-    x = np.asarray(q, dtype=np.float64).reshape(-1, Q)[np.asarray(atom_mask).reshape(-1) > 0]
+    real = np.asarray(atom_mask).reshape(-1) > 0
+    x = np.asarray(q, dtype=np.float64).reshape(-1, Q)[real]
+    z = np.asarray(Z).reshape(-1)[real]
+    if str(cfg.descriptor_scale) == "minmax":
+        m, mu = _q_scale_rows(x, cfg)
+        return np.tile(m, (T, 1)), np.tile(mu, (T, 1))
+    m = np.ones((T, Q), np.float32)
+    mu = np.zeros((T, Q), np.float32)
+    for t in range(T):
+        if np.any(z == t):
+            m[t], mu[t] = _q_scale_rows(x[z == t], cfg)
+    return m, mu
+
+
+def _q_scale_rows(x: np.ndarray, cfg) -> tuple:
+    """compute_q_scale's rule on the real-atom rows x [N, Q] of one species
+    (or all atoms, minmax): (m [Q], μ [Q])."""
+    Q = x.shape[-1]
     if str(cfg.descriptor_scale) == "minmax":
         rng = x.max(0) - x.min(0)
         m = 1.0 / np.where(rng > 0, rng, 1.0)
@@ -520,27 +569,60 @@ def compute_q_scale(q: np.ndarray, atom_mask: np.ndarray, cfg) -> tuple:
     live = s > 0
     if not np.any(live):
         return np.ones(Q, dtype=np.float32), mu.astype(np.float32)
-    s_ref = float(np.median(s[live]))
+    # Equalise first: every group's median std → 1 (and, in "channel" mode,
+    # each channel pulled toward 1 within the clamp).
     g = np.ones(Q, dtype=np.float64)
     for idx in q_scale_groups(cfg):
         sg = s[idx][live[idx]]
         if sg.size:
-            g[idx] = s_ref / float(np.median(sg))
+            g[idx] = 1.0 / float(np.median(sg))
     m = g.copy()
     if str(cfg.descriptor_scale) == "channel":
         s1 = s * g
-        s_ref1 = float(np.median(s1[live]))
-        r = np.clip((s_ref1 / np.where(live, s1, s_ref1)) ** Q_SCALE_ALPHA,
+        r = np.clip((1.0 / np.where(live, s1, 1.0)) ** Q_SCALE_ALPHA,
                     1.0 / Q_SCALE_CLAMP, Q_SCALE_CLAMP)
         m = g * r
+    # Then unit NORM per model: each ANN's scaled, centred input vector has
+    # median length 1 over the training atoms, whatever its width or raw
+    # magnitude. One SNES step σ then moves a pre-activation by ~σ in EVERY
+    # model (at unit std per channel a 180-wide input made σ = 0.1 as large
+    # as the signal; sharing one width left a 2-body model 12x under-stepped).
+    for sl in q_scale_model_slices(cfg, Q):
+        n = float(np.median(np.linalg.norm((x[:, sl] - mu[sl]) * np.where(live[sl], m[sl], 0.0), axis=1)))
+        if n > 0:
+            m[sl] /= n
     m[~live] = 1.0
     return m.astype(np.float32), mu.astype(np.float32)
+
+
+def soap_descriptors_needed(cfg) -> bool:
+    """Whether the SOAP power spectrum is built at all.
+
+    nep_descriptor="replace" feeds the ANN the NEP block ALONE — TNEP._ann_inputs
+    returns it and never looks at the `descriptors` argument — and the SOAP
+    gradient stream is already skipped (data.soap_gradients_needed). Building
+    the spectrum anyway cost ~150 ms per frame of pure waste, which is most of
+    the startup on a few hundred structures."""
+    from gap_descriptor import gap_main_slice
+    return (str(getattr(cfg, "nep_descriptor", "off")) != "replace"
+            and gap_main_slice(cfg) is None)
+
+
+def staged_descriptor_width(cfg) -> int:
+    """Width of the `descriptors` slot as the data path actually stages it:
+    0 when the SOAP spectrum is skipped (soap_descriptors_needed), else the
+    builder's own width. This is what a built data dict must agree with."""
+    return descriptor_input_width(cfg) if soap_descriptors_needed(cfg) else 0
 
 
 def descriptor_input_width(cfg) -> int:
     """Width of the per-atom vector the builder emits in the `descriptors`
     slot: the raw compressed SOAP dim, or under cfg.radial_basis_size the
-    flattened raw centre coefficients S·K·k_max·2 (species, κ, (l,m), re/im)."""
+    flattened raw centre coefficients S·K·k_max·2 (species, κ, (l,m), re/im).
+
+    This is the REAL builder's width — spectroscopy's fused path builds the
+    spectrum itself and needs it. For the width a data dict actually carries
+    (zero when the spectrum is skipped) use staged_descriptor_width."""
     K = getattr(cfg, "radial_basis_size", None)
     if K is None:
         return soap_dim(cfg)
@@ -554,25 +636,30 @@ def descriptor_block_layout(cfg) -> dict:
     Each kept (n, n', l) channel maps to the pair owning (n, n'),
     decomposing dim_q into T·(T+1)/2 blocks. Kept channels for a pair are
     NOT contiguous (they interleave along the Fortran (n, n', l) order), so
-    callers gather by q index. compress_mode='trivial' only; raises on
-    'linear' (not separable by species pair).
+    callers gather by q index. compress_mode 'trivial' and 'none' share the
+    same Fortran (n, n', l) emit order — 'trivial' is a subset mask of the
+    uncompressed spectrum (soap_turbo.f90:516, skip mask all-false when
+    compression is off) — so the only difference is the `kept` filter below.
+    Raises on 'linear' (not separable by species pair).
 
     Returns dict: pair_keys, pair_q_index, pair_ln_index, l_index,
     block_sizes, max_block_size, alpha_eff_per_pair, max_alpha_eff,
     N_per_l, dim_q.
     """
     compress_mode = getattr(cfg, "compress_mode", "trivial")
-    if compress_mode != "trivial":
+    if compress_mode not in ("trivial", "none"):
         raise NotImplementedError(
-            f"descriptor_block_layout supports compress_mode='trivial' "
-            f"only (got {compress_mode!r}); 'linear' compression's "
+            f"descriptor_block_layout supports compress_mode 'trivial' and "
+            f"'none' (got {compress_mode!r}); 'linear' compression's "
             f"channel-to-species-pair mapping is not separable")
     alpha_max = int(cfg.alpha_max)
     l_max = int(cfg.l_max)
     n_species = int(cfg.num_types)
-    if str(getattr(cfg, "nep_descriptor", "off")) == "replace":
-        # The ANN sees the NEP block only: no SOAP species-pair blocks
-        # (mixing is rejected in this mode).
+    from gap_descriptor import gap_main_slice
+    if (str(getattr(cfg, "nep_descriptor", "off")) == "replace"
+            or gap_main_slice(cfg) is not None):
+        # The ANN sees the NEP block (or one GAP block) only: no SOAP
+        # species-pair blocks (mixing is rejected in this mode).
         return dict(
             pair_keys=[], pair_q_index={}, pair_ln_index={},
             l_index={l: np.zeros(0, dtype=np.int32) for l in range(l_max + 1)},
@@ -625,7 +712,11 @@ def descriptor_block_layout(cfg) -> dict:
     n_max = sum(alpha_per_species)
     for n in range(1, n_max + 1):
         for nprime in range(n, n_max + 1):
-            kept = (n in pivots) or (nprime in pivots)
+            # Uncompressed: every (n, n') survives, so each pair's channel
+            # set is the complete Sym²/tensor square of its species' radial
+            # block — closed under a radial basis change, unlike 'trivial'.
+            kept = (compress_mode == "none"
+                    or (n in pivots) or (nprime in pivots))
             for l in range(l_max + 1):
                 if kept:
                     s_a = int(n_to_species[n])
@@ -734,6 +825,27 @@ def make_compress_mask_trivial(
         n_compressed=int(counter),
         n_uncompressed=int(n_uncompressed),
     )
+
+
+def make_compress_mask(
+    alpha_max_per_species: list[int],
+    l_max: int,
+    compress_mode: str = "trivial",
+) -> dict:
+    """make_compress_mask_trivial's projection for 'trivial', the identity over
+    the full (n, n', l) spectrum for 'none' (same order, nothing dropped)."""
+    if compress_mode == "trivial":
+        return make_compress_mask_trivial(alpha_max_per_species, l_max)
+    if compress_mode != "none":
+        raise NotImplementedError(
+            f"GPU SOAP supports compress_mode 'trivial' or 'none', got {compress_mode!r}")
+    n_max = sum(alpha_max_per_species)
+    n = n_max * (n_max + 1) // 2 * (l_max + 1)
+    idx = np.arange(n, dtype=np.int32)
+    return dict(compressed_idx=idx, uncompressed_idx=idx.copy(),
+                coeffs=np.ones(n, dtype=np.float64),
+                skip_mask=np.zeros(n, dtype=bool),
+                n_compressed=int(n), n_uncompressed=int(n))
 
 
 def build_multiplicity_array(

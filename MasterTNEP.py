@@ -94,7 +94,8 @@ from data import (collect, split, pad_and_stack,
                   dipole_self_pairs_only)
 from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_history,
                       plot_timing, plot_correlation, plot_cosine_similarity,
-                      plot_loss_breakdown, plot_error_vs_magnitude)
+                      plot_loss_breakdown, plot_error_vs_magnitude,
+                      plot_error_decomposition)
 from model_io import save_model, save_history, setup_run_directory, load_model
 from spectroscopy import (predict_trajectory_batch,
                            compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
@@ -284,6 +285,7 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
                      cfg, save, show, suffix=suffix_per_atom)
     plot_cosine_similarity(metrics, cfg, save, show, suffix=suffix_per_atom)
     plot_error_vs_magnitude(targets, preds_np, cfg, save, show, suffix=suffix_per_atom)
+    plot_error_decomposition(targets, preds_np, cfg, save, show, suffix=suffix_per_atom)
 
     if not has_total:
         return
@@ -300,6 +302,7 @@ def _plot_eval_set(cfg: TNEPconfig, data: dict, preds, metrics: dict,
         total_metrics["cos_sim_all"] = metrics["cos_sim_all"]
     plot_correlation(total_targets, total_preds, total_metrics, cfg, save, show, suffix=suffix_total)
     plot_error_vs_magnitude(total_targets, total_preds, cfg, save, show, suffix=suffix_total)
+    plot_error_decomposition(total_targets, total_preds, cfg, save, show, suffix=suffix_total)
 
 
 def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> None:
@@ -442,7 +445,7 @@ def _train_model_inner(cfg: TNEPconfig,
     train_data, test_pending, val_data = split(dataset, dataset_types_int, cfg)
 
     # Resolve dim_q before any consumer needs it; cross-checked below.
-    from DescriptorBuilderGPU import compute_dim_q, descriptor_input_width
+    from DescriptorBuilderGPU import compute_dim_q, staged_descriptor_width
     cfg.dim_q = compute_dim_q(cfg)
 
     # Pad to dense tensors for GPU-batched eval (test_data padded lazily).
@@ -473,10 +476,12 @@ def _train_model_inner(cfg: TNEPconfig,
                                      pin_to_cpu=cfg.pin_data_to_cpu)
 
     # Cross-check built descriptor width vs cfg (catches cfg/builder drift).
+    # Zero under nep_descriptor="replace": the SOAP spectrum is skipped
+    # entirely because nothing reads it (soap_descriptors_needed).
     built_width = int(train_data["descriptors"][0].shape[-1])
-    if built_width != descriptor_input_width(cfg):
+    if built_width != staged_descriptor_width(cfg):
         raise RuntimeError(
-            f"descriptor_input_width={descriptor_input_width(cfg)} disagrees "
+            f"staged_descriptor_width={staged_descriptor_width(cfg)} disagrees "
             f"with built descriptor width {built_width}; cfg / builder mismatch.")
     print("Dimension of q: " + str(cfg.dim_q))
     if cfg.radial_basis_size is not None:
@@ -495,14 +500,17 @@ def _train_model_inner(cfg: TNEPconfig,
                  "sqrt": "; per-atom L2 normalisation OFF (sign·√|q| × scale, degree 1)"}[cfg.radial_basis_norm]
               + f" (M_radial {_shape} in the SNES vector; init = fixed basis)")
     if cfg.nep_descriptor == "gap_sum":
-        from gap_descriptor import gap_slices
+        from gap_descriptor import gap_slices, gap_models
         gs = gap_slices(cfg)
+        _gm = gap_models(cfg)
         print(f"GAP descriptor (gap_sum): W2={gs['two_body'].stop - gs['two_body'].start}, "
               f"W3={gs['three_body'].stop - gs['three_body'].start}, "
               f"M2={cfg.gap2b_n_centres}, M3={cfg.gap3b_n_centres}, "
               f"rcut=({cfg.gap2b_rcut}, {cfg.gap3b_rcut}), buffer={cfg.gap_buffer}, "
-              f"sigma=({cfg.gap2b_sigma}, {cfg.gap3b_sigma}); ANN_2b(q2) + ANN_3b(q3) "
-              f"(H_e = {cfg.nep_num_neurons}) + SOAP ANN, expert W1 = 0 at gen 0; "
+              f"sigma=({cfg.gap2b_sigma}, {cfg.gap3b_sigma}); models = {' + '.join(_gm)} "
+              f"(main ANN: {_gm[0]}, H = {cfg.num_neurons}; extra ANNs H_e = "
+              f"{cfg.nep_num_neurons}, W1 = 0 at gen 0), each with its own "
+              f"species-pair readout table; "
               f"delta (soap, 2b, 3b) = {list(cfg.sum_delta)}"
               + (" (learned, excluded from L1/L2)" if cfg.sum_delta_learn else " (fixed)")
               + "; "
@@ -545,16 +553,18 @@ def _train_model_inner(cfg: TNEPconfig,
         from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
         q0 = gen0_ann_inputs(cfg, train_data)
         amask = train_data["atom_mask"]
-        m, mu = compute_q_scale(q0, amask.numpy() if hasattr(amask, "numpy") else np.asarray(amask), cfg)
-        cfg.q_scale = [float(v) for v in m]
-        cfg.q_shift = [float(v) for v in mu]
-        print(f"Descriptor scale ({cfg.descriptor_scale}): m per group "
-              f"[min / median / max] = "
-              + ", ".join(f"{m[g].min():.2f}/{np.median(m[g]):.2f}/{m[g].max():.2f}"
-                          for g in q_scale_groups(cfg))
-              + ("; no centring (minmax)" if str(cfg.descriptor_scale) == "minmax" else
-                 "; centred (mean|μ| per group = "
-                 + ", ".join(f"{np.abs(mu[g]).mean():.2e}" for g in q_scale_groups(cfg)) + ")"))
+        m, mu = compute_q_scale(q0, np.asarray(train_data["Z_int"]),
+                                amask.numpy() if hasattr(amask, "numpy") else np.asarray(amask), cfg)
+        cfg.q_scale = m.tolist()
+        cfg.q_shift = mu.tolist()
+        for t, z in enumerate(cfg.types):
+            print(f"Descriptor scale ({cfg.descriptor_scale}), centre Z={z}: m per group "
+                  f"[min / median / max] = "
+                  + ", ".join(f"{m[t, g].min():.2f}/{np.median(m[t, g]):.2f}/{m[t, g].max():.2f}"
+                              for g in q_scale_groups(cfg))
+                  + ("; no centring (minmax)" if str(cfg.descriptor_scale) == "minmax" else
+                     "; centred (mean|μ| per group = "
+                     + ", ".join(f"{np.abs(mu[t, g]).mean():.2e}" for g in q_scale_groups(cfg)) + ")"))
         del q0
 
     # The NEP 3-body Gram path (nep_descriptor.nep_gram_on) reads the angular

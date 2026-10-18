@@ -247,7 +247,7 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
             wg.create_dataset("c_r", data=model.c_r.numpy())
             wg.create_dataset("c_a", data=model.c_a.numpy())
         if model._experts_on:
-            for k in EXPERT_WEIGHTS:
+            for k in model.expert_keys:
                 wg.create_dataset(k, data=getattr(model, k).numpy())
             # Per-expert amplitudes δ (cfg.sum_delta / sum_delta_learn).
             wg.create_dataset("sum_delta", data=model.sum_delta.numpy())
@@ -519,7 +519,7 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
         model.sum_delta.assign(sum_delta)
     if model._experts_on:
         experts = experts or {}
-        for k in EXPERT_WEIGHTS:
+        for k in model.expert_keys:
             if k not in experts:
                 raise ValueError(
                     f"cfg.nep_descriptor={model._nep_mode!r} but the save has no {k} dataset — "

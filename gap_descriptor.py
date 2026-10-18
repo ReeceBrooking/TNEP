@@ -2,7 +2,7 @@
 
 Per-atom neighbour sums that, contracted with a linear readout, ARE TurboGAP's
 2b/3b site energies (gapf90 gap.f90: get_2b_energy_and_forces 264-281,
-get_3b_energy_and_forces 571-647; "exp" kernel only, "pol" not implemented).
+get_3b_energy_and_forces 571-647; 3b kernel "exp" or "pol" per cfg.gap3b_kernel).
 Exact identities, checked in tests/test_gap_descriptor.py against direct
 transcriptions of those loops (delta = 1, cutoff(s) = 1, e0 = 0):
 
@@ -58,6 +58,30 @@ def gap_dim(cfg):
     return gap_slices(cfg)["three_body"].stop
 
 
+GAP_MODELS = ("soap", "2b", "3b")
+GAP_MODEL_SLICE = {"2b": "two_body", "3b": "three_body"}
+
+
+def gap_models(cfg) -> tuple:
+    """cfg.gap_models validated and in canonical order (soap, 2b, 3b). Under
+    nep_descriptor="gap_sum" each selected model is its own ANN with its own
+    species-pair readout table; the FIRST is the main ANN (so leaving "soap"
+    out drops the SOAP network entirely, like nep_descriptor="replace")."""
+    sel = list(getattr(cfg, "gap_models", GAP_MODELS))
+    if not sel or len(set(sel)) != len(sel) or any(m not in GAP_MODELS for m in sel):
+        raise ValueError(f"cfg.gap_models={sel!r}: expected a non-empty subset of {GAP_MODELS}.")
+    return tuple(m for m in GAP_MODELS if m in sel)
+
+
+def gap_main_slice(cfg):
+    """Slice of q2‖q3 feeding the MAIN ANN when "soap" is not selected under
+    nep_descriptor="gap_sum"; None when the main ANN reads SOAP."""
+    if str(getattr(cfg, "nep_descriptor", "off")) != "gap_sum":
+        return None
+    first = gap_models(cfg)[0]
+    return None if first == "soap" else gap_slices(cfg)[GAP_MODEL_SLICE[first]]
+
+
 def validate_gap_cfg(cfg):
     if cfg.gap2b_n_centres < 1 or cfg.gap3b_n_centres < 1:
         raise ValueError("gap2b_n_centres and gap3b_n_centres must be ≥ 1")
@@ -66,6 +90,8 @@ def validate_gap_cfg(cfg):
     s3 = np.asarray(cfg.gap3b_sigma, dtype=np.float64)
     if s3.shape != (3,) or np.any(s3 <= 0):
         raise ValueError("gap3b_sigma must be three positive widths")
+    if str(getattr(cfg, "gap3b_kernel", "exp")) not in ("exp", "pol"):
+        raise ValueError(f"gap3b_kernel={cfg.gap3b_kernel!r}: expected 'exp' or 'pol'")
     for rc in (cfg.gap2b_rcut, cfg.gap3b_rcut):
         if not 0 < cfg.gap_buffer <= rc:
             raise ValueError(f"gap_buffer must satisfy 0 < buffer ≤ rcut (buffer={cfg.gap_buffer}, rcut={rc})")
@@ -139,7 +165,13 @@ def gap_raw_numpy(atoms, types_int, cfg):
     # ponytail: per-dimension accumulation keeps the peak at one [P, M3] (P ≈ N·M²/2
     # triplets per frame, ~11k×50 for water at 3.5 Å); chunk over P if frames get large
     d2 = sum(((q[:, d, None] - Q3[None, :, d]) / s3[d]) ** 2 for d in range(3))
-    k3 = w[:, None] * np.exp(-0.5 * d2)
+    if str(getattr(cfg, "gap3b_kernel", "exp")) == "pol":
+        # TurboGAP's cov_pp(r, 3, 1) (gap.f90:760-788): compact support,
+        # exactly zero beyond a scaled distance of 1 (σ is the support radius).
+        r3 = np.sqrt(d2)
+        k3 = w[:, None] * np.where(r3 < 1.0, (1.0 - r3) ** 4 * (4.0 * r3 + 1.0), 0.0)
+    else:
+        k3 = w[:, None] * np.exp(-0.5 * d2)
     slot = pair_index(T)[types_int[ja], types_int[jb]]
     q3 = np.zeros((N, T * (T + 1) // 2, len(Q3)))
     np.add.at(q3, (ci, slot), k3)

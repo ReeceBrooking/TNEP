@@ -113,7 +113,9 @@ def test_q_scale_minmax_is_gpumd_scaler():
     q[:, 6] = 2.0                                                       # dead channel
     # "replace": the ANN input IS the NEP block, so every channel is scaled.
     cfg = _cfg(descriptor_scale="minmax", nep_descriptor="replace")
-    m, mu = compute_q_scale(q, mask, cfg)
+    m, mu = compute_q_scale(q, np.arange(50) % cfg.num_types, mask, cfg)
+    assert m.shape == (cfg.num_types, 7) and np.all(m == m[0])       # species-blind, like GPUMD
+    m, mu = m[0], mu[0]
     np.testing.assert_allclose(m[:6], 1.0 / (q[:, :6].max(0) - q[:, :6].min(0)), rtol=1e-6)   # nep.cu:347
     assert m[6] == 1.0
     assert np.all(mu == 0.0)                                            # no centring
@@ -133,7 +135,8 @@ def test_minmax_is_confined_to_the_nep_block():
         assert 0 < sw < W                       # both blocks present
         rng = np.random.default_rng(1)
         q = rng.normal(size=(200, W)) * np.linspace(1.0, 50.0, W)
-        m, mu = compute_q_scale(q, np.ones(200), cfg)
+        m, mu = compute_q_scale(q, np.zeros(200, int), np.ones(200), cfg)
+        m, mu = m[0], mu[0]
         assert np.all(m[:sw] == 1.0)            # SOAP untouched
         assert np.all(m[sw:] != 1.0)            # NEP scaled
         np.testing.assert_allclose(
@@ -141,7 +144,7 @@ def test_minmax_is_confined_to_the_nep_block():
         assert np.all(mu == 0.0)
     with pytest.raises(ValueError, match="no.*NEP block"):
         compute_q_scale(np.random.default_rng(0).normal(size=(20, 75)),
-                        np.ones(20), _cfg(descriptor_scale="minmax"))
+                        np.zeros(20, int), np.ones(20), _cfg(descriptor_scale="minmax"))
 
 
 def test_mirrored_sampling_switch():
@@ -165,9 +168,8 @@ def test_minmax_threads_into_model_fold():
     cfg = _cfg(descriptor_scale="minmax", nep_descriptor="replace")
     W = sum(int(g.size) for g in q_scale_groups(cfg))
     q_np = np.random.default_rng(2).normal(size=(200, W)) * np.linspace(1.0, 20.0, W)
-    m, mu = compute_q_scale(q_np, np.ones(200), cfg)
-    cfg.q_scale = [float(v) for v in m]
-    cfg.q_shift = [float(v) for v in mu]
+    m, mu = compute_q_scale(q_np, np.zeros(200, int), np.ones(200), cfg)
+    cfg.q_scale, cfg.q_shift = m.tolist(), mu.tolist()
     model = _model(cfg)
     np.testing.assert_allclose(model._q_scale.numpy(), m)
     assert np.all(model._q_shift_m.numpy() == 0.0)
@@ -539,6 +541,57 @@ def test_compute_dim_q_and_layout_per_mode():
     assert lr["pair_keys"] == [] and lr["dim_q"] == nd.nep_dim(rp) and lr["max_block_size"] == 0
 
 
+def test_uncompressed_block_layout_and_mixing():
+    """compress_mode='none': same Fortran (n,n',l) order as 'trivial', which is
+    a strict subset of it. Blocks tile dim_q, each pair's block is the complete
+    Sym²/tensor square of its species' radial channels, and the assembled
+    U_full is identity at init and block-orthogonal after reconstruction."""
+    from DescriptorBuilderGPU import compute_dim_q, descriptor_block_layout
+    a, lm = 4, 4
+    for T in (1, 2, 3):
+        kw = dict(types=[8, 1, 6][:T], num_types=T,
+                  type_map={z: i for i, z in enumerate([8, 1, 6][:T])},
+                  alpha_max=a, l_max=lm, descriptor_mode=0)
+        none = _base_cfg(compress_mode="none", **kw)
+        triv = _base_cfg(compress_mode="trivial", **kw)
+        ln, lt = descriptor_block_layout(none), descriptor_block_layout(triv)
+        # dim_q agrees with the closed form, and the blocks tile it exactly.
+        assert ln["dim_q"] == compute_dim_q(none)
+        tiled = sorted(int(q) for k in ln["pair_keys"]
+                       for q in ln["pair_q_index"][k])
+        assert tiled == list(range(ln["dim_q"]))
+        # Same pairs as trivial, and every trivial channel count is smaller:
+        # trivial masks the uncompressed spectrum, it does not reorder it.
+        assert ln["pair_keys"] == lt["pair_keys"]
+        # (s,s) blocks = Sym²(alpha) per l; (s,t) blocks = alpha² per l.
+        for k in ln["pair_keys"]:
+            want = a * (a + 1) // 2 if k[0] == k[1] else a * a
+            assert ln["alpha_eff_per_pair"][k] == want, (T, k)
+            assert lt["alpha_eff_per_pair"][k] < want
+            # alpha_eff is uniform across l (what the padded U_pair assumes).
+            assert {len(v) for v in ln["pair_ln_index"][k].values()} == {want}
+
+    cfg = _base_cfg(compress_mode="none", alpha_max=a, l_max=lm,
+                    descriptor_mode=0, descriptor_mixing=True,
+                    descriptor_mixing_regularizer="expm")
+    m = _model(cfg)
+    assert tuple(m.U_pair.shape) == (3, lm + 1, a * a, a * a)   # padded to max α
+    Q = cfg.dim_q
+    np.testing.assert_allclose(m._U_full().numpy(), np.eye(Q), atol=0)  # gen 0 = I
+    snes = m.optimizer
+    named = snes._split_reconstructed(snes.reconstruct_params_tf(
+        0.05 * tf.random.stateless_normal([snes.dim], seed=(1, 2))))
+    U = m._U_full(named["U_pair"]).numpy()
+    np.testing.assert_allclose(U @ U.T, np.eye(Q), atol=1e-5)   # orthogonal
+    blk = np.zeros((Q, Q), dtype=bool)
+    for k in m._mix_pair_keys:
+        for l in range(m._mix_L):
+            idx = m._mix_layout["pair_ln_index"][k][l]
+            blk[np.ix_(idx, idx)] = True
+    assert not U[~blk].any()                       # no cross-pair / cross-l leak
+    assert np.abs(U - np.eye(Q)).max() > 1e-3      # and the blocks did move
+
+
 # ── Task 5: nep_raw data plumbing + every forward call site ────────────────
 
 def _forward_args(m, d):
@@ -818,26 +871,30 @@ def test_minmax_scaler_uses_c_equal_one():
 
 @pytest.mark.parametrize("scale", ["block", "channel", "minmax"])
 @pytest.mark.parametrize("mode", ["concat", "replace"])
-def test_scaled_nep_model_is_gen0_reparameterisation(mode, scale):
+def test_scaled_nep_model_folds_into_W0(mode, scale):
     from DescriptorBuilderGPU import compute_q_scale
     from TNEP import gen0_ann_inputs
     atoms = _bulk_frame(); small = atoms[:12]; small.info["dipole"] = np.zeros(3)
     cfg_off = _cfg(nep_descriptor=mode)
     cfg_on = _cfg(nep_descriptor=mode, descriptor_scale=scale)
     d = prepare_eval_data([atoms, small], cfg_off)
-    m_np, mu_np = compute_q_scale(gen0_ann_inputs(cfg_on, d), d["atom_mask"].numpy(), cfg_on)
-    cfg_on.q_scale, cfg_on.q_shift = [float(v) for v in m_np], [float(v) for v in mu_np]
-    assert len(cfg_on.q_scale) == cfg_on.dim_q and (mu_np == 0).all() == (scale == "minmax")
+    m_np, mu_np = compute_q_scale(gen0_ann_inputs(cfg_on, d), d["Z_int"].numpy(), d["atom_mask"].numpy(), cfg_on)
+    cfg_on.q_scale, cfg_on.q_shift = m_np.tolist(), mu_np.tolist()
+    assert len(cfg_on.q_scale[0]) == cfg_on.dim_q and (mu_np == 0).all() == (scale == "minmax")
     m_off, m_on = _model(cfg_off), _model(cfg_on)
     np.testing.assert_array_equal(m_on.c_r.numpy(), m_off.c_r.numpy())
-    np.testing.assert_allclose(m_on.W0.numpy() * m_np[None, :, None], m_off.W0.numpy(), rtol=1e-6)
-    np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
+    # Stored init is the plain one (never divided by m), also in the SNES mean:
+    # under GPUMD's q_scaler that is O(1) weights on the scaled descriptor.
+    np.testing.assert_array_equal(m_on.W0.numpy(), m_off.W0.numpy())
+    assert np.abs(m_on.b0.numpy()).max() == 0
+    n_ann = m_on.optimizer.n_typed
+    np.testing.assert_array_equal(m_on.optimizer.mu.numpy()[:n_ann], m_off.optimizer.mu.numpy()[:n_ann])
     # Any scaled model == unscaled model with W0' = m∘W0, b0' = b0 − (m∘μ)·W0.
     rng = np.random.default_rng(1)
     W = rng.normal(size=m_on.W0.shape).astype(np.float32)
     B = rng.normal(size=m_on.b0.shape).astype(np.float32)
     m_on.W0.assign(W); m_on.b0.assign(B)
-    m_off.W0.assign(W * m_np[None, :, None]); m_off.b0.assign(B - np.einsum('q,tqh->th', m_np * mu_np, W))
+    m_off.W0.assign(W * m_np[:, :, None]); m_off.b0.assign(B - np.einsum('tq,tqh->th', m_np * mu_np, W))
     np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
 
 
@@ -1005,9 +1062,10 @@ def test_sum_mode_regularisation_includes_experts():
 
 
 @pytest.mark.parametrize("scale", ["block", "channel", "minmax"])
-def test_sum_mode_scaled_is_gen0_reparameterisation(scale):
+def test_sum_mode_scaled_folds_into_every_W0(scale):
     """gen0_ann_inputs is the full [q_soap ‖ q_nep]; the SOAP / radial / angular
-    slices fold into W0, W0_r, W0_a; a scaled model equals the unscaled one."""
+    slices fold into W0, W0_r, W0_a; a scaled model equals the unscaled one
+    with the fold applied (the stored init itself is never divided by m)."""
     from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
     from TNEP import gen0_ann_inputs
     atoms = _bulk_frame(); small = atoms[:12]; small.info["dipole"] = np.zeros(3)
@@ -1019,20 +1077,22 @@ def test_sum_mode_scaled_is_gen0_reparameterisation(scale):
     groups = q_scale_groups(cfg_on)
     assert sorted(np.concatenate(groups).tolist()) == list(range(ds + dn))
     assert len(groups) == len(q_scale_groups(_cfg(descriptor_scale=scale))) + 1 + 4 + 1
-    m_np, mu_np = compute_q_scale(q0, d["atom_mask"].numpy(), cfg_on)
-    cfg_on.q_scale, cfg_on.q_shift = [float(v) for v in m_np], [float(v) for v in mu_np]
+    m_np, mu_np = compute_q_scale(q0, d["Z_int"].numpy(), d["atom_mask"].numpy(), cfg_on)
+    cfg_on.q_scale, cfg_on.q_shift = m_np.tolist(), mu_np.tolist()
     m_off, m_on = _model(cfg_off), _model(cfg_on)
-    sl = nd.nep_slices(cfg_on); m_r, m_a = m_np[ds:][sl["radial"]], m_np[ds:][sl["angular"]]
-    np.testing.assert_allclose(m_on.W0.numpy() * m_np[None, :ds, None], m_off.W0.numpy(), rtol=1e-6)
-    np.testing.assert_allclose(m_on.W0_r.numpy() * m_r[None, :, None], m_off.W0_r.numpy(), rtol=1e-6)
-    np.testing.assert_allclose(m_on.W0_a.numpy() * m_a[None, :, None], m_off.W0_a.numpy(), rtol=1e-6)
+    sl = nd.nep_slices(cfg_on); m_r, m_a = m_np[:, ds:][:, sl["radial"]], m_np[:, ds:][:, sl["angular"]]
+    for k in ("W0", "W0_r", "W0_a"):
+        np.testing.assert_array_equal(getattr(m_on, k).numpy(), getattr(m_off, k).numpy())
     for m in (m_off, m_on):
         _randomise_experts(m)                      # same draw on both → live experts
+    # fold the main ANN's shared draw into m_on, like the experts below
+    m_on.W0.assign(m_off.W0.numpy() / m_np[:, :ds, None])
+    m_on.b0.assign(m_off.b0.numpy() + np.einsum('tq,tqh->th', (m_np * mu_np)[:, :ds], m_on.W0.numpy()))
     for k, mk in (("r", m_r), ("a", m_a)):     # re-fold the shared draw into m_on
-        getattr(m_on, f"W0_{k}").assign(getattr(m_off, f"W0_{k}").numpy() / mk[None, :, None])
-        mu_k = (m_np * mu_np)[ds:][sl["radial" if k == "r" else "angular"]]
+        getattr(m_on, f"W0_{k}").assign(getattr(m_off, f"W0_{k}").numpy() / mk[:, :, None])
+        mu_k = (m_np * mu_np)[:, ds:][:, sl["radial" if k == "r" else "angular"]]
         getattr(m_on, f"b0_{k}").assign(getattr(m_off, f"b0_{k}").numpy()
-                                        + np.einsum('q,tqh->th', mu_k, getattr(m_on, f"W0_{k}").numpy()))
+                                        + np.einsum('tq,tqh->th', mu_k, getattr(m_on, f"W0_{k}").numpy()))
     np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
     assert np.abs(_predict_eff(m_on, d)).max() > 0
 

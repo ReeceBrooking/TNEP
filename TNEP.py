@@ -202,6 +202,17 @@ class TNEP(layers.Layer):
         # "sum" / "gap_sum": ANN_2b + ANN_3b experts added to the SOAP ANN;
         # their inputs are the NEP contraction or the GAP q2 ‖ q3 raw slot.
         self._experts_on = self._nep_mode in ("sum", "gap_sum")
+        # The models that make up the prediction, in order; the first is the
+        # main ANN, the rest are extra ANNs. Each has its OWN species-pair
+        # readout table: μ = Σ_k Σ_i s_k,i·Ω_k(r_ij)·d_ij (neighbor readout).
+        # "gap_sum" takes the selection from cfg.gap_models.
+        if self._nep_mode == "gap_sum":
+            from gap_descriptor import gap_models
+            self._models = gap_models(cfg)
+        else:
+            self._models = ("soap", "2b", "3b") if self._experts_on else ("soap",)
+        self._main_in = None      # slice of the raw expert input feeding the main ANN (None = SOAP)
+        self._expert_suf = ()     # weight-name suffix per extra model
         # Per-expert amplitudes δ = (δ_soap, δ_2b, δ_3b) on the summed head.
         # Exactly redundant with rescaling each expert's W1 — meaningful only
         # because δ is excluded from the L1/L2 penalty on W1 (cfg.sum_delta).
@@ -252,16 +263,24 @@ class TNEP(layers.Layer):
         if self._experts_on:
             if self._nep_mode == "gap_sum":
                 from gap_descriptor import gap_slices
-                nsl, keys = gap_slices(cfg), ("two_body", "three_body")
+                nsl, key = gap_slices(cfg), {"2b": "two_body", "3b": "three_body"}
             else:
-                nsl, keys = nep_slices(cfg), ("radial", "angular")
+                nsl, key = nep_slices(cfg), {"2b": "radial", "3b": "angular"}
             ds = self._scale_width
+            if self._models[0] != "soap":
+                self._main_in = nsl[key[self._models[0]]]
+            extra = self._models[1:]
+            self._expert_suf = tuple({"2b": "_r", "3b": "_a"}[m] for m in extra)
             self._expert_in = tuple(
-                (nsl[k], slice(ds + nsl[k].start, ds + nsl[k].stop)) for k in keys)
+                (nsl[key[m]], slice(ds + nsl[key[m]].start, ds + nsl[key[m]].stop)) for m in extra)
             self._scale_width += self._nep_dim
-        # Descriptor scale preconditioning: m folded into W0 (see _W0_eff);
-        # the Keras W0 init is divided by m so the initial function is the
-        # unscaled one. SNES's μ init does the same in _build_mu_init.
+        # δ slot (δ_soap, δ_2b, δ_3b) of each model, main first.
+        self._delta_idx = tuple(("soap", "2b", "3b").index(m) for m in self._models)
+        # Descriptor scale: m folded into W0 (see _W0_eff). The stored weights
+        # keep their plain Glorot / zero init and act on the SCALED, centred
+        # input m∘(q − μ) — GPUMD's convention (O(1) weights on O(1) inputs).
+        # Do NOT divide the init by m to reproduce the unscaled model: that
+        # starts the tanh layer saturated and inflates L1/L2 by 1/m.
         self._q_scale = None
         if str(getattr(cfg, "descriptor_scale", "off")) != "off":
             if str(cfg.descriptor_scale) not in ("block", "channel", "minmax"):
@@ -274,10 +293,11 @@ class TNEP(layers.Layer):
                     "training driver computes it from the training set "
                     "(compute_q_scale) before building the model.")
             m = np.asarray(cfg.q_scale, dtype=np.float32)
-            if m.shape != (self._scale_width,):
+            if m.shape != (cfg.num_types, self._scale_width):
                 raise ValueError(
                     f"cfg.q_scale has shape {m.shape}, expected "
-                    f"({self._scale_width},) — recompute for this descriptor.")
+                    f"({cfg.num_types}, {self._scale_width}) — one row per "
+                    f"centre species; recompute for this descriptor.")
             self._q_scale = tf.constant(m)
             if cfg.q_shift is None:
                 raise ValueError("cfg.q_shift is None — computed with q_scale.")
@@ -407,7 +427,10 @@ class TNEP(layers.Layer):
                         pair_idx[t, t2] = pair_idx[t2, t] = p
                         p += 1
             self._pair_idx = tf.constant(pair_idx)
-            c_shape = (self._dipole_channels, int(pair_idx.max()) + 1)
+            # One table per model, side by side on the pair axis: model k
+            # owns columns [k·n_pairs, (k+1)·n_pairs) (see _c_full).
+            self._n_pairs = int(pair_idx.max()) + 1
+            c_shape = (self._dipole_channels, self._n_pairs * len(self._models))
             if self._c_learnable:
                 self.c_pair = self.add_weight(
                     name="c_pair", shape=c_shape,
@@ -489,7 +512,7 @@ class TNEP(layers.Layer):
         # the SOAP ANN's before _split_head. W1_r / W1_a start at zero so a
         # fresh model equals the SOAP-only one; b1 stays the one global bias.
         self._ann_blocks = [AnnBlock("", int(cfg.dim_q), int(cfg.num_neurons), self._sl_main)]
-        for suf, (sl_in, sl_m) in zip(("_r", "_a"), self._expert_in):
+        for suf, (sl_in, sl_m) in zip(self._expert_suf, self._expert_in):
             d_in, He = sl_in.stop - sl_in.start, int(cfg.nep_num_neurons)
             self._ann_blocks.append(AnnBlock(suf, d_in, He, sl_m))
             for name, shape, init in (("W0", (cfg.num_types, d_in, He), "glorot_uniform"),
@@ -568,18 +591,6 @@ class TNEP(layers.Layer):
             )
         else:
             self.U_pair = None
-
-        if self._q_scale is not None:
-            # Stored W0 = Glorot / m and b0 = (m∘μ)·W0_stored, so W0_eff / b0_eff
-            # at init equal the unscaled Glorot / zero init exactly — for every
-            # typed ANN on its own slice of q_scale.
-            anns = [(getattr(self, "W0" + b.suffix), getattr(self, "b0" + b.suffix), b.scale_slice)
-                    for b in self._ann_blocks]
-            if cfg.target_mode == 2:
-                anns.append((self.W0_pol, self.b0_pol, self._sl_main))
-            for W0, b0, sl in anns:
-                W0.assign(W0 * (1.0 / self._q_scale[sl, tf.newaxis]))
-                b0.assign(tf.einsum('q,tqh->th', self._q_shift_m[sl], W0))
 
         self.optimizer = SNES(self)
 
@@ -664,9 +675,9 @@ class TNEP(layers.Layer):
         if self._q_scale is None:
             return W0, b0
         sl = self._sl_main if sl is None else sl
-        W0_eff = W0 * self._q_scale[sl, tf.newaxis]
+        W0_eff = W0 * self._q_scale[:, sl, tf.newaxis]
         b0_eff = (None if b0 is None
-                  else b0 - tf.einsum('q,...tqh->...th', self._q_shift_m[sl], W0))
+                  else b0 - tf.einsum('tq,...tqh->...th', self._q_shift_m[:, sl], W0))
         return W0_eff, b0_eff
 
     # ---- learned radial basis ---------------------------------------------
@@ -853,7 +864,8 @@ class TNEP(layers.Layer):
                 f"the raw expert input [.., W_raw] (the NEP basis, or GAP q2‖q3 "
                 f"under gap_sum) at every forward site.")
         if self._experts_on:              # experts read nep_raw in _expert_outputs
-            return descriptors, None
+            return (descriptors if self._main_in is None
+                    else nep_raw[..., self._main_in.start:self._main_in.stop]), None
         # s is consumed ONLY by the tnep pair-force contraction; asking for it
         # elsewhere would force the slow path and build a [C, N, n, 24] tensor.
         if self._nep_pair_forces_on:
@@ -875,9 +887,15 @@ class TNEP(layers.Layer):
         return tf.concat([descriptors, q_nep], -1), s
 
     @property
+    def expert_keys(self) -> tuple:
+        """Weight names of the extra models' ANNs, in SNES / Adam / save order
+        (a subset of EXPERT_WEIGHTS: only the selected models exist)."""
+        return tuple(n + suf for suf in self._expert_suf for n in ("W0", "b0", "W1"))
+
+    @property
     def expert_weights(self) -> tuple:
-        """The six "sum"-mode expert tensors in EXPERT_WEIGHTS order."""
-        return tuple(getattr(self, k) for k in EXPERT_WEIGHTS)
+        """The extra models' tensors in expert_keys order."""
+        return tuple(getattr(self, k) for k in self.expert_keys)
 
     def _expert_ann(self, q: tf.Tensor, Z: tf.Tensor, atom_mask: tf.Tensor,
                     W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor,
@@ -920,30 +938,48 @@ class TNEP(layers.Layer):
     def _expert_outputs(self, nep_raw: tf.Tensor, Z: tf.Tensor, atom_mask: tf.Tensor,
                         c_r: tf.Tensor | None = None, c_a: tf.Tensor | None = None,
                         experts: tuple | None = None,
-                        sum_delta: tf.Tensor | None = None) -> tf.Tensor:
-        """δ_2b·ANN_2b(q_r) + δ_3b·ANN_3b(q_ang) head outputs
-        [(C,) ..., A, head_slots] under nep_descriptor="sum" / "gap_sum"
-        (q2 / q3), added to δ_soap·(the SOAP ANN's) before _split_head.
-        experts: the six STORED tensors in EXPERT_WEIGHTS order (optional
-        leading candidate axis); None → the model's variables. sum_delta:
-        [3] or per-candidate [C, 3]; None → self.sum_delta."""
+                        sum_delta: tf.Tensor | None = None) -> list:
+        """The extra models' head outputs δ_k·ANN_k(q_k), one
+        [(C,) ..., A, head_slots] tensor per extra model, under
+        nep_descriptor="sum" / "gap_sum". experts: the STORED tensors in
+        expert_keys order (optional leading candidate axis); None → the
+        model's variables. sum_delta: [3] or per-candidate [C, 3]; None →
+        self.sum_delta."""
         q = nep_raw if self._nep_mode == "gap_sum" else self.nep_from_raw(nep_raw, Z, c_r, c_a)
         w = self.expert_weights if experts is None else tuple(experts)
         d = self.sum_delta if sum_delta is None else sum_delta
-        return tf.add_n([
-            self._delta_scale(d, i + 1,
-                              self._expert_ann(q, Z, atom_mask, *w[3 * i:3 * i + 3], *sl))
-            for i, sl in enumerate(self._expert_in)])
+        return [self._delta_scale(d, self._delta_idx[i + 1],
+                                  self._expert_ann(q, Z, atom_mask, *w[3 * i:3 * i + 3], *sl))
+                for i, sl in enumerate(self._expert_in)]
 
-    def _head_with_experts(self, out: tf.Tensor, nep_raw: tf.Tensor, Z: tf.Tensor,
-                           atom_mask: tf.Tensor, c_r: tf.Tensor | None = None,
-                           c_a: tf.Tensor | None = None, experts: tuple | None = None,
-                           sum_delta: tf.Tensor | None = None) -> tf.Tensor:
-        """The summed head: δ_soap·ANN_soap + δ_2b·ANN_2b + δ_3b·ANN_3b.
-        Called at every forward site when self._experts_on."""
+    def _model_outs(self, out: tf.Tensor, nep_raw: tf.Tensor, Z: tf.Tensor,
+                    atom_mask: tf.Tensor, c_r: tf.Tensor | None = None,
+                    c_a: tf.Tensor | None = None, experts: tuple | None = None,
+                    sum_delta: tf.Tensor | None = None) -> list:
+        """Per-model head outputs [main, *extras] for _site_coeff. `out` is
+        the main ANN's head output. Called at every neighbor-readout site."""
+        if not self._experts_on:
+            return [out]
         d = self.sum_delta if sum_delta is None else sum_delta
-        return (self._delta_scale(d, 0, out)
+        return ([self._delta_scale(d, self._delta_idx[0], out)]
                 + self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts, d))
+
+    def _site_coeff(self, outs: list, c_pair: tf.Tensor, Z: tf.Tensor) -> tf.Tensor:
+        """G[.., a, n, t'] = Σ_k s_k[.., a, n]·c_k[n, t_a, t'] — every model's
+        site values through its OWN pair table; μ = Σ_{a,n,t'} G·V. outs:
+        _model_outs; c_pair packed [(C,) Ch, M·n_pairs]; Z [..., A]. THE one
+        place the per-model readout is assembled."""
+        G = None
+        for k, out in enumerate(outs):
+            s = self._split_head(out)                                   # [(C,) ..., A, Ch]
+            c = self._c_full(c_pair, k)                                 # [(C,) Ch, T, T]
+            if len(c.shape) == 4:                                       # per-candidate table
+                c_at = tf.gather(tf.transpose(c, [0, 2, 1, 3]), Z, axis=1)   # [C, ..., A, Ch, T]
+            else:
+                c_at = tf.gather(tf.transpose(c, [1, 0, 2]), Z)              # [..., A, Ch, T]
+            g = s[..., tf.newaxis] * c_at
+            G = g if G is None else G + g
+        return G
 
     def predict(self, descriptors: tf.Tensor, gradients: tf.Tensor, grad_index: tf.Tensor,
                 positions: tf.Tensor, Z: tf.Tensor, box: tf.Tensor,
@@ -1018,9 +1054,9 @@ class TNEP(layers.Layer):
             # under dipole_species_pairs="ordered" that identity breaks and
             # the exclusion is a modeling choice — keep it, don't "fix" it.
             out = tf.einsum('ah,ahk->ak', h, W1_t)                    # [A, S]
-            if self._experts_on:
-                out = self._head_with_experts(out, nep_raw, Z, atom_mask, c_r, c_a)
-            s = self._split_head(out)                                 # [A, C]
+            G = self._site_coeff(
+                self._model_outs(out, nep_raw, Z, atom_mask, c_r, c_a),
+                self.c_pair, Z)                                       # [A, C, T]
             dr, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)          # dr = neighbor − center
             rc = float(self.cfg.dipole_rc)
@@ -1034,10 +1070,7 @@ class TNEP(layers.Layer):
             V = tf.einsum('amn,amd,amt->adnt',                # float64 accum.
                           tf.cast(Rw, tf.float64),
                           tf.cast(-dr, tf.float64), tp)      # [A, 3, C, T]
-            c_full = self._c_full(self.c_pair)                        # [C, T, T]
-            c_at = tf.gather(c_full, Z, axis=1)                       # [C, A, T]
-            mu = tf.einsum('an,nat,adnt->d',
-                           s, c_at, tf.cast(V, s.dtype))                 # [3]
+            mu = tf.einsum('ant,adnt->d', G, tf.cast(V, G.dtype))     # [3]
             return mu
 
         # Modes 1 and 2 need forces
@@ -1436,7 +1469,8 @@ class TNEP(layers.Layer):
             metrics, preds = self.score(test_data)
             if plot:
                 # Lazy import: keeps matplotlib out of module import.
-                from plotting import plot_correlation, plot_error_vs_magnitude
+                from plotting import (plot_correlation, plot_error_vs_magnitude,
+                                      plot_error_decomposition)
                 if save_plots is not None:
                     os.makedirs(save_plots, exist_ok=True)
                 targets_np = test_data["targets"].numpy()
@@ -1465,6 +1499,10 @@ class TNEP(layers.Layer):
                                       suffix=suffix,
                                       shared_axis_scale=shared_axis_scale)
                     plot_error_vs_magnitude(targets_np, preds_np, self.cfg,
+                                             save_plots=save_plots,
+                                             show_plots=show_plots,
+                                             suffix=suffix)
+                    plot_error_decomposition(targets_np, preds_np, self.cfg,
                                              save_plots=save_plots,
                                              show_plots=show_plots,
                                              suffix=suffix)
@@ -1619,11 +1657,10 @@ class TNEP(layers.Layer):
             if c_pair is None:
                 c_pair = self.c_pair  # model-weight callers (score, spectro)
             out = tf.einsum('bah,bahk->bak', h1, W1_t)               # [B, A, S]
-            if self._experts_on:
-                out = self._head_with_experts(out, nep_raw, Z, atom_mask, c_r, c_a,
-                                              experts, sum_delta)
-            s = self._split_head(out)                                # [B, A, C]
-            V = W_atom  # [B, A, 3, C, T] geometry kernel via the W_atom slot
+            G = self._site_coeff(
+                self._model_outs(out, nep_raw, Z, atom_mask, c_r, c_a,
+                                 experts, sum_delta), c_pair, Z)     # [B, A, C, T]
+            V = W_atom  # [B, A, D, C, T] geometry kernel via the W_atom slot
             if V is None:
                 # Full-pair callers (spectroscopy fused / legacy pack):
                 # build V in-graph from the r_d pair stream (r_c ≤ rcut_hard).
@@ -1631,9 +1668,7 @@ class TNEP(layers.Layer):
                     positions, boxes, box_inv, pair_struct, pair_atom,
                     pair_gidx, Z, tf.shape(descriptors)[0],
                     tf.shape(descriptors)[1])
-            c_full = self._c_full(c_pair)                         # [C, T, T]
-            c_at = tf.gather(c_full, Z, axis=1)                   # [C, B, A, T]
-            mu = tf.einsum('ban,nbat,badnt->bd', s, c_at, V)      # [B, 3]
+            mu = tf.einsum('bant,badnt->bd', G, V)                # [B, D]
             return mu
 
         # Single-hidden backward chain (∂U/∂q):
@@ -1822,20 +1857,13 @@ class TNEP(layers.Layer):
             # b1 stays excluded: exact gauge with c symmetric; a modeling
             # choice (kept deliberately) under "ordered" Ω.
             out = tf.einsum('cbah,cbahk->cbak', h1, W1_t_all)      # [C, B, A, S]
-            if self._experts_on:
-                out = self._head_with_experts(out, nep_raw, Z, atom_mask, c_r, c_a,
-                                              experts, sum_delta)
-            s = self._split_head(out)                           # [C, B, A, Ch]
-            if c_pair is None:
-                # Candidate-independent c (frozen c ≡ 1, or model weights):
-                # tile once so ONE einsum serves both cases. (Symbolic C —
-                # never `list + TensorShape`, it does not trace.)
-                c_full = tf.tile(self._c_full(self.c_pair)[tf.newaxis],
-                                 [C, 1, 1, 1])                     # [C, Ch, T, T]
-            else:
-                c_full = self._c_full(c_pair)                      # [C, Ch, T, T]
-            c_at = tf.gather(c_full, Z, axis=2)                    # [C, Ch, B, A, T]
-            mu = tf.einsum('cban,cnbat,badnt->cbd', s, c_at, W_atom)   # [C, B, 3]
+            # c_pair None = candidate-independent table (frozen c ≡ 1, or the
+            # model's weights): it broadcasts against the candidate axis of s.
+            G = self._site_coeff(
+                self._model_outs(out, nep_raw, Z, atom_mask, c_r, c_a,
+                                 experts, sum_delta),
+                self.c_pair if c_pair is None else c_pair, Z)      # [C, B, A, Ch, T]
+            mu = tf.einsum('cbant,badnt->cbd', G, W_atom)          # [C, B, D]
             return mu
 
         # ── Dipole: backward matmul ───────────────────────────────────────────
@@ -2200,10 +2228,11 @@ class TNEP(layers.Layer):
         return tf.broadcast_to(
             out, tf.concat([tf.shape(out)[:-1], [self._dipole_channels]], 0))
 
-    def _c_full(self, c_pair: tf.Tensor) -> tf.Tensor:
-        """Packed c_pair [..., C, n_pairs] → [..., C, T, T] via _pair_idx
-        (symmetric table for "off"/"symmetric", ordered for "ordered")."""
-        return tf.gather(c_pair, self._pair_idx, axis=-1)
+    def _c_full(self, c_pair: tf.Tensor, k: int = 0) -> tf.Tensor:
+        """Model k's table from the packed c_pair [..., C, M·n_pairs] →
+        [..., C, T, T] via _pair_idx (symmetric table for "off"/"symmetric",
+        ordered for "ordered")."""
+        return tf.gather(c_pair, self._pair_idx + k * self._n_pairs, axis=-1)
 
     def _neighbor_V_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
                         box_inv: tf.Tensor, pair_struct: tf.Tensor,

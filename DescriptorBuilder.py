@@ -452,6 +452,11 @@ class DescriptorBuilder(layers.Layer):
         Returns:
             Same triple as `build_descriptors`, one self-pair entry per atom.
         """
+        from data import soap_gradients_needed
+        if not soap_gradients_needed(self.cfg):
+            # Neighbor readout / nep "replace": no SOAP gradient is read.
+            return self.build_descriptors(dataset, calc_gradients=False,
+                                          **build_kwargs)
         if batch_size is None or batch_size >= len(dataset):
             # Single-shot path — still filters, just doesn't chunk.
             descs, grads, gidx = self.build_descriptors(dataset, **build_kwargs)
@@ -537,6 +542,41 @@ class DescriptorBuilder(layers.Layer):
 # =========================================================================
 
 
+class _SoapFreeBuilder:
+    """Emits a ZERO-WIDTH `descriptors` slot instead of the SOAP power
+    spectrum, for nep_descriptor="replace" where nothing reads it
+    (DescriptorBuilderGPU.soap_descriptors_needed).
+
+    Everything else delegates to the real builder, so a path that genuinely
+    needs SOAP fails loudly on the shape rather than quietly reading zeros."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    @staticmethod
+    def _empty(dataset):
+        """The calc_gradients=False shape contract at dim_q = 0: descriptors
+        [N, 0], one zero-ROW gradient tensor per atom (a bare [] converts to
+        shape (0,) and breaks the downstream concat), empty index lists."""
+        import tensorflow as _tf
+        descs, grads, gidx = [], [], []
+        for st in dataset:
+            n = len(st)
+            descs.append(_tf.zeros((n, 0), dtype=_tf.float32))
+            grads.append([_tf.zeros((0, 3, 0), dtype=_tf.float32) for _ in range(n)])
+            gidx.append([[] for _ in range(n)])
+        return descs, grads, gidx
+
+    def build_descriptors(self, dataset, *a, **kw):
+        return self._empty(dataset)
+
+    def build_descriptors_self_only(self, dataset, *a, **kw):
+        return self._empty(dataset)
+
+
 def make_descriptor_builder(cfg: TNEPconfig, mode: int | None = None):
     """Return the descriptor builder selected by `cfg.descriptor_mode` or `mode`.
 
@@ -548,12 +588,14 @@ def make_descriptor_builder(cfg: TNEPconfig, mode: int | None = None):
         mode 1 → DescriptorBuilderGPUTF (TF/GPU). GPU backend imported lazily.
     """
     selected = cfg.descriptor_mode if mode is None else int(mode)
+    from DescriptorBuilderGPU import soap_descriptors_needed
+    wrap = (lambda b: b) if soap_descriptors_needed(cfg) else _SoapFreeBuilder
     if selected == 0:
-        return DescriptorBuilder(cfg)
+        return wrap(DescriptorBuilder(cfg))
     if selected == 1:
         # Local import to avoid circular dependency at module load time
         from DescriptorBuilderGPU_tf import DescriptorBuilderGPUTF
-        return DescriptorBuilderGPUTF(cfg)
+        return wrap(DescriptorBuilderGPUTF(cfg))
     raise ValueError(
         f"Unknown descriptor_mode={selected}. Use 0 (quippy) or 1 (GPU TF)."
     )

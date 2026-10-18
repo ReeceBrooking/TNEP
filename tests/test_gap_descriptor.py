@@ -73,7 +73,7 @@ def _gap2b_energy_f90(atoms, sp, alphas, Qs, sigma, sp1, sp2, rcut, buffer):
     return E
 
 
-def _gap3b_energy_f90(atoms, sp, alphas, Qs, sigma, sp0, sp1, sp2, rcut, buffer):
+def _gap3b_energy_f90(atoms, sp, alphas, Qs, sigma, sp0, sp1, sp2, rcut, buffer, kernel="exp"):
     """get_3b_energy_and_forces energy loop (gap.f90:566-647), summed over sites."""
     ii, jj, DD, rr = _pairs(atoms, rcut)
     Qs, sigma = np.asarray(Qs, dtype=np.float64), np.asarray(sigma, dtype=np.float64)
@@ -100,7 +100,18 @@ def _gap3b_energy_f90(atoms, sp, alphas, Qs, sigma, sp0, sp1, sp2, rcut, buffer)
                     fcut = _fcut_f90(r12, rcut, buffer) * _fcut_f90(r13, rcut, buffer)
                     q = np.array([r12 + r13, (r12 - r13) ** 2, r23])
                     d = np.sqrt(np.sum((q - Qs) ** 2 / sigma ** 2, axis=1))
-                    E += fcut * np.sum(pref * np.exp(-0.5 * d ** 2))
+                    if kernel == "exp":
+                        k = np.exp(-0.5 * d ** 2)
+                    else:                       # cov_pp(r, 3, 1), gap.f90:760-788: j_int = 3/2 + 1 + 1 = 3
+                        k = np.zeros_like(d)
+                        for n_, r_ in enumerate(d):
+                            if r_ >= 1.0:
+                                k[n_] = 0.0
+                            elif r_ <= 0.0:
+                                k[n_] = 1.0
+                            else:
+                                k[n_] = (1.0 - r_) ** (3 + 1) * ((3.0 + 1.0) * r_ + 1.0)
+                    E += fcut * np.sum(pref * k)
     return E
 
 
@@ -130,10 +141,13 @@ def test_gap2b_matches_f90(sp1, sp2):
     np.testing.assert_allclose(E_ours, E_f90, rtol=1e-6)
 
 
+@pytest.mark.parametrize("kernel", ["exp", "pol"])
 @pytest.mark.parametrize("sp0,sp1,sp2", [(0, 1, 1), (0, 0, 1), (1, 0, 1), (1, 1, 1)])
-def test_gap3b_matches_f90(sp0, sp1, sp2):
+def test_gap3b_matches_f90(sp0, sp1, sp2, kernel):
     rng = np.random.default_rng(13)
-    cfg = _random_centres(rng, _cfg())
+    # pol: sigma = 2.0 (TurboGAP's published value) so the support covers the centres
+    cfg = _random_centres(rng, _cfg(gap3b_kernel=kernel,
+                                    **({"gap3b_sigma": [2.0, 2.0, 2.0]} if kernel == "pol" else {})))
     at, ti = _frame()
     alphas = rng.normal(size=cfg.gap3b_n_centres)
     q3 = gd.gap_raw_numpy(at, ti, cfg)[:, gd.gap_slices(cfg)["three_body"]].astype(np.float64)
@@ -141,7 +155,7 @@ def test_gap3b_matches_f90(sp0, sp1, sp2):
     p = gd.pair_index(cfg.num_types)[sp1, sp2]
     E_ours = 2.0 * (alphas @ q3[ti == sp0, p].sum(0))
     E_f90 = _gap3b_energy_f90(at, ti, alphas, cfg.gap3b_centres, cfg.gap3b_sigma,
-                              sp0, sp1, sp2, RCUT, BUFFER)
+                              sp0, sp1, sp2, RCUT, BUFFER, kernel=kernel)
     assert abs(E_f90) > 1e-3
     np.testing.assert_allclose(E_ours, E_f90, rtol=1e-6)
 
@@ -293,6 +307,128 @@ def test_gap_sum_experts_add():
     np.testing.assert_allclose(mu_all, mu_soap + mu_2b + mu_3b, rtol=1e-5, atol=1e-6)
 
 
+def test_gap_models_each_have_their_own_pair_table():
+    """mu = sum_k (model k through ITS OWN table): scaling model k's table
+    scales only model k's share of the dipole."""
+    cfg = _gap_cfg(dipole_readout="neighbor", dipole_species_pairs="ordered")
+    m = _model(cfg); _randomise_experts(m); at, _ = _frame()
+    d = prepare_eval_data([at], cfg)
+    P = m._n_pairs
+    assert m._models == ("soap", "2b", "3b") and tuple(m.c_pair.shape) == (m._dipole_channels, 3 * P)
+    keys = ("W1", "W1_r", "W1_a"); W = {k: getattr(m, k).numpy().copy() for k in keys}
+
+    def share(k):                       # only model k's head alive
+        for j in keys:
+            getattr(m, j).assign(W[j] if j == k else np.zeros_like(W[j]))
+        return _predict_eff(m, d)[0]
+
+    base = [share(k) for k in keys]
+    c0 = m.c_pair.numpy().copy()
+    rng = np.random.default_rng(0)
+    for k in range(3):                  # give model k a different table
+        c = c0.copy(); c[:, k * P:(k + 1) * P] = rng.normal(size=(c.shape[0], P))
+        m.c_pair.assign(c)
+        for j, key in enumerate(keys):
+            now = share(key)
+            if j == k:
+                assert not np.allclose(now, base[j], rtol=1e-3, atol=1e-6)
+            else:
+                np.testing.assert_allclose(now, base[j], rtol=1e-5, atol=1e-7)
+        m.c_pair.assign(c0)
+
+
+@pytest.mark.parametrize("sel", [["soap", "2b"], ["soap", "3b"], ["2b"], ["2b", "3b"], ["3b"]])
+def test_gap_models_selection(sel, tmp_path):
+    """Any subset: the first selected model is the main ANN (no SOAP network
+    at all when "soap" is left out), the rest are extras; SNES layout, the
+    candidate path and save/load all follow."""
+    import model_io
+    from DescriptorBuilderGPU import soap_descriptors_needed, compute_dim_q
+    from SNES import _set_model_params
+    cfg = _gap_cfg(dipole_readout="neighbor", dipole_species_pairs="ordered", gap_models=list(sel))
+    widths = {"2b": 12, "3b": 24}
+    has_soap = "soap" in sel
+    assert soap_descriptors_needed(cfg) == has_soap
+    assert cfg.dim_q == (compute_dim_q(_cfg()) if has_soap else widths[sel[0]])
+    m = _model(cfg); opt = m.optimizer; at, _ = _frame()
+    assert m._models == tuple(sel)
+    extras = sel[1:]
+    assert m.expert_keys == tuple(n + {"2b": "_r", "3b": "_a"}[e] for e in extras for n in ("W0", "b0", "W1"))
+    assert not any(hasattr(m, k) for k in EXPERTS if k not in m.expert_keys)
+    T, H, He, Hw = 2, cfg.num_neurons, 6, m._head_slots
+    n_main = T * (cfg.dim_q * H + H + H * Hw)
+    assert opt.n_typed == n_main + sum(T * (widths[e] * He + He + He * Hw) for e in extras)
+    assert opt.n_c == m._dipole_channels * m._n_pairs * len(sel)
+    d = prepare_eval_data([at], cfg)
+    vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [5, 6])
+    _set_model_params(m, *opt.reconstruct_params_tf(vec))
+    mu_model = m.predict_batch(*_forward_args(m, d), W_atom=d["V_atom"], nep_raw=d["nep_raw"])[0].numpy()
+    nb = opt._split_reconstructed(opt.reconstruct_params_tf(vec[tf.newaxis]))
+    mu_cand = m.predict_batch_candidates(
+        d["descriptors"], d["V_atom"], d["Z_int"], d["atom_mask"],
+        nb["W0"], nb["b0"], nb["W1"], nb["b1"], c_pair=nb["c_pair"],
+        experts=opt._experts_of(nb), nep_raw=d["nep_raw"])[0, 0].numpy()
+    np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
+    assert np.linalg.norm(mu_model) > 1e-6
+    p = str(tmp_path / "sel.h5")
+    model_io.save_model(m, cfg, path=p)
+    loaded = model_io.load_model(p)
+    d2 = prepare_eval_data([at], loaded.cfg)
+    np.testing.assert_allclose(
+        loaded.predict_batch(*_forward_args(loaded, d2), W_atom=d2["V_atom"], nep_raw=d2["nep_raw"])[0].numpy(),
+        mu_model, rtol=1e-5, atol=1e-6)
+
+
+def test_gap_models_rejects_bad_selection():
+    for bad in ([], ["soap", "soap"], ["4b"]):
+        with pytest.raises(ValueError, match="gap_models"):
+            gd.gap_models(_gap_cfg(gap_models=bad))
+    assert gd.gap_models(_gap_cfg(gap_models=["3b", "soap"])) == ("soap", "3b")   # canonical order
+
+
+def test_per_model_lambda():
+    """A list gives each model its own strength; each model is normalised by
+    its own parameter count; a single model reproduces the pooled formula."""
+    def terms(**kw):
+        m = _model(_gap_cfg(dipole_readout="neighbor", dipole_species_pairs="ordered", **kw))
+        opt = m.optimizer
+        pv = (opt.mu + 0.3 * tf.random.stateless_normal(opt.mu.shape, [7, 8]))[tf.newaxis]
+        return opt, pv, [x.numpy() for x in opt._reg_terms(pv)]
+
+    lam = [1e-3, 2e-2, 5e-1]
+    opt, pv, got = terms(lambda_1=lam, lambda_2=lam)
+    np.testing.assert_allclose(opt.lambda_1.numpy(), lam)
+    v = pv.numpy()[0]; T = 2
+    l1_t = np.zeros(T); l2_t = np.zeros(T); l1_g = l2_g = 0.0
+    for k, (tsl, n_t, gsl, n_g) in enumerate(opt._reg_layout):
+        for t in range(T):
+            x = np.concatenate([v[a:b] for a, b in tsl[t]])
+            assert x.size == n_t
+            l1_t[t] += lam[k] * np.abs(x).sum() / n_t
+            l2_t[t] += lam[k] * np.sqrt((x ** 2).sum() / n_t)
+        g = np.concatenate([v[a:b] for a, b in gsl])
+        l1_g += lam[k] * np.abs(g).sum() / n_g
+        l2_g += lam[k] * np.sqrt((g ** 2).sum() / n_g)
+    np.testing.assert_allclose(got[0][0], l1_t, rtol=1e-5); np.testing.assert_allclose(got[1][0], l2_t, rtol=1e-5)
+    np.testing.assert_allclose(got[2][0], l1_g, rtol=1e-5); np.testing.assert_allclose(got[3][0], l2_g, rtol=1e-5)
+    # every typed parameter and every table column is owned by exactly one model
+    owned = np.concatenate([np.arange(a, b) for *_, gsl, _ in opt._reg_layout for a, b in gsl])
+    assert len(set(owned)) == owned.size == opt.n_typed + opt.n_c
+    # the strength really is per model: tripling model 1's lambda moves only its share
+    _, _, alt = terms(lambda_1=[lam[0], 3 * lam[1], lam[2]], lambda_2=lam)
+    assert alt[2][0] > got[2][0] and np.allclose(alt[3], got[3])
+    # one model: the pooled GPUMD formula, as before
+    o1 = _model(_base_cfg(dipole_readout="neighbor", dipole_species_pairs="ordered", lambda_1=3e-3, lambda_2=3e-3)).optimizer
+    p1 = (o1.mu + 0.3 * tf.random.stateless_normal(o1.mu.shape, [9, 9]))
+    a = [x.numpy()[0] for x in o1._reg_terms(p1[tf.newaxis])]
+    for t in range(T):
+        x = o1._extract_type_params(p1, t).numpy()
+        np.testing.assert_allclose(a[0][t], 3e-3 * np.abs(x).sum() / o1._n_per_type, rtol=1e-5)
+        np.testing.assert_allclose(a[1][t], 3e-3 * np.sqrt((x ** 2).sum() / o1._n_per_type), rtol=1e-5)
+    with pytest.raises(ValueError, match="lambda_1"):
+        _model(_gap_cfg(dipole_readout="neighbor", lambda_1=[1e-3, 1e-3]))
+
+
 def test_gap_sum_four_path():
     cfg = _gap_cfg(dipole_readout="neighbor"); m = _model(cfg)
     _randomise_experts(m)
@@ -350,7 +486,7 @@ def test_gap_sum_save_load(tmp_path):
     np.testing.assert_allclose(_predict_eff(loaded, prepare_eval_data([at], lc)), mu0, atol=1e-6)
 
 
-def test_gap_sum_scaled_block_is_gen0_reparameterisation():
+def test_gap_sum_scaled_block_folds_into_every_W0():
     from DescriptorBuilderGPU import compute_q_scale, q_scale_groups
     from TNEP import gen0_ann_inputs
     at, _ = _frame(); small = at[:12]; small.info["dipole"] = np.zeros(3)
@@ -363,18 +499,27 @@ def test_gap_sum_scaled_block_is_gen0_reparameterisation():
     groups = q_scale_groups(cfg_on)
     assert sorted(np.concatenate(groups).tolist()) == list(range(ds + W2 + W3))
     assert len(groups) == len(q_scale_groups(_cfg(descriptor_scale="block"))) + 2
-    m_np, mu_np = compute_q_scale(q0, d["atom_mask"].numpy(), cfg_on)
-    cfg_on.q_scale, cfg_on.q_shift = [float(v) for v in m_np], [float(v) for v in mu_np]
+    m_np, mu_np = compute_q_scale(q0, d["Z_int"].numpy(), d["atom_mask"].numpy(), cfg_on)
+    cfg_on.q_scale, cfg_on.q_shift = m_np.tolist(), mu_np.tolist()
     m_off, m_on = _model(cfg_off), _model(cfg_on)
-    sl = gd.gap_slices(cfg_on); m_r, m_a = m_np[ds:][sl["two_body"]], m_np[ds:][sl["three_body"]]
-    np.testing.assert_allclose(m_on.W0.numpy() * m_np[None, :ds, None], m_off.W0.numpy(), rtol=1e-6)
+    sl = gd.gap_slices(cfg_on); m_r, m_a = m_np[:, ds:][:, sl["two_body"]], m_np[:, ds:][:, sl["three_body"]]
+    # every model is normalised by its OWN input width: each network's scaled
+    # input vector has norm ~1 (not shrunk by the other models' channels).
+    real = d["atom_mask"].numpy() > 0; zz = d["Z_int"].numpy()[real]
+    xs = (q0[real] - mu_np[zz]) * m_np[zz]
+    for a, b in ((0, ds), (ds, ds + W2), (ds + W2, ds + W2 + W3)):
+        for t in range(2):                           # per centre species, exactly 1 at the median
+            np.testing.assert_allclose(np.median(np.linalg.norm(xs[zz == t][:, a:b], axis=1)), 1.0, rtol=1e-4)
+    np.testing.assert_array_equal(m_on.W0.numpy(), m_off.W0.numpy())    # stored init never divided by m
     for m in (m_off, m_on):
         _randomise_experts(m)
+    m_on.W0.assign(m_off.W0.numpy() / m_np[:, :ds, None])              # fold the shared draw into m_on
+    m_on.b0.assign(m_off.b0.numpy() + np.einsum('tq,tqh->th', (m_np * mu_np)[:, :ds], m_on.W0.numpy()))
     for k, mk, s in (("r", m_r, sl["two_body"]), ("a", m_a, sl["three_body"])):
-        getattr(m_on, f"W0_{k}").assign(getattr(m_off, f"W0_{k}").numpy() / mk[None, :, None])
-        mu_k = (m_np * mu_np)[ds:][s]
+        getattr(m_on, f"W0_{k}").assign(getattr(m_off, f"W0_{k}").numpy() / mk[:, :, None])
+        mu_k = (m_np * mu_np)[:, ds:][:, s]
         getattr(m_on, f"b0_{k}").assign(getattr(m_off, f"b0_{k}").numpy()
-                                        + np.einsum('q,tqh->th', mu_k, getattr(m_on, f"W0_{k}").numpy()))
+                                        + np.einsum('tq,tqh->th', mu_k, getattr(m_on, f"W0_{k}").numpy()))
     np.testing.assert_allclose(_predict_eff(m_on, d), _predict_eff(m_off, d), rtol=1e-4, atol=1e-6)
     assert np.abs(_predict_eff(m_on, d)).max() > 0
 
@@ -500,7 +645,7 @@ def test_gapmode_phi_blocks_explicit_loop(gap_fitted):
 @pytest.mark.parametrize("flags", [dict(gap_2b=True, gap_3b=False), dict(gap_2b=True, gap_3b=True)])
 def test_gapmode_exact_recovery_known_alpha(tmp_path, flags):
     frames, p0 = _six_frames(tmp_path)
-    kw = dict(total_N=None, gap_ridge_lambda=1e-12, **{**GAP_KW, **flags})
+    kw = dict(total_N=None, gap_sigma=1e-7, **{**GAP_KW, **flags})
     with _chdir(tmp_path):
         base = gap_dipole.fit_gap_dipole(_dip_cfg(data_path=p0, **kw))
     assert (base.alpha_gap3b is None) == (not flags["gap_3b"])

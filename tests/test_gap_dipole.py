@@ -68,7 +68,8 @@ def _cfg(**kw):
     cfg.gap2b_centres = cfg.gap3b_centres = None
     cfg.gap_sparse_per_species = 40
     cfg.gap_kernel_power = 2
-    cfg.gap_ridge_lambda = 1e-6
+    cfg.gap_sigma = 1e-3
+    cfg.gap_sparse_jitter = 1e-10
     for k, v in kw.items():
         setattr(cfg, k, v)
     return cfg
@@ -171,7 +172,7 @@ def test_exact_recovery_known_alpha(tmp_path, overrides):
     p0 = str(tmp_path / "zeros.xyz")
     write(p0, frames)
     kw = dict(total_N=None, gap_sparse_per_species=8,
-              gap_ridge_lambda=1e-12, **overrides)
+              gap_sigma=1e-7, **overrides)
     with _chdir(tmp_path):
         base = gap_dipole.fit_gap_dipole(_cfg(data_path=p0, **kw))
     rng = np.random.default_rng(0)
@@ -258,7 +259,7 @@ def test_pair_columns_subsume_off(tmp_path):
         f.info["dipole"] = np.zeros(3)   # OFF-fit targets are irrelevant
     p0 = str(tmp_path / "zeros.xyz")
     write(p0, frames)
-    kw = dict(total_N=None, gap_sparse_per_species=8, gap_ridge_lambda=1e-12,
+    kw = dict(total_N=None, gap_sparse_per_species=8, gap_sigma=1e-7,
               dipole_radial="chebyshev", dipole_cutoff="cosine2",
               dipole_channels=2)
     with _chdir(tmp_path):
@@ -340,7 +341,7 @@ def test_multiscale_exact_recovery_known_alpha(tmp_path):
         f.info["dipole"] = np.zeros(3)
     p0 = str(tmp_path / "zeros.xyz")
     write(p0, frames)
-    kw = dict(total_N=None, gap_sparse_per_species=8, gap_ridge_lambda=1e-12,
+    kw = dict(total_N=None, gap_sparse_per_species=8, gap_sigma=1e-7,
               gap_extra_rcut=4.5, gap_kernel_power=[1, 2], **CHEB_PAIRS)
     with _chdir(tmp_path):
         base = gap_dipole.fit_gap_dipole(_cfg(data_path=p0, **kw))
@@ -360,21 +361,13 @@ def test_multiscale_exact_recovery_known_alpha(tmp_path):
                        atol=1e-8 * max(np.abs(mu_star).max(), 1.0))
 
 
-def test_multiscale_off_default_bitcompat(tmp_path):
-    """gap_extra_rcut=None + single-int ξ reproduces a frozen α on the small
-    fixture, so the single-scale path cannot drift.
-
-    The hash was re-captured on 2026-09-30 when the augmented-lstsq ("primal")
-    solver was removed: the dual ridge is the same estimator but differs in the
-    last bits, so the pre-removal baseline no longer applies. It therefore pins
-    stability from here forward, not equality with the pre-multiscale code."""
-    import hashlib
+def test_multiscale_off_by_default(tmp_path):
+    """gap_extra_rcut=None: no second scale is built. (The estimator itself is
+    pinned by test_fit_is_gap_fit_sparse_gp, not by a frozen hash of α — a
+    hash breaks on every legitimate last-bit change of the solve.)"""
     with _chdir(tmp_path):
         m = gap_dipole.fit_gap_dipole(_cfg())
     assert m.builder2 is None and m.sparse_desc2 is None and m.alpha2 is None
-    h = hashlib.sha256(np.concatenate(m.alpha).tobytes()).hexdigest()
-    assert h == ("307cf80b358d1ddece1a767474aaeb48"
-                 "9856a6fd8883e4da8e61d0c71bc3d700")
 
 
 # ── config validation ──────────────────────────────────────────────────────
@@ -423,7 +416,8 @@ def test_run_record(tmp_path):
         with open(os.path.join("GAP", records[0])) as fh:
             rec = json.load(fh)
     assert rec["config"]["dipole_radial"] == "screened"
-    assert rec["config"]["gap_ridge_lambda"] == 1e-6
+    assert rec["config"]["gap_sigma"] == 1e-3 and rec["gap"]["sigma"] == 1e-3
+    assert rec["gap"]["sparse_jitter"] == 1e-10
     assert rec["gap"]["sparse_per_species"] == 10
     assert set(rec["gap"]["M_per_species"]) == {"8", "1"}
     assert rec["gap"]["radial"] == "screened"
@@ -435,40 +429,46 @@ def test_run_record(tmp_path):
         assert key in rec["metrics"]
 
 
-def test_dual_solve_matches_augmented_lstsq(tmp_path):
-    """The dual ridge α = Φᵀ(ΦΦᵀ+λI)⁻¹μ the fit uses is a matrix identity
-    with the augmented [Φ; √λ·I] least-squares solve. The augmented route is
-    no longer in the code (it peaked at ~n_columns² memory), so it lives here
-    as a test-only oracle: it is the better-conditioned of the two, and this
-    is what pins the production solve."""
+def test_fit_is_gap_fit_sparse_gp(tmp_path):
+    """The fit is gap_fit's estimator (gp_predict.F90 gpSparse_fit): the least
+    squares solution of the augmented system
+        [ Λ^-½·Φ ; chol(K_MM)ᵀ ⊗ I ]·α = [ Λ^-½·μ ; 0 ],
+    i.e. min Σ((Φα − μ)/σ_obs)² + αᵀ·K_MM·α with σ_obs = gap_sigma·√N_atoms.
+    Production solves the same minimiser in whitened coefficients through the
+    dual; the augmented route lives here as the oracle."""
     with _chdir(tmp_path):
         model = gap_dipole.fit_gap_dipole(_cfg(**CHEB_PAIRS))
     cfg = model.cfg
-    # Rebuild the same design the fit solved, frame by frame (the column
-    # contract lives in _phi_frame, so this cannot drift from the fit).
     dataset = read(cfg.data_path, index=":")
     dataset = [dataset[k] for k in cfg.indices]
     tis = data.assign_type_indices(dataset, cfg.types)
     descs = gap_dipole._descriptors(model.builder, dataset)
-    scales = [(descs, model.sparse_desc)]
+    deltas = gap_dipole._deltas(cfg)
     Phi = np.stack([gap_dipole._phi_frame(
         [(descs[f], model.sparse_desc)], gap_dipole._v_atoms(dataset[f], tis[f], cfg),
-        tis[f], model.xi) for f in range(len(dataset))])
+        tis[f], model.xi, None, deltas) for f in range(len(dataset))])
     Phi_flat = Phi.reshape(-1, Phi.shape[-1])
     mu = gap_dipole._targets(dataset, cfg)
-    lam_eff = (float(cfg.gap_ridge_lambda)
-               * float(np.mean(np.sum(Phi_flat ** 2, axis=0))))
+    K = Phi.shape[-1] // sum(len(sd) for sd in model.sparse_desc)       # readout columns per sparse point
+    w = np.repeat(1.0 / (cfg.gap_sigma * np.sqrt([len(a) for a in dataset])), 3)
+    pen = []
+    for Dm in model.sparse_desc:                                        # one block per species (one ξ)
+        Kmm = deltas[0] ** 2 * (Dm @ Dm.T) ** model.xi[0] + cfg.gap_sparse_jitter * np.eye(len(Dm))
+        pen.append(np.kron(np.linalg.cholesky(Kmm).T, np.eye(K)))
     n_cols = Phi_flat.shape[1]
-    A = np.vstack([Phi_flat, np.sqrt(lam_eff) * np.eye(n_cols)])
-    b = np.concatenate([mu.reshape(-1), np.zeros(n_cols)])
+    R = np.zeros((n_cols, n_cols)); o = 0
+    for blk in pen:
+        R[o:o + len(blk), o:o + len(blk)] = blk; o += len(blk)
+    A = np.vstack([Phi_flat * w[:, None], R])
+    b = np.concatenate([mu.reshape(-1) * w, np.zeros(n_cols)])
     alpha_aug = np.linalg.lstsq(A, b, rcond=None)[0]
     alpha_fit = np.concatenate(model.alpha)
-    # Predictions must agree; the coefficients themselves need not (the
-    # design is ill-conditioned, see GapDipoleModel's docstring).
     pred_aug = (Phi_flat @ alpha_aug).reshape(-1, 3)
     pred_fit = (Phi_flat @ alpha_fit).reshape(-1, 3)
-    assert np.allclose(pred_aug, pred_fit,
-                       rtol=1e-6, atol=1e-8 * np.abs(pred_fit).max())
+    assert np.allclose(pred_aug, pred_fit, rtol=1e-5, atol=1e-7 * np.abs(pred_fit).max())
+    # and the penalised objective agrees (the coefficients are the same minimiser)
+    obj = lambda a: np.sum(((Phi_flat @ a - mu.reshape(-1)) * w) ** 2) + np.sum((R @ a) ** 2)
+    assert obj(alpha_fit) == pytest.approx(obj(alpha_aug), rel=1e-6)
 
 
 def test_gap_rejects_non_neighbor_readout():
@@ -500,7 +500,7 @@ def test_configs_are_independent():
     # gap_delta_* amplitudes, which are GAP-only hyperparameters of the summed
     # kernel model and have no ANN counterpart.
     gap_only = {"descriptor_self_batch_size", "gap_delta_soap",
-                "gap_delta_2b", "gap_delta_3b"}
+                "gap_delta_2b", "gap_delta_3b", "gap_sigma", "gap_sparse_jitter"}
     missing = (set(GAPconfig.__annotations__)
                - set(TNEPconfig.__annotations__) - gap_only)
     assert not missing, missing

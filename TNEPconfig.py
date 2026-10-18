@@ -67,7 +67,7 @@ class TNEPconfig:
     #   2 = Xu et al. JCTC 2024 / GPUMD default, μ = −Σ_pair |r_ij|²·F_ij
     #   ≥3 = higher moments (diagnostic)
     # Models must be re-trained if N changes.
-    dipole_rij_power: int = 0
+    dipole_rij_power: int = 2
 
     # Dipole readout form (target_mode=1 only):
     #   "tnep"     : descriptor-gradient form above (dipole_rij_power applies)
@@ -93,13 +93,13 @@ class TNEPconfig:
     #                        σ = dipole_gauss_sigma_scale × spacing
     #   "screened"         : R(r) = r^(ζ−1)·f_c(r) — single channel
     #                        (requires dipole_channels == 1).
-    dipole_radial: str = "gaussian"
+    dipole_radial: str = "chebyshev_warped"
     # Screened-radial exponent ζ (dipole_radial="screened" only). Default −2
     # from the rigid-charge LSQ scan: floors 2.70 at ζ=−1, 2.72 at ζ=−2,
     # 11.0 at ζ=+1 (ζ>0 inverts the covalent/H-bond weighting). −2 chosen
     # over the marginally-lower −1 deliberately: ~equal floor, stronger
     # H-bond suppression (Coulomb-like r^−2 screening).
-    dipole_zeta: float = -3.0
+    dipole_zeta: float = -2.0
     # Gaussian-window width scale σ/spacing (dipole_radial="gaussian" only):
     # σ = scale × r_c/(C+1) (C=1 ⇒ scale·r_c/2). Step-0 rigid-charge LSQ
     # evidence (diagnostics/diag_basis.py): scale 0.5 lowers the C=4 floor
@@ -129,7 +129,7 @@ class TNEPconfig:
     #              radial resolution then lives only in the learned
     #              species-pair table c[n, pair], so pair it with
     #              dipole_species_pairs != "off". Head width 1 vs C.
-    dipole_head: str = "vector"
+    dipole_head: str = "scalar"
     # Neighbor-readout cutoff r_c (Å). None inherits the cutoff of whatever
     # descriptor actually feeds the model: nep_rc_radial under
     # nep_descriptor="replace", else rcut_hard (resolved_dipole_rc, applied at
@@ -157,17 +157,14 @@ class TNEPconfig:
     # than rcut_hard — adds long-sighted environment resolution (multi-scale
     # SOAP ~25%: Willatt/Musil/Ceriotti PCCP 2018). None = single scale.
     gap_extra_rcut: float | None = None
-    # Ridge strength λ, applied RELATIVE to mean(diag(ΦᵀΦ)) — dimensionless
-    # (λ_eff = λ · mean_m ‖Φ[:,m]‖²), so its scale is data-independent.
-    gap_ridge_lambda: float = 1e-6
 
     # ═══════════════════════════════════════════════════════════════════
     # 2. DESCRIPTOR (SOAP-turbo)
     # ═══════════════════════════════════════════════════════════════════
 
     # --- geometric parameters ------------------------------------------
-    l_max: int = 4
-    alpha_max: int = 4
+    l_max: int = 7
+    alpha_max: int = 7
     rcut_hard: float = 4.0
     rcut_soft: float = 3.5
     basis: str = "poly3"
@@ -179,13 +176,13 @@ class TNEPconfig:
     #             N = num_types*alpha_max radial channels. This is what
     #             TurboGAP's soap_turbo type defaults to (types.f90 keeps
     #             compress_mode="none" behind its own compress_soap flag).
-    #             quippy path only (descriptor_mode=0): the keyword is OMITTED
+    #             On the quippy path (descriptor_mode=0) the keyword is OMITTED
     #             from the descriptor string, because soap_turbo's
     #             get_compress_indices rejects the literal "none"
     #             (soap_turbo_compress.f90:292).
     # "linear"  : quippy's linear compression, dim = 2*num_types*(l_max+1).
-    compress_mode: str = "trivial"
-    atom_sigma_r: float = 0.5
+    compress_mode: str = "none"
+    atom_sigma_r: float = 0.3
     atom_sigma_t: float = 0.5
     atom_sigma_r_scaling: float = 0.0
     atom_sigma_t_scaling: float = 0.0
@@ -194,8 +191,8 @@ class TNEPconfig:
 
     # --- compute backend (CPU/quippy vs GPU/TF) ------------------------
     # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU).
-    # GPU path supports basis="poly3" and compress_mode="trivial" only.
-    descriptor_mode: int = 0
+    # GPU path supports basis="poly3" and compress_mode "trivial"/"none" only.
+    descriptor_mode: int = 1
 
     # GPU descriptor compute precision: "float64" (matches Fortran reference)
     # or "float32" (~half VRAM, faster on consumer GPUs, looser agreement).
@@ -254,25 +251,29 @@ class TNEPconfig:
     # and b0_eff = b0 − (m∘μ)·W0 (the ANN sees m∘(q − μ)), so the model
     # class is unchanged (any scaled model == an unscaled one with W0' = m∘W0)
     # and q / ∂q/∂R are never touched; only the SNES/Adam search geometry
-    # changes (effective per-channel step σ·m). Both inits are divided by m,
-    # so generation 0 is identical to "off". Two levels from the per-channel
-    # std s_k of the generation-0 descriptor over training atoms (frozen):
-    # a per-group factor g = s_ref/median(s_group) (α = 1, unclamped: group
+    # changes (effective per-channel step σ·m). The stored weights keep the
+    # plain Glorot / zero init and act on the scaled input, so generation 0
+    # is NOT the "off" model (dividing the init by m to make it so starts
+    # the tanh layer saturated and inflates L1/L2 by 1/m — measured
+    # 2026-10-05). Two levels from the per-channel std s_k of the
+    # generation-0 descriptor over training atoms (frozen): a per-group
+    # factor g = 1/median(s_group) (unit spread; α = 1, unclamped: group
     # medians are robust) times, in "channel" mode, a per-channel residual
-    # clip((s_ref'/(g·s_k))^0.5, 1/10, 10) (dust protection). Dead channels
+    # clip((1/(g·s_k))^0.5, 1/10, 10) (dust protection). Dead channels
     # keep m = 1.
     #   "off"     : no scaling or centring (bit-identical to before)
     #   "block"   : group factor only (SOAP l groups + each extra block, ≤ 9)
     #   "channel" : group factor × per-channel residual
     #   "minmax"  : GPUMD q_scaler — 1/(max−min) per channel, no centring
-    descriptor_scale: str = "off"
-    # Runtime: the scale vector [dim_q], computed by the driver from the
+    descriptor_scale: str = "block"
+    # Runtime: the scale [num_types, dim_q] — one row per centre species,
+    # each from that species' atoms — computed by the driver from the
     # training set and saved in the model's config (None = not yet computed).
-    q_scale: list[float] | None = None
-    # Runtime: per-channel centring μ [dim_q] (mean of the generation-0
+    q_scale: list[list[float]] | None = None
+    # Runtime: per-channel centring μ [num_types, dim_q] (mean of the generation-0
     # descriptor over training atoms), folded into b0 (b0_eff = b0 − (m∘μ)·W0)
     # so the ANN sees m∘(q − μ); computed with q_scale.
-    q_shift: list[float] | None = None
+    q_shift: list[list[float]] | None = None
     # GPUMD NEP descriptors (multi_descriptor_plan.md §0.3), computed
     # exactly as GPUMD's nep.cu / nep_utilities.cuh from a raw per-atom
     # basis (nep_descriptor.py) contracted in-model by learnable c tensors.
@@ -283,17 +284,17 @@ class TNEPconfig:
     #   "sum"     : summed experts (§0.4)
     #   "gap_sum" : summed experts on the GAP 2b/3b distance descriptors
     #               (gap_descriptor_plan.md §0.2; no NEP header, no c tensors)
-    nep_descriptor: str = "off"
+    nep_descriptor: str = "gap_sum"
     nep_n_max_radial: int = 6            # q_n, n = 0..n_max
     nep_n_max_angular: int = 6
-    nep_basis_size_radial: int = 6       # Chebyshev k = 0..basis_size
-    nep_basis_size_angular: int = 6
+    nep_basis_size_radial: int = 10       # Chebyshev k = 0..basis_size
+    nep_basis_size_angular: int = 10
     nep_l_max: int = 4                   # GPUMD: the only supported value
     nep_four_body: bool = True           # GPUMD L_max_4body = 2 → q_n222
-    nep_five_body: bool = False          # GPUMD L_max_5body = 1 → q_n1111; needs nep_four_body
-    nep_rc_radial: float = 8.0
+    nep_five_body: bool = True         # GPUMD L_max_5body = 1 → q_n1111; needs nep_four_body
+    nep_rc_radial: float = 6.0
     nep_rc_angular: float = 4.0
-    nep_num_neurons: int = 30            # "sum" mode only: width of ANN_2b / ANN_3b
+    nep_num_neurons: int = 10            # "sum" mode only: width of ANN_2b / ANN_3b
     # Per-expert amplitudes (δ_soap, δ_2b, δ_3b) for the summed head
     #   out = δ_soap·ANN_soap + δ_2b·ANN_2b + δ_3b·ANN_3b
     # Honest statement: δ multiplying an expert's head output is EXACTLY
@@ -308,18 +309,31 @@ class TNEPconfig:
     # gap_descriptor_plan.md §0.1): GAP's neighbour sums with FIXED centres
     # (sparse points) and widths, "exp" kernel only (no "pol"). Used by the
     # ANN nep_descriptor="gap_sum" experts and the GAP-mode column blocks.
-    gap2b_rcut: float = 3.5              # GAP rcut of the 2b term
-    gap3b_rcut: float = 3.5              # GAP rcut of the 3b term
+    gap2b_rcut: float = 6.0              # GAP rcut of the 2b term
+    gap3b_rcut: float = 2.0              # GAP rcut of the 3b term
     gap_buffer: float = 0.5              # GAP buffer: cosine taper width inside rcut
-    gap2b_n_centres: int = 20            # M2 kernel centres on r
-    gap2b_sigma: float = 0.3             # 2b kernel width (Å)
-    gap3b_n_centres: int = 50            # M3 kernel centres on q = [r_ij+r_ik, (r_ij−r_ik)², r_jk]
-    gap3b_sigma: list[float] = [0.5, 0.5, 0.5]  # per q component
+    gap2b_n_centres: int = 40            # M2 kernel centres on r
+    gap2b_sigma: float = 0.5             # 2b kernel width (Å)
+    gap3b_n_centres: int = 100            # M3 kernel centres on q = [r_ij+r_ik, (r_ij−r_ik)², r_jk]
+    gap3b_sigma: list[float] = [2.0, 2.0, 2.0]  # per q component
+    # 3b kernel on the scaled distance r = |(u − Q)/σ| (gap.f90 kernel_type):
+    #   "exp" : exp(−r²/2) — σ is a Gaussian width
+    #   "pol" : (1−r)⁴(4r+1) for r < 1, else 0 — σ is the SUPPORT radius
+    #           (σ = 2.0 ≈ a Gaussian width of 0.5). TurboGAP's published
+    #           potentials use "pol" with σ = 2.0 and rcut = 2.0.
+    gap3b_kernel: str = "pol"
     # Runtime: auto-selected by gap_descriptor.select_centres when None
     # (2b uniform grid, 3b farthest-point sampling under cfg.seed) and saved
     # with the model like q_scale; shapes [M2] and [M3, 3].
     gap2b_centres: list[float] | None = None
     gap3b_centres: list[list[float]] | None = None
+    # nep_descriptor="gap_sum": which models make up the prediction, any
+    # non-empty subset of "soap", "2b", "3b". Each is its own ANN with its own
+    # species-pair readout table, μ = Σ_k Σ_i s_k,i·Ω_k(r_ij)·d_ij; the extra
+    # models start at zero output, so generation 0 is the first model alone.
+    # Leaving "soap" out drops the SOAP network and descriptor entirely (the
+    # first selected GAP block feeds the main ANN, like nep_descriptor="replace").
+    gap_models: list[str] = ["soap", "2b", "3b"]
     # GAP-mode (gap_dipole.py) additive linear column blocks.
     gap_2b: bool = False
     gap_3b: bool = False
@@ -329,18 +343,18 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # Hidden-layer width of the per-type ANN.
-    num_neurons: int = 70
+    num_neurons: int = 10
     # Hidden-layer activation (any tf.keras.activations name for the forward
     # pass). Dipole/polarisability training (target_mode 1/2) has a hand-coded
     # backward — only "tanh" and "swish" (alias "silu") supported there;
     # energy training (target_mode 0) accepts any.
-    activation: str = 'swish'
+    activation: str = 'tanh'
 
     # When True, insert a learnable per-species-pair linear mixing layer
     # between the fixed SOAP-turbo descriptor and the ANN (U_pair shared
     # across central types, identity-init). Analog of NEP's trainable
     # radial-basis coefficients c_nk.
-    descriptor_mixing: bool = True
+    descriptor_mixing: bool = False
     # When True (with descriptor_mixing), U_pair becomes per-central-type
     # ([T, num_pairs, max_bs, max_bs]) — more expressive, T× the param count.
     descriptor_mixing_per_type: bool = False
@@ -360,9 +374,12 @@ class TNEPconfig:
     toggle_regularization: bool = True
     # L1/L2 strengths: None = auto sqrt(dim*1e-6/num_types), -1.0 = dynamic
     # (adapt every lambda_adapt_interval gens toward lambda_target_ratio of
-    # data RMSE), float = fixed.
-    lambda_1: float | None = 0.0005
-    lambda_2: float | None = 0.0005
+    # data RMSE), float = fixed. A LIST gives each model its own strength,
+    # in model order (nep_descriptor="gap_sum": the gap_models selection in
+    # soap, 2b, 3b order) — like GAP's per-descriptor priors. Each model's
+    # penalty is normalised by its own parameter count either way.
+    lambda_1: float | list[float] | None = [0.0005, 0.003, 0.005]
+    lambda_2: float | list[float] | None = [0.0005, 0.003, 0.005]
     # Dynamic-λ controls (only when lambda_1 or lambda_2 == -1):
     #   target_ratio : target reg-penalty / data-RMSE ratio
     #   damping      : step exponent, λ_new = λ·(target/r)^d (smaller = gentler)
@@ -395,13 +412,13 @@ class TNEPconfig:
     # Number of samples made in each train generation
     pop_size: int | None = 100
     # Number of training generations (number of updates to the model)
-    num_generations: int = 20000
+    num_generations: int = 100000
     # Number of structures used in each train step (None = full batch)
     batch_size: int | None = None
     # Learning rate for sigma (None = auto from canonical SNES heuristic)
     eta_sigma: float | None = None
     # Initial distribution standard deviation
-    init_sigma: float = 0.1
+    init_sigma: float = 0.02
     # Antithetic (mirrored) sampling of the SNES population: candidates come
     # in ± pairs. GPUMD does NOT do this — snes.cu gpu_create_population draws
     # one independent normal per candidate. The pair halves the variance of
@@ -410,7 +427,7 @@ class TNEPconfig:
     # the loss is locally linear a good step and its mirror take opposite
     # ranks and those utilities cancel, so σ barely adapts and stays near
     # init_sigma. Set False to reproduce GPUMD's sampler.
-    mirrored_sampling: bool = True
+    mirrored_sampling: bool = False
     # GPUMD's data procedure (fitness.cu report_error + snes.cu's loop):
     # every frame of data_path trains, there is NO validation split, and the
     # monitor loop runs on the EXTERNAL TEST SET purely to be reported. It
@@ -418,17 +435,17 @@ class TNEPconfig:
     # and tracks no best-ever model, so best_val_model == final_model here and
     # cfg.patience is inert. That is what keeps monitoring the test set honest
     # — selecting on it would leak. Requires cfg.test_data_path.
-    gpumd_path: bool = False
+    gpumd_path: bool = True
     # Lower bound on sigma after each SNES update, preventing σ→0 collapse of
     # the search distribution on long runs. None or 0 = disable; 1e-6 is
     # non-distorting (typical adapted σ is 1e-3 to 1e-1).
-    sigma_floor: float | None = 1e-6
+    sigma_floor: float | None = 1e-8
 
     # --- validation ----------------------------------------------------
     # Number of structures in each validation step (None = use entire val set)
     val_size: int | None = None
     # Validate every N generations (1 = every gen, 10 = every 10th, etc.)
-    val_interval: int = 1
+    val_interval: int = 100
 
     # --- early stopping ------------------------------------------------
     # Early stopping patience in val ticks (None = disabled)
@@ -655,7 +672,7 @@ class GAPconfig:
 
     # --- GAP-mode dipole fit (gap_dipole.py) -----------------------------
     # FPS-selected sparse environments per species for the kernel basis.
-    gap_sparse_per_species: int = 500
+    gap_sparse_per_species: int = 40
     # Power(s) ξ of the normalized SOAP dot-product kernel (D̂_i·D̂_m)^ξ.
     # An int is a single kernel; a list (e.g. [1, 2, 4]) is a sum-of-kernels
     # fit — each sparse point contributes one column block PER ξ and the
@@ -669,34 +686,32 @@ class GAPconfig:
     # than rcut_hard — adds long-sighted environment resolution (multi-scale
     # SOAP ~25%: Willatt/Musil/Ceriotti PCCP 2018). None = single scale.
     gap_extra_rcut: float | None = None
-    # Ridge strength λ, applied RELATIVE to mean(diag(ΦᵀΦ)) — dimensionless
-    # (λ_eff = λ · mean_m ‖Φ[:,m]‖²), so its scale is data-independent.
-    # Amplitude δ per body order of the summed model:
-    #     U_i = δ_soap·U_i(SOAP) + δ_2b·U_i(2b) + δ_3b·U_i(3b)
-    # Each δ scales that block's design columns, so it does NOT change what
-    # the model can represent (least squares would absorb it into α) — it
-    # changes how hard the single global ridge λ_eff penalises that block:
-    # scaling by δ is equivalent to penalising that block's contribution by
-    # λ_eff/δ², so δ² is the block's prior variance. That is what GAP's δ
-    # means; gap.f90 carries δ² on the kernel because its δ is an amplitude
-    # and δ² the variance, so the multiplier HERE is δ (squaring as well
-    # would make the penalty 1/δ⁴ and the knob the square of GAP's).
-    # 1.0 = unweighted (the 2b/3b blocks are inert unless gap_2b/gap_3b).
-    gap_delta_soap: float = 1.0
-    gap_delta_2b: float = 1.0
-    gap_delta_3b: float = 1.0
-    gap_ridge_lambda: float = 1e-6
+    # δ is each body order's amplitude, exactly gap_fit's `delta`: the
+    # kernel carries δ² (gap.f90 `delta**2 * alphas * kernel`), on the design
+    # columns AND on the sparse-sparse kernel that regularises the fit, so δ²
+    # is the prior variance of that term's site function. TurboGAP's
+    # published potentials use 0.5 (2b), 0.1 (SOAP), 0.01 (3b).
+    # (the 2b/3b blocks are inert unless gap_2b/gap_3b).
+    gap_delta_soap: float = 0.1
+    gap_delta_2b: float = 0.5
+    gap_delta_3b: float = 0.01
+    # Regularisation, as gap_fit: the expected ABSOLUTE error of a dipole
+    # component per √atom (gap_fit's default_sigma with
+    # sigma_per_atom=T: σ_obs = gap_sigma·√N_atoms), and the jitter added to
+    # the sparse-sparse kernel before factorising (gap_fit default 1e-10).
+    gap_sigma: float = 1e-8
+    gap_sparse_jitter: float = 1e-10
 
     # ═══════════════════════════════════════════════════════════════════
     # 2. DESCRIPTOR (SOAP-turbo)
     # ═══════════════════════════════════════════════════════════════════
 
     # --- geometric parameters ------------------------------------------
-    l_max: int = 4
-    alpha_max: int = 4
+    l_max: int = 8
+    alpha_max: int = 8
     rcut_hard: float = 4.0
     rcut_soft: float = 3.5
-    basis: str = "poly3"
+    basis: str = "poly3gauss"
     scaling_mode: str = "polynomial"
     radial_enhancement: int = 0
     # "trivial" : soap_turbo's traditional compression recipe (the only mode
@@ -705,13 +720,13 @@ class GAPconfig:
     #             N = num_types*alpha_max radial channels. This is what
     #             TurboGAP's soap_turbo type defaults to (types.f90 keeps
     #             compress_mode="none" behind its own compress_soap flag).
-    #             quippy path only (descriptor_mode=0): the keyword is OMITTED
+    #             On the quippy path (descriptor_mode=0) the keyword is OMITTED
     #             from the descriptor string, because soap_turbo's
     #             get_compress_indices rejects the literal "none"
     #             (soap_turbo_compress.f90:292).
     # "linear"  : quippy's linear compression, dim = 2*num_types*(l_max+1).
-    compress_mode: str = "trivial"
-    atom_sigma_r: float = 0.5
+    compress_mode: str = "none"
+    atom_sigma_r: float = 0.3
     atom_sigma_t: float = 0.5
     atom_sigma_r_scaling: float = 0.0
     atom_sigma_t_scaling: float = 0.0
@@ -720,7 +735,7 @@ class GAPconfig:
 
     # --- compute backend (CPU/quippy vs GPU/TF) ------------------------
     # Descriptor backend: 0 = quippy (Fortran, CPU), 1 = native TF/NumPy (GPU).
-    # GPU path supports basis="poly3" and compress_mode="trivial" only.
+    # GPU path supports basis="poly3" and compress_mode "trivial"/"none" only.
     descriptor_mode: int = 0
 
     # Structures per SOAP graph call: 1 = per-frame (lowest VRAM), int>1 =
@@ -754,21 +769,22 @@ class GAPconfig:
     # gap_descriptor_plan.md §0.1): GAP's neighbour sums with FIXED centres
     # (sparse points) and widths, "exp" kernel only (no "pol"). Used by the
     # ANN nep_descriptor="gap_sum" experts and the GAP-mode column blocks.
-    gap2b_rcut: float = 3.5              # GAP rcut of the 2b term
-    gap3b_rcut: float = 3.5              # GAP rcut of the 3b term
+    gap2b_rcut: float = 4.0              # GAP rcut of the 2b term
+    gap3b_rcut: float = 2.0              # GAP rcut of the 3b term
     gap_buffer: float = 0.5              # GAP buffer: cosine taper width inside rcut
-    gap2b_n_centres: int = 20            # M2 kernel centres on r
-    gap2b_sigma: float = 0.3             # 2b kernel width (Å)
-    gap3b_n_centres: int = 50            # M3 kernel centres on q = [r_ij+r_ik, (r_ij−r_ik)², r_jk]
-    gap3b_sigma: list[float] = [0.5, 0.5, 0.5]  # per q component
+    gap2b_n_centres: int = 40            # M2 kernel centres on r
+    gap2b_sigma: float = 1.0             # 2b kernel width (Å)
+    gap3b_n_centres: int = 200            # M3 kernel centres on q = [r_ij+r_ik, (r_ij−r_ik)², r_jk]
+    gap3b_sigma: list[float] = [2.0, 2.0, 2.0]  # per q component
+    gap3b_kernel: str = "pol"            # "exp" | "pol" (see TNEPconfig)
     # Runtime: auto-selected by gap_descriptor.select_centres when None
     # (2b uniform grid, 3b farthest-point sampling under cfg.seed) and saved
     # with the model like q_scale; shapes [M2] and [M3, 3].
     gap2b_centres: list[float] | None = None
     gap3b_centres: list[list[float]] | None = None
     # GAP-mode (gap_dipole.py) additive linear column blocks.
-    gap_2b: bool = False
-    gap_3b: bool = False
+    gap_2b: bool = True
+    gap_3b: bool = True
 
     # ═══════════════════════════════════════════════════════════════════
     # 6. MEMORY & I/O STAGING

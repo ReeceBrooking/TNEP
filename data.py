@@ -559,10 +559,15 @@ def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
     if np.isfinite(L_min):
         if rc >= L_min:
             print(f"  WARNING: dipole_rc={rc} Å ≥ the smallest box height "
-                  f"{L_min:.2f} Å. An atom's own periodic image is inside the "
-                  f"readout radius, and the readout DROPS self-image pairs "
-                  f"(i == j), so those contributions are missing rather than "
-                  f"wrong — the neighbour sum is truncated at the box scale.")
+                  f"{L_min:.2f} Å, so every neighbour enters through several "
+                  f"periodic images and the readout is effectively a lattice "
+                  f"sum rather than a local one. Still EXACT: images are "
+                  f"enumerated, not minimum-imaged, and the self-image terms "
+                  f"the readout drops (i == j) cancel identically — for every "
+                  f"lattice vector a in range there is −a, and R_n depends on "
+                  f"|a| only. GPUMD keeps those terms because its descriptor "
+                  f"is a scalar sum, where they do not cancel; our NEP basis "
+                  f"keeps them too (nep_descriptor.nep_pair_list).")
         elif 2.0 * rc >= L_min:
             print(f"  WARNING: dipole_rc={rc} Å ≥ half the smallest box height "
                   f"{L_min:.2f} Å. The staged V is image-exact and fine, but "
