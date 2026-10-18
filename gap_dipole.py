@@ -142,11 +142,10 @@ def _validate(cfg: GAPconfig) -> None:
         (str(cfg.nep_descriptor) == "off",
          "GAP mode needs nep_descriptor='off' (NEP inputs are not part of "
          "the kernel fit)"),
-        # mirror the model-init r_c contract (no TNEP is ever constructed
-        # on the GAP path, so it must be enforced here too).
-        (0.0 < float(cfg.dipole_rc or cfg.rcut_hard) <= float(cfg.rcut_hard),
-         f"dipole_rc must satisfy 0 < rc <= rcut_hard="
-         f"{cfg.rcut_hard}, got {cfg.dipole_rc}"),
+        # Any positive radius, as at model init (47ae1cc): the staged V comes
+        # from an image-exact neighbour list, so r_c > rcut_hard is legal.
+        (0.0 < float(cfg.dipole_rc or cfg.rcut_hard),
+         f"dipole_rc must be > 0, got {cfg.dipole_rc}"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     if bad:
