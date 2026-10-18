@@ -98,9 +98,9 @@ class SNES:
         # [Ch, T(T+1)/2] for dipole_species_pairs="symmetric", [Ch, T²] for
         # "ordered", none for "off" (c ≡ 1 frozen; Ch = 1 / n_c = 0 in every
         # other mode).
-        self._Ch = (int(model._dipole_channels)
-                    if model._neighbor_readout else 1)      # channels → c_pair
-        # W1's last axis: C ("vector" head) or 1 ("scalar") under "neighbor".
+        self._Ch = (int(model._kernel_channels)
+                    if model._neighbor_readout else 1)      # kernel channels → c_pair
+        # W1's last axis: Ck ("vector" head) or one per kernel group ("scalar").
         self._Hw = int(model._head_slots)      # head width → W1
         _T = self.cfg.num_types
         # One table per model (model._models), side by side on the pair axis.

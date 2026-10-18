@@ -37,7 +37,8 @@ handles it — train RMSE approaches 0 there and test RMSE is the metric.
 Takes its own GAPconfig (declared in TNEPconfig.py), never TNEPconfig: the ANN modes
 are frozen constants there, so no ANN experiment can reach the fit.
 Polarisability (target_mode=2) fits the same way with the rank-2 kernel
-(D = 6 Voigt rows per frame instead of 3; data.bond_geometry):
+(D = 6 Voigt rows per frame instead of 3, and 2·C kernel channels — the
+isotropic |d|²I and traceless d⊗d − |d|²I/3 groups; data.bond_geometry):
 α = Σ_i Σ_k s_i^k W_i[:, k] — linear in the site scalars exactly as μ is.
 Still fixed: dipole_readout="neighbor", scale_targets=False.
 NO model persistence — fit writes a config+metrics run record JSON to GAP/."""
@@ -58,7 +59,7 @@ import data as tnep_data
 from DescriptorBuilder import make_descriptor_builder
 from gap_descriptor import (f_cut, gap_raw_numpy, gap_slices, select_centres,
                             validate_gap_cfg)
-from TNEPconfig import GAPconfig, resolved_dipole_cutoff, bond_rank
+from TNEPconfig import GAPconfig, resolved_dipole_cutoff, bond_rank, kernel_channels
 
 
 @dataclass
@@ -425,7 +426,8 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     mu = np.stack([np.asarray(t, dtype=np.float64) for t in d["targets"]])
     pair = _pair_columns(cfg)
     vs = [_collapse_V(V, pair) for V in d["V_atom"]]
-    n_vcols = int(cfg.dipole_channels) * (cfg.num_types if pair else 1)
+    # Kernel channels (2·C under target_mode=2: isotropic + traceless groups).
+    n_vcols = kernel_channels(cfg) * (cfg.num_types if pair else 1)
 
     # Per-species FPS sparse points, per scale (scale-2 selected on ITS OWN
     # descriptors — the wider builder — from the same rng stream, after
@@ -559,6 +561,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                 "radial": cfg.dipole_radial,
                 "cutoff": resolved_dipole_cutoff(cfg),
                 "channels": int(cfg.dipole_channels),
+                "kernel_channels": kernel_channels(cfg),
                 # True ⇒ per-(sparse-point, channel, neighbor-species)
                 # columns; subsumes symmetric c AND ordered Ω (no distinction
                 # in the absorbed linear form).

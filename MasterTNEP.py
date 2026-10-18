@@ -346,7 +346,7 @@ def _print_param_breakdown(model) -> None:
     # Primary ANN — per-layer breakdown.
     rows.append(("ANN  W0  [T·Q·H]", int(opt._n_W0)))
     rows.append(("ANN  b0  [T·H]",   int(opt._n_b0)))
-    _S = "C" if model._dipole_head == "vector" else "1"
+    _S = str(model._head_slots)
     _w1_label = (f"ANN  W1  [T·H·{_S}]" if model._neighbor_readout
                  else "ANN  W1  [T·H]")
     rows.append((_w1_label,          int(opt._n_W1)))
@@ -597,7 +597,10 @@ def _train_model_inner(cfg: TNEPconfig,
         print(f"Dipole readout: neighbor basis — "
               f"b_ij = Σ_n c_n[t_i,t_j]·R_n(r_ij)·s_i^n (+ mirrored j term), "
               f"μ = Σ_pairs b_ij·(r_i − r_j); {_r_desc}, {_fc_desc}, "
-              f"C = {model._dipole_channels} channels, {_c_desc}, "
+              f"C = {model._dipole_channels} radial channels"
+              + (f" × {model._bond_rank} kernel groups (isotropic, traceless)"
+                 if model._bond_rank == 2 else "")
+              + f", {_c_desc}, "
               f"r_c = {cfg.dipole_rc} Å"
               + f"; head = {model._dipole_head}")
     print(f"Model Parameters: {model.optimizer.dim}  |  Population Size: {model.optimizer.pop_size}")

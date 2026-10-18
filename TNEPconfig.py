@@ -43,7 +43,7 @@ class TNEPconfig:
 
     # --- target type, units, conversions -------------------------------
     # 0 : PES (energy), 1 : Dipole, 2 : Polarizability
-    target_mode: int = 1
+    target_mode: int = 2
     # Override the info/results key used to read targets from ASE structures.
     # None = use the default for target_mode ("energy", "dipole", "pol").
     # Set to a custom string to support non-standard dataset labels (e.g. "mu", "alpha").
@@ -60,11 +60,15 @@ class TNEPconfig:
     # Polarizability off-diagonal ([xy,yz,zx]) loss weight, scaled by
     # lambda_shear^2 (target_mode=2 only). 1.0 = equal weighting (GPUMD default).
     # Mode 2 is the rank-2 neighbour readout (docs/superpowers/specs/
-    # 2026-10-18-neighbor-polarizability-design.md): the same site head and
-    # radial channels as the dipole readout, contracted with Voigt(d⊗d)
-    # instead of d — α = Σ_{i<j} R_n(r_ij)·c·(s_i^n + s_j^n)·d⊗d. Every
-    # dipole_* readout field below applies; dipole_readout itself must be
-    # "neighbor" (the descriptor-gradient polarisability form was removed).
+    # 2026-10-18-neighbor-polarizability-design.md): the dipole readout's
+    # site head and radial channels on TWO even bond kernels — isotropic
+    # R_n·|d|²·I and traceless R_n·(d⊗d − |d|²I/3) — each with its own site
+    # head (a bond polarisability's α⊥ / α∥−α⊥; GPUMD's scalar + anisotropic
+    # pair). The split exists because the isotropic and anisotropic parts
+    # differ by two orders of magnitude and must not share a coefficient.
+    # Kernel channels = 2·dipole_channels (group-major: C isotropic, then C
+    # traceless). Every dipole_* readout field below applies; dipole_readout
+    # must be "neighbor" (the descriptor-gradient form was removed).
     lambda_shear: float = 1.0
 
     # Power N of |r_ij| in the dipole contraction (target_mode=1 only):
@@ -290,7 +294,7 @@ class TNEPconfig:
     #   "sum"     : summed experts (§0.4)
     #   "gap_sum" : summed experts on the GAP 2b/3b distance descriptors
     #               (gap_descriptor_plan.md §0.2; no NEP header, no c tensors)
-    nep_descriptor: str = "gap_sum"
+    nep_descriptor: str = "off"
     nep_n_max_radial: int = 6            # q_n, n = 0..n_max
     nep_n_max_angular: int = 6
     nep_basis_size_radial: int = 10       # Chebyshev k = 0..basis_size
@@ -349,7 +353,7 @@ class TNEPconfig:
     # ═══════════════════════════════════════════════════════════════════
 
     # Hidden-layer width of the per-type ANN.
-    num_neurons: int = 10
+    num_neurons: int = 15
     # Hidden-layer activation (any tf.keras.activations name for the forward
     # pass). Dipole/polarisability training (target_mode 1/2) has a hand-coded
     # backward — only "tanh" and "swish" (alias "silu") supported there;
@@ -384,8 +388,8 @@ class TNEPconfig:
     # in model order (nep_descriptor="gap_sum": the gap_models selection in
     # soap, 2b, 3b order) — like GAP's per-descriptor priors. Each model's
     # penalty is normalised by its own parameter count either way.
-    lambda_1: float | list[float] | None = [0.0005, 0.003, 0.005]
-    lambda_2: float | list[float] | None = [0.0005, 0.003, 0.005]
+    lambda_1: float | list[float] | None = 0.005 #[0.0005, 0.003, 0.005]
+    lambda_2: float | list[float] | None = 0.005 #[0.0005, 0.003, 0.005]
     # Dynamic-λ controls (only when lambda_1 or lambda_2 == -1):
     #   target_ratio : target reg-penalty / data-RMSE ratio
     #   damping      : step exponent, λ_new = λ·(target/r)^d (smaller = gentler)
@@ -849,8 +853,15 @@ def neighbor_readout_on(cfg: "TNEPconfig | GAPconfig") -> bool:
 
 def bond_rank(cfg: "TNEPconfig | GAPconfig") -> int:
     """Rank of the bond tensor in the neighbour readout's geometry kernel:
-    1 → d [3] (dipole), 2 → Voigt(d⊗d) [6] (polarisability)."""
+    1 → d [3] (dipole, one kernel group), 2 → Voigt [6] (polarisability, two
+    kernel groups: isotropic |d|²I and traceless d⊗d − |d|²I/3)."""
     return 2 if int(cfg.target_mode) == 2 else 1
+
+
+def kernel_channels(cfg: "TNEPconfig | GAPconfig") -> int:
+    """Channel axis of the staged kernel V[N, D, Ck, T]: the C radial
+    channels per kernel group, group-major — Ck = C·bond_rank."""
+    return int(cfg.dipole_channels) * bond_rank(cfg)
 
 
 def resolved_dipole_rc(cfg: "TNEPconfig | GAPconfig") -> float:

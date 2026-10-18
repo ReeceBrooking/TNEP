@@ -548,13 +548,15 @@ def test_pol_exact_recovery_known_alpha(tmp_path):
     R = np.stack([np.ones_like(x), x, 2 * x * x - 1], 1) * fc[:, None]  # [P, 3]
     xx, yy, zz = d[:, 0] ** 2, d[:, 1] ** 2, d[:, 2] ** 2
     voigt = np.stack([xx, yy, zz, d[:, 0] * d[:, 1], d[:, 1] * d[:, 2], d[:, 2] * d[:, 0]], 1)
-    W = np.zeros((len(at), 6, C, 2))                     # [N, 6, C, T']
+    iso = np.stack([r * r] * 3 + [0 * r] * 3, 1)
+    geom = np.stack([iso, voigt - iso / 3.0], 2)         # [P, 6, 2] iso | traceless
+    W = np.zeros((len(at), 6, 2 * C, 2))                 # [N, 6, 2C, T'] group-major
     np.add.at(W, (i, slice(None), slice(None), ti[j]),
-              voigt[:, :, None] * R[:, None, :])
+              np.einsum("pdg,pn->pdgn", geom, R).reshape(len(r), 6, 2 * C))
     a_ref = np.zeros(6)
     for n in range(len(at)):
         k = (D[n] @ refit.sparse_desc[ti[n]].T) ** refit.xi[0]      # [M]
-        s = (refit.alpha[ti[n]].reshape(len(k), -1) * k[:, None]).sum(0)  # [C·T']
+        s = (refit.alpha[ti[n]].reshape(len(k), -1) * k[:, None]).sum(0)  # [2C·T']
         a_ref += W[n].reshape(6, -1) @ s
     assert np.allclose(gap_dipole.predict(refit, [at])[0], a_ref,
                        atol=1e-6 * max(np.abs(a_ref).max(), 1.0))

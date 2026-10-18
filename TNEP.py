@@ -72,12 +72,16 @@ class TNEP(layers.Layer):
         0 PES     : E = -Σ_i U_i                                   → [1]
         1 Dipole  : tnep     μ = -Σ_ij |r_ij|² · (dU_i/dr_ij_vec)  → [3]
                     neighbor μ = Σ_i Σ_n s_i^n · c · V_i[:, n, :]  → [3]
-        2 Polar.  : neighbor, rank 2 — V built from Voigt(d⊗d)    → [6]
+        2 Polar.  : neighbor, rank 2 — two even bond kernels          → [6]
 
-    Mode 2 is ALWAYS the neighbour readout (bond_rank 2): the same site head
-    and radial channels as the dipole form, contracted with d⊗d instead of
-    d, i.e. α = Σ_{i<j} R_n(r_ij)·c·(s_i^n + s_j^n)·d⊗d — a learned bond
-    polarisability. Output order: [xx, yy, zz, xy, yz, zx].
+    Mode 2 is ALWAYS the neighbour readout (bond_rank 2) on two kernel
+    groups, each with its own site head (channels group-major, Ck = 2C):
+        α = Σ_{i<j} R_n(r_ij)·[ c⁰ (s_i^n + s_j^n) |d|²·I
+                               + c¹ (u_i^n + u_j^n) (d⊗d − |d|²I/3) ]
+    — a learned bond polarisability with independent α⊥ and α∥−α⊥ (the
+    isotropic and anisotropic parts differ by ~100× in scale and must not
+    share a coefficient; this mirrors GPUMD's scalar + anisotropic pair).
+    Output order: [xx, yy, zz, xy, yz, zx].
     """
 
     def __init__(self,
@@ -336,9 +340,12 @@ class TNEP(layers.Layer):
                 f"descriptor-gradient (dual ANN) polarisability form was "
                 f"removed. Set dipole_readout='neighbor' (got {_readout!r}).")
         self._neighbor_readout = neighbor_readout_on(cfg)
-        # Bond tensor rank of the geometry kernel: 1 → d [3], 2 → Voigt(d⊗d) [6].
+        # Bond tensor rank = number of kernel groups: 1 → d [3]; 2 → Voigt [6]
+        # with an isotropic and a traceless group (_bond_geometry).
         self._bond_rank = bond_rank(cfg)
-        self._dipole_channels = int(cfg.dipole_channels)
+        self._dipole_channels = int(cfg.dipole_channels)      # radial channels C
+        # Channel axis of V / c_pair / the vector head: C per group, group-major.
+        self._kernel_channels = self._dipole_channels * self._bond_rank
         self._dipole_radial = str(cfg.dipole_radial)
         self._dipole_zeta = float(cfg.dipole_zeta)
         self._dipole_cutoff = resolved_dipole_cutoff(cfg)
@@ -356,11 +363,15 @@ class TNEP(layers.Layer):
                 f"cfg.dipole_head must be 'vector' or 'scalar', "
                 f"got {cfg.dipole_head!r}.")
         # THE single source for W1's last axis; SNES/model_io read it back.
-        # C slots under the vector head, 1 (broadcast in _split_head) under
-        # "scalar"; 1 for every non-neighbour readout (the head is a scalar).
-        self._head_slots = (self._dipole_channels
-                            if self._neighbor_readout
-                            and self._dipole_head == "vector" else 1)
+        # Ck = C·groups slots under the vector head; one slot PER KERNEL GROUP
+        # under "scalar" (broadcast over that group's C channels in
+        # _split_head); 1 for every non-neighbour readout.
+        if not self._neighbor_readout:
+            self._head_slots = 1
+        elif self._dipole_head == "vector":
+            self._head_slots = self._kernel_channels
+        else:
+            self._head_slots = self._bond_rank
         if (self._neighbor_readout and self._dipole_head == "scalar"
                 and self._species_pairs == "off"):
             warnings.warn(
@@ -439,7 +450,7 @@ class TNEP(layers.Layer):
             # One table per model, side by side on the pair axis: model k
             # owns columns [k·n_pairs, (k+1)·n_pairs) (see _c_full).
             self._n_pairs = int(pair_idx.max()) + 1
-            c_shape = (self._dipole_channels, self._n_pairs * len(self._models))
+            c_shape = (self._kernel_channels, self._n_pairs * len(self._models))
             if self._c_learnable:
                 self.c_pair = self.add_weight(
                     name="c_pair", shape=c_shape,
@@ -1029,8 +1040,9 @@ class TNEP(layers.Layer):
         if self._neighbor_readout:
             # Neighbor-basis readout, C Chebyshev channels + species-pair c:
             #   μ = Σ_i Σ_n s_i^n Σ_t' c[t_i,t',n]·V_i[:,n,t'],
-            #   V_i[:,n,t'] = Σ_{j∈t'} R_n(|d|)·g(d),  d = r_i − r_j (MIC),
-            #   g = d (dipole) or Voigt(d⊗d) (polarisability, _bond_geometry).
+            #   V_i[:,k,t'] = Σ_{j∈t'} R_n(|d|)·g_group(d),  d = r_i − r_j (MIC),
+            #   k = group·C + n; g = d (dipole) or the isotropic / traceless
+            #   Voigt tensors (polarisability) — _bond_geometry.
             # No de_dq backward chain here — the readout reads no descriptor
             # gradients; don't re-add it. b1 stays excluded from s: with c
             # symmetric a per-channel uniform shift of s^n is exact gauge;
@@ -1050,10 +1062,11 @@ class TNEP(layers.Layer):
             Rw = self._radial(rij) * w[:, :, tf.newaxis]           # [A, M, C]
             tp = tf.one_hot(tf.gather(Z, grad_index), self.num_types,
                             dtype=tf.float64)                      # [A, M, T]
-            V = tf.einsum('amn,amd,amt->adnt',                # float64 accum.
-                          tf.cast(Rw, tf.float64),
-                          self._bond_geometry(tf.cast(-dr, tf.float64)),
-                          tp)                                 # [A, D, C, T]
+            g = self._bond_geometry(tf.cast(-dr, tf.float64))      # [A, M, D, G]
+            V = tf.einsum('amn,amdg,amt->adgnt',              # float64 accum.
+                          tf.cast(Rw, tf.float64), g, tp)    # [A, D, G, C, T]
+            V = tf.reshape(V, [tf.shape(V)[0], tf.shape(V)[1],
+                               self._kernel_channels, self.num_types])  # [A, D, Ck, T]
             mu = tf.einsum('ant,adnt->d', G, tf.cast(V, G.dtype))     # [D]
             return mu
 
@@ -2145,22 +2158,27 @@ class TNEP(layers.Layer):
         raise ValueError(f"unknown dipole_radial {rad!r}")
 
     def _bond_geometry(self, d: tf.Tensor) -> tf.Tensor:
-        """Bond tensor [..., 3] → [..., D] per self._bond_rank: 1 → d itself
-        (dipole, D = 3); 2 → Voigt(d⊗d) = [dx², dy², dz², dxdy, dydz, dzdx]
-        (polarisability, D = 6; even under d → −d, so the per-site sum equals
-        the symmetric pair form). TF twin of data.bond_geometry."""
+        """Bond tensors [..., 3] → [..., D, G] per self._bond_rank. 1: d itself
+        (dipole, D = 3, G = 1). 2 (polarisability, D = 6 Voigt, G = 2): group
+        0 the isotropic |d|²·I, group 1 the traceless d⊗d − |d|²I/3 — both
+        even under d → −d, so the per-site sum equals the symmetric pair
+        form. TF twin of data.bond_geometry."""
         if self._bond_rank == 1:
-            return d
+            return d[..., tf.newaxis]
         x, y, z = tf.unstack(d, axis=-1)
-        return tf.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=-1)
+        r2 = x * x + y * y + z * z
+        zero = tf.zeros_like(r2)
+        iso = tf.stack([r2, r2, r2, zero, zero, zero], axis=-1)
+        tr = tf.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=-1) - iso / 3.0
+        return tf.stack([iso, tr], axis=-1)
 
     def _split_head(self, out: tf.Tensor):
-        """Head output [.., S] → site values s [.., C], S = _head_slots (C for
-        dipole_head="vector"; 1 for "scalar", broadcast over the C channels)."""
-        if self._head_slots == self._dipole_channels:
+        """Head output [.., S] → site values s [.., Ck], S = _head_slots (Ck
+        for dipole_head="vector"; one slot per kernel group for "scalar",
+        repeated over that group's C channels — group-major like V)."""
+        if self._head_slots == self._kernel_channels:
             return out
-        return tf.broadcast_to(
-            out, tf.concat([tf.shape(out)[:-1], [self._dipole_channels]], 0))
+        return tf.repeat(out, self._dipole_channels, axis=-1)
 
     def _c_full(self, c_pair: tf.Tensor, k: int = 0) -> tf.Tensor:
         """Model k's table from the packed c_pair [..., C, M·n_pairs] →
@@ -2199,17 +2217,18 @@ class TNEP(layers.Layer):
         r = tf.sqrt(rij2)
         keep = tf.logical_and(r < rc, tf.not_equal(pair_atom, pair_gidx))
         Rw = self._radial(r) * tf.cast(keep, r.dtype)[:, tf.newaxis]  # [P, C]
-        # contrib[p, d, n] = R_n·g(d), d = −(neighbor − center).
-        g = self._bond_geometry(-dr)                                # [P, D]
-        D = int(g.shape[-1])
-        contrib = tf.cast(g[:, :, tf.newaxis]
-                          * Rw[:, tf.newaxis, :], tf.float64)      # [P, D, C]
+        # contrib[p, d, k] = R_n·g_group(d), k = group·C + n, d = −(neighbor − center).
+        g = self._bond_geometry(-dr)                                # [P, D, G]
+        D, Ck = int(g.shape[1]), self._kernel_channels
+        contrib = tf.reshape(
+            tf.einsum('pdg,pn->pdgn', tf.cast(g, tf.float64),
+                      tf.cast(Rw, tf.float64)), [-1, D, Ck])       # [P, D, Ck]
         tprime = tf.gather_nd(Z, tf.stack([pair_struct, pair_gidx], axis=1))
         seg = (pair_struct * A + pair_atom) * T + tf.cast(tprime, pair_atom.dtype)
         V = tf.math.unsorted_segment_sum(
-            tf.reshape(contrib, [-1, D * C]), seg, num_segments=B * A * T)
-        V = tf.reshape(tf.cast(V, dr.dtype), [B, A, T, D, C])
-        return tf.transpose(V, [0, 1, 3, 4, 2])                  # [B,A,D,C,T]
+            tf.reshape(contrib, [-1, D * Ck]), seg, num_segments=B * A * T)
+        V = tf.reshape(tf.cast(V, dr.dtype), [B, A, T, D, Ck])
+        return tf.transpose(V, [0, 1, 3, 4, 2])                  # [B,A,D,Ck,T]
 
     def _dipole_coo(self, forces_per_pair: tf.Tensor, pair_struct: tf.Tensor,
                     pair_atom: tf.Tensor, pair_gidx: tf.Tensor,

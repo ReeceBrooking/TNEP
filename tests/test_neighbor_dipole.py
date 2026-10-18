@@ -1046,6 +1046,14 @@ def _voigt(d):
     return np.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=1)
 
 
+def _iso_tr(d):
+    """The two even bond kernels: isotropic |d|²·I and traceless d⊗d − |d|²I/3
+    (Voigt), matching data.bond_geometry group order."""
+    r2 = (d ** 2).sum(1)
+    iso = np.stack([r2, r2, r2, 0 * r2, 0 * r2, 0 * r2], 1)
+    return iso, _voigt(d) - iso / 3.0
+
+
 def _voigt_to_mat(v):
     xx, yy, zz, xy, yz, zx = v
     return np.array([[xx, xy, zx], [xy, yy, yz], [zx, yz, zz]])
@@ -1064,20 +1072,27 @@ def _pol_setup():
 
 
 def test_pol_symmetric_pair_sum_matches_model():
+    """α = Σ_{i<j} R_n [c⁰ (s_i+s_j) |d|²I + c¹ (u_i+u_j)(d⊗d − |d|²I/3)]:
+    two kernel groups, each with its own site head and pair table slice."""
     cfg, model, atoms, data = _pol_setup()
     assert model._neighbor_readout and model._bond_rank == 2
-    assert tuple(data["V_atom"].shape) == (1, len(atoms), 6, 4, 2)
-    assert tuple(data["targets"].shape) == (1, 6)
-    s = _site_scalars_np(model, data)                           # [A, C]
-    Z = data["Z_int"][0].numpy()
     C, rc = cfg.dipole_channels, cfg.dipole_rc
-    c = model.c_pair.numpy().astype(np.float64)[:, _pair_index(2)]  # [C, T, T]
+    assert model._kernel_channels == 2 * C and model._head_slots == 2 * C
+    assert tuple(data["V_atom"].shape) == (1, len(atoms), 6, 2 * C, 2)
+    assert tuple(data["targets"].shape) == (1, 6)
+    s_all = _site_scalars_np(model, data)                       # [A, 2C]: iso | traceless
+    Z = data["Z_int"][0].numpy()
+    c = model.c_pair.numpy().astype(np.float64)[:, _pair_index(2)]  # [2C, T, T]
     i, j, D = neighbor_list("ijD", atoms, rc)
     keep = i < j
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
     R = _R_np(np.linalg.norm(d, axis=1), rc, C)                 # [P, C]
-    w = np.einsum("pn,pn->p", R, c[:, Z[i], Z[j]].T * (s[i] + s[j]))
-    a_ref = (w[:, None] * _voigt(d)).sum(0)
+    iso, tr = _iso_tr(d)
+    a_ref = np.zeros(6)
+    for g, geom in enumerate((iso, tr)):
+        s, cg = s_all[:, g * C:(g + 1) * C], c[g * C:(g + 1) * C]
+        w = np.einsum("pn,pn->p", R, cg[:, Z[i], Z[j]].T * (s[i] + s[j]))
+        a_ref += (w[:, None] * geom).sum(0)
     a_model = _alpha(model, atoms, cfg)
     assert np.allclose(a_model, a_ref, rtol=1e-5,
                        atol=1e-5 * np.abs(a_ref).max())
@@ -1147,7 +1162,8 @@ def test_pol_snes_tail_has_no_second_ann_and_gen0_identity():
     # One ANN only: typed slab + b1 + c_pair; the dual-ANN doubling is gone.
     assert int(opt.dim) == opt.n_typed + 1 + opt.n_c
     assert opt.n_anns_total == opt.n_primary and opt._n_per_type == opt.n_typed // T
-    assert opt._n_W1 == T * H * C and opt.n_c == C * (T * (T + 1) // 2)
+    # Two kernel groups: the head and the pair table carry 2C channels.
+    assert opt._n_W1 == T * H * 2 * C and opt.n_c == 2 * C * (T * (T + 1) // 2)
     assert np.allclose(opt._pol_weights.numpy(), np.ones(6))
     assert not any(k.endswith("_pol") for k in
                    opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu)))
@@ -1206,6 +1222,29 @@ def test_pol_save_load_roundtrip_and_old_dual_ann_refused(tmp_path):
         f["weights"].create_dataset("W0_pol", data=np.zeros((2, cfg.dim_q, 8)))
     with pytest.raises(ValueError, match="W0_pol"):
         model_io.load_model(p)
+
+
+def test_pol_scalar_head_is_one_slot_per_kernel_group():
+    """dipole_head="scalar" under mode 2 keeps the isotropic and traceless
+    groups independent: W1 [T, H, 2], each slot repeated over its group's C
+    channels — identical to a vector head tiled group-wise."""
+    cfg_s = _cfg(target_mode=2, dipole_head="scalar", dipole_species_pairs="symmetric")
+    cfg_v = _cfg(target_mode=2, dipole_head="vector", dipole_species_pairs="symmetric")
+    m_s, m_v = _model(cfg_s), _model(cfg_v)
+    C = cfg_s.dipole_channels
+    assert tuple(m_s.W1.shape) == (2, 8, 2) and tuple(m_v.W1.shape) == (2, 8, 2 * C)
+    assert m_s.optimizer._n_W1 == 2 * 8 * 2 and m_s.optimizer.n_c == m_v.optimizer.n_c
+    W1s = tf.random.stateless_normal(m_s.W1.shape, [7, 8])
+    m_s.W1.assign(W1s)
+    m_v.W0.assign(m_s.W0); m_v.b0.assign(m_s.b0)
+    m_v.W1.assign(tf.repeat(W1s, C, axis=-1))                 # group-major tiling
+    rng = np.random.default_rng(5)
+    cp = rng.uniform(0.3, 1.7, size=m_s.c_pair.shape).astype(np.float32)
+    m_s.c_pair.assign(cp); m_v.c_pair.assign(cp)
+    atoms = _pol_frame()
+    a_s, a_v = _alpha(m_s, atoms, cfg_s), _alpha(m_v, atoms, cfg_v)
+    np.testing.assert_allclose(a_s, a_v, rtol=1e-5, atol=1e-5 * np.abs(a_v).max())
+    assert np.any(a_s != 0.0)
 
 
 def test_pol_rejects_tnep_readout_and_needs_no_gradients():

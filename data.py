@@ -474,15 +474,20 @@ def _neighbor_pairs(atoms: Atoms, rc: float):
 
 
 def bond_geometry(d: np.ndarray, rank: int) -> np.ndarray:
-    """Bond tensor of the neighbour readout, [P, 3] → [P, D]: rank 1 is d
-    itself (D = 3, odd — the dipole); rank 2 is Voigt(d⊗d) =
-    [dx², dy², dz², dxdy, dydz, dzdx] (D = 6, even — the polarisability).
+    """Bond tensors of the neighbour readout, [P, 3] → [P, D, G] (G kernel
+    groups). rank 1: d itself (D = 3, G = 1, odd — the dipole). rank 2
+    (D = 6 Voigt [xx, yy, zz, xy, yz, zx], G = 2, even — the polarisability):
+    group 0 the isotropic |d|²·I, group 1 the traceless d⊗d − |d|²I/3, so a
+    bond carries independent α⊥-like and (α∥−α⊥)-like coefficients.
     Numpy twin of TNEP._bond_geometry."""
     if rank == 1:
-        return d
+        return d[:, :, None]
     if rank == 2:
         x, y, z = d[:, 0], d[:, 1], d[:, 2]
-        return np.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=1)
+        r2 = x * x + y * y + z * z
+        iso = np.stack([r2, r2, r2, 0 * r2, 0 * r2, 0 * r2], axis=1)
+        tr = np.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=1) - iso / 3.0
+        return np.stack([iso, tr], axis=2)
     raise ValueError(f"bond rank must be 1 or 2, got {rank}")
 
 
@@ -490,9 +495,9 @@ def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
                            zeta: float, cutoff: str, gauss_sigma_scale: float,
                            rank: int = 1):
     """Ordered neighbor pairs of the neighbor-basis readout: (i, j, G) with
-    G[p] = R_n(|d|)·g(d) [P, D, C], g = bond_geometry(d, rank) (d for the
-    dipole, Voigt(d⊗d) for the polarisability), d = r_i − r_j (image pairs,
-    self-images dropped). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
+    G[p] = R_n(|d|)·g(d) [P, D, G·C] (channel = group·C + n, groups and D per
+    bond_geometry(d, rank)), d = r_i − r_j (image pairs, self-images
+    dropped). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
     "chebyshev_warped" T_n(2(r/rc − 1)² − 1)·f_c, "gaussian"
     exp(−(r − μ_n)²/2σ²)·f_c (μ_n interior points of linspace(0, rc, C+2),
     σ = gauss_sigma_scale·rc/(C+1)), or "screened" r^(ζ−1)·f_c. f_c per
@@ -528,8 +533,9 @@ def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
         Rw = np.exp(-(r[:, None] - mu) ** 2 / (2.0 * sigma ** 2)) * fc[:, None]
     else:
         raise ValueError(f"unknown dipole_radial {radial!r}")
-    g = bond_geometry(d, rank)
-    return i, j, g[:, :, None] * Rw[:, None, :]              # [P, D, C]
+    g = bond_geometry(d, rank)                                # [P, D, G]
+    P_, D_, G_ = g.shape
+    return i, j, np.einsum("pdg,pn->pdgn", g, Rw).reshape(P_, D_, G_ * Rw.shape[1])
 
 
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
@@ -539,15 +545,16 @@ def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
                        gauss_sigma_scale: float = 1.0,
                        rank: int = 1) -> np.ndarray:
     """Per-atom geometry kernel of the neighbor-basis readout:
-    V_i[:,n,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·g(d), g = d (rank 1,
-    dipole) or Voigt(d⊗d) (rank 2, polarisability); pairs and R_n from
-    _neighbor_dipole_pairs. float64 accumulate → float32 [N, D, C, T]."""
+    V_i[:,k,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·g_group(d), k = group·C + n
+    (rank 1: d, one group; rank 2: isotropic |d|²I and traceless
+    d⊗d − |d|²I/3 groups); pairs and R_n from _neighbor_dipole_pairs.
+    float64 accumulate → float32 [N, D, G·C, T]."""
     i, j, G = _neighbor_dipole_pairs(atoms, rc, C, radial, zeta, cutoff,
                                      gauss_sigma_scale, rank)
-    D = G.shape[1]
-    V = np.zeros((len(atoms), T, D, C))
+    D, Ck = G.shape[1], G.shape[2]
+    V = np.zeros((len(atoms), T, D, Ck))
     np.add.at(V, (i, np.asarray(types_int)[j]), G)
-    return V.transpose(0, 2, 3, 1).astype(np.float32)      # [N, D, C, T]
+    return V.transpose(0, 2, 3, 1).astype(np.float32)      # [N, D, G·C, T]
 
 
 def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
