@@ -500,7 +500,9 @@ def test_configs_are_independent():
     # gap_delta_* amplitudes, which are GAP-only hyperparameters of the summed
     # kernel model and have no ANN counterpart.
     gap_only = {"descriptor_self_batch_size", "gap_delta_soap",
-                "gap_delta_2b", "gap_delta_3b", "gap_sigma", "gap_sparse_jitter"}
+                "gap_delta_2b", "gap_delta_3b", "gap_sigma", "gap_sparse_jitter",
+                # polarisability kernel-group knobs of the linear fit
+                "gap_group_delta", "gap_lambda_shear", "gap_cross_channels"}
     missing = (set(GAPconfig.__annotations__)
                - set(TNEPconfig.__annotations__) - gap_only)
     assert not missing, missing
@@ -560,3 +562,71 @@ def test_pol_exact_recovery_known_alpha(tmp_path):
         a_ref += W[n].reshape(6, -1) @ s
     assert np.allclose(gap_dipole.predict(refit, [at])[0], a_ref,
                        atol=1e-6 * max(np.abs(a_ref).max(), 1.0))
+
+
+# ── polarisability kernel groups: cross sym(v⊗v) group, group δ, λ_shear ───
+
+POL_KW = dict(target_mode=2, dipole_radial="chebyshev", dipole_channels=3,
+              dipole_cutoff="cosine2", dipole_species_pairs="symmetric")
+
+
+def test_pol_cross_group_identity_and_column_count(tmp_path):
+    """_cross_group == hand-rolled sym(v^a⊗v^b) − tr/3 over channel pairs of the
+    species-resolved dipole kernel; the design gains K₁(K₁+1)/2 columns per
+    sparse point and the fit runs end to end with group δ and λ_shear set."""
+    at = read(WATER_XYZ, index="4")
+    cfg = _cfg(**POL_KW, gap_cross_channels=2, gap_group_delta=[1.0, 2.0, 0.5],
+               gap_lambda_shear=2.0)
+    cfg.types, cfg.num_types = [8, 1], 2    # collect() normally sets these
+    ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
+    X = gap_dipole._cross_group(at, ti, cfg)                       # [N, 6, K_x]
+    rc, Cx, T = float(cfg.dipole_rc), 2, 2
+    i, j, Dv = neighbor_list("ijD", at, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    x = 2.0 * r / rc - 1.0
+    fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    R = np.stack([np.ones_like(x), x], 1) * fc[:, None]              # [P, C_x]
+    v = np.zeros((len(at), 3, Cx, T))
+    np.add.at(v, (i, slice(None), slice(None), ti[j]), d[:, :, None] * R[:, None, :])   # [P, 3, C_x]
+    v = v.reshape(len(at), 3, Cx * T)                                 # k = (a, t′), C-major
+    K1 = Cx * T
+    ref = []
+    for a in range(K1):
+        for b in range(a, K1):
+            S = 0.5 * (np.einsum("ni,nj->nij", v[:, :, a], v[:, :, b])
+                       + np.einsum("ni,nj->nij", v[:, :, b], v[:, :, a]))
+            tr = np.trace(S, axis1=1, axis2=2) / 3
+            ref.append(np.stack([S[:, 0, 0] - tr, S[:, 1, 1] - tr, S[:, 2, 2] - tr,
+                                 S[:, 0, 1], S[:, 1, 2], S[:, 2, 0]], 1))
+    ref = np.stack(ref, 2)
+    assert X.shape == (len(at), 6, K1 * (K1 + 1) // 2)
+    assert np.allclose(X, ref, atol=2e-5 * np.abs(ref).max())      # V is staged in float32
+    assert np.allclose(X[:, :3].sum(1), 0.0, atol=2e-5 * np.abs(ref).max())   # traceless
+    # Group δ scale the two bond groups, the cross group rides behind them.
+    vfull = gap_dipole._v_atoms(at, ti, cfg)
+    cfg0 = _cfg(**POL_KW); cfg0.types, cfg0.num_types = [8, 1], 2
+    base = gap_dipole._v_atoms(at, ti, cfg0)
+    assert vfull.shape[2] == gap_dipole._n_vcols(cfg) == 2 * 3 * T + K1 * (K1 + 1) // 2
+    assert np.allclose(vfull[:, :, :6], base[:, :, :6] * 1.0)
+    assert np.allclose(vfull[:, :, 6:12], base[:, :, 6:12] * 2.0)
+    assert np.allclose(vfull[:, :, 12:], 0.5 * X)
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(_cfg(**POL_KW, gap_cross_channels=2,
+                                           gap_group_delta=[1.0, 2.0, 0.5],
+                                           gap_lambda_shear=2.0, gap_sparse_per_species=6))
+        rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
+    assert rec["gap"]["cross_channels"] == 2 and rec["gap"]["lambda_shear"] == 2.0
+    assert rec["gap"]["n_columns"] == 2 * 6 * gap_dipole._n_vcols(cfg)
+    assert gap_dipole.predict(m, [at]).shape == (1, 6)
+
+
+@pytest.mark.parametrize("kw,msg", [
+    (dict(target_mode=1, gap_cross_channels=2), "gap_cross_channels"),
+    (dict(target_mode=2, gap_group_delta=[1.0, 1.0]), "gap_group_delta"),
+    (dict(target_mode=2, gap_lambda_shear=0.0), "gap_lambda_shear"),
+])
+def test_pol_group_validation_raises(kw, msg):
+    with pytest.raises(ValueError, match=msg):
+        gap_dipole._validate(_cfg(**kw))

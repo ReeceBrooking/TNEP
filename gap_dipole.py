@@ -135,6 +135,12 @@ def _validate(cfg: GAPconfig) -> None:
          f"dipole_channels must be 1 for the screened radial, got "
          f"{cfg.dipole_channels}"),
         (not cfg.scale_targets, "scale_targets must be False"),
+        (int(cfg.gap_cross_channels) == 0 or int(cfg.target_mode) == 2,
+         "gap_cross_channels is a polarisability (target_mode=2) kernel group"),
+        (int(cfg.gap_cross_channels) >= 0, "gap_cross_channels must be >= 0"),
+        (len(cfg.gap_group_delta) == 3 and all(float(x) > 0 for x in cfg.gap_group_delta),
+         "gap_group_delta needs 3 positive entries (isotropic, traceless, cross)"),
+        (float(cfg.gap_lambda_shear) > 0, "gap_lambda_shear must be > 0"),
         # nep_descriptor is a frozen constant on GAPconfig, so this cannot
         # fire from a class default — it catches INSTANCE mutation
         # (cfg.nep_descriptor = "concat"), which would otherwise reach
@@ -180,16 +186,71 @@ def _collapse_V(V: np.ndarray, pair_columns: bool) -> np.ndarray:
     return V.sum(axis=-1)
 
 
+def _cross_group(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
+    """Third polarisability kernel group [N, 6, K_x] (gap_cross_channels C_x):
+    the dipole kernel v_i^a = Σ_j R_a(r_ij) d_ij over its first C_x radial
+    channels (species-resolved under pair columns, K₁ = C_x·T′ vectors),
+    combined as traceless symmetric products sym(v^a ⊗ v^b) − tr/3 for a ≤ b,
+    K_x = K₁(K₁+1)/2. Expanding v⊗v = Σ_j Σ_k R_a R_b d_j⊗d_k shows it carries
+    the two-neighbour cross tensors the bond-axis groups lack. Even under
+    inversion, covariant, image-exact, linear in the site coefficient."""
+    V1 = tnep_data._neighbor_dipole_V(
+        atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard),
+        int(cfg.gap_cross_channels), int(cfg.num_types),
+        str(cfg.dipole_radial), float(cfg.dipole_zeta),
+        resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale),
+        rank=1)                                                 # [N, 3, C_x, T]
+    v = _collapse_V(V1, _pair_columns(cfg))                     # [N, 3, K₁]
+    a_idx, b_idx = np.triu_indices(v.shape[2])
+    a, b = v[:, :, a_idx], v[:, :, b_idx]                       # [N, 3, K_x]
+    sym = 0.5 * (a[:, :, None, :] * b[:, None, :, :]
+                 + b[:, :, None, :] * a[:, None, :, :])         # [N, 3, 3, K_x]
+    tr3 = (sym[:, 0, 0] + sym[:, 1, 1] + sym[:, 2, 2]) / 3.0
+    return np.stack([sym[:, 0, 0] - tr3, sym[:, 1, 1] - tr3, sym[:, 2, 2] - tr3,
+                     sym[:, 0, 1], sym[:, 1, 2], sym[:, 2, 0]], axis=1)
+
+
+def _finish_v(V: np.ndarray, atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
+    """Staged kernel [N, D, Ck, T] → design geometry v_i [N, D, K]: collapse
+    to pair columns, then (target_mode=2) scale each kernel group by its
+    gap_group_delta and append the cross group. THE one place fit and predict
+    both go through, so the column contract cannot drift."""
+    v = _collapse_V(V, _pair_columns(cfg))
+    if int(cfg.target_mode) != 2:
+        return v
+    d_iso, d_tr, d_x = (float(x) for x in cfg.gap_group_delta)
+    per_group = v.shape[2] // 2                                  # C·T′ channels per group
+    v = v.copy()
+    v[:, :, :per_group] *= d_iso
+    v[:, :, per_group:] *= d_tr
+    if int(cfg.gap_cross_channels) > 0:
+        v = np.concatenate([v, d_x * _cross_group(atoms, ti, cfg)], axis=2)
+    return v
+
+
+def _n_vcols(cfg: GAPconfig) -> int:
+    """K: design geometry columns per sparse point (kernel channels × pair
+    columns, + the cross group's K₁(K₁+1)/2 under target_mode=2)."""
+    T_ = cfg.num_types if _pair_columns(cfg) else 1
+    k = kernel_channels(cfg) * T_
+    cx = int(cfg.gap_cross_channels)
+    if int(cfg.target_mode) == 2 and cx > 0:
+        k1 = cx * T_
+        k += k1 * (k1 + 1) // 2
+    return k
+
+
 def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
     """Per-atom geometry vectors v_i [N, D, K] per the cfg's radial/cutoff/
-    channels, pair-column mode and bond rank (target_mode)."""
+    channels, pair-column mode, bond rank (target_mode) and polarisability
+    kernel-group settings."""
     V = tnep_data._neighbor_dipole_V(
         atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard),
         int(cfg.dipole_channels), int(cfg.num_types),
         str(cfg.dipole_radial), float(cfg.dipole_zeta),
         resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale),
         rank=bond_rank(cfg))
-    return _collapse_V(V, _pair_columns(cfg))
+    return _finish_v(V, atoms, ti, cfg)
 
 
 def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
@@ -424,9 +485,9 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
         cfg)
     mu = np.stack([np.asarray(t, dtype=np.float64) for t in d["targets"]])
     pair = _pair_columns(cfg)
-    vs = [_collapse_V(V, pair) for V in d["V_atom"]]
+    vs = [_finish_v(V, a, t, cfg) for V, a, t in zip(d["V_atom"], dataset, tis)]
     # Kernel channels (2·C under target_mode=2: isotropic + traceless groups).
-    n_vcols = kernel_channels(cfg) * (cfg.num_types if pair else 1)
+    n_vcols = _n_vcols(cfg)
 
     # Per-species FPS sparse points, per scale (scale-2 selected on ITS OWN
     # descriptors — the wider builder — from the same rng stream, after
@@ -508,6 +569,9 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     # regardless of n_columns.
     sigma = float(cfg.gap_sigma)
     row_w = np.repeat(1.0 / (sigma * np.sqrt([len(a) for a in dataset])), D)
+    if D == 6 and float(cfg.gap_lambda_shear) != 1.0:
+        # GPUMD lambda_shear: off-diagonal rows fitted with σ/λ_shear.
+        row_w = row_w * np.tile([1.0] * 3 + [float(cfg.gap_lambda_shear)] * 3, F)
     factors = _prior_factors(cfg, scale_sparse, xis, n_vcols)
     Phi_w = _whiten(Phi_flat, factors, n_vcols, False) * row_w[:, None]
     G = Phi_w @ Phi_w.T                                  # [DF, DF]
@@ -565,6 +629,10 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                 # columns; subsumes symmetric c AND ordered Ω (no distinction
                 # in the absorbed linear form).
                 "pair_columns": pair,
+                **({"group_delta": [float(x) for x in cfg.gap_group_delta],
+                    "lambda_shear": float(cfg.gap_lambda_shear),
+                    "cross_channels": int(cfg.gap_cross_channels)}
+                   if int(cfg.target_mode) == 2 else {}),
                 "extra_rcut": cfg.gap_extra_rcut,
                 "n_columns": n_columns,
                 # additive TurboGAP 2b/3b blocks (gap_descriptor.py)

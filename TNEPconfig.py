@@ -705,6 +705,22 @@ class GAPconfig:
     gap_delta_soap: float = 0.1
     gap_delta_2b: float = 0.5
     gap_delta_3b: float = 0.01
+    # --- polarisability (target_mode=2) kernel groups ----------------------
+    # Relative amplitude of each kernel group (isotropic |d|²·I, traceless
+    # d⊗d − |d|²I/3, cross sym(v⊗v)), multiplying gap_delta_soap: scales that
+    # group's kernel channels, i.e. the prior std of its site function — the
+    # GAP analogue of the ANN's independent per-group heads.
+    gap_group_delta: list[float] = [1.0, 1.0, 1.0]
+    # Off-diagonal observation weight (GPUMD's lambda_shear): the xy, yz, zx
+    # rows are fitted with σ_obs / gap_lambda_shear.
+    gap_lambda_shear: float = 1.0
+    # Third polarisability kernel group, GAP only. C_x radial channels of the
+    # dipole kernel v_i^a = Σ_j R_a(r_ij)·d_ij (species-resolved when
+    # dipole_species_pairs != "off"), combined as the traceless symmetric
+    # products sym(v^a ⊗ v^b), a ≤ b — the two-neighbour d_ij⊗d_ik tensors
+    # (bond-angle anisotropy) that GPUMD's angular forces supply and the
+    # bond-axis groups cannot. 0 = off.
+    gap_cross_channels: int = 0
     # Regularisation, as gap_fit: the expected ABSOLUTE error of a dipole
     # component per √atom (gap_fit's default_sigma with
     # sigma_per_atom=T: σ_obs = gap_sigma·√N_atoms), and the jitter added to
