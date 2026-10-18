@@ -7,7 +7,7 @@ error gap_sigma·√N_atoms, penalty αᵀ·K_MM·α per GAP term, δ² on every
 
     μ = Σ_i Σ_k s_i^k v_i[:, k],  s_i^k = Σ_m α_m^k (D̂_i · D̂_m)^ξ
 
-with v_i from data._neighbor_dipole_V [N, 3, C, T] — any radial
+with v_i from data._neighbor_dipole_V [N, D, C, T] — any radial
 (chebyshev/warped/gaussian/screened; screened requires C = 1, matching the
 readout contract) and any cutoff. The k axis of v — and hence the design
 columns per sparse point m — depends on dipole_species_pairs:
@@ -36,7 +36,10 @@ Columns = M_tot·K can exceed the 3·F equations (underdetermined); the prior
 handles it — train RMSE approaches 0 there and test RMSE is the metric.
 Takes its own GAPconfig (declared in TNEPconfig.py), never TNEPconfig: the ANN modes
 are frozen constants there, so no ANN experiment can reach the fit.
-Still fixed: dipole_readout="neighbor", target_mode=1, scale_targets=False.
+Polarisability (target_mode=2) fits the same way with the rank-2 kernel
+(D = 6 Voigt rows per frame instead of 3; data.bond_geometry):
+α = Σ_i Σ_k s_i^k W_i[:, k] — linear in the site scalars exactly as μ is.
+Still fixed: dipole_readout="neighbor", scale_targets=False.
 NO model persistence — fit writes a config+metrics run record JSON to GAP/."""
 from __future__ import annotations
 
@@ -55,7 +58,7 @@ import data as tnep_data
 from DescriptorBuilder import make_descriptor_builder
 from gap_descriptor import (f_cut, gap_raw_numpy, gap_slices, select_centres,
                             validate_gap_cfg)
-from TNEPconfig import GAPconfig, resolved_dipole_cutoff
+from TNEPconfig import GAPconfig, resolved_dipole_cutoff, bond_rank
 
 
 @dataclass
@@ -119,8 +122,9 @@ def _validate(cfg: GAPconfig) -> None:
                 f"gap_extra_rcut={extra} <= rcut_hard={cfg.rcut_hard}: legal, "
                 f"but the second scale usually adds LONGER-range resolution")
     checks = [
-        (cfg.target_mode == 1,
-         f"target_mode must be 1, got {cfg.target_mode}"),
+        (cfg.target_mode in (1, 2),
+         f"target_mode must be 1 (dipole) or 2 (polarisability), got "
+         f"{cfg.target_mode}"),
         (cfg.dipole_readout == "neighbor",
          f"dipole_readout must be 'neighbor', got {cfg.dipole_readout!r}"),
         (int(cfg.dipole_channels) >= 1,
@@ -166,23 +170,25 @@ def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
 
 
 def _collapse_V(V: np.ndarray, pair_columns: bool) -> np.ndarray:
-    """[N, 3, C, T] → v_i [N, 3, K] — the ONE place the column contract is
+    """[N, D, C, T] → v_i [N, D, K] — the ONE place the column contract is
     encoded (float64, shared by fit + predict). K = C·T with pair columns
-    (k = (n, t′), C-major, matching reshape order) else K = C (t′ summed)."""
+    (k = (n, t′), C-major, matching reshape order) else K = C (t′ summed).
+    D = 3 (dipole) or 6 (polarisability, Voigt)."""
     V = np.asarray(V, dtype=np.float64)
     if pair_columns:
-        return V.reshape(V.shape[0], 3, -1)
+        return V.reshape(V.shape[0], V.shape[1], -1)
     return V.sum(axis=-1)
 
 
 def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
-    """Per-atom geometry vectors v_i [N, 3, K] per the cfg's radial/cutoff/
-    channels and pair-column mode."""
+    """Per-atom geometry vectors v_i [N, D, K] per the cfg's radial/cutoff/
+    channels, pair-column mode and bond rank (target_mode)."""
     V = tnep_data._neighbor_dipole_V(
         atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard),
         int(cfg.dipole_channels), int(cfg.num_types),
         str(cfg.dipole_radial), float(cfg.dipole_zeta),
-        resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale))
+        resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale),
+        rank=bond_rank(cfg))
     return _collapse_V(V, _pair_columns(cfg))
 
 
@@ -203,7 +209,8 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
                gap_q: tuple[np.ndarray | None, np.ndarray | None] | None = None,
                deltas: tuple[float, float, float] = (1.0, 1.0, 1.0),
                ) -> np.ndarray:
-    """[3, n_columns] design block for one frame — THE column contract for
+    """[D, n_columns] design block for one frame (D = v.shape[1]: 3 dipole
+    components or 6 Voigt polarisability components) — THE column contract for
     fit AND predict. scales = [(D, sparse_desc)] per length scale; each
     scale's kernels couple its own descriptors to its own sparse points ONLY
     (scales never cross, like species). Block order: scale → species → ξ →
@@ -223,6 +230,7 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
     fit (_prior_factors), which is what makes δ² the prior variance of that
     term's site function."""
     d_soap, d_2b, d_3b = (float(d) for d in deltas)
+    n_rows = v.shape[1]                  # 3 (dipole) or 6 (polarisability)
     cols = []
     for D, sparse_desc in scales:
         for t, Dm in enumerate(sparse_desc):
@@ -231,7 +239,7 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
             vt = v[sel]
             for xi in xis:
                 cols.append(d_soap ** 2 * np.einsum("nm,nxk->xmk", G ** xi, vt)
-                            .reshape(3, -1))            # [3, M_t·K]
+                            .reshape(n_rows, -1))       # [D, M_t·K]
     for q, d_q in zip(gap_q or (), (d_2b, d_3b)):
         if q is not None:
             # scales[0][1] is the scale-1 sparse list: exactly one entry per
@@ -239,7 +247,7 @@ def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
             for t in range(len(scales[0][1])):
                 sel = ti == t
                 cols.append(d_q ** 2 * np.einsum("ns,nxk->xsk", q[sel], v[sel])
-                            .reshape(3, -1))            # [3, W·K]
+                            .reshape(n_rows, -1))       # [D, W·K]
     return np.concatenate(cols, axis=1)
 
 
@@ -349,22 +357,24 @@ def _whiten(X: np.ndarray, factors: list, n_vcols: int, solve_with_transpose: bo
 
 
 def _targets(frames: list[Atoms], cfg: GAPconfig) -> np.ndarray:
-    """Dipole targets [F, 3], unit-converted per cfg (matches assemble).
+    """Targets [F, D] (dipole [F, 3] unit-converted per cfg, matching
+    assemble; polarisability [F, 6] Voigt as stored).
 
     NOTE: unlike the training path (assemble_data_dict), this applies NO
     box/label guards — a pathological test file scores silently."""
     key = tnep_data._resolve_target_key(cfg)
     mu = np.stack([np.asarray(tnep_data._extract_target(s, key))
                    for s in frames]).astype(np.float64)
-    if getattr(cfg, "convert_dipole_to_eangstrom", True):
+    if cfg.target_mode == 1 and getattr(cfg, "convert_dipole_to_eangstrom", True):
         mu = mu * tnep_data._dipole_conversion_factor(cfg.dipole_units)
     return mu
 
 
 def _rmse_r2(pred: np.ndarray, mu: np.ndarray) -> tuple[float, float]:
-    """Total-vector RMSE √(mean(per-component²)·3) (diag_zeta convention), R²."""
+    """Total-vector RMSE √(mean(per-component²)·D) (diag_zeta convention;
+    D = 3 dipole, 6 Voigt polarisability), R²."""
     res = pred - mu
-    rmse = float(np.sqrt(np.mean(res ** 2) * 3.0))
+    rmse = float(np.sqrt(np.mean(res ** 2) * mu.shape[1]))
     tot = float(np.sum((mu - mu.mean(0)) ** 2))
     r2 = 1.0 - float(np.sum(res ** 2)) / tot if tot > 0.0 else float("nan")
     return rmse, r2
@@ -378,7 +388,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     `gap3b_centres` (when auto-selected) are filled in, because they must
     travel with the model for `predict` and into the run record.
 
-    Solver memory: the dual ridge solves the [3F, 3F] Gram, so Φ itself
+    Solver memory: the dual ridge solves the [DF, DF] Gram, so Φ itself
     dominates (~1.7 GB at F=1500, 48k columns) and memory is linear in
     columns. Multi-scale (gap_extra_rcut) ≈ 2× descriptor build time, fit
     and predict."""
@@ -463,7 +473,8 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
 
     # Φ frame-by-frame — the full N_envs × M kernel never exists.
     F = len(dataset)
-    Phi = np.empty((F, 3, n_columns))
+    D = mu.shape[1]                      # 3 (dipole) or 6 (polarisability)
+    Phi = np.empty((F, D, n_columns))
     deltas = _deltas(cfg)
     for f in range(F):
         scales = [(descs[f], sparse_desc)]
@@ -471,7 +482,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
             scales.append((descs2[f], sparse_desc2))
         Phi[f] = _phi_frame(scales, vs[f], tis[f], xis,
                             _gap_q(dataset[f], tis[f], cfg), deltas)
-    Phi_flat = Phi.reshape(3 * F, n_columns)
+    Phi_flat = Phi.reshape(D * F, n_columns)
 
     # An unpopulated species-pair slot (or a centre no triplet reaches) gives
     # identically-zero gap columns: those coefficients are unidentifiable.
@@ -492,13 +503,13 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     # gap_fit solves the augmented system [Λ^-½·K_NM; chol(K_MM)] by QR. The
     # readout multiplies the columns by K per sparse point, so here the SAME
     # minimiser is taken in whitened coefficients β = (Lᵀ ⊗ I)·α, where the
-    # penalty is ‖β‖², and solved in the dual: the Gram is [3F, 3F]
+    # penalty is ‖β‖², and solved in the dual: the Gram is [DF, DF]
     # regardless of n_columns.
     sigma = float(cfg.gap_sigma)
-    row_w = np.repeat(1.0 / (sigma * np.sqrt([len(a) for a in dataset])), 3)
+    row_w = np.repeat(1.0 / (sigma * np.sqrt([len(a) for a in dataset])), D)
     factors = _prior_factors(cfg, scale_sparse, xis, n_vcols)
     Phi_w = _whiten(Phi_flat, factors, n_vcols, False) * row_w[:, None]
-    G = Phi_w @ Phi_w.T                                  # [3F, 3F]
+    G = Phi_w @ Phi_w.T                                  # [DF, DF]
     G[np.diag_indices_from(G)] += 1.0
     beta = Phi_w.T @ np.linalg.solve(G, mu.reshape(-1) * row_w)
     alpha_flat = _whiten(beta[None], factors, n_vcols, True)[0]
@@ -517,7 +528,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                            alpha_gap2b=alpha_gap2b, alpha_gap3b=alpha_gap3b)
 
     train_rmse, train_r2 = _rmse_r2(
-        (Phi_flat @ alpha_flat).reshape(F, 3), mu)
+        (Phi_flat @ alpha_flat).reshape(F, D), mu)
     metrics = {"train_rmse": train_rmse, "train_r2": train_r2,
                "n_train_frames": F, "fit_seconds": time.time() - t0}
     print(f"[gap_dipole] fit M={sizes} xi={list(xis)} sigma={sigma:g} "
@@ -584,7 +595,8 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
 
 
 def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
-    """μ [F, 3] for a list of frames via the model's held cfg/builder.
+    """μ [F, 3] (or α [F, 6], target_mode=2) for a list of frames via the
+    model's held cfg/builder.
 
     Routes through _phi_frame — the SAME design-matrix contraction the fit
     uses (μ = Φα) — so fit and predict cannot drift."""
@@ -596,14 +608,17 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
     alpha_flat = np.concatenate(
         model.alpha + list(model.alpha2 or []) + list(model.alpha_gap2b or [])
         + list(model.alpha_gap3b or []))
-    out = np.empty((len(frames), 3))
+    out = None
     for f, (atoms, ti, D) in enumerate(zip(frames, tis, descs)):
         ti = np.asarray(ti)
         scales = [(D, model.sparse_desc)]
         if descs2 is not None:
             scales.append((descs2[f], model.sparse_desc2))
-        out[f] = _phi_frame(scales, _v_atoms(atoms, ti, cfg), ti, model.xi,
-                            _gap_q(atoms, ti, cfg), _deltas(cfg)) @ alpha_flat
+        row = _phi_frame(scales, _v_atoms(atoms, ti, cfg), ti, model.xi,
+                         _gap_q(atoms, ti, cfg), _deltas(cfg)) @ alpha_flat
+        if out is None:
+            out = np.empty((len(frames), len(row)))     # D = 3 or 6
+        out[f] = row
     return out
 
 

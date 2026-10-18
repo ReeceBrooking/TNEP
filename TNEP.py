@@ -10,7 +10,8 @@ from typing import Callable, NamedTuple
 
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
-from TNEPconfig import TNEPconfig, resolved_dipole_cutoff, resolved_dipole_rc
+from TNEPconfig import (TNEPconfig, resolved_dipole_cutoff, resolved_dipole_rc,
+                        neighbor_readout_on, bond_rank)
 from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices,
                             find_q_tf, fn_and_fnp_tf, real_harmonics_tf,
                             real_harmonics_grad_tf, nep_pair_kwargs, NUM_ABC,
@@ -68,13 +69,15 @@ class TNEP(layers.Layer):
         b1 ()                               global scalar bias
 
     Modes (cfg.target_mode):
-        0 PES     : E = -Σ_i U_i                            → [1]
-        1 Dipole  : μ = -Σ_ij |r_ij|² · (dU_i/dr_ij_vec)    → [3]
-        2 Polar.  : α[6] via dual ANN (scalar + tensor)     → [6]
+        0 PES     : E = -Σ_i U_i                                   → [1]
+        1 Dipole  : tnep     μ = -Σ_ij |r_ij|² · (dU_i/dr_ij_vec)  → [3]
+                    neighbor μ = Σ_i Σ_n s_i^n · c · V_i[:, n, :]  → [3]
+        2 Polar.  : neighbor, rank 2 — V built from Voigt(d⊗d)    → [6]
 
-    Mode 2 adds a scalar ANN (W0_pol/b0_pol/W1_pol/b1_pol) giving the isotropic
-    diagonal; the primary ANN's forces give the anisotropic virial.
-    Output order: [xx, yy, zz, xy, yz, zx].
+    Mode 2 is ALWAYS the neighbour readout (bond_rank 2): the same site head
+    and radial channels as the dipole form, contracted with d⊗d instead of
+    d, i.e. α = Σ_{i<j} R_n(r_ij)·c·(s_i^n + s_j^n)·d⊗d — a learned bond
+    polarisability. Output order: [xx, yy, zz, xy, yz, zx].
     """
 
     def __init__(self,
@@ -137,7 +140,7 @@ class TNEP(layers.Layer):
                 raise NotImplementedError(
                     "cfg.radial_basis_size: descriptor gradients through the "
                     "learned radial basis are not implemented — only the "
-                    "neighbor dipole readout (target_mode=1) "
+                    "neighbor readout (dipole or polarisability) "
                     "is supported.")
             self._rb_species_sum = bool(cfg.radial_basis_species_sum)
             self._rb_per_l = bool(cfg.radial_basis_per_l)
@@ -327,8 +330,14 @@ class TNEP(layers.Layer):
         # Neighbor-basis dipole readout: decided before W1 so the site head
         # can carry its channel axis.
         _readout = str(cfg.dipole_readout)
-        self._neighbor_readout = (cfg.target_mode == 1
-                                  and _readout == "neighbor")
+        if cfg.target_mode == 2 and _readout != "neighbor":
+            raise ValueError(
+                f"target_mode=2 is the rank-2 neighbour readout; the "
+                f"descriptor-gradient (dual ANN) polarisability form was "
+                f"removed. Set dipole_readout='neighbor' (got {_readout!r}).")
+        self._neighbor_readout = neighbor_readout_on(cfg)
+        # Bond tensor rank of the geometry kernel: 1 → d [3], 2 → Voigt(d⊗d) [6].
+        self._bond_rank = bond_rank(cfg)
         self._dipole_channels = int(cfg.dipole_channels)
         self._dipole_radial = str(cfg.dipole_radial)
         self._dipole_zeta = float(cfg.dipole_zeta)
@@ -439,7 +448,7 @@ class TNEP(layers.Layer):
                 self.c_pair = tf.ones(c_shape, dtype=tf.float32)
 
         # Validate dipole contraction power (mode 1 only) at construction time.
-        if cfg.target_mode == 1:
+        if cfg.target_mode == 1 or self._neighbor_readout:
             _N = int(cfg.dipole_rij_power)
             if _N < 0:
                 raise ValueError(
@@ -477,33 +486,6 @@ class TNEP(layers.Layer):
                         "charge_aux_weight > 0 is incompatible with "
                         "dipole_readout='neighbor': the site scalar s is an "
                         "electronegativity-like potential, not a charge.")
-
-        # Scalar ANN for polarizability mode (target_mode == 2)
-        if cfg.target_mode == 2:
-            self.W0_pol = self.add_weight(
-                name="W0_pol",
-                shape=(cfg.num_types, cfg.dim_q, cfg.num_neurons),
-                initializer="glorot_uniform",
-                trainable=True,
-            )
-            self.b0_pol = self.add_weight(
-                name="b0_pol",
-                shape=(cfg.num_types, cfg.num_neurons),
-                initializer="zeros",
-                trainable=True,
-            )
-            self.W1_pol = self.add_weight(
-                name="W1_pol",
-                shape=(cfg.num_types, self._H_final),
-                initializer="glorot_uniform",
-                trainable=True,
-            )
-            self.b1_pol = self.add_weight(
-                name="b1_pol",
-                shape=(),
-                initializer="zeros",
-                trainable=True,
-            )
 
         # Typed single-hidden-layer ANN blocks in SNES order — (suffix, input
         # width, hidden width, q_scale slice): the SOAP ANN, then under
@@ -1010,7 +992,7 @@ class TNEP(layers.Layer):
         Returns:
             target_mode 0: [1]  total energy
             target_mode 1: [3]  dipole vector
-            target_mode 2: [6]  polarizability tensor
+            target_mode 2: [6]  polarizability tensor [xx, yy, zz, xy, yz, zx]
         """
         if self._nep_pair_forces_on:
             raise NotImplementedError(
@@ -1047,7 +1029,8 @@ class TNEP(layers.Layer):
         if self._neighbor_readout:
             # Neighbor-basis readout, C Chebyshev channels + species-pair c:
             #   μ = Σ_i Σ_n s_i^n Σ_t' c[t_i,t',n]·V_i[:,n,t'],
-            #   V_i[:,n,t'] = Σ_{j∈t'} R_n(|d|)·d,  d = r_i − r_j (MIC).
+            #   V_i[:,n,t'] = Σ_{j∈t'} R_n(|d|)·g(d),  d = r_i − r_j (MIC),
+            #   g = d (dipole) or Voigt(d⊗d) (polarisability, _bond_geometry).
             # No de_dq backward chain here — the readout reads no descriptor
             # gradients; don't re-add it. b1 stays excluded from s: with c
             # symmetric a per-channel uniform shift of s^n is exact gauge;
@@ -1069,11 +1052,12 @@ class TNEP(layers.Layer):
                             dtype=tf.float64)                      # [A, M, T]
             V = tf.einsum('amn,amd,amt->adnt',                # float64 accum.
                           tf.cast(Rw, tf.float64),
-                          tf.cast(-dr, tf.float64), tp)      # [A, 3, C, T]
-            mu = tf.einsum('ant,adnt->d', G, tf.cast(V, G.dtype))     # [3]
+                          self._bond_geometry(tf.cast(-dr, tf.float64)),
+                          tp)                                 # [A, D, C, T]
+            mu = tf.einsum('ant,adnt->d', G, tf.cast(V, G.dtype))     # [D]
             return mu
 
-        # Modes 1 and 2 need forces
+        # The tnep dipole readout needs the descriptor-gradient forces.
         forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask,
                                   z=z)  # [A, M, 3]
 
@@ -1088,44 +1072,6 @@ class TNEP(layers.Layer):
             dipole_contribs = rij_n[:, :, tf.newaxis] * forces            # [A, M, 3]
             dipole = -tf.reduce_sum(dipole_contribs, axis=[0, 1])         # [3]
             return dipole
-
-        elif self.cfg.target_mode == 2:
-            # Polarizability via dual ANN (GPUMD approach)
-            dr_gathered, _ = self._neighbor_displacements_single(positions, box, grad_index)
-
-            # --- Scalar ANN (isotropic) ---
-            W0_pol_eff = self._W0_eff(self.W0_pol)
-            W0p_t = tf.gather(W0_pol_eff, Z)   # [A, dim_q, H]
-            b0p_t = tf.gather(self.b0_pol, Z)  # [A, H]
-            W1p_t = tf.gather(self.W1_pol, Z)  # [A, H]
-
-            h_pol = tf.einsum('nd,ndh->nh', descriptors, W0p_t)  # [A, H]
-            h_pol = h_pol + b0p_t
-            h_pol = self.activation(h_pol)
-            h_pol = h_pol * atom_mask[:, tf.newaxis]
-            F_pol = tf.reduce_sum(h_pol * W1p_t, axis=1) + self.b1_pol  # [A]
-            F_pol = F_pol * atom_mask
-            scalar_sum = tf.reduce_sum(F_pol)
-
-            # --- Tensor ANN (anisotropic virial) ---
-            pol_outer = -tf.einsum('nma,nmb->nmab', dr_gathered, forces)  # [A, M, 3, 3]
-            pol_outer = pol_outer * neighbor_mask[:, :, tf.newaxis, tf.newaxis]
-            pol_matrix = tf.reduce_sum(pol_outer, axis=[0, 1])  # [3, 3]
-
-            # Extract 6 unique components: [xx, yy, zz, xy, yz, zx]
-            pol = tf.stack([
-                pol_matrix[0, 0],
-                pol_matrix[1, 1],
-                pol_matrix[2, 2],
-                pol_matrix[0, 1],
-                pol_matrix[1, 2],
-                pol_matrix[2, 0],
-            ])
-
-            # Add scalar ANN to diagonal
-            pol = pol + tf.stack([scalar_sum, scalar_sum, scalar_sum,
-                                  0.0, 0.0, 0.0])
-            return pol
 
     def _activation_grad(self, h: tf.Tensor, z: tf.Tensor) -> tf.Tensor:
         """dh/dz for the activation, applied as a Hadamard factor in the dipole/pol
@@ -1237,16 +1183,10 @@ class TNEP(layers.Layer):
         S_test = test_data["num_atoms"].shape[0]
         chunk_sz = (self.cfg.batch_chunk_size
                     if self.cfg.batch_chunk_size is not None else S_test)
-        # Pre-fold U_pairᵀ into W0 (and W0_pol) once so every chunk shares the
-        # absorbed weights (no-op when mixing is off).
+        # Pre-fold U_pairᵀ into W0 once so every chunk shares the absorbed
+        # weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
         b0_eff = self._b0_eff(self.b0, self.W0)
-        W0_pol_eff = (self._W0_eff(self.W0_pol)
-                      if (self.cfg.target_mode == 2
-                          and getattr(self, "W0_pol", None) is not None)
-                      else getattr(self, "W0_pol", None))
-        b0_pol_eff = (self._b0_eff(self.b0_pol, self.W0_pol)
-                      if self.cfg.target_mode == 2 else getattr(self, 'b0_pol', None))
         ranges = [(s, min(s + chunk_sz, S_test)) for s in range(0, S_test, chunk_sz)]
         pred_parts: list = []
         for _, _, chunk in prefetched_chunks(
@@ -1258,11 +1198,7 @@ class TNEP(layers.Layer):
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],
                 W0_eff, b0_eff, self.W1, self.b1,
-                W0_pol_eff,
-                b0_pol_eff,
-                getattr(self, 'W1_pol', None),
-                getattr(self, 'b1_pol', None),
-                W_atom=chunk.get("V_atom"),  # neighbor readout: [B,A,3] kernel
+                W_atom=chunk.get("V_atom"),  # neighbor readout: [B,A,D,C,T] kernel
                 nep_raw=chunk.get("nep_raw"), **nep_pair_kwargs(chunk),
             ))
             del chunk
@@ -1560,8 +1496,6 @@ class TNEP(layers.Layer):
                       positions: tf.Tensor, Z: tf.Tensor,
                       boxes: tf.Tensor, atom_mask: tf.Tensor,
                       W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor, b1: tf.Tensor,
-                      W0_pol: tf.Tensor | None = None, b0_pol: tf.Tensor | None = None,
-                      W1_pol: tf.Tensor | None = None, b1_pol: tf.Tensor | None = None,
                       W_atom: tf.Tensor | None = None,
                       c_pair: tf.Tensor | None = None,
                       M_radial: tf.Tensor | None = None,
@@ -1594,9 +1528,9 @@ class TNEP(layers.Layer):
             b0          : [T, H]      hidden bias
             W1          : [T, H]      output weights ([T, H, C] neighbor readout)
             b1          : ()          scalar bias
-            W0_pol..b1_pol : same shapes, for mode 2 only (None otherwise)
             W_atom      : dipole kernel [B, A, 3, Q]; neighbor readout: V
-                          [B, A, 3, C, T] instead (built in-graph when None)
+                          [B, A, D, C, T] instead (D = 3 dipole, 6 polaris-
+                          ability; built in-graph when None)
             c_pair      : [C, T(T+1)/2] species-pair coefficients (neighbor
                           readout; None → self.c_pair)
             M_radial    : [T, S, α, K] learned radial basis (None → self.M_radial)
@@ -1619,10 +1553,9 @@ class TNEP(layers.Layer):
         descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
-        # Pure forward primitive: caller decides whether W0/W0_pol are raw or
-        # already U-absorbed, so no double-mixing here.
+        # Pure forward primitive: caller decides whether W0 is raw or already
+        # U-absorbed, so no double-mixing here.
         W0_use = W0
-        W0_pol_use = W0_pol
 
         b0_t = tf.gather(b0, Z)   # [B, A, H]
         W1_t = tf.gather(W1, Z)   # [B, A, H_final]
@@ -1710,16 +1643,7 @@ class TNEP(layers.Layer):
             return self._dipole_coo(forces_per_pair, pair_struct, pair_atom, pair_gidx,
                                     positions, boxes, box_inv, B)
 
-        elif self.cfg.target_mode == 2:
-            # Scalar ANN uses the U-absorbed W0_pol_use (same feature space as
-            # the main ANN); raw descriptors ≡ feeding desc_mixed into raw W0_pol.
-            return self._polarizability_coo(
-                descriptors, forces_per_pair, pair_struct, pair_atom, pair_gidx,
-                positions, boxes, box_inv, Z, atom_mask,
-                W0_pol_use, b0_pol, W1_pol, b1_pol, B)
-
-        else:
-            tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
+        tf.debugging.assert_equal(True, False, message="Unsupported target_mode")
 
     @tf.function(reduce_retracing=True)
     def predict_batch_candidates(self,
@@ -1744,7 +1668,7 @@ class TNEP(layers.Layer):
                                   nep_pair_ang: tf.Tensor | None = None) -> tf.Tensor:
         """Forward pass for C candidates × B structures using explicit batched GEMMs.
 
-        Replaces vectorized_map for target_mode 0 (PES) and 1 (dipole).
+        Replaces vectorized_map for every mode (PES, dipole, polarisability).
         Both the input→hidden and hidden→descriptor matmuls are executed as
         single large GEMMs over all C candidates simultaneously:
 
@@ -1852,7 +1776,7 @@ class TNEP(layers.Layer):
 
         # ── Dipole, neighbor-basis readout ────────────────────────────────────
         if self._neighbor_readout:
-            # W_atom slot carries V [B, A, 3, Ch, T] (SNES threads it); no
+            # W_atom slot carries V [B, A, D, Ch, T] (SNES threads it); no
             # backward matmul — the readout reads no descriptor gradients.
             # b1 stays excluded: exact gauge with c symmetric; a modeling
             # choice (kept deliberately) under "ordered" Ω.
@@ -2220,6 +2144,16 @@ class TNEP(layers.Layer):
             return g * self._fc(r)[..., tf.newaxis]
         raise ValueError(f"unknown dipole_radial {rad!r}")
 
+    def _bond_geometry(self, d: tf.Tensor) -> tf.Tensor:
+        """Bond tensor [..., 3] → [..., D] per self._bond_rank: 1 → d itself
+        (dipole, D = 3); 2 → Voigt(d⊗d) = [dx², dy², dz², dxdy, dydz, dzdx]
+        (polarisability, D = 6; even under d → −d, so the per-site sum equals
+        the symmetric pair form). TF twin of data.bond_geometry."""
+        if self._bond_rank == 1:
+            return d
+        x, y, z = tf.unstack(d, axis=-1)
+        return tf.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=-1)
+
     def _split_head(self, out: tf.Tensor):
         """Head output [.., S] → site values s [.., C], S = _head_slots (C for
         dipole_head="vector"; 1 for "scalar", broadcast over the C channels)."""
@@ -2238,15 +2172,16 @@ class TNEP(layers.Layer):
                         box_inv: tf.Tensor, pair_struct: tf.Tensor,
                         pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
                         Z: tf.Tensor, B: tf.Tensor, A: tf.Tensor) -> tf.Tensor:
-        """Geometry kernel of the neighbor-basis dipole readout:
-            V[b,a,:,n,t'] = Σ_{pairs (a,j), |d|<r_c, t_j=t'} R_n(|d|)·d,
-            d = r_a − r_j (MIC), R_n per cfg.dipole_radial (_radial).
+        """Geometry kernel of the neighbor-basis readout:
+            V[b,a,:,n,t'] = Σ_{pairs (a,j), |d|<r_c, t_j=t'} R_n(|d|)·g(d),
+            d = r_a − r_j (MIC), g = _bond_geometry (d or Voigt(d⊗d)),
+            R_n per cfg.dipole_radial (_radial).
         Pairs come from the r_d descriptor list (r_c ≤ rcut_hard guarantees
         coverage); j==a self-image entries are excluded. Accumulated in
         float64, cast back to the pipeline dtype.
 
         Returns:
-            V : [B, A, 3, C, T]
+            V : [B, A, D, C, T]
         """
         if float(self.cfg.dipole_rc) > float(self.cfg.rcut_hard):
             raise ValueError(
@@ -2264,15 +2199,17 @@ class TNEP(layers.Layer):
         r = tf.sqrt(rij2)
         keep = tf.logical_and(r < rc, tf.not_equal(pair_atom, pair_gidx))
         Rw = self._radial(r) * tf.cast(keep, r.dtype)[:, tf.newaxis]  # [P, C]
-        # contrib[p, d, n] = R_n·d, d = −(neighbor − center).
-        contrib = tf.cast((-dr)[:, :, tf.newaxis]
-                          * Rw[:, tf.newaxis, :], tf.float64)      # [P, 3, C]
+        # contrib[p, d, n] = R_n·g(d), d = −(neighbor − center).
+        g = self._bond_geometry(-dr)                                # [P, D]
+        D = int(g.shape[-1])
+        contrib = tf.cast(g[:, :, tf.newaxis]
+                          * Rw[:, tf.newaxis, :], tf.float64)      # [P, D, C]
         tprime = tf.gather_nd(Z, tf.stack([pair_struct, pair_gidx], axis=1))
         seg = (pair_struct * A + pair_atom) * T + tf.cast(tprime, pair_atom.dtype)
         V = tf.math.unsorted_segment_sum(
-            tf.reshape(contrib, [-1, 3 * C]), seg, num_segments=B * A * T)
-        V = tf.reshape(tf.cast(V, dr.dtype), [B, A, T, 3, C])
-        return tf.transpose(V, [0, 1, 3, 4, 2])                  # [B,A,3,C,T]
+            tf.reshape(contrib, [-1, D * C]), seg, num_segments=B * A * T)
+        V = tf.reshape(tf.cast(V, dr.dtype), [B, A, T, D, C])
+        return tf.transpose(V, [0, 1, 3, 4, 2])                  # [B,A,D,C,T]
 
     def _dipole_coo(self, forces_per_pair: tf.Tensor, pair_struct: tf.Tensor,
                     pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
@@ -2301,70 +2238,6 @@ class TNEP(layers.Layer):
         dipole = -tf.math.unsorted_segment_sum(
             dipole_contrib, pair_struct, num_segments=B)                  # [B, 3]
         return dipole
-
-    def _polarizability_coo(self, descriptors: tf.Tensor, forces_per_pair: tf.Tensor,
-                            pair_struct: tf.Tensor, pair_atom: tf.Tensor,
-                            pair_gidx: tf.Tensor, positions: tf.Tensor,
-                            boxes: tf.Tensor, box_inv: tf.Tensor,
-                            Z: tf.Tensor, atom_mask: tf.Tensor,
-                            W0_pol: tf.Tensor, b0_pol: tf.Tensor,
-                            W1_pol: tf.Tensor, b1_pol: tf.Tensor,
-                            B: tf.Tensor) -> tf.Tensor:
-        """Batched polarizability via dual ANN using COO forces.
-
-        Args:
-            descriptors     : [B, A, Q]
-            forces_per_pair : [P, 3]
-            pair_struct     : [P]
-            pair_atom       : [P]
-            pair_gidx       : [P]
-            positions       : [B, A, 3]
-            boxes           : [B, 3, 3]
-            box_inv         : [B, 3, 3]
-            Z               : [B, A]
-            atom_mask       : [B, A]
-            W0_pol..b1_pol  : scalar ANN weights
-
-        Returns:
-            pol : [B, 6]  — [xx, yy, zz, xy, yz, zx]
-        """
-        dr, _ = self._neighbor_displacements_coo(positions, boxes, box_inv,
-                                                  pair_struct, pair_atom, pair_gidx)
-
-        # Scalar ANN (isotropic contribution) — same type-loop pattern as main ANN
-        b0p_t = tf.gather(b0_pol, Z)   # [B, A, H]
-        W1p_t = tf.gather(W1_pol, Z)   # [B, A, H]
-        type_masks_p = [
-            tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
-            for t in range(self.num_types)
-        ]
-        h_pol = tf.add_n([
-            tf.einsum('baq,qh->bah', descriptors, W0_pol[t]) * type_masks_p[t]
-            for t in range(self.num_types)
-        ]) + b0p_t
-        h_pol = self.activation(h_pol)
-        h_pol = h_pol * atom_mask[:, :, tf.newaxis]
-        F_pol = tf.reduce_sum(h_pol * W1p_t, axis=2) + b1_pol  # [B, A]
-        F_pol = F_pol * atom_mask
-        scalar_sum = tf.reduce_sum(F_pol, axis=1)               # [B]
-
-        # Tensor part: per-pair outer product, then segment-sum per structure
-        pol_outer = -tf.einsum('ki,kj->kij', dr, forces_per_pair)  # [P, 3, 3]
-        pol_flat  = tf.reshape(pol_outer, [-1, 9])                  # [P, 9]
-        pol_mat_flat = tf.math.unsorted_segment_sum(
-            pol_flat, pair_struct, num_segments=B)                  # [B, 9]
-        pol_matrix = tf.reshape(pol_mat_flat, [B, 3, 3])
-
-        pol = tf.stack([
-            pol_matrix[:, 0, 0], pol_matrix[:, 1, 1], pol_matrix[:, 2, 2],
-            pol_matrix[:, 0, 1], pol_matrix[:, 1, 2], pol_matrix[:, 2, 0],
-        ], axis=1)  # [B, 6]
-
-        diag_add = tf.stack([scalar_sum, scalar_sum, scalar_sum,
-                             tf.zeros_like(scalar_sum),
-                             tf.zeros_like(scalar_sum),
-                             tf.zeros_like(scalar_sum)], axis=1)
-        return pol + diag_add
 
 
 def gen0_ann_inputs(cfg, data) -> np.ndarray:

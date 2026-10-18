@@ -58,6 +58,9 @@ def _cfg(**kw):
     cfg.descriptor_scale = "off"
     cfg.q_scale = None
     cfg.optimizer = "snes"
+    # Regularisation strengths are per-model lists in the working tree;
+    # the suites build one-model configs, so pin a scalar.
+    cfg.lambda_1 = cfg.lambda_2 = 0.0005
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)

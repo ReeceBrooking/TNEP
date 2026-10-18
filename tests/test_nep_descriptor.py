@@ -503,8 +503,9 @@ def test_nep_rejects_descriptor_gradient_readouts():
     # Phase B lifts the guard for the tnep dipole readout only (Task 11).
     with pytest.raises(NotImplementedError, match="target_mode"):
         _model(_cfg(nep_descriptor="replace", target_mode=0))
-    with pytest.raises(NotImplementedError, match="target_mode"):
-        _model(_cfg(nep_descriptor="concat", target_mode=2))
+    # Polarisability is the rank-2 neighbour readout: no descriptor
+    # gradients, so NEP inputs are allowed exactly as under mode-1 neighbor.
+    assert _model(_cfg(nep_descriptor="concat", target_mode=2))._neighbor_readout
     with pytest.raises(NotImplementedError, match="target_mode"):
         _model(_cfg(nep_descriptor="sum", dipole_readout="tnep", dipole_rij_power=2))
 

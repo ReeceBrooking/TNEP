@@ -661,24 +661,14 @@ def _get_fused_predict(model: 'TNEP'):
         # Keras 3 Variables expose .value (a Tensor); fall back to convert.
         return tf.convert_to_tensor(v.value if hasattr(v, "value") else v)
 
-    # Pre-absorb U_pairᵀ into W0 (and W0_pol) when descriptor mixing is active;
+    # Pre-absorb U_pairᵀ into W0 when descriptor mixing is active;
     # predict_batch trusts the caller to do this. Mirrors score() in TNEP.py.
     W0_eff_var = model._W0_eff(model.W0)
     b0_eff_var = model._b0_eff(model.b0, model.W0)
-    W0p_eff_var = (model._W0_eff(model.W0_pol)
-                    if (cfg.target_mode == 2
-                        and getattr(model, "W0_pol", None) is not None)
-                    else getattr(model, "W0_pol", None))
-    b0p_eff_var = (model._b0_eff(model.b0_pol, model.W0_pol)
-                    if cfg.target_mode == 2 else getattr(model, "b0_pol", None))
     W0_t  = _to_tensor(W0_eff_var)
     b0_t  = _to_tensor(b0_eff_var)
     W1_t  = _to_tensor(model.W1)
     b1_t  = _to_tensor(model.b1)
-    W0p_t = _to_tensor(W0p_eff_var)
-    b0p_t = _to_tensor(b0p_eff_var)
-    W1p_t = _to_tensor(getattr(model, "W1_pol", None))
-    b1p_t = _to_tensor(getattr(model, "b1_pol", None))
 
     # Not jit_compile: predict_batch has shape-dependent stacks in
     # _calc_forces_coo (varying P per call) that XLA can't lower, and the
@@ -708,7 +698,6 @@ def _get_fused_predict(model: 'TNEP'):
             descriptors, grad_concat, pa_concat, pg_concat, pair_struct,
             positions, Z, boxes, atom_mask,
             W0_t, b0_t, W1_t, b1_t,
-            W0p_t, b0p_t, W1p_t, b1p_t,
         )
         # predict_batch returns the TOTAL dipole (not per-atom) regardless of
         # cfg.scale_targets, so do NOT multiply by num_atoms.
@@ -952,12 +941,6 @@ def predict_trajectory_batch(
         # backends produce identical predictions.
         W0_pred = model._W0_eff(model.W0)
         b0_pred = model._b0_eff(model.b0, model.W0)
-        W0p_pred = (model._W0_eff(model.W0_pol)
-                     if (cfg.target_mode == 2
-                         and getattr(model, "W0_pol", None) is not None)
-                     else getattr(model, "W0_pol", None))
-        b0p_pred = (model._b0_eff(model.b0_pol, model.W0_pol)
-                     if cfg.target_mode == 2 else getattr(model, 'b0_pol', None))
 
         preds = model.predict_batch(
             batch["descriptors"], batch["grad_values"],
@@ -965,10 +948,6 @@ def predict_trajectory_batch(
             batch["positions"], batch["Z_int"], batch["boxes"],
             batch["atom_mask"],
             W0_pred, b0_pred, model.W1, model.b1,
-            W0p_pred,
-            b0p_pred,
-            getattr(model, 'W1_pol', None),
-            getattr(model, 'b1_pol', None),
         )
         # predict_batch returns the TOTAL dipole regardless of
         # cfg.scale_targets; no per-atom→total rescaling needed.

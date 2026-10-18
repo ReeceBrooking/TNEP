@@ -70,6 +70,9 @@ def _cfg(**kw):
     cfg.sum_delta_learn = False
     cfg.gap_2b = False
     cfg.gap_3b = False
+    # Regularisation strengths are per-model lists in the working tree;
+    # the suites build one-model configs, so pin a scalar.
+    cfg.lambda_1 = cfg.lambda_2 = 0.0005
     for k, v in kw.items():
         setattr(cfg, k, v)
     cfg.dim_q = compute_dim_q(cfg)
@@ -1022,3 +1025,214 @@ def test_scalar_head_validation_and_warning():
         warnings.simplefilter("always")
         _model(_cfg(dipole_head="scalar", dipole_species_pairs="off"))
     assert any("dipole_head" in str(x.message) for x in w)
+
+
+# ── Polarisability: target_mode=2 is the rank-2 neighbour readout ───────────
+# α = Σ_i Σ_n s_i^n c[n, p(t_i, t')] W_i[:, n, t'],  W_i = Σ_j R_n(|d|) Voigt(d⊗d)
+#   ≡ Σ_{i<j} R_n c (s_i^n + s_j^n) d⊗d   (d⊗d even under i↔j).
+
+def _pol_frame():
+    at = read(WATER_XYZ, index="0")       # carries a 9-component pol label
+    return at
+
+
+def _alpha(model, atoms, cfg):
+    """α [6] through the production eval path (predict_batch, V via W_atom)."""
+    return _mu(model, atoms, cfg)
+
+
+def _voigt(d):
+    x, y, z = d.T
+    return np.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=1)
+
+
+def _voigt_to_mat(v):
+    xx, yy, zz, xy, yz, zx = v
+    return np.array([[xx, xy, zx], [xy, yy, yz], [zx, yz, zz]])
+
+
+@functools.lru_cache(maxsize=2)
+def _pol_setup():
+    cfg = _cfg(target_mode=2, dipole_species_pairs="symmetric")
+    model = _model(cfg)
+    rng = np.random.default_rng(3)
+    model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape)
+                        .astype(np.float32))
+    atoms = _pol_frame()
+    data = prepare_eval_data([atoms], cfg)
+    return cfg, model, atoms, data
+
+
+def test_pol_symmetric_pair_sum_matches_model():
+    cfg, model, atoms, data = _pol_setup()
+    assert model._neighbor_readout and model._bond_rank == 2
+    assert tuple(data["V_atom"].shape) == (1, len(atoms), 6, 4, 2)
+    assert tuple(data["targets"].shape) == (1, 6)
+    s = _site_scalars_np(model, data)                           # [A, C]
+    Z = data["Z_int"][0].numpy()
+    C, rc = cfg.dipole_channels, cfg.dipole_rc
+    c = model.c_pair.numpy().astype(np.float64)[:, _pair_index(2)]  # [C, T, T]
+    i, j, D = neighbor_list("ijD", atoms, rc)
+    keep = i < j
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
+    R = _R_np(np.linalg.norm(d, axis=1), rc, C)                 # [P, C]
+    w = np.einsum("pn,pn->p", R, c[:, Z[i], Z[j]].T * (s[i] + s[j]))
+    a_ref = (w[:, None] * _voigt(d)).sum(0)
+    a_model = _alpha(model, atoms, cfg)
+    assert np.allclose(a_model, a_ref, rtol=1e-5,
+                       atol=1e-5 * np.abs(a_ref).max())
+    assert np.any(a_ref != 0.0)
+
+
+def test_pol_four_path_consistency():
+    cfg, model, atoms, _ = _pol_setup()
+    types_int = assign_type_indices([atoms], cfg.types)
+    builder = make_descriptor_builder(cfg)
+    desc, grads, gidx = builder.build_descriptors([atoms])
+    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
+    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=False)
+    args = (full["descriptors"], full["grad_values"],
+            full["pair_atom"], full["pair_gidx"], full["pair_struct"],
+            full["positions"], full["Z_int"], full["boxes"], full["atom_mask"],
+            model.W0, model.b0, model.W1, model.b1)
+    a_slot = model.predict_batch(*args, W_atom=full["V_atom"])[0].numpy()
+    a_ingraph = model.predict_batch(*args, W_atom=None)[0].numpy()
+    a_cand = model.predict_batch_candidates(
+        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
+        model.W0[tf.newaxis], model.b0[tf.newaxis],
+        model.W1[tf.newaxis], model.b1[tf.newaxis])[0, 0].numpy()
+    gi = gidx[0]
+    A = len(atoms)
+    M = max(len(lst) for lst in gi)
+    grad_index = np.zeros((A, M), dtype=np.int32)
+    nmask = np.zeros((A, M), dtype=np.float32)
+    for a, lst in enumerate(gi):
+        grad_index[a, :len(lst)] = lst
+        nmask[a, :len(lst)] = 1.0
+    a_single = model.predict(
+        full["descriptors"][0], tf.zeros([A, M, 3, cfg.dim_q]),
+        tf.constant(grad_index), full["positions"][0], full["Z_int"][0],
+        full["boxes"][0], full["atom_mask"][0], tf.constant(nmask)).numpy()
+    atol = 1e-4 * max(np.abs(a_slot).max(), 1.0)
+    assert a_slot.shape == (6,)
+    assert np.allclose(a_slot, a_ingraph, atol=atol)
+    assert np.allclose(a_slot, a_cand, atol=atol)
+    assert np.allclose(a_slot, a_single, atol=atol)
+
+
+def test_pol_rotation_covariance_and_translation_invariance():
+    cfg, model, atoms, _ = _pol_setup()
+    a0 = _voigt_to_mat(_alpha(model, atoms, cfg))
+    a, b, c = 0.7, -0.4, 1.1
+    Rz = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+    Ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
+    Rx = np.array([[1, 0, 0], [0, np.cos(c), -np.sin(c)], [0, np.sin(c), np.cos(c)]])
+    R = Rz @ Ry @ Rx
+    at2 = atoms.copy()
+    at2.set_cell(atoms.cell[:] @ R.T, scale_atoms=False)
+    at2.positions = atoms.positions @ R.T
+    a_rot = _voigt_to_mat(_alpha(model, at2, cfg))
+    assert np.allclose(a_rot, R @ a0 @ R.T, atol=2e-3 * np.abs(a0).max())
+    at3 = atoms.copy()
+    at3.positions = atoms.positions + np.array([1.3, -0.7, 2.1])
+    assert np.allclose(_alpha(model, at3, cfg), _alpha(model, atoms, cfg),
+                       atol=1e-4 * np.abs(a0).max())
+
+
+def test_pol_snes_tail_has_no_second_ann_and_gen0_identity():
+    from SNES import _set_model_params
+    cfg, model, atoms, _ = _pol_setup()
+    opt = model.optimizer
+    T, H, C = 2, 8, 4
+    # One ANN only: typed slab + b1 + c_pair; the dual-ANN doubling is gone.
+    assert int(opt.dim) == opt.n_typed + 1 + opt.n_c
+    assert opt.n_anns_total == opt.n_primary and opt._n_per_type == opt.n_typed // T
+    assert opt._n_W1 == T * H * C and opt.n_c == C * (T * (T + 1) // 2)
+    assert np.allclose(opt._pol_weights.numpy(), np.ones(6))
+    assert not any(k.endswith("_pol") for k in
+                   opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu)))
+    types_int = assign_type_indices([atoms], cfg.types)
+    builder = make_descriptor_builder(cfg)
+    desc, grads, gidx = builder.build_descriptors([atoms])
+    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
+    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
+    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
+    _set_model_params(model, *opt.reconstruct_params_tf(mu_vec))
+    a_model = model.predict_batch(
+        full["descriptors"], full["grad_values"], full["pair_atom"], full["pair_gidx"],
+        full["pair_struct"], full["positions"], full["Z_int"], full["boxes"],
+        full["atom_mask"], model.W0, model.b0, model.W1, model.b1,
+        W_atom=full["V_atom"])[0].numpy()
+    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
+    a_cand = model.predict_batch_candidates(
+        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
+        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"])[0, 0].numpy()
+    np.testing.assert_allclose(a_cand, a_model, rtol=1e-5, atol=1e-6)
+    _pol_setup.cache_clear()          # model weights were perturbed
+
+
+def test_pol_lambda_shear_weights_fitness_only():
+    from SNES import _set_model_params
+    cfg = _cfg(target_mode=2, lambda_shear=0.5)
+    model = _model(cfg)
+    opt = model.optimizer
+    assert np.allclose(opt._pol_weights.numpy(), [1, 1, 1, .25, .25, .25])
+    atoms = _pol_frame()
+    data = prepare_eval_data([atoms], cfg)
+    data["_W_atom"] = data["V_atom"]
+    fit, sq = opt._evaluate_chunk_impl(opt.mu[tf.newaxis], data)
+    _set_model_params(model, *opt.reconstruct_params_tf(opt.mu))   # μ ≠ Keras init
+    preds = model.predict_batch_candidates(
+        data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
+        *(t[tf.newaxis] for t in (model.W0, model.b0, model.W1, model.b1)))[0, 0].numpy()
+    diff = preds - data["targets"][0].numpy()
+    np.testing.assert_allclose(sq[0, 0], (diff ** 2).sum(), rtol=1e-4)
+    np.testing.assert_allclose(fit[0, 0], (diff ** 2 * opt._pol_weights.numpy()).sum(), rtol=1e-4)
+
+
+def test_pol_save_load_roundtrip_and_old_dual_ann_refused(tmp_path):
+    import h5py
+    import model_io
+    cfg, model, atoms, _ = _pol_setup()
+    a0 = _alpha(model, atoms, cfg)
+    p = str(tmp_path / "pol.h5")
+    model_io.save_model(model, cfg, path=p)
+    with h5py.File(p, "r") as f:
+        assert "W0_pol" not in f["weights"] and f.attrs["target_mode"] == 2
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.target_mode == 2 and loaded._bond_rank == 2
+    assert np.allclose(a0, _alpha(loaded, atoms, loaded.cfg), atol=1e-6 * np.abs(a0).max())
+    with h5py.File(p, "a") as f:
+        f["weights"].create_dataset("W0_pol", data=np.zeros((2, cfg.dim_q, 8)))
+    with pytest.raises(ValueError, match="W0_pol"):
+        model_io.load_model(p)
+
+
+def test_pol_rejects_tnep_readout_and_needs_no_gradients():
+    from data import descriptor_gradients_needed, dipole_self_pairs_only
+    with pytest.raises(ValueError, match="rank-2 neighbour readout"):
+        _model(_cfg(target_mode=2, dipole_readout="tnep"))
+    cfg = _cfg(target_mode=2)
+    assert not descriptor_gradients_needed(cfg) and dipole_self_pairs_only(cfg)
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "snes"])
+def test_pol_fit_smoke(optimizer):
+    """Both trainers run end to end in mode 2: the V kernel rides the W_atom
+    slot, lambda_shear weights the ranking, every head weight moves."""
+    cfg = _cfg(target_mode=2, dipole_species_pairs="symmetric", optimizer=optimizer,
+               num_generations=3, val_interval=1, pop_size=6, patience=None,
+               adam_lr=1e-2, batch_chunk_size=4, save_path=None, lambda_shear=0.7)
+    model = _model(cfg)
+    frames = read(WATER_XYZ, index="0:6")
+    tr = prepare_eval_data(frames[:4], cfg)
+    va = prepare_eval_data(frames[4:], cfg)
+    for d in (tr, va):
+        d["types_contained"] = tf.ones((int(d["num_atoms"].shape[0]), 2))
+    before = (model.W1.numpy().copy(), model.c_pair.numpy().copy())
+    history, final_model, best_model = model.fit(tr, va)
+    assert np.all(np.isfinite(history["val_loss"])) and len(history["val_loss"]) >= 2
+    assert not np.allclose(final_model.W1.numpy(), before[0])
+    assert not np.allclose(final_model.c_pair.numpy(), before[1])
+    metrics, preds = final_model.score(va)
+    assert tuple(preds.shape) == (2, 6) and np.isfinite(float(metrics["rmse"]))

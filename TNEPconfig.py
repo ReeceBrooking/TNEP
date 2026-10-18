@@ -59,6 +59,12 @@ class TNEPconfig:
     convert_dipole_to_eangstrom: bool = False
     # Polarizability off-diagonal ([xy,yz,zx]) loss weight, scaled by
     # lambda_shear^2 (target_mode=2 only). 1.0 = equal weighting (GPUMD default).
+    # Mode 2 is the rank-2 neighbour readout (docs/superpowers/specs/
+    # 2026-10-18-neighbor-polarizability-design.md): the same site head and
+    # radial channels as the dipole readout, contracted with Voigt(d⊗d)
+    # instead of d — α = Σ_{i<j} R_n(r_ij)·c·(s_i^n + s_j^n)·d⊗d. Every
+    # dipole_* readout field below applies; dipole_readout itself must be
+    # "neighbor" (the descriptor-gradient polarisability form was removed).
     lambda_shear: float = 1.0
 
     # Power N of |r_ij| in the dipole contraction (target_mode=1 only):
@@ -832,6 +838,20 @@ class GAPconfig:
             self.indices = indices[:self.total_N]
         else:
             self.indices = indices
+
+def neighbor_readout_on(cfg: "TNEPconfig | GAPconfig") -> bool:
+    """THE neighbour-readout predicate: mode 2 (polarisability is always the
+    rank-2 neighbour readout) or mode 1 with dipole_readout="neighbor". Data
+    assembly, the model, SNES and the GAP fit all key on this one rule."""
+    return int(cfg.target_mode) == 2 or (
+        int(cfg.target_mode) == 1 and str(cfg.dipole_readout) == "neighbor")
+
+
+def bond_rank(cfg: "TNEPconfig | GAPconfig") -> int:
+    """Rank of the bond tensor in the neighbour readout's geometry kernel:
+    1 → d [3] (dipole), 2 → Voigt(d⊗d) [6] (polarisability)."""
+    return 2 if int(cfg.target_mode) == 2 else 1
+
 
 def resolved_dipole_rc(cfg: "TNEPconfig | GAPconfig") -> float:
     """Active neighbour-readout radius — THE dipole_rc=None rule.

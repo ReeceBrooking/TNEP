@@ -86,7 +86,7 @@ for _gpu in tf.config.list_physical_devices('GPU'):
         pass
 
 from TNEP import TNEP, gen0_ann_inputs
-from TNEPconfig import TNEPconfig
+from TNEPconfig import TNEPconfig, neighbor_readout_on
 from data import (collect, split, pad_and_stack,
                   print_dipole_statistics, print_polarizability_statistics,
                   assign_type_indices, prepare_eval_data, print_score_summary,
@@ -334,9 +334,7 @@ def _setup_grad_staging(cfg: TNEPconfig, train_data: dict, val_data: dict) -> No
 
 def _print_param_breakdown(model) -> None:
     """Print a per-layer breakdown (component → count → % of total) of the
-    SNES parameter budget. Polarisability mirrors the primary ANN when
-    target_mode == 2.
-    """
+    SNES parameter budget."""
     opt = model.optimizer
     cfg = model.cfg
     total = int(opt.dim)
@@ -358,20 +356,14 @@ def _print_param_breakdown(model) -> None:
                  if model._neighbor_readout else "ANN  b1")
     rows.append((_b1_label,          int(opt._n_b1)))
     if opt.n_c > 0:
-        rows.append(("c_pair  [C·T²]" if model._species_pairs == "ordered"
-                     else "c_pair  [C·T(T+1)/2]", int(opt.n_c)))
-    # nep_descriptor="sum" / "gap_sum": the 2-body / 3-body experts (inside
-    # the typed slab); d_2b / d_3b = NEP radial / angular or GAP q2 / q3 widths.
-    for name, n in zip(("ANN_2b  [T·(d_2b·H_e + H_e + H_e·Hw)]",
-                        "ANN_3b  [T·(d_3b·H_e + H_e + H_e·Hw)]"), opt._n_expert):
-        rows.append((name, int(n)))
-
-    # Polarisability ANN — same per-layer shape, mirrored doubling.
-    if cfg.target_mode == 2:
-        rows.append(("ANN_pol  W0  [T·Q·H]", int(opt._n_W0)))
-        rows.append(("ANN_pol  b0  [T·H]",   int(opt._n_b0)))
-        rows.append(("ANN_pol  W1  [T·H]",   int(opt._n_W1)))
-        rows.append(("ANN_pol  b1",          int(opt._n_b1)))
+        _m = len(model._models)
+        rows.append((("c_pair  [C·T²" if model._species_pairs == "ordered"
+                      else "c_pair  [C·T(T+1)/2") + (f"·{_m} models]" if _m > 1 else "]"),
+                     int(opt.n_c)))
+    # nep_descriptor="sum" / "gap_sum": the extra models' ANNs (inside the
+    # typed slab), one per selected model after the main one.
+    for name, n in zip(model._models[1:], opt._n_expert):
+        rows.append((f"ANN_{name}  [T·(d·H_e + H_e + H_e·Hw)]", int(n)))
 
     # Optional add-ons.
     if int(opt.n_U_pair) > 0:
@@ -462,7 +454,7 @@ def _train_model_inner(cfg: TNEPconfig,
         n_train_pairs = int(train_data["grad_values"].shape[0])
         n_val_pairs   = int(val_data["grad_values"].shape[0])
         _reason = ("neighbor readout"
-                   if cfg.dipole_readout == "neighbor"
+                   if neighbor_readout_on(cfg)
                    else "dipole_rij_power=0")
         print(f"  {_reason}: COO restricted to self-pairs only "
               f"(train P={n_train_pairs}, val P={n_val_pairs})")

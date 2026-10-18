@@ -506,3 +506,55 @@ def test_configs_are_independent():
     assert not missing, missing
     for f in ("gap_delta_soap", "gap_delta_2b", "gap_delta_3b"):
         assert hasattr(GAPconfig, f) and not hasattr(TNEPconfig, f)
+
+
+# ── polarisability (target_mode=2): rank-2 kernel, 6 Voigt rows per frame ──
+
+def test_pol_exact_recovery_known_alpha(tmp_path):
+    frames = read(WATER_XYZ, index="0:6")
+    for f in frames:
+        f.calc = None
+    kw = dict(total_N=None, gap_sparse_per_species=8, gap_sigma=1e-7,
+              target_mode=2, dipole_radial="chebyshev", dipole_channels=3,
+              dipole_cutoff="cosine2", dipole_species_pairs="symmetric")
+    p0 = str(tmp_path / "pol0.xyz")
+    write(p0, frames)
+    with _chdir(tmp_path):
+        base = gap_dipole.fit_gap_dipole(_cfg(data_path=p0, **kw))
+    rng = np.random.default_rng(0)
+    star = replace(base, alpha=[rng.normal(size=len(a)) for a in base.alpha])
+    a_star = gap_dipole.predict(star, frames)          # α = Φα* by construction
+    assert a_star.shape == (6, 6)
+    for f, a in zip(frames, a_star):
+        f.info["pol"] = a
+    p1 = str(tmp_path / "pol_synth.xyz")
+    write(p1, frames)
+    with _chdir(tmp_path):
+        refit = gap_dipole.fit_gap_dipole(_cfg(data_path=p1, **kw))
+    assert np.allclose(gap_dipole.predict(refit, frames), a_star,
+                       atol=1e-8 * max(np.abs(a_star).max(), 1.0))
+    # The design rows ARE the model's rank-2 kernel: Σ_i s_i W_i with
+    # W_i = Σ_j R_n Voigt(d⊗d) — check one frame against a hand-rolled sum.
+    at = frames[2]
+    ti = np.array([refit.cfg.types.index(int(z)) for z in at.numbers])
+    D = np.asarray(refit.builder.build_descriptors([at], calc_gradients=False)[0][0])
+    rc, C = float(refit.cfg.dipole_rc), 3
+    i, j, Dv = neighbor_list("ijD", at, rc)
+    keep = i != j
+    i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)
+    r = np.linalg.norm(d, axis=1)
+    x = 2.0 * r / rc - 1.0
+    fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    R = np.stack([np.ones_like(x), x, 2 * x * x - 1], 1) * fc[:, None]  # [P, 3]
+    xx, yy, zz = d[:, 0] ** 2, d[:, 1] ** 2, d[:, 2] ** 2
+    voigt = np.stack([xx, yy, zz, d[:, 0] * d[:, 1], d[:, 1] * d[:, 2], d[:, 2] * d[:, 0]], 1)
+    W = np.zeros((len(at), 6, C, 2))                     # [N, 6, C, T']
+    np.add.at(W, (i, slice(None), slice(None), ti[j]),
+              voigt[:, :, None] * R[:, None, :])
+    a_ref = np.zeros(6)
+    for n in range(len(at)):
+        k = (D[n] @ refit.sparse_desc[ti[n]].T) ** refit.xi[0]      # [M]
+        s = (refit.alpha[ti[n]].reshape(len(k), -1) * k[:, None]).sum(0)  # [C·T']
+        a_ref += W[n].reshape(6, -1) @ s
+    assert np.allclose(gap_dipole.predict(refit, [at])[0], a_ref,
+                       atol=1e-6 * max(np.abs(a_ref).max(), 1.0))

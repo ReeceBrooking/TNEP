@@ -41,9 +41,6 @@ def _trainable(model) -> dict:
         vs.update({k: getattr(model, k) for k in model.expert_keys})
     if model._neighbor_readout and model._c_learnable:
         vs["c_pair"] = model.c_pair
-    if model.cfg.target_mode == 2:
-        vs.update(W0_pol=model.W0_pol, b0_pol=model.b0_pol,
-                  W1_pol=model.W1_pol, b1_pol=model.b1_pol)
     if model.M_radial is not None:
         vs["M_radial"] = model.M_radial
     if (getattr(model, "sum_delta", None) is not None
@@ -62,8 +59,6 @@ def _ann_core(model) -> list:
     core = [model.W0, model.b0, model.W1]
     if model._experts_on:
         core += list(model.expert_weights)
-    if model.cfg.target_mode == 2:
-        core += [model.W0_pol, model.b0_pol, model.W1_pol]
     return [_tf_var(v) for v in core]
 
 
@@ -116,15 +111,12 @@ def fit_adam(model, train_data: dict, val_data: dict,
         U = _mixing_V() if mix_flat is not None else None
         b0 = model._b0_eff(named["b0"], named["W0"])    # centring fold (stored W0)
         W0 = model._W0_eff(named["W0"], U)     # U fold (if mixing) + q-scale fold
-        b0p = model._b0_eff(named["b0_pol"], named["W0_pol"]) if cfg.target_mode == 2 else None
-        W0p = model._W0_eff(named["W0_pol"], U) if cfg.target_mode == 2 else None
         preds = model.predict_batch(
             chunk["descriptors"], chunk["grad_values"],
             chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
             chunk["positions"], chunk["Z_int"], chunk["boxes"],
             chunk["atom_mask"],
             W0, b0, named["W1"], named["b1"],
-            W0p, b0p, named.get("W1_pol"), named.get("b1_pol"),
             W_atom=chunk.get("V_atom"),
             c_pair=named.get("c_pair"),
             M_radial=named.get("M_radial"),

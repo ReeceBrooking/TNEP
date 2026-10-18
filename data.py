@@ -3,7 +3,7 @@ from __future__ import annotations
 import tensorflow as tf
 import numpy as np
 from TNEPconfig import (TNEPconfig, resolved_dipole_cutoff,
-                        resolved_dipole_rc)
+                        resolved_dipole_rc, neighbor_readout_on, bond_rank)
 from DescriptorBuilder import make_descriptor_builder
 from ase.io import read
 from ase import Atoms
@@ -345,8 +345,8 @@ def assemble_data_dict(
         if factor != 1.0:
             targets = [t * factor for t in targets]
     # Guards read TOTAL-cell dipoles (branch-gap quantum e·L), so run them
-    # before any per-atom scaling.
-    if cfg.target_mode == 1 and cfg.dipole_readout == "neighbor":
+    # before any per-atom scaling. Dipole-only: α is single-valued under PBC.
+    if cfg.target_mode == 1 and neighbor_readout_on(cfg):
         _neighbor_dipole_guards(dataset, targets, cfg)
     if cfg.scale_targets and cfg.target_mode == 1:
         targets = [t / tf.cast(len(s), tf.float32) for t, s in zip(targets, dataset)]
@@ -360,9 +360,10 @@ def assemble_data_dict(
         "grad_index": grad_index,
     }
 
-    # Neighbor-basis dipole readout: precompute the per-structure geometry
-    # kernel V (data-static; delivered to the forwards via the W_atom slot).
-    if cfg.target_mode == 1 and cfg.dipole_readout == "neighbor":
+    # Neighbor-basis readout (dipole, or polarisability = rank 2): precompute
+    # the per-structure geometry kernel V [N, D, C, T] (data-static;
+    # delivered to the forwards via the W_atom slot).
+    if neighbor_readout_on(cfg):
         from tqdm import tqdm
         data["V_atom"] = [
             _neighbor_dipole_V(s, t, resolved_dipole_rc(cfg),
@@ -370,7 +371,8 @@ def assemble_data_dict(
                                str(cfg.dipole_radial),
                                float(cfg.dipole_zeta),
                                resolved_dipole_cutoff(cfg),
-                               float(cfg.dipole_gauss_sigma_scale))
+                               float(cfg.dipole_gauss_sigma_scale),
+                               rank=bond_rank(cfg))
             for s, t in tqdm(list(zip(dataset, types_int)),
                              desc="Building neighbor-readout V", unit="struct",
                              disable=len(dataset) < 50)]
@@ -416,23 +418,22 @@ def assemble_data_dict(
 
 
 def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
-    """True when mode-1 batches need only self descriptor gradients:
-    dipole_rij_power=0 (self-pair readout) or a readout that reads no SOAP
-    descriptor gradients at all (neighbor; tnep under
-    nep_descriptor="replace")."""
-    return cfg.target_mode == 1 and (
-        int(cfg.dipole_rij_power) == 0 or not soap_gradients_needed(cfg))
+    """True when the batches need only self descriptor gradients: a readout
+    that reads no SOAP descriptor gradients at all (neighbor — modes 1 and 2;
+    tnep under nep_descriptor="replace") or dipole_rij_power=0."""
+    return not soap_gradients_needed(cfg) or (
+        cfg.target_mode == 1 and int(cfg.dipole_rij_power) == 0)
 
 
 def descriptor_gradients_needed(cfg: TNEPconfig) -> bool:
-    """False only for the neighbor dipole readout, which reads no descriptor
-    gradients — every other mode contracts ∂q/∂r (model-side guards: learned
-    basis, Phase B). NOTE: that readout still needs the PAIR INDEX stream
-    (pair_atom/pair_gidx) on the trajectory path, where V is built in-graph
-    — that path keeps calc_gradients=True and only the gradient VALUES are
-    skipped (zero-width under the learned basis)."""
-    return not (cfg.target_mode == 1
-                and cfg.dipole_readout == "neighbor")
+    """False only for the neighbor readout (dipole, and always
+    polarisability), which reads no descriptor gradients — every other mode
+    contracts ∂q/∂r (model-side guards: learned basis, Phase B). NOTE: that
+    readout still needs the PAIR INDEX stream (pair_atom/pair_gidx) on the
+    trajectory path, where V is built in-graph — that path keeps
+    calc_gradients=True and only the gradient VALUES are skipped (zero-width
+    under the learned basis)."""
+    return not neighbor_readout_on(cfg)
 
 
 def soap_gradients_needed(cfg: TNEPconfig) -> bool:
@@ -472,11 +473,26 @@ def _neighbor_pairs(atoms: Atoms, rc: float):
     return i, j, D[i, j]
 
 
+def bond_geometry(d: np.ndarray, rank: int) -> np.ndarray:
+    """Bond tensor of the neighbour readout, [P, 3] → [P, D]: rank 1 is d
+    itself (D = 3, odd — the dipole); rank 2 is Voigt(d⊗d) =
+    [dx², dy², dz², dxdy, dydz, dzdx] (D = 6, even — the polarisability).
+    Numpy twin of TNEP._bond_geometry."""
+    if rank == 1:
+        return d
+    if rank == 2:
+        x, y, z = d[:, 0], d[:, 1], d[:, 2]
+        return np.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=1)
+    raise ValueError(f"bond rank must be 1 or 2, got {rank}")
+
+
 def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
-                           zeta: float, cutoff: str, gauss_sigma_scale: float):
+                           zeta: float, cutoff: str, gauss_sigma_scale: float,
+                           rank: int = 1):
     """Ordered neighbor pairs of the neighbor-basis readout: (i, j, G) with
-    G[p] = R_n(|d|)·d [P, 3, C], d = r_i − r_j (image pairs, self-images
-    dropped). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
+    G[p] = R_n(|d|)·g(d) [P, D, C], g = bond_geometry(d, rank) (d for the
+    dipole, Voigt(d⊗d) for the polarisability), d = r_i − r_j (image pairs,
+    self-images dropped). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
     "chebyshev_warped" T_n(2(r/rc − 1)² − 1)·f_c, "gaussian"
     exp(−(r − μ_n)²/2σ²)·f_c (μ_n interior points of linspace(0, rc, C+2),
     σ = gauss_sigma_scale·rc/(C+1)), or "screened" r^(ζ−1)·f_c. f_c per
@@ -512,22 +528,26 @@ def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
         Rw = np.exp(-(r[:, None] - mu) ** 2 / (2.0 * sigma ** 2)) * fc[:, None]
     else:
         raise ValueError(f"unknown dipole_radial {radial!r}")
-    return i, j, d[:, :, None] * Rw[:, None, :]              # [P, 3, C]
+    g = bond_geometry(d, rank)
+    return i, j, g[:, :, None] * Rw[:, None, :]              # [P, D, C]
 
 
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
                        C: int, T: int, radial: str = "chebyshev",
                        zeta: float = -2.0,
                        cutoff: str = "cosine2",
-                       gauss_sigma_scale: float = 1.0) -> np.ndarray:
-    """Per-atom geometry kernel of the neighbor-basis dipole readout:
-    V_i[:,n,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·d (pairs and R_n from
-    _neighbor_dipole_pairs). float64 accumulate → float32 [N, 3, C, T]."""
+                       gauss_sigma_scale: float = 1.0,
+                       rank: int = 1) -> np.ndarray:
+    """Per-atom geometry kernel of the neighbor-basis readout:
+    V_i[:,n,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·g(d), g = d (rank 1,
+    dipole) or Voigt(d⊗d) (rank 2, polarisability); pairs and R_n from
+    _neighbor_dipole_pairs. float64 accumulate → float32 [N, D, C, T]."""
     i, j, G = _neighbor_dipole_pairs(atoms, rc, C, radial, zeta, cutoff,
-                                     gauss_sigma_scale)
-    V = np.zeros((len(atoms), T, 3, C))
+                                     gauss_sigma_scale, rank)
+    D = G.shape[1]
+    V = np.zeros((len(atoms), T, D, C))
     np.add.at(V, (i, np.asarray(types_int)[j]), G)
-    return V.transpose(0, 2, 3, 1).astype(np.float32)      # [N, 3, C, T]
+    return V.transpose(0, 2, 3, 1).astype(np.float32)      # [N, D, C, T]
 
 
 def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,

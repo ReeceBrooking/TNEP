@@ -34,7 +34,7 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
     """Assign weight tensors from reconstruct_params_tf into the model's Variables.
 
     Tail order: W0,b0,W1,b1 | +experts (nep_descriptor="sum" / "gap_sum") | +c_pair
-    (neighbor readout, _c_learnable) | +pol ANN (mode 2) | +U_pair (mixing)
+    (neighbor readout, _c_learnable) | +U_pair (mixing)
     | +M_radial (learned radial basis) | +c_r, +c_a (NEP contraction
     coefficients) | +sum_delta (cfg.sum_delta_learn, 3 unpenalised per-expert
     amplitudes at the very end).
@@ -50,11 +50,6 @@ def _set_model_params(model: TNEP, *params: tf.Tensor) -> None:
             getattr(model, k).assign(params[idx]); idx += 1
     if model._neighbor_readout and model._c_learnable:
         model.c_pair.assign(params[idx]); idx += 1
-    if model.cfg.target_mode == 2:
-        model.W0_pol.assign(params[idx]); idx += 1
-        model.b0_pol.assign(params[idx]); idx += 1
-        model.W1_pol.assign(params[idx]); idx += 1
-        model.b1_pol.assign(params[idx]); idx += 1
     if (getattr(model, "descriptor_mixing", False)
             and getattr(model, "U_pair", None) is not None
             and idx < len(params)):
@@ -129,26 +124,18 @@ class SNES:
         n_W1 = self.cfg.num_types * self.H * self._Hw
         n_b1 = 1
         self.n_typed = _T * per_type
-        # The mode-2 polarizability ANN mirrors the SOAP block only.
-        self.n_typed_pol = _T * _block_per_type(self._blocks[0])
         # Per-expert counts (breakdown); n_expert = 0 outside "sum" / "gap_sum".
         self._n_expert = [_T * _block_per_type(b) for b in self._blocks[1:]]
         self.n_expert = sum(self._n_expert)
-        # Per-type param count (type t's rows of every block). target_mode==2
-        # has a second (polarizability) ANN whose type-t block is ALSO
-        # extracted for per-type regularization, so the denominator doubles
-        # to match _extract_type_params.
-        self._n_per_type = per_type * (2 if self.cfg.target_mode == 2 else 1)
+        # Per-type param count (type t's rows of every block), the
+        # denominator of the per-type regularization (_extract_type_params).
+        self._n_per_type = per_type
         self.n_primary = self.n_typed + n_b1 + self.n_c
         self._n_W0 = n_W0
         self._n_b0 = n_b0
         self._n_W1 = n_W1
         self._n_b1 = n_b1
-        # Mode 2 (polarizability) adds a second identical-shape ANN.
-        if self.cfg.target_mode == 2:
-            self.n_anns_total = 2 * self.n_primary
-        else:
-            self.n_anns_total = self.n_primary
+        self.n_anns_total = self.n_primary
         # Optional U_pair tail (descriptor-mixing layer): one [bs,bs] matrix
         # per species pair, packed densely (active entries only) at the end
         # of the param vector, unpacked via reconstruct_params_tf.
@@ -500,8 +487,6 @@ class SNES:
         if self.n_c > 0:
             mu[off:off + self.n_c] = 1.0
             off += self.n_c
-        if self.cfg.target_mode == 2:
-            off = _fill_ann(off, self._blocks[:1])
         # V_pair tail: zeroed so U_full = I at gen 0.
         if self.n_U_pair > 0:
             mu[self.n_anns_total:self.n_anns_total + self.n_U_pair] = 0.0
@@ -596,18 +581,13 @@ class SNES:
 
     def _type_slices(self, t: int) -> list:
         """(start, end) of type t's rows in W0 / b0 / W1 of every typed ANN
-        block (slab order), plus the polarizability ANN's (mode 2: the SOAP
-        block's layout offset by n_primary — its type-t block must share the
-        per-type penalty, else it is only weakly reached by the global term)."""
+        block (slab order)."""
         T = self.cfg.num_types
         out, off = [], 0
         for b in self._blocks:
             for n in (b.dim_in * b.hidden, b.hidden, b.hidden * self._Hw):
                 out.append((off + t * n, off + (t + 1) * n))
                 off += T * n
-        if self.cfg.target_mode == 2:
-            p = self.n_primary
-            out += [(p + s, p + e) for s, e in out[:3]]
         return out
 
     def _build_type_of_variable(self) -> np.ndarray:
@@ -631,10 +611,7 @@ class SNES:
             tov[offset:] = T
             return tov
 
-        if self.cfg.target_mode == 2:
-            ann_tov = np.concatenate([_ann_types(self._blocks), _ann_types(self._blocks[:1])])
-        else:
-            ann_tov = _ann_types(self._blocks)
+        ann_tov = _ann_types(self._blocks)
 
         # U_pair labels: shared V_pair → global label T (mixing is shared
         # across central types); per-type V_pair → T contiguous slabs, each
@@ -1253,7 +1230,7 @@ class SNES:
                 tf.int32)
 
         # Intra-gen cache: same μ used twice (val + train) at a val gen
-        # shouldn't re-fold. Holds post-fold W0/W0p keyed by id(μ); fit()
+        # shouldn't re-fold. Holds post-fold W0 keyed by id(μ); fit()
         # clears it each gen.
         _cache = getattr(self, "_validate_fold_cache", None)
         _cache_hit = (mu_tf is not None
@@ -1265,10 +1242,6 @@ class SNES:
             named = self._split_reconstructed(params)
             W0 = named.get("W0"); b0 = named.get("b0")
             W1 = named.get("W1"); b1 = named.get("b1")
-            W0p = named.get("W0_pol")
-            b0p = named.get("b0_pol")
-            W1p = named.get("W1_pol")
-            b1p = named.get("b1_pol")
             U_pair_val = named.get("U_pair")
             c_pair_val = named.get("c_pair")
             M_val = named.get("M_radial")
@@ -1277,19 +1250,15 @@ class SNES:
             sd_val = named.get("sum_delta")
             # Centring fold (needs the stored W0), then absorb U_pair^T.
             b0 = self.model._b0_eff(b0, W0)
-            if W0p is not None:
-                b0p = self.model._b0_eff(b0p, W0p)
             W0 = self.model._W0_eff(W0, U_pair_val)
-            if W0p is not None:
-                W0p = self.model._W0_eff(W0p, U_pair_val)
             # Stash folded tensors for the next validate() call this gen.
             self._validate_fold_cache = {
                 "_key": id(mu_tf),
-                "fold": (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val,
+                "fold": (W0, b0, W1, b1, c_pair_val, M_val,
                          c_r_val, c_a_val, experts_val, sd_val),
             }
         elif _cache_hit:
-            (W0, b0, W1, b1, W0p, b0p, W1p, b1p, c_pair_val, M_val,
+            (W0, b0, W1, b1, c_pair_val, M_val,
              c_r_val, c_a_val, experts_val, sd_val) = _cache["fold"]
         else:
             W0, b0, W1, b1 = self.model.W0, self.model.b0, self.model.W1, self.model.b1
@@ -1298,16 +1267,8 @@ class SNES:
             c_r_val = c_a_val = None   # ... and to model.c_r / c_a
             experts_val = None         # ... and to the model's expert weights
             sd_val = None              # ... and to model.sum_delta
-            W0p = getattr(self.model, 'W0_pol', None)
-            b0p = getattr(self.model, 'b0_pol', None)
-            W1p = getattr(self.model, 'W1_pol', None)
-            b1p = getattr(self.model, 'b1_pol', None)
             b0 = self.model._b0_eff(b0, W0)
-            if W0p is not None:
-                b0p = self.model._b0_eff(b0p, W0p)
             W0 = self.model._W0_eff(W0)
-            if W0p is not None:
-                W0p = self.model._W0_eff(W0p)
 
         # Streaming chunk loop honours batch_chunk_size (bounded tensor
         # materialisation). Full-val (val_size=None) uses prefetched_chunks;
@@ -1325,7 +1286,7 @@ class SNES:
             # across gens when val_size is None (static chunks); random
             # subsets bypass the cache. Two-level dict: id(val_data) → chunk_idx.
             W_atom_v = None
-            if self.cfg.target_mode == 1:
+            if self.cfg.target_mode in (1, 2):
                 _can_cache = (self.cfg.val_size is None)
                 if _can_cache:
                     _vd_id = id(val_data)
@@ -1338,7 +1299,7 @@ class SNES:
                     W_atom_v = _sub.get(chunk_idx)
                 if W_atom_v is None:
                     if self.model._neighbor_readout:
-                        # Neighbor readout: V [B,A,3] geometry kernel,
+                        # Neighbor readout: V [B,A,D,C,T] geometry kernel,
                         # precomputed in data.py — same slot as W_atom.
                         # Independent of nep_descriptor ("replace" included).
                         W_atom_v = chunk["V_atom"]
@@ -1358,7 +1319,7 @@ class SNES:
                 chunk["pair_atom"], chunk["pair_gidx"], chunk["pair_struct"],
                 chunk["positions"], chunk["Z_int"], chunk["boxes"],
                 chunk["atom_mask"],
-                W0, b0, W1, b1, W0p, b0p, W1p, b1p,
+                W0, b0, W1, b1,
                 W_atom=W_atom_v, c_pair=c_pair_val, M_radial=M_val,
                 c_r=c_r_val, c_a=c_a_val, experts=experts_val,
                 sum_delta=sd_val,
@@ -1407,7 +1368,7 @@ class SNES:
         """Parse the reconstruct_params_tf tuple into a named dict.
 
         Tail order: W0,b0,W1,b1 | W0_r..W1_a (nep_descriptor="sum" / "gap_sum") | c_pair
-        (neighbor readout, _c_learnable) | W0_pol.. (mode 2) | U_pair (mixing)
+        (neighbor readout, _c_learnable) | U_pair (mixing)
         | M_radial (learned radial basis) | c_r, c_a (NEP)
         | sum_delta (cfg.sum_delta_learn; the last 3).
         """
@@ -1423,11 +1384,6 @@ class SNES:
                 out[k] = params[idx]; idx += 1
         if self.n_c > 0:
             out["c_pair"] = params[idx]; idx += 1
-        if self.cfg.target_mode == 2:
-            out["W0_pol"] = params[idx]; idx += 1
-            out["b0_pol"] = params[idx]; idx += 1
-            out["W1_pol"] = params[idx]; idx += 1
-            out["b1_pol"] = params[idx]; idx += 1
         if self.n_U_pair > 0 and idx < len(params):
             out["U_pair"] = params[idx]; idx += 1
         if self.n_radial > 0 and idx < len(params):
@@ -1447,7 +1403,7 @@ class SNES:
         Args:
             param_vectors : [P, dim] or [dim] float32
         Returns:
-            tuple (W0,b0,W1,b1) + optional (pol ANN, U_pair, M_radial); each
+            tuple (W0,b0,W1,b1) + optional (experts, c_pair, U_pair, M_radial, ...); each
             [P, ...] for batched input or [...] for single.
         """
         T = self.cfg.num_types
@@ -1483,12 +1439,7 @@ class SNES:
             offset += self.n_c
             primary = primary + (c,)
 
-        if self.cfg.target_mode == 2:
-            second = _extract(param_vectors, offset, self._blocks[:1])
-            offset = second[-1]
-            tail = primary + second[:-1]
-        else:
-            tail = primary
+        tail = primary
 
         if self.n_U_pair > 0:
             # Unpack the mixing tail. Per-type: T contiguous slabs. Inside a
@@ -1767,7 +1718,7 @@ class SNES:
             # cache keyed by (chunk_idx, id(batch_data)). With batch_size set,
             # each gen resamples → recompute (cache invalidated on id change).
             _W_atom_cached = None
-            if self.cfg.target_mode == 1:
+            if self.cfg.target_mode in (1, 2):
                 if getattr(self.cfg, "batch_size", None) is None:
                     _bd_id = id(batch_data)
                     _cache = getattr(self, "_W_atom_static_cache", None)
@@ -1777,9 +1728,9 @@ class SNES:
                     _W_atom_cached = _cache.get(chunk_idx)
                 if _W_atom_cached is not None:
                     chunk["_W_atom"] = _W_atom_cached
-            if self.cfg.target_mode == 1 and "_W_atom" not in chunk:
+            if self.cfg.target_mode in (1, 2) and "_W_atom" not in chunk:
                 if self.model._neighbor_readout:
-                    # Neighbor readout: V [B,A,3] geometry kernel from
+                    # Neighbor readout: V [B,A,D,C,T] geometry kernel from
                     # data.py rides the batch — same slot as W_atom. Staged
                     # for EVERY nep_descriptor (data.py keys only on the
                     # readout), so "replace" must not skip it: the readout
@@ -1915,84 +1866,51 @@ class SNES:
         named = self._split_reconstructed(params)
         W0 = named.get("W0"); b0 = named.get("b0")
         W1 = named.get("W1"); b1 = named.get("b1")
-        W0p = named.get("W0_pol")
-        b0p = named.get("b0_pol")
-        W1p = named.get("W1_pol")
-        b1p = named.get("b1_pol")
         # Per-candidate mixing tensor (None when disabled).
         U_pair_cand = named.get("U_pair")
 
-        if self.cfg.target_mode == 2:
-            pol_weights = self._pol_weights  # [6] component weights
-            # Pre-absorb U_pair^T into W0/W0_pol per candidate (linear _W0_eff
-            # broadcasts over the candidate axis) so the loop uses raw descriptors.
-            b0 = self.model._b0_eff(b0, W0)
-            b0p = self.model._b0_eff(b0p, W0p)
-            W0 = self.model._W0_eff(W0, U_pair_cand)
-            W0p = self.model._W0_eff(W0p, U_pair_cand)
+        # W_atom [B,A,3,Q] is candidate-independent. evaluate_population
+        # stashes it on batch_data["_W_atom"] per struct chunk so the pop
+        # loop reuses it; inline fallback for other callers (score, etc.).
+        W_atom = batch_data.get("_W_atom")
+        if W_atom is None and self.cfg.target_mode in (1, 2):
+            if self.model._neighbor_readout:
+                # Neighbor readout: V [B,A,D,C,T] geometry kernel from
+                # data.py — same slot as W_atom. Independent of
+                # nep_descriptor; "replace" must not skip it.
+                W_atom = batch_data["V_atom"]
+            elif self.model._nep_mode != "replace":
+                # replace+tnep: μ is NEP-only — no SOAP kernel to build.
+                B_static = desc.shape[0]
+                A_static = desc.shape[1]
+                B_arg = (B_static if B_static is not None
+                         else tf.shape(desc)[0])
+                A_arg = (A_static if A_static is not None
+                         else tf.shape(desc)[1])
+                W_atom = self.model._precompute_dipole_kernel(
+                    grad_values, pair_struct, pair_atom, pair_gidx,
+                    pos, boxes,
+                    B_arg, A_arg)
 
-            fitness_comp_w = pol_weights[tf.newaxis]  # [1, 6]
-            sq_comp_w = pol_weights[tf.newaxis]
+        # Evaluate all C candidates via batched GEMMs (one GEMM per type
+        # per direction, not C matmuls inside vectorized_map).
+        preds = self.model.predict_batch_candidates(
+            desc, W_atom, Z, amask, W0, b0, W1, b1,
+            U_pair=U_pair_cand,
+            c_pair=named.get("c_pair"),
+            M_radial=named.get("M_radial"),
+            c_r=named.get("c_r"), c_a=named.get("c_a"),
+            experts=self._experts_of(named),
+            sum_delta=named.get("sum_delta"),
+            nep_raw=batch_data.get("nep_raw"),
+            **nep_pair_kwargs(batch_data))  # [C, B, T_dim]
 
-            def _forward_one_candidate(args):
-                w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p = args
-                preds = self.model.predict_batch(
-                    desc, grad_values, pair_atom, pair_gidx, pair_struct,
-                    pos, Z, boxes, amask,
-                    w0, bb0, w1, bb1, w0p, bb0p, w1p, bb1p,
-                )
-                diff = preds - targets  # [B, 6]
-                fitness = squared_error_per_structure(
-                    diff, component_weights=fitness_comp_w)
-                sq = squared_error_per_structure(diff, component_weights=sq_comp_w)
-                return tf.stack([fitness, sq], axis=0)  # [2, B]
+        if _scale_preds:
+            preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]
 
-            stacked = (W0, b0, W1, b1, W0p, b0p, W1p, b1p)
-            both = tf.vectorized_map(_forward_one_candidate, stacked)  # [C, 2, B]
-            return both[:, 0, :], both[:, 1, :]
-
-        else:
-
-            # W_atom [B,A,3,Q] is candidate-independent. evaluate_population
-            # stashes it on batch_data["_W_atom"] per struct chunk so the pop
-            # loop reuses it; inline fallback for other callers (score, etc.).
-            W_atom = batch_data.get("_W_atom")
-            if W_atom is None and self.cfg.target_mode == 1:
-                if self.model._neighbor_readout:
-                    # Neighbor readout: V [B,A,3] geometry kernel from
-                    # data.py — same slot as W_atom. Independent of
-                    # nep_descriptor; "replace" must not skip it.
-                    W_atom = batch_data["V_atom"]
-                elif self.model._nep_mode != "replace":
-                    # replace+tnep: μ is NEP-only — no SOAP kernel to build.
-                    B_static = desc.shape[0]
-                    A_static = desc.shape[1]
-                    B_arg = (B_static if B_static is not None
-                             else tf.shape(desc)[0])
-                    A_arg = (A_static if A_static is not None
-                             else tf.shape(desc)[1])
-                    W_atom = self.model._precompute_dipole_kernel(
-                        grad_values, pair_struct, pair_atom, pair_gidx,
-                        pos, boxes,
-                        B_arg, A_arg)
-
-            # Evaluate all C candidates via batched GEMMs (one GEMM per type
-            # per direction, not C matmuls inside vectorized_map).
-            preds = self.model.predict_batch_candidates(
-                desc, W_atom, Z, amask, W0, b0, W1, b1,
-                U_pair=U_pair_cand,
-                c_pair=named.get("c_pair"),
-                M_radial=named.get("M_radial"),
-                c_r=named.get("c_r"), c_a=named.get("c_a"),
-                experts=self._experts_of(named),
-                sum_delta=named.get("sum_delta"),
-                nep_raw=batch_data.get("nep_raw"),
-                **nep_pair_kwargs(batch_data))  # [C, B, T_dim]
-
-            if _scale_preds:
-                preds = preds * inv_num_atoms[tf.newaxis]  # [C, B, T_dim] * [1, B, 1]
-
-            diff = preds - targets[tf.newaxis]  # [C, B, T_dim]
-            fitness = squared_error_per_structure(diff)
-            sq = fitness  # unweighted MSE, for RMSE/RRMSE
-            return fitness, sq
+        diff = preds - targets[tf.newaxis]  # [C, B, T_dim]
+        # Mode 2: lambda_shear² on the off-diagonal components (ranking only).
+        fitness = squared_error_per_structure(diff, self._pol_weights)
+        sq = (fitness if self._pol_weights is None
+              else squared_error_per_structure(diff))  # unweighted, for RMSE/RRMSE
+        return fitness, sq

@@ -183,7 +183,7 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
     """Save trained TNEP weights + config to an HDF5 (.h5) file.
 
     Layout: top-level attrs (target_mode, num_types, num_neurons, dim_q,
-    elements); /weights (W0,b0,W1,b1, + pol variants for mode 2); /descriptor
+    elements); /weights (W0,b0,W1,b1 [+ c_pair, U_pair, ...]); /descriptor
     (z_to_type_index); /config (TNEPconfig as JSON string).
 
     Cayley note: under descriptor_mixing_regularizer=="cayley" the saved
@@ -224,11 +224,6 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         wg.create_dataset("b0", data=model.b0.numpy())
         wg.create_dataset("W1", data=model.W1.numpy())
         wg.create_dataset("b1", data=model.b1.numpy())
-        if cfg.target_mode == 2:
-            wg.create_dataset("W0_pol", data=model.W0_pol.numpy())
-            wg.create_dataset("b0_pol", data=model.b0_pol.numpy())
-            wg.create_dataset("W1_pol", data=model.W1_pol.numpy())
-            wg.create_dataset("b1_pol", data=model.b1_pol.numpy())
         # Neighbor readout: learned species-pair coefficient table (only when
         # learnable; frozen c ≡ 1 is rebuilt at load, not stored).
         if model._neighbor_readout and model._c_learnable:
@@ -436,7 +431,6 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
 
 
 def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
-                  W0_pol=None, b0_pol=None, W1_pol=None, b1_pol=None,
                   U_pair=None, c_pair=None,
                   M_radial=None, c_r=None, c_a=None, experts=None,
                   sum_delta=None) -> None:
@@ -459,11 +453,6 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
     model.b0.assign(b0)
     model.W1.assign(W1)
     model.b1.assign(b1)
-    if cfg.target_mode == 2:
-        model.W0_pol.assign(W0_pol)
-        model.b0_pol.assign(b0_pol)
-        model.W1_pol.assign(W1_pol)
-        model.b1_pol.assign(b1_pol)
     # Optional V_pair restore (h5 dataset "U_pair" holds V = U - I). When
     # absent (pre-mixing or mixing-disabled runs), keep TNEP.__init__'s
     # zero-init V (U_full = I, no-mixing path).
@@ -563,13 +552,14 @@ def _load_model_h5(path: str) -> TNEP:
         wg = f["weights"]
         if "W_pre_angular" in wg:
             raise ValueError(_W_PRE_REMOVED.format(path=path))
+        if "W0_pol" in wg:
+            raise ValueError(
+                f"{path}: this polarisability model predates the rank-2 "
+                f"neighbour readout (it carries the removed dual-ANN W0_pol "
+                f"weights). Mode-2 saves cannot be mapped — re-train.")
         weights = {
             "W0": wg["W0"][:], "b0": wg["b0"][:],
             "W1": wg["W1"][:], "b1": wg["b1"][()],
-            "W0_pol": wg["W0_pol"][:] if "W0_pol" in wg else None,
-            "b0_pol": wg["b0_pol"][:] if "b0_pol" in wg else None,
-            "W1_pol": wg["W1_pol"][:] if "W1_pol" in wg else None,
-            "b1_pol": wg["b1_pol"][:] if "b1_pol" in wg else None,
             "U_pair": wg["U_pair"][:] if "U_pair" in wg else None,
             "c_pair": wg["c_pair"][:] if "c_pair" in wg else None,
             "M_radial": wg["M_radial"][:] if "M_radial" in wg else None,
@@ -656,8 +646,6 @@ def _load_model_npz(path: str) -> TNEP:
     _load_weights(
         model, cfg,
         data["W0"], data["b0"], data["W1"], data["b1"],
-        data.get("W0_pol"), data.get("b0_pol"),
-        data.get("W1_pol"), data.get("b1_pol"),
         U_pair=(data["U_pair"] if has_U_pair else None),
         M_radial=data.get("M_radial"),
         c_r=data.get("c_r"), c_a=data.get("c_a"),
