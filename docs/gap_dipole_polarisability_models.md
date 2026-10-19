@@ -93,7 +93,8 @@ uncompressed SOAP ($840$-dimensional), $M=250$ per species, $\sigma = 10^{-3}$.
 | Production bond basis, $l=\alpha=4$, compressed | 1.76 % | — |
 | Same, $l=\alpha=7$ uncompressed | 1.56 % | — |
 | + Ewald field column, fit 400 | 1.17 % | — |
-| **+ Ewald field column, fit 500** | **1.08 %** | $0.067\ e\cdot a_0$ per cell, $2.1\times10^{-3}\ e\cdot a_0$ per molecule, 5.4 mD |
+| + Ewald field column, fit 500 | 1.08 % | $0.067\ e\cdot a_0$ per cell, $2.1\times10^{-3}\ e\cdot a_0$ per molecule, 5.4 mD |
+| **+ 2b site model, $\delta_{2b}=0.3$, fit 500 (§3.4)** | **1.00 %** | $0.062\ e\cdot a_0$ per cell |
 | Published TNEP (6 Å radial cutoff, 200k SNES generations) | 0.85 % | $1.7\times10^{-3}\ e\cdot a_0$ per molecule |
 
 $R^2 = 0.99988$.
@@ -133,6 +134,41 @@ worth 11 % on its own because $\sigma$ pinned at the smallest value scanned,
 the signature of a capacity-limited site function; and the warped Chebyshev
 radial family (or Gaussians with $C=20$, $\sigma$-scale 0.5) outperformed plain
 Chebyshev, wide Gaussians and spherical Bessel functions by 7–60 %.
+
+### 3.4 A summed 2b site model
+
+The site function of §3.1 is a single sparse kernel on the SOAP vector. The
+NEP decomposition of the site energy by body order suggests the sum
+
+$$
+s_i = \sum_m \alpha_m\,(\hat{\mathbf q}_i\cdot\hat{\mathbf q}_m)^{2}
+\;+\;\delta_{2b}\sum_{m'} \beta_{m'}\,(\hat{\mathbf q}^{(2)}_i\cdot\hat{\mathbf q}^{(2)}_{m'})^{2},
+\qquad
+q^{(2)}_{i,\,n t'} = \sum_{j\in t'} R_n(r_{ij}),
+$$
+
+a SOAP kernel plus a kernel on the radial distribution of the environment
+($C=10$ warped Chebyshev channels per neighbour species, 20 numbers), each
+with its own FPS sparse set ($M=250$ per species) and its own $K_{MM}$ prior,
+never mixed; $\delta_{2b}$ is the relative prior amplitude. Both read out
+through the same bond basis and field column. A 3b model (angular power
+spectrum $q_{nn'l}$, $l\le2$) reads out through an angular kernel
+$\sum_{j,k\ne j}R_aR_b\,P_l(\cos\theta_{jik})\,\mathbf d_{ij}$ instead, so that the
+bond vector stays uncontracted.
+
+Val-selected on 400/100 and refit on 500 frames (test RRMSE): SOAP 1.08 %;
+**SOAP + 2b, $\delta_{2b}=0.3$, $\sigma=3\times10^{-3}$: 1.00 %**; SOAP + 3b
+($\delta_{3b}=0.3$) 1.02 %; SOAP + 2b + 3b ($\delta=0.3$) 1.05 %. Alone, the
+2b model reaches 1.76 % and the 3b model 2.65 %, i.e. neither replaces SOAP,
+and at $\delta=1$ every sum is worse than SOAP alone (1.19–1.37 % on 400
+frames against 1.17). The gain is modest (0.08 points, ≈ 3× the σ-to-σ
+noise) and comes with a shift of the selected $\sigma$ from $10^{-3}$ to
+$3\times10^{-3}$: a small-amplitude, smooth two-body component lets the
+composite tolerate stronger regularisation, which is where the improvement
+appears. It costs 2× the columns (22 000) and nothing in fit time. This is the
+mechanism the TurboGAP 2b *column block* of §7 could not deliver: there the
+distance features were linear columns inside the one SOAP site function; here
+the 2b term is a separately regularised site function of its own.
 
 ## 4. Best polarisability model
 
@@ -219,6 +255,8 @@ matters and its amplitude is absorbed by the site function.
 | QEq "polarise" (bonds built on $\mathbf d-(\mathbf y_i-\mathbf y_j)$) | 3.6–4.9 % | Over-relaxes: bond shifts of 0.6 Å RMS at $H=10$ eV/e$^2$. |
 | TurboGAP 2b block (Gaussians on $r_{ij}$) | neutral at small amplitude (1.18 %), worse at $\delta_{2b}\ge1$ | See §7. |
 | TurboGAP 3b block (triplet kernel) | 1.75–3.6 % at every $\delta_{3b}$, $\sigma$ and kernel tried | Train RMSE drops to $10^{-4}$: the block interpolates the training set. See §7. |
+| 2b or 3b *site model* alone (own kernel, §3.4) | 1.76 % / 2.65 % | A radial distribution or an $l\le2$ angular spectrum is not a sufficient environment descriptor for $\mu$; SOAP is. |
+| Summed site models at $\delta=1$ | 1.19–1.37 % (fit 400, vs 1.17) | Equal prior weight on the weaker kernel inflates the variance; only $\delta\approx0.3$ helps (§3.4). |
 | Spherical Bessel radial family | 1.85 % (vs 1.17 warped Chebyshev) | Oscillatory over the whole $[0, r_c]$ with large amplitude at short range. |
 | More channels ($C=20$) or more sparse points ($M=500$) | 1.75 % / 1.55 % | Kernel resolution saturates; extra columns need $\sigma$ re-selection and gain nothing. |
 
@@ -232,6 +270,8 @@ matters and its amplitude is absorbed by the site function.
 | Cross group wider than 4 channels | flat diagonal, off-diagonal 16.0 → 17.1 % at 10 | Angular information is low-dimensional; extra columns fit noise. |
 | Full (non-traceless) induced-coupling tensor | 16.7 / 15.2 % | Its isotropic part competes with the isotropic bond group. |
 | TurboGAP 2b / 3b blocks | 23–31 % diagonal at every $\sigma$ | See §7. |
+| 2b site model alone / summed with SOAP ($\delta_{2b}=0.3$) | 24.2 / 19.2 % · 16.1 / 17.0 % (vs 14.9 / 16.0) | The radial distribution carries no anisotropy; added to SOAP it only dilutes the prior. |
+| 3b site model through its angular kernel, alone / + SOAP ($l_x\le1$) / + SOAP + 2b | off-diagonal 18.6 % (no isotropic group) · 14.9 / 17.0 % · 15.5 / 15.9 % | The $l=0$ member *is* the cross group already in the base; the $l=1$ member and the 2b/3b descriptors add columns (74k–112k) that the fit cannot pin down — $\sigma$ moves to 0.3. See §7. |
 
 ## 7. The 2b/3b blocks: correct, and still harmful
 
@@ -261,6 +301,29 @@ cannot pin down, and its genuine content, pair distances and bond angles within
 blocks earn their keep in energy GAPs because the energy has a large, smooth
 two-body part that SOAP represents inefficiently; the dipole and
 polarisability of water have no such part.
+
+The follow-up scan (2026-10-20, `gap_site_models_scan.py`) tested the other
+way of separating body orders: not extra columns inside one site function but
+*separate site functions*, each a sparse kernel on its own descriptor (SOAP;
+the radial distribution $q^{(2)}_{nt'}$; the angular power spectrum
+$q^{(3)}_{nn'l}$) with its own FPS set and prior, summed with relative
+amplitudes $\delta$ — the NEP ansatz transplanted to a kernel. The hypothesis
+under test was that the SOAP site function already encodes the 2b and 3b
+information, so the decomposition should not help. For the polarisability it
+holds: val-selected and refit on 500 frames, SOAP alone 14.9 / 16.0 %,
+SOAP + 2b 16.1 / 17.0, SOAP + 3b 14.9 / 17.0, SOAP + 2b + 3b 15.5 / 15.9, 2b
+alone 24.2 / 19.2, 3b alone (angular kernel only, so no isotropic group)
+18.6 % off-diagonal; every sum pushed the selected $\sigma$ from 0.1 to 0.3
+and none beat the base beyond the ≈ 0.3-point noise. For the dipole it holds
+for the 3b part (SOAP + 3b 1.02 %, within noise of SOAP + 2b + 3b at 1.05)
+but a small-amplitude 2b kernel is a real, if modest, gain: 1.08 → 1.00 %
+(§3.4), where the same 2b content as a column block had been neutral at best.
+The difference is regularisation, not information: a separately regularised
+two-body site function with a weak prior ($\delta_{2b}=0.3$) can be smooth
+where the SOAP kernel is not, whereas 20 Gaussian columns inside the SOAP
+site function can only interpolate. Separate body orders therefore do not add
+information the 7-7 SOAP lacks; they add a second, smoother prior, which is
+worth 7 % on the dipole and nothing on the polarisability.
 
 ## 8. Methodological lessons
 
