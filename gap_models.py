@@ -19,6 +19,7 @@ import numpy as np
 from ase import Atoms
 
 import data as tnep_data
+from gap_descriptor import pair_index
 from TNEPconfig import GAPconfig, resolved_dipole_cutoff
 
 
@@ -44,6 +45,7 @@ def _site_pairs(atoms: Atoms, cfg: GAPconfig, C: int):
 
 
 def _normalise(q: np.ndarray) -> np.ndarray:
+    """Unit rows; zero rows stay zero."""
     n = np.linalg.norm(q, axis=1, keepdims=True)
     return q / np.where(n > 0, n, 1.0)
 
@@ -57,10 +59,11 @@ def two_body_descriptor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndar
     return _normalise(q.reshape(len(atoms), -1))
 
 
-def _triplets(i, j):
+def _triplets(i):
     """All ordered neighbour pairs (p, k) of the same centre, p ≠ k, as index
-    arrays into the pair list (centres are sorted in ASE's output)."""
-    order = np.argsort(i, kind="stable"); i, j = i[order], j[order]
+    arrays into the pair list sorted by centre: (order, P, K) with P grouped
+    by centre (i[order][P] is non-decreasing)."""
+    order = np.argsort(i, kind="stable"); i = i[order]
     starts = np.flatnonzero(np.r_[True, i[1:] != i[:-1]]); ends = np.r_[starts[1:], len(i)]
     P, K = [], []
     for s, e in zip(starts, ends):
@@ -69,23 +72,50 @@ def _triplets(i, j):
     return order, np.concatenate(P), np.concatenate(K)
 
 
-def three_body_descriptor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
-    """[N, T(T+1)/2·C·C·(L+1)] angular power spectrum, unit rows."""
-    C, L, T = int(cfg.gap_site_channels), int(cfg.gap_site_lmax), int(cfg.num_types)
+def _angular_triplets(atoms: Atoms, cfg: GAPconfig, C: int, L: int):
+    """Shared preamble of the angular descriptors/kernels: site pairs →
+    triplets → reorder → clipped Legendre of the bond angle. Returns
+    (i, j, d, R, P, K, Pl, starts, ends): the pair list sorted by centre,
+    triplet indices P/K into it, Pl = P_0..P_L(cos θ_pik) [Q, L+1], and the
+    centre segments [starts[c], ends[c]) of P/K (centre i[P[starts[c]]];
+    centres with < 2 neighbours have no segment)."""
     i, j, d, R = _site_pairs(atoms, cfg, C)
-    order, P, K = _triplets(i, j)
+    order, P, K = _triplets(i)
     i, j, d, R = i[order], j[order], d[order], R[order]
     r = np.linalg.norm(d, axis=1)
     cos = np.einsum("pd,pd->p", d[P], d[K]) / (r[P] * r[K])
     Pl = legendre(np.clip(cos, -1.0, 1.0), L)                           # [Q, L+1]
-    from gap_descriptor import pair_index
+    ic = i[P]
+    starts = np.flatnonzero(np.r_[True, ic[1:] != ic[:-1]]); ends = np.r_[starts[1:], len(P)]
+    return i, j, d, R, P, K, Pl, starts, ends
+
+
+def _species_resolved(R: np.ndarray, tj: np.ndarray, T: int, pair: bool) -> np.ndarray:
+    """[P, C] → [P, K1] radial weights scattered to the partner-species column,
+    k = (a, t′): K1 = C·T under pair columns, C (R unchanged) otherwise."""
+    if not pair:
+        return R
+    Rp = np.zeros((len(R), R.shape[1], T)); Rp[np.arange(len(R)), :, tj] = R
+    return Rp.reshape(len(R), -1)
+
+
+def three_body_descriptor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
+    """[N, T(T+1)/2·C·C·(L+1)] angular power spectrum, unit rows."""
+    C, L, T = int(cfg.gap_site_channels), int(cfg.gap_site_lmax), int(cfg.num_types)
+    N, S = len(atoms), T * (T + 1) // 2
+    i, j, d, R, P, K, Pl, starts, ends = _angular_triplets(atoms, cfg, C, L)
+    Q = len(P)
     slot = pair_index(T)[np.asarray(ti)[j[P]], np.asarray(ti)[j[K]]]
-    contrib = np.einsum("qa,qb,ql->qabl", R[P], R[K], Pl)                # [Q, C, C, L+1]
-    q = np.zeros((len(atoms), T * (T + 1) // 2, C, C, L + 1))
-    np.add.at(q, (i[P], slot), contrib)
+    Pls = np.zeros((Q, S, L + 1)); Pls[np.arange(Q), slot] = Pl         # Legendre in its species slot
+    Pls = Pls.reshape(Q, -1)                                              # [Q, S·(L+1)]
+    RR = (R[P][:, :, None] * R[K][:, None, :]).reshape(Q, -1)             # [Q, C·C]
+    q = np.zeros((N, C * C, S * (L + 1)))
+    for s, e in zip(starts, ends):                                        # per-centre segmented reduction
+        q[i[P[s]]] = RR[s:e].T @ Pls[s:e]
+    q = q.reshape(N, C, C, S, L + 1).transpose(0, 3, 1, 2, 4)             # [N, S, C, C, L+1]
     # The C×C block is symmetric in (n, n') under the ordered p≠k sum: redundant
     # but harmless columns of an INVARIANT descriptor (kept for a simple layout).
-    return _normalise(q.reshape(len(atoms), -1))
+    return _normalise(q.reshape(N, -1))
 
 
 def angular_cross_tensor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
@@ -93,26 +123,18 @@ def angular_cross_tensor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nda
     channel pairs a ≤ b (species-resolved under pair columns) and l ≤ gap_cross_lmax."""
     Cx, L, T = int(cfg.gap_cross_channels), int(cfg.gap_cross_lmax), int(cfg.num_types)
     pair = str(cfg.dipole_species_pairs) != "off"
-    i, j, d, R = _site_pairs(atoms, cfg, Cx)
-    order, P, K = _triplets(i, j)
-    i, j, d, R = i[order], j[order], d[order], R[order]
-    r = np.linalg.norm(d, axis=1)
-    cos = np.einsum("pd,pd->p", d[P], d[K]) / (r[P] * r[K])
-    Pl = legendre(np.clip(cos, -1.0, 1.0), L)
-    tj = np.asarray(ti)[j]
-    # species-resolved radial weights: k = (a, t') with t' the partner species
-    Tp = T if pair else 1
-    Rp = np.zeros((len(R), Cx, Tp)); Rp[np.arange(len(R)), :, (tj if pair else 0)] = R
-    Rp = Rp.reshape(len(R), -1)                                           # [P, K1]
-    K1 = Rp.shape[1]; au, bu = np.triu_indices(K1)
+    i, j, d, R, P, K, Pl, starts, ends = _angular_triplets(atoms, cfg, Cx, L)
+    Rp = _species_resolved(R, np.asarray(ti)[j], T, pair)                 # [P, K1]
+    au, bu = np.triu_indices(Rp.shape[1])
     S = 0.5 * (d[P][:, :, None] * d[K][:, None, :] + d[K][:, :, None] * d[P][:, None, :])   # [Q, 3, 3]
     tr = np.trace(S, axis1=1, axis2=2) / 3.0
     S[:, 0, 0] -= tr; S[:, 1, 1] -= tr; S[:, 2, 2] -= tr
     voigt = np.stack([S[:, 0, 0], S[:, 1, 1], S[:, 2, 2], S[:, 0, 1], S[:, 1, 2], S[:, 2, 0]], 1)
-    w = 0.5 * (Rp[P][:, au] * Rp[K][:, bu] + Rp[P][:, bu] * Rp[K][:, au])    # [Q, K_x/(L+1)] symmetric in a↔b
-    contrib = np.einsum("qd,qc,ql->qdcl", voigt, w, Pl).reshape(len(P), 6, -1)
-    W = np.zeros((len(atoms), 6, contrib.shape[2]))
-    np.add.at(W, i[P], contrib)
+    w = 0.5 * (Rp[P][:, au] * Rp[K][:, bu] + Rp[P][:, bu] * Rp[K][:, au])    # [Q, K1(K1+1)/2] symmetric in a↔b
+    wl = (w[:, :, None] * Pl[:, None, :]).reshape(len(P), -1)             # [Q, K_x], column = c·(L+1) + l
+    W = np.zeros((len(atoms), 6, wl.shape[1]))
+    for s, e in zip(starts, ends):                                        # per-centre segmented reduction
+        W[i[P[s]]] = voigt[s:e].T @ wl[s:e]
     return W
 
 
@@ -121,17 +143,12 @@ def angular_cross_vector(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nda
     (l = 0 collapses to the one-hop basis and is skipped)."""
     Cx, L, T = int(cfg.gap_cross_channels), int(cfg.gap_cross_lmax), int(cfg.num_types)
     pair = str(cfg.dipole_species_pairs) != "off"
-    i, j, d, R = _site_pairs(atoms, cfg, Cx)
-    order, P, K = _triplets(i, j)
-    i, j, d, R = i[order], j[order], d[order], R[order]
-    r = np.linalg.norm(d, axis=1)
-    cos = np.einsum("pd,pd->p", d[P], d[K]) / (r[P] * r[K])
-    Pl = legendre(np.clip(cos, -1.0, 1.0), L)[:, 1:]                      # drop l = 0
-    tj = np.asarray(ti)[j]; Tp = T if pair else 1
-    Rp = np.zeros((len(R), Cx, Tp)); Rp[np.arange(len(R)), :, (tj if pair else 0)] = R
-    Rp = Rp.reshape(len(R), -1)
-    w = Rp[P][:, :, None] * Rp[K][:, None, :]                              # [Q, K1, K1] (a on j, b on k)
-    contrib = np.einsum("qd,qab,ql->qdabl", d[P], w, Pl).reshape(len(P), 3, -1)
-    out = np.zeros((len(atoms), 3, contrib.shape[2]))
-    np.add.at(out, i[P], contrib)
+    i, j, d, R, P, K, Pl, starts, ends = _angular_triplets(atoms, cfg, Cx, L)
+    Pl = Pl[:, 1:]                                                        # drop l = 0
+    Rp = _species_resolved(R, np.asarray(ti)[j], T, pair)
+    w = (Rp[P][:, :, None] * Rp[K][:, None, :]).reshape(len(P), -1)       # [Q, K1·K1] (a on j, b on k)
+    wl = (w[:, :, None] * Pl[:, None, :]).reshape(len(P), -1)             # [Q, K_x], column = (a·K1 + b)·L + (l−1)
+    out = np.zeros((len(atoms), 3, wl.shape[1]))
+    for s, e in zip(starts, ends):                                        # per-centre segmented reduction
+        out[i[P[s]]] = d[P][s:e].T @ wl[s:e]
     return out

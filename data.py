@@ -502,7 +502,8 @@ def bond_geometry(d: np.ndarray, rank: int) -> np.ndarray:
     raise ValueError(f"bond rank must be 1 or 2, got {rank}")
 
 
-def _radial_weights(r, rc, C, radial, zeta, cutoff, gauss_sigma_scale) -> np.ndarray:
+def _radial_weights(r: np.ndarray, rc: float, C: int, radial: str, zeta: float,
+                    cutoff: str, gauss_sigma_scale: float) -> np.ndarray:
     """R_n(r)·f_c(r) → [P, C] (screened: [P, 1]); numpy twin of TNEP._radial/_fc."""
     if cutoff == "cosine2":
         fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
