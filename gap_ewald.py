@@ -320,3 +320,134 @@ def fit_polarise(setup: gb.Setup, split: bool = True, n_iter: int = 1, mix: floa
             return chain(frames, tis, descs, stages[:k + 1])[0]
         return predict
     return [make_predict(k) for k in range(len(stages))]
+
+
+# ── 4. charge equilibration (QEq) columns — port of ExperimentalDipoleEwald ──
+# "chi": Ṽ = −P·L⁺·v_fc, so Σ_i χ_i Ṽ_i ≡ Σ_i q_i r_i with q = −P·χ (bond
+# form, PBC-safe); one extra geometry column, χ a kernel site function.
+# "polarise": the local charges relax, δq = −P·J·q₀; in bond form every bond
+# is built on d_ij − (y_i − y_j), y = −J·Ṽ, no extra column.
+
+from ase.data import covalent_radii
+from ase.geometry import get_distances
+from scipy.special import erf
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+
+_COULOMB_EV_A = 14.399645
+
+
+def _fc_np(cutoff, r, rc):
+    if cutoff == "cosine2":
+        return ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    if cutoff == "cosine":
+        return (1.0 + np.cos(np.pi * r / rc)) / 2.0
+    if cutoff == "cubic":
+        x = r / rc; return 1.0 - 3.0 * x * x + 2.0 * x ** 3
+    if cutoff == "tanh3":
+        return np.tanh(1.0 - r / rc) ** 3 / np.tanh(1.0) ** 3
+    raise ValueError(cutoff)
+
+
+def ewald_point_matrix(positions, cell):
+    """Point-charge Ewald interaction matrix J [N, N] (1/Å), tin-foil, α = 7/h_min."""
+    cell = np.asarray(cell, float); r = np.asarray(positions, float); N = len(r)
+    V = abs(np.linalg.det(cell)); heights = 1.0 / np.linalg.norm(np.linalg.inv(cell), axis=0)
+    alpha = 7.0 / heights.min()
+    _, R = get_distances(r, cell=cell, pbc=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        J = np.where(R > 0, erfc(alpha * R) / R, 0.0)
+    B = 2.0 * np.pi * np.linalg.inv(cell).T; kmax = 8.6 * alpha
+    nmax = np.ceil(kmax * np.linalg.norm(cell, axis=1) / (2.0 * np.pi)).astype(int)
+    grids = np.meshgrid(*[np.arange(-m, m + 1) for m in nmax], indexing="ij")
+    n = np.stack([g.ravel() for g in grids], 1); n = n[np.any(n != 0, axis=1)]
+    K = n @ B; k2 = (K * K).sum(1); sel = k2 <= kmax * kmax; K, k2 = K[sel], k2[sel]
+    w = np.exp(-k2 / (4 * alpha * alpha)) / k2
+    phase = r @ K.T; c, s = np.cos(phase), np.sin(phase)
+    J += (4 * np.pi / V) * ((c * w) @ c.T + (s * w) @ s.T)
+    J[np.diag_indices(N)] -= 2 * alpha / np.sqrt(np.pi)
+    return J
+
+
+def qeq_coulomb(atoms, sigma):
+    """Gaussian-charge Coulomb matrix (eV/e²), periodic: Ewald + short-range correction."""
+    r = atoms.positions.astype(float); N = len(r)
+    gam = np.sqrt(sigma[:, None] ** 2 + sigma[None, :] ** 2)
+    J = ewald_point_matrix(r, atoms.cell.array)
+    i, j, d = neighbor_list("ijd", atoms, 3.5 * np.sqrt(2.0) * gam.max())
+    np.add.at(J, (i, j), -erfc(d / (np.sqrt(2.0) * gam[i, j])) / d)
+    J[np.diag_indices(N)] += 1.0 / (sigma * np.sqrt(np.pi))
+    return _COULOMB_EV_A * J
+
+
+def qeq_parts(atoms, ti, cfg, hardness=10.0, sigma=None):
+    """(J, Ṽ [N, 3], y [N, 3]) — Ṽ = −P·L⁺·v_fc (chi column), y = −J·Ṽ (polarise)."""
+    from TNEPconfig import resolved_dipole_cutoff
+    rc = float(cfg.dipole_rc or cfg.rcut_hard); N = len(atoms)
+    i, j, D = neighbor_list("ijD", atoms, rc)
+    keep = i != j; i, j, d = i[keep], j[keep], -D[keep].astype(float)
+    fc = _fc_np(resolved_dipole_cutoff(cfg), np.linalg.norm(d, axis=1), rc)
+    assert connected_components(coo_matrix((np.ones(len(i)), (i, j)), shape=(N, N)), directed=False)[0] == 1
+    L = np.zeros((N, N)); np.add.at(L, (i, j), -fc); L[np.diag_indices(N)] = -L.sum(1)
+    v = np.zeros((N, 3)); np.add.at(v, i, fc[:, None] * d)
+    sig = (np.asarray(sigma, float) if sigma is not None else covalent_radii[np.asarray(cfg.types)])[np.asarray(ti)]
+    J = qeq_coulomb(atoms, sig)
+    A = J + float(hardness) * np.eye(N)
+    ones = np.ones((N, 1))
+    kkt = lambda M: np.block([[M, ones], [ones.T, np.zeros((1, 1))]])
+    x = np.linalg.solve(kkt(L), np.vstack([v, np.zeros((1, 3))]))[:N]
+    Vq = -np.linalg.solve(kkt(A), np.vstack([x, np.zeros((1, 3))]))[:N]
+    return J, Vq, -(J @ Vq)
+
+
+def v_polarised(atoms, ti, cfg, y):
+    """Production geometry v_i [N, 3, K] with every bond built on d − (y_i − y_j)
+    (radial weights on the true length): V' = V − Σ_j R_n (y_i − y_j)."""
+    import data as tnep_data
+    from TNEPconfig import resolved_dipole_cutoff
+    i, j, G = tnep_data._neighbor_dipole_pairs(
+        atoms, float(cfg.dipole_rc or cfg.rcut_hard), int(cfg.dipole_channels), str(cfg.dipole_radial),
+        float(cfg.dipole_zeta), resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale), 1)
+    _, _, D = neighbor_list("ijD", atoms, float(cfg.dipole_rc or cfg.rcut_hard))
+    # recover R_n from G = d ⊗ R_n using the largest bond component
+    d = -D[(np.arange(len(D)) >= 0)]; d = d[np.linalg.norm(d, axis=1) > 0] if False else None
+    T, C = int(cfg.num_types), int(cfg.dipole_channels)
+    # G[p, :, n] = d_p R_n → R_n = G[p, a, n] / d_p[a] for the component a with max |d|
+    Gn = np.abs(G).max(axis=2)                         # [P, 3]
+    a = Gn.argmax(1)
+    dd = tnep_data._neighbor_pairs(atoms, float(cfg.dipole_rc or cfg.rcut_hard))
+    i2, j2, D2 = dd; keep = i2 != j2; d2 = -D2[keep].astype(float)
+    assert np.array_equal(i2[keep], i) and np.array_equal(j2[keep], j)
+    Rw = G[np.arange(len(G)), a, :] / d2[np.arange(len(G)), a][:, None]   # [P, C]
+    shift = (y[i] - y[j])                                                   # [P, 3]
+    Gs = G - shift[:, :, None] * Rw[:, None, :]
+    V = np.zeros((len(atoms), T, 3, C)); np.add.at(V, (i, np.asarray(ti)[j]), Gs)
+    return gd._collapse_V(V.transpose(0, 2, 3, 1), gd._pair_columns(cfg))
+
+
+def fit_with_v(setup: gb.Setup, v_fn, feature_fn=None, delta: float = 1.0):
+    """Production fit with a custom base geometry v_fn(atoms, ti) → [N, 3, K]
+    and optional extra columns feature_fn(frames, tis) → [N, 3, n_extra]."""
+    cfg = setup.cfg
+    vs = [v_fn(a, ti) for a, ti in zip(setup.frames, setup.tis)]
+    X = feature_fn(setup.frames, setup.tis) if feature_fn else [np.zeros((len(a), 3, 0)) for a in setup.frames]
+    n_extra = X[0].shape[2]
+    rms_v = np.sqrt(np.mean([(v ** 2).mean() for v in vs]))
+    scale = (delta * rms_v / np.sqrt(np.mean([(x ** 2).mean(axis=(0, 1)) for x in X], axis=0))) if n_extra else np.zeros(0)
+    K1 = setup.n_vcols + n_extra
+    factors = gd._prior_factors(cfg, [setup.sparse], setup.xis, K1)
+
+    def design(tis, descs, X, vs):
+        return np.stack([gd._phi_frame([(D, setup.sparse)], np.concatenate([v, x * scale], 2), ti, setup.xis, None, gd._deltas(cfg))
+                         for ti, D, x, v in zip(tis, descs, X, vs)]).reshape(3 * len(vs), -1)
+    Phi = design(setup.tis, setup.descs, X, vs)
+    beta = gb._solve([gd._whiten(Phi, factors, K1, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
+    alpha = gd._whiten(beta[None], factors, K1, True)[0]
+
+    def predict(frames):
+        tis, descs = setup.prep(frames)
+        v2 = [v_fn(a, ti) for a, ti in zip(frames, tis)]
+        X2 = feature_fn(frames, tis) if feature_fn else [np.zeros((len(a), 3, 0)) for a in frames]
+        return (design(tis, descs, X2, v2) @ alpha).reshape(len(frames), 3)
+    predict.n_columns = Phi.shape[1]
+    return predict

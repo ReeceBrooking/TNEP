@@ -14,3 +14,4 @@ the repo root (`python diagnostics/gap_experiments/<script>.py`), output in
 | gap_variants.py | μ: bilinear ALS, antisymmetric bond kernel | ALS degrades val; bond kernel ≤ 2% gain |
 | gap_ewald_scan*.py | μ: Ewald field column, φ product kernel, near/far split | field column 1.56 → 1.17 (1.08 on 500 frames); near-only or far-only ≈ 0 gain; φ kernel harmful |
 | gap_polarise.py | μ: self-consistent induced-dipole field | see memory notes |
+| gap_qeq_scan.py | μ: QEq "chi" column (Ṽ = −P·L⁺·v_fc, identity verified 1e-14 on a cluster) and "polarise" kernel, ± field column | chi 1.69–1.70 at H = 5/10/20 (baseline 1.67), chi+field 1.19 vs field 1.17; polarise 4.85 (H=10) / 3.59 (H=40), harmful |
