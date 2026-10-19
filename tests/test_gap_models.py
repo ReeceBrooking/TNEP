@@ -83,3 +83,38 @@ def test_three_body_descriptor_matches_triplet_loop_and_symmetries():
     assert np.allclose(gm.three_body_descriptor(_moved(at, shift=[1.0, -2.0, 0.5]), ti, cfg), q, atol=1e-6)
     assert np.allclose(gm.two_body_descriptor(_moved(at, R3, [0.3, 0.3, 0.3]), ti, cfg),
                        gm.two_body_descriptor(at, ti, cfg), atol=1e-6)
+
+
+def test_angular_cross_tensor_l0_equals_existing_cross_group_and_is_covariant():
+    import gap_dipole
+    cfg, at, ti = _setup(target_mode=2, gap_cross_channels=2, gap_cross_lmax=0)
+    W = gm.angular_cross_tensor(at, ti, cfg)                 # [N, 6, K1(K1+1)/2]
+    X = gap_dipole._cross_group(at, ti, cfg)                 # sym(v⊗v), traceless
+    # v⊗v = Σ_{j,k} d_j d_k (INCLUDING j = k); the l=0 angular kernel excludes
+    # j = k, so add the bond-axis part back: Σ_j R_a R_b (d_j d_jᵀ)_traceless.
+    i, j, d, R = gm._site_pairs(at, cfg, 2)
+    tj = ti[j]; Rp = np.zeros((len(R), 2, 2)); Rp[np.arange(len(R)), :, tj] = R; Rp = Rp.reshape(len(R), -1)
+    au, bu = np.triu_indices(Rp.shape[1])
+    dd = d[:, :, None] * d[:, None, :]; tr = np.trace(dd, axis1=1, axis2=2) / 3
+    for k in range(3): dd[:, k, k] -= tr
+    voigt = np.stack([dd[:, 0, 0], dd[:, 1, 1], dd[:, 2, 2], dd[:, 0, 1], dd[:, 1, 2], dd[:, 2, 0]], 1)
+    diag = np.zeros_like(W); np.add.at(diag, i, voigt[:, :, None] * (Rp[:, au] * Rp[:, bu])[:, None, :])
+    assert np.allclose(W + diag, X, atol=1e-5 * np.abs(X).max())
+    # covariance: W(Rx) = R W Rᵀ per site; translation invariance
+    R3 = _rot(0.4, 0.9, -0.7)
+    W2 = gm.angular_cross_tensor(_moved(at, R3), ti, cfg)
+    def mat(v): return np.array([[v[0], v[3], v[5]], [v[3], v[1], v[4]], [v[5], v[4], v[2]]])
+    for n in (0, 7, 50):
+        for c in range(W.shape[2]):
+            assert np.allclose(mat(W2[n, :, c]), R3 @ mat(W[n, :, c]) @ R3.T, atol=1e-5 * np.abs(W).max())
+    assert np.allclose(gm.angular_cross_tensor(_moved(at, shift=[2, 1, -1]), ti, cfg), W, atol=1e-6 * np.abs(W).max())
+
+
+def test_angular_cross_vector_is_odd_and_covariant():
+    cfg, at, ti = _setup(target_mode=1, gap_cross_channels=2, gap_cross_lmax=2)
+    w = gm.angular_cross_vector(at, ti, cfg)                 # [N, 3, K1²·2]
+    assert w.shape[2] == 16 * 2
+    R3 = _rot(0.2, 0.5, 0.8)
+    w2 = gm.angular_cross_vector(_moved(at, R3), ti, cfg)
+    assert np.allclose(w2, np.einsum("ab,nbk->nak", R3, w), atol=1e-5 * np.abs(w).max())
+    assert np.allclose(gm.angular_cross_vector(_moved(at, -np.eye(3)), ti, cfg), -w, atol=1e-5 * np.abs(w).max())   # odd
