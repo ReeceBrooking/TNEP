@@ -150,6 +150,22 @@ def _validate(cfg: GAPconfig) -> None:
         # from an image-exact neighbour list, so r_c > rcut_hard is legal.
         (0.0 < float(cfg.dipole_rc or cfg.rcut_hard),
          f"dipole_rc must be > 0, got {cfg.dipole_rc}"),
+        (bool(cfg.gap_site_models) and set(cfg.gap_site_models) <= {"soap", "2b", "3b"},
+         f"gap_site_models must be a non-empty subset of soap/2b/3b, got {cfg.gap_site_models!r}"),
+        (set(cfg.gap_site_models) <= set(cfg.gap_model_delta)
+         and all(float(cfg.gap_model_delta[m]) > 0 for m in cfg.gap_site_models),
+         "gap_model_delta needs a positive entry for every entry of gap_site_models"),
+        (int(cfg.gap_site_channels) >= 1 and int(cfg.gap_site_lmax) >= 0,
+         "gap_site_channels >= 1 and gap_site_lmax >= 0 required"),
+        (int(cfg.gap_cross_lmax) >= 0, "gap_cross_lmax must be >= 0"),
+        ("3b" not in cfg.gap_site_models or int(cfg.gap_cross_channels) >= 1,
+         "the 3b site model reads out through the angular kernel: gap_cross_channels >= 1 required"),
+        ("3b" not in cfg.gap_site_models or int(cfg.target_mode) == 2 or int(cfg.gap_cross_lmax) >= 1,
+         "3b dipole kernel needs gap_cross_lmax >= 1 (l = 0 collapses to the one-hop basis)"),
+        (set(cfg.gap_site_models) <= {"soap"} or cfg.dipole_radial != "screened",
+         "2b/3b site models need a multi-channel radial (screened is single-channel)"),
+        (not (cfg.gap_2b or cfg.gap_3b) or list(cfg.gap_site_models)[:1] == ["soap"],
+         "the TurboGAP 2b/3b tails read out through the bond basis of the first (soap) site model"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     if bad:

@@ -502,7 +502,9 @@ def test_configs_are_independent():
     gap_only = {"descriptor_self_batch_size", "gap_delta_soap",
                 "gap_delta_2b", "gap_delta_3b", "gap_sigma", "gap_sparse_jitter",
                 # polarisability kernel-group knobs of the linear fit
-                "gap_group_delta", "gap_lambda_shear", "gap_cross_channels"}
+                "gap_group_delta", "gap_lambda_shear", "gap_cross_channels",
+                "gap_site_models", "gap_model_delta", "gap_site_channels",
+                "gap_site_lmax", "gap_cross_lmax"}
     missing = (set(GAPconfig.__annotations__)
                - set(TNEPconfig.__annotations__) - gap_only)
     assert not missing, missing
@@ -663,3 +665,27 @@ def test_dipole_cross_group_identity_and_fit(tmp_path):
         m = gap_dipole.fit_gap_dipole(_cfg(**CHEB_PAIRS, gap_cross_channels=2,
                                            gap_sparse_per_species=6))
     assert gap_dipole.predict(m, [at]).shape == (1, 3)
+
+
+# ── site models (gap_site_models) ───────────────────────────────────────────
+
+def test_site_model_fields_are_gap_only_and_validated():
+    from TNEPconfig import GAPconfig, TNEPconfig
+    for f in ("gap_site_models", "gap_model_delta", "gap_site_channels", "gap_site_lmax", "gap_cross_lmax"):
+        assert hasattr(GAPconfig, f) and not hasattr(TNEPconfig, f)
+    assert GAPconfig.gap_site_models == ["soap"]            # default = today's model
+    with pytest.raises(ValueError, match="gap_site_models"):
+        gap_dipole._validate(_cfg(gap_site_models=["soap", "4b"]))
+    with pytest.raises(ValueError, match="gap_site_models"):
+        gap_dipole._validate(_cfg(gap_site_models=[]))
+    with pytest.raises(ValueError, match="gap_model_delta"):
+        gap_dipole._validate(_cfg(gap_site_models=["soap", "2b"], gap_model_delta={"soap": 1.0}))
+    with pytest.raises(ValueError, match="gap_cross_lmax"):
+        gap_dipole._validate(_cfg(gap_site_models=["3b"], gap_cross_lmax=-1))
+    with pytest.raises(ValueError, match="gap_cross_channels"):
+        gap_dipole._validate(_cfg(gap_site_models=["3b"], dipole_radial="chebyshev", dipole_channels=3))
+    with pytest.raises(ValueError, match="multi-channel radial"):
+        gap_dipole._validate(_cfg(gap_site_models=["2b"]))          # _cfg default radial is "screened"
+    gap_dipole._validate(_cfg(gap_site_models=["soap", "2b", "3b"], dipole_radial="chebyshev",
+                              dipole_channels=3, gap_cross_channels=2,
+                              gap_model_delta={"soap": 1.0, "2b": 0.5, "3b": 0.1}))

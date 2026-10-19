@@ -752,6 +752,27 @@ class GAPconfig:
     #                  bond-angle charge flux the one-hop difference form
     #                  cannot carry. 0 = off.
     gap_cross_channels: int = 0
+    # --- site models (GAP only): a kernel per body order, summed ------------
+    # Each entry is a site function s_i = Σ_m α_m (D̂_i·D̂_m)^ξ on ITS OWN
+    # descriptor with its own FPS sparse set and K_MM prior (never mixed):
+    #   "soap" : the SOAP power spectrum (today's model)
+    #   "2b"   : radial distribution q_n^{t'} = Σ_{j∈t'} R_n(r_ij)   (gap_models)
+    #   "3b"   : angular power spectrum q_{nn'l}^{t't''} =
+    #            Σ_{j∈t',k∈t''} R_n(r_ij) R_n'(r_ik) P_l(cos θ_jik)
+    # "soap" and "2b" read out through the bond basis (+ field channel);
+    # "3b" through its own angular kernel (gap_cross_lmax) — the only way a
+    # three-body model keeps an uncontracted bond vector (equivariance).
+    gap_site_models: list[str] = ["soap"]
+    # Relative amplitude δ per site model (multiplies gap_delta_soap); the
+    # prior std of that model's site function. Keys must cover gap_site_models.
+    gap_model_delta: dict = {"soap": 1.0, "2b": 1.0, "3b": 1.0}
+    # Radial channels C and Legendre order L of the 2b/3b DESCRIPTORS (the
+    # readout channels stay dipole_channels). Width: 2b T·C, 3b T(T+1)/2·C²·(L+1).
+    gap_site_channels: int = 6
+    gap_site_lmax: int = 2
+    # Legendre order of the 3b model's angular kernel: channels (a ≤ b, l),
+    # l = 0..gap_cross_lmax; l = 0 is the existing sym(v⊗v) cross group.
+    gap_cross_lmax: int = 1
     # Regularisation, as gap_fit: the expected ABSOLUTE error of a dipole
     # component per √atom (gap_fit's default_sigma with
     # sigma_per_atom=T: σ_obs = gap_sigma·√N_atoms), and the jitter added to
