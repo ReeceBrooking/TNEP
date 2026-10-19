@@ -537,10 +537,12 @@ def _phi_frame(scales: list, ti: np.ndarray, xis: tuple[int, ...],
                 out.append((len(Dm) * k, chol(dm ** 2 * base ** xi)))
 ```
 
-and the TurboGAP 2b/3b tails take the bond-basis width as an explicit argument,
-`_prior_factors(cfg, scale_sparse, xis, tail_vcols)` (= `_n_vcols(cfg)`, the width of the
-bond basis `v` those tails read out through — NOT `scale_sparse[0][2]`, which is the
-first site model's width and differs when "soap" is not first).
+and the TurboGAP 2b/3b tails take the bond-basis width as an explicit keyword,
+`_prior_factors(cfg, scale_sparse, xis, tail_vcols: int | None = None)` (= `_n_vcols(cfg)`,
+the width of the bond basis `v` those tails read out through — NOT `scale_sparse[0][2]`,
+which is the first site model's width and differs when "soap" is not first). `tail_vcols`
+is required (assert not None) only when `cfg.gap_2b or cfg.gap_3b`; the Step 1 test calls
+with three arguments and no tails.
 
 `_whiten(X, factors, solve_with_transpose)` — exactly three positional arguments,
 width per block derived as `k = n // len(L)`. Do **not** add a fourth positional: the
@@ -633,7 +635,17 @@ as **read-only properties** returning the `"soap"` entries so every existing rea
 with `replace(base, alpha=[…])` (`tests/test_gap_dipole.py:179, 527`,
 `tests/test_gap_descriptor.py:653`) change to `replace(base, site_alpha={**base.site_alpha, "soap": […]})`.
 The `gap_extra_rcut` second SOAP scale keeps its own fields (`builder2`, `sparse_desc2`,
-`alpha2`) and is appended to `scales` after the site models, exactly as today. Legacy
+`alpha2`) and is appended to `scales` after the site models, exactly as today.
+
+Block bookkeeping must become per-model: in `fit_gap_dipole` replace the single-width
+`sizes`/`blocks` (today `blocks = [n·len(xis)·n_vcols for sz in sizes for n in sz]`) by
+`blocks = [len(Dm)·len(xis)·K_m for each site model m, for each species] + [len(Dm)·len(xis)·n_vcols
+for the extra-rcut scale, if any] + tails`, with `K_m = geom_m[0].shape[2]`; the run record's
+`M_per_species` comes from the FIRST site model's sparse sizes and `M_per_species_2` is
+gated on `sparse_desc2 is not None` (not on `len(sizes) > 1`, which is now true for any two
+site models). `fit`, `predict` and the record must never read `model.alpha`/`model.sparse_desc`
+(the "soap" properties raise `KeyError` for a model without "soap", e.g. the 3b-alone test);
+they iterate `site_sparse`/`site_alpha` by model name. Legacy
 identity ("soap" alone == today's model) is pinned by the existing suites passing after
 Task 4/5 (α-hash and explicit-loop tests); no separate test is needed. Add the descriptor/geometry dispatch:
 
