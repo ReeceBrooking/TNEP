@@ -502,24 +502,8 @@ def bond_geometry(d: np.ndarray, rank: int) -> np.ndarray:
     raise ValueError(f"bond rank must be 1 or 2, got {rank}")
 
 
-def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
-                           zeta: float, cutoff: str, gauss_sigma_scale: float,
-                           rank: int = 1):
-    """Ordered neighbor pairs of the neighbor-basis readout: (i, j, G) with
-    G[p] = R_n(|d|)·g(d) [P, D, G·C] (channel = group·C + n, groups and D per
-    bond_geometry(d, rank)), d = r_i − r_j (image pairs, self-images
-    dropped). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
-    "chebyshev_warped" T_n(2(r/rc − 1)² − 1)·f_c, "gaussian"
-    exp(−(r − μ_n)²/2σ²)·f_c (μ_n interior points of linspace(0, rc, C+2),
-    σ = gauss_sigma_scale·rc/(C+1)), or "screened" r^(ζ−1)·f_c. f_c per
-    `cutoff` — "cosine2" ((1+cos(πr/rc))/2)², "cosine" (1+cos(πr/rc))/2,
-    "cubic" 1 − 3x² + 2x³, x = r/rc, or "tanh3" tanh³(1 − r/rc)/tanh³(1)
-    (numpy twin of TNEP._radial/_fc; pairs are filtered before the power,
-    so no r=0 guard). float64 throughout; callers cast."""
-    i, j, D = _neighbor_pairs(atoms, rc)
-    keep = i != j                                  # drop self-image pairs
-    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
-    r = np.linalg.norm(d, axis=1)
+def _radial_weights(r, rc, C, radial, zeta, cutoff, gauss_sigma_scale) -> np.ndarray:
+    """R_n(r)·f_c(r) → [P, C] (screened: [P, 1]); numpy twin of TNEP._radial/_fc."""
     if cutoff == "cosine2":
         fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
     elif cutoff == "cosine":
@@ -548,6 +532,28 @@ def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
         Rw = np.sin(np.pi * n1[None, :] * r[:, None] / rc) / (r[:, None] / rc) * fc[:, None]
     else:
         raise ValueError(f"unknown dipole_radial {radial!r}")
+    return Rw
+
+
+def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
+                           zeta: float, cutoff: str, gauss_sigma_scale: float,
+                           rank: int = 1):
+    """Ordered neighbor pairs of the neighbor-basis readout: (i, j, G) with
+    G[p] = R_n(|d|)·g(d) [P, D, G·C] (channel = group·C + n, groups and D per
+    bond_geometry(d, rank)), d = r_i − r_j (image pairs, self-images
+    dropped). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
+    "chebyshev_warped" T_n(2(r/rc − 1)² − 1)·f_c, "gaussian"
+    exp(−(r − μ_n)²/2σ²)·f_c (μ_n interior points of linspace(0, rc, C+2),
+    σ = gauss_sigma_scale·rc/(C+1)), or "screened" r^(ζ−1)·f_c. f_c per
+    `cutoff` — "cosine2" ((1+cos(πr/rc))/2)², "cosine" (1+cos(πr/rc))/2,
+    "cubic" 1 − 3x² + 2x³, x = r/rc, or "tanh3" tanh³(1 − r/rc)/tanh³(1)
+    (numpy twin of TNEP._radial/_fc; pairs are filtered before the power,
+    so no r=0 guard). float64 throughout; callers cast."""
+    i, j, D = _neighbor_pairs(atoms, rc)
+    keep = i != j                                  # drop self-image pairs
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
+    r = np.linalg.norm(d, axis=1)
+    Rw = _radial_weights(r, rc, C, radial, zeta, cutoff, gauss_sigma_scale)
     g = bond_geometry(d, rank)                                # [P, D, G]
     P_, D_, G_ = g.shape
     return i, j, np.einsum("pdg,pn->pdgn", g, Rw).reshape(P_, D_, G_ * Rw.shape[1])
