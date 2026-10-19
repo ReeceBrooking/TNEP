@@ -65,7 +65,7 @@ def _triplets(i):
     by centre (i[order][P] is non-decreasing)."""
     order = np.argsort(i, kind="stable"); i = i[order]
     starts = np.flatnonzero(np.r_[True, i[1:] != i[:-1]]); ends = np.r_[starts[1:], len(i)]
-    P, K = [], []
+    P, K = [np.zeros(0, dtype=np.int64)], [np.zeros(0, dtype=np.int64)]   # keeps concatenate happy when there are no pairs
     for s, e in zip(starts, ends):
         idx = np.arange(s, e); pp, kk = np.meshgrid(idx, idx, indexing="ij")
         m = pp != kk; P.append(pp[m]); K.append(kk[m])
@@ -85,8 +85,11 @@ def _angular_triplets(atoms: Atoms, cfg: GAPconfig, C: int, L: int):
     r = np.linalg.norm(d, axis=1)
     cos = np.einsum("pd,pd->p", d[P], d[K]) / (r[P] * r[K])
     Pl = legendre(np.clip(cos, -1.0, 1.0), L)                           # [Q, L+1]
-    ic = i[P]
-    starts = np.flatnonzero(np.r_[True, ic[1:] != ic[:-1]]); ends = np.r_[starts[1:], len(P)]
+    if len(P) == 0:                                                       # no centre with ≥ 2 neighbours
+        starts = ends = np.zeros(0, dtype=np.int64)
+    else:
+        ic = i[P]
+        starts = np.flatnonzero(np.r_[True, ic[1:] != ic[:-1]]); ends = np.r_[starts[1:], len(P)]
     return i, j, d, R, P, K, Pl, starts, ends
 
 
@@ -107,8 +110,8 @@ def three_body_descriptor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nd
     Q = len(P)
     slot = pair_index(T)[np.asarray(ti)[j[P]], np.asarray(ti)[j[K]]]
     Pls = np.zeros((Q, S, L + 1)); Pls[np.arange(Q), slot] = Pl         # Legendre in its species slot
-    Pls = Pls.reshape(Q, -1)                                              # [Q, S·(L+1)]
-    RR = (R[P][:, :, None] * R[K][:, None, :]).reshape(Q, -1)             # [Q, C·C]
+    Pls = Pls.reshape(Q, S * (L + 1))
+    RR = (R[P][:, :, None] * R[K][:, None, :]).reshape(Q, C * C)
     q = np.zeros((N, C * C, S * (L + 1)))
     for s, e in zip(starts, ends):                                        # per-centre segmented reduction
         q[i[P[s]]] = RR[s:e].T @ Pls[s:e]
@@ -126,12 +129,13 @@ def angular_cross_tensor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nda
     i, j, d, R, P, K, Pl, starts, ends = _angular_triplets(atoms, cfg, Cx, L)
     Rp = _species_resolved(R, np.asarray(ti)[j], T, pair)                 # [P, K1]
     au, bu = np.triu_indices(Rp.shape[1])
-    S = 0.5 * (d[P][:, :, None] * d[K][:, None, :] + d[K][:, :, None] * d[P][:, None, :])   # [Q, 3, 3]
+    Q, dP, dK = len(P), d[P], d[K]
+    S = 0.5 * (dP[:, :, None] * dK[:, None, :] + dK[:, :, None] * dP[:, None, :])          # [Q, 3, 3]
     tr = np.trace(S, axis1=1, axis2=2) / 3.0
     S[:, 0, 0] -= tr; S[:, 1, 1] -= tr; S[:, 2, 2] -= tr
     voigt = np.stack([S[:, 0, 0], S[:, 1, 1], S[:, 2, 2], S[:, 0, 1], S[:, 1, 2], S[:, 2, 0]], 1)
     w = 0.5 * (Rp[P][:, au] * Rp[K][:, bu] + Rp[P][:, bu] * Rp[K][:, au])    # [Q, K1(K1+1)/2] symmetric in a↔b
-    wl = (w[:, :, None] * Pl[:, None, :]).reshape(len(P), -1)             # [Q, K_x], column = c·(L+1) + l
+    wl = (w[:, :, None] * Pl[:, None, :]).reshape(Q, len(au) * (L + 1))   # [Q, K_x], column = c·(L+1) + l
     W = np.zeros((len(atoms), 6, wl.shape[1]))
     for s, e in zip(starts, ends):                                        # per-centre segmented reduction
         W[i[P[s]]] = voigt[s:e].T @ wl[s:e]
@@ -146,9 +150,10 @@ def angular_cross_vector(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nda
     i, j, d, R, P, K, Pl, starts, ends = _angular_triplets(atoms, cfg, Cx, L)
     Pl = Pl[:, 1:]                                                        # drop l = 0
     Rp = _species_resolved(R, np.asarray(ti)[j], T, pair)
-    w = (Rp[P][:, :, None] * Rp[K][:, None, :]).reshape(len(P), -1)       # [Q, K1·K1] (a on j, b on k)
-    wl = (w[:, :, None] * Pl[:, None, :]).reshape(len(P), -1)             # [Q, K_x], column = (a·K1 + b)·L + (l−1)
+    Q, K1, dP = len(P), Rp.shape[1], d[P]
+    w = (Rp[P][:, :, None] * Rp[K][:, None, :]).reshape(Q, K1 * K1)       # [Q, K1·K1] (a on j, b on k)
+    wl = (w[:, :, None] * Pl[:, None, :]).reshape(Q, K1 * K1 * L)         # [Q, K_x], column = (a·K1 + b)·L + (l−1)
     out = np.zeros((len(atoms), 3, wl.shape[1]))
     for s, e in zip(starts, ends):                                        # per-centre segmented reduction
-        out[i[P[s]]] = d[P][s:e].T @ wl[s:e]
+        out[i[P[s]]] = dP[s:e].T @ wl[s:e]
     return out

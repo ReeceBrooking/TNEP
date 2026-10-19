@@ -118,3 +118,20 @@ def test_angular_cross_vector_is_odd_and_covariant():
     w2 = gm.angular_cross_vector(_moved(at, R3), ti, cfg)
     assert np.allclose(w2, np.einsum("ab,nbk->nak", R3, w), atol=1e-5 * np.abs(w).max())
     assert np.allclose(gm.angular_cross_vector(_moved(at, -np.eye(3)), ti, cfg), -w, atol=1e-5 * np.abs(w).max())   # odd
+
+
+def test_no_triplets_gives_zero_angular_outputs():
+    """A dimer has no centre with two neighbours: 3b descriptor and angular
+    kernels must come back as correctly shaped zeros, the 2b descriptor intact."""
+    from ase import Atoms
+    cfg, _, _ = _setup(gap_cross_channels=2, gap_cross_lmax=1)
+    at = Atoms("OH", positions=[[10.0, 10.0, 10.0], [10.97, 10.0, 10.0]], cell=[20.0] * 3, pbc=True)
+    ti = np.array([0, 1])
+    q3 = gm.three_body_descriptor(at, ti, cfg)
+    assert q3.shape == (2, 3 * 9 * 3) and not q3.any()
+    W = gm.angular_cross_tensor(at, ti, cfg)
+    assert W.shape == (2, 6, 10 * 2) and not W.any()
+    w = gm.angular_cross_vector(at, ti, cfg)
+    assert w.shape == (2, 3, 16 * 1) and not w.any()
+    q2 = gm.two_body_descriptor(at, ti, cfg)
+    assert np.isfinite(q2).all() and np.allclose(np.linalg.norm(q2, axis=1), 1.0)
