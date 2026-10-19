@@ -420,12 +420,12 @@ def test_run_record(tmp_path):
     assert rec["config"]["gap_sigma"] == 1e-3 and rec["gap"]["sigma"] == 1e-3
     assert rec["gap"]["sparse_jitter"] == 1e-10
     assert rec["gap"]["sparse_per_species"] == 10
-    assert set(rec["gap"]["M_per_species"]) == {"8", "1"}
+    assert set(rec["gap"]["M_per_species"]["soap"]) == {"8", "1"}
     assert rec["gap"]["radial"] == "screened"
     assert rec["gap"]["cutoff"] == "cubic"
     assert rec["gap"]["channels"] == 1
     assert rec["gap"]["pair_columns"] is False
-    assert rec["gap"]["n_columns"] == sum(rec["gap"]["M_per_species"].values())
+    assert rec["gap"]["n_columns"] == sum(rec["gap"]["M_per_species"]["soap"].values())
     for key in ("train_rmse", "train_r2", "fit_seconds"):
         assert key in rec["metrics"]
 
@@ -731,8 +731,9 @@ def test_phi_frame_accepts_per_scale_geometry_and_widths():
 
 # ── summed site models (soap / 2b / 3b) ─────────────────────────────────────
 
-POL_SITE = dict(target_mode=2, dipole_radial="chebyshev", dipole_channels=3, dipole_cutoff="cosine2",
-                dipole_species_pairs="symmetric", gap_site_channels=3, gap_site_lmax=1, gap_cross_channels=2, gap_cross_lmax=1)
+POL_SITE = dict(target_mode=2, dipole_radial="chebyshev", dipole_channels=3,
+                dipole_cutoff="cosine2", dipole_species_pairs="symmetric",
+                gap_site_channels=3, gap_site_lmax=1, gap_cross_channels=2, gap_cross_lmax=1)
 
 
 def test_site_models_column_count_and_exact_recovery(tmp_path):
@@ -740,10 +741,12 @@ def test_site_models_column_count_and_exact_recovery(tmp_path):
     columns each), 3b through its angular kernel (K_x columns); a known α*
     is recovered exactly from synthetic labels."""
     frames = read(WATER_XYZ, index="0:6")
-    for f in frames: f.calc = None
+    for f in frames:
+        f.calc = None
     p0 = str(tmp_path / "pol0.xyz"); write(p0, frames)
     kw = dict(POL_SITE, total_N=None, gap_sparse_per_species=6, gap_sigma=1e-7,
-              gap_site_models=["soap", "2b", "3b"], gap_model_delta={"soap": 1.0, "2b": 0.7, "3b": 0.3})
+              gap_site_models=["soap", "2b", "3b"],
+              gap_model_delta={"soap": 1.0, "2b": 0.7, "3b": 0.3})
     with _chdir(tmp_path):
         base = gap_dipole.fit_gap_dipole(_cfg(data_path=p0, **kw))
     T, C, Cx, L = 2, 3, 2, 1
@@ -753,18 +756,21 @@ def test_site_models_column_count_and_exact_recovery(tmp_path):
     assert [a.size for a in base.site_alpha["2b"]] == [6 * K_b] * T
     assert [a.size for a in base.site_alpha["3b"]] == [6 * K_x] * T
     rng = np.random.default_rng(0)
-    star = replace(base, site_alpha={m: [rng.normal(size=a.size) for a in al] for m, al in base.site_alpha.items()})
+    star = replace(base, site_alpha={m: [rng.normal(size=a.size) for a in al]
+                                     for m, al in base.site_alpha.items()})
     a_star = gap_dipole.predict(star, frames)
     for f, a in zip(frames, a_star): f.info["pol"] = a
     p1 = str(tmp_path / "pol1.xyz"); write(p1, frames)
     with _chdir(tmp_path):
         refit = gap_dipole.fit_gap_dipole(_cfg(data_path=p1, **kw))
-    assert np.allclose(gap_dipole.predict(refit, frames), a_star, atol=1e-8 * max(np.abs(a_star).max(), 1.0))
+    assert np.allclose(gap_dipole.predict(refit, frames), a_star,
+                       atol=1e-8 * max(np.abs(a_star).max(), 1.0))
 
 
 def test_site_models_3b_alone_dipole_runs_and_record(tmp_path):
     with _chdir(tmp_path):
-        m = gap_dipole.fit_gap_dipole(_cfg(**CHEB_PAIRS, gap_site_models=["3b"], gap_cross_channels=2, gap_cross_lmax=2,
+        m = gap_dipole.fit_gap_dipole(_cfg(**CHEB_PAIRS, gap_site_models=["3b"],
+                                           gap_cross_channels=2, gap_cross_lmax=2,
                                            gap_sparse_per_species=6))
         rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
     assert rec["gap"]["site_models"] == ["3b"] and set(m.site_alpha) == {"3b"}
