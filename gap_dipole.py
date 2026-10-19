@@ -333,13 +333,13 @@ def _phi_frame(scales: list, ti: np.ndarray, xis: tuple[int, ...],
     gap3b (species → (s, k)) — Σ_{i∈t} q[i, s]·v[i, x, k] — i.e. the 2b/3b
     site energies with a linear readout, μ-weighted by the bond basis `v`.
 
-    deltas = (δ_soap, δ_2b, δ_3b): the 2b/3b kernels carry δ², as in gap.f90
-    (`delta**2 * alphas * kernel`) and gap_fit's covariance — so the columns
-    here are δ²·k and the coefficients α are in gap_fit's convention. Each
-    model's δ comes from its scales entry (callers pass δ_soap for SOAP). The
-    same δ² sits on the sparse-sparse kernel K_MM that regularises the fit
-    (_prior_factors), which is what makes δ² the prior variance of that
-    term's site function."""
+    deltas = (ignored, δ_2b, δ_3b): a model's δ comes ONLY from its scales
+    entry; deltas[0] is kept for call-site symmetry with _deltas(cfg). The
+    2b/3b kernels carry δ², as in gap.f90 (`delta**2 * alphas * kernel`) and
+    gap_fit's covariance — so the columns here are δ²·k and the coefficients
+    α are in gap_fit's convention. The same δ² sits on the sparse-sparse
+    kernel K_MM that regularises the fit (_prior_factors), which is what
+    makes δ² the prior variance of that term's site function."""
     _, d_2b, d_3b = (float(d) for d in deltas)
     cols = []
     for D, sparse_desc, vm, dm in scales:
@@ -351,6 +351,8 @@ def _phi_frame(scales: list, ti: np.ndarray, xis: tuple[int, ...],
             for xi in xis:
                 cols.append(dm ** 2 * np.einsum("nm,nxk->xmk", G ** xi, vt)
                             .reshape(n_rows, -1))       # [D, M_t·K]
+    assert v is not None or not any(q is not None for q in (gap_q or ())), \
+        "_phi_frame: the TurboGAP tails need v (the bond basis)"
     for q, d_q in zip(gap_q or (), (d_2b, d_3b)):
         if q is not None:
             # scales[0][1] is the first model's sparse list: exactly one entry
@@ -741,13 +743,14 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
         model.alpha + list(model.alpha2 or []) + list(model.alpha_gap2b or [])
         + list(model.alpha_gap3b or []))
     deltas = _deltas(cfg)
+    d_soap = deltas[0]
     out = None
     for f, (atoms, ti, D) in enumerate(zip(frames, tis, descs)):
         ti = np.asarray(ti)
         v = _v_atoms(atoms, ti, cfg)
-        scales = [(D, model.sparse_desc, v, deltas[0])]
+        scales = [(D, model.sparse_desc, v, d_soap)]
         if descs2 is not None:
-            scales.append((descs2[f], model.sparse_desc2, v, deltas[0]))
+            scales.append((descs2[f], model.sparse_desc2, v, d_soap))
         row = _phi_frame(scales, ti, model.xi,
                          _gap_q(atoms, ti, cfg), deltas, v=v) @ alpha_flat
         if out is None:

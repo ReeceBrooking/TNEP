@@ -704,8 +704,11 @@ def test_phi_frame_accepts_per_scale_geometry_and_widths():
     one = gap_dipole._phi_frame([(D, sparse, v3, 1.0)], ti, (2,))
     two = gap_dipole._phi_frame([(D, sparse, v3, 1.0), (D, sparse, v3, 1.0)], ti, (2,))
     assert two.shape[1] == 2 * one.shape[1] and np.allclose(two[:, :one.shape[1]], one)
+    assert np.allclose(two[:, one.shape[1]:], one)
     mixed = gap_dipole._phi_frame([(D, sparse, v3, 1.0), (D, sparse, v7, 0.5)], ti, (2,))
     assert mixed.shape[1] == 6 * 4 + 6 * 7
+    mixed1 = gap_dipole._phi_frame([(D, sparse, v3, 1.0), (D, sparse, v7, 1.0)], ti, (2,))
+    assert np.allclose(mixed[:, 6 * 4:], 0.25 * mixed1[:, 6 * 4:])     # δ² on the v7 block only
     cfg = _cfg(); cfg.types, cfg.num_types = [8, 1], 2
     factors = gap_dipole._prior_factors(cfg, [(sparse, 1.0, 4), (sparse, 0.5, 7)], (2,))
     assert [n for n, _ in factors] == [12, 12, 21, 21]
@@ -717,3 +720,9 @@ def test_phi_frame_accepts_per_scale_geometry_and_widths():
         back[:, off:off + n] = np.einsum("rmk,mn->rnk", Xw[:, off:off + n].reshape(5, M, k), L.T).reshape(5, n)
         off += n
     assert np.allclose(back, X)
+    beta = rng.normal(size=mixed.shape[1]); alpha = gap_dipole._whiten(beta[None], factors, True)[0]
+    off = 0
+    for n, L in factors:                                           # transpose branch: α = L⁻ᵀβ per block
+        M = len(L); k = n // M
+        assert np.allclose(alpha[off:off + n], np.linalg.solve(L.T, beta[off:off + n].reshape(M, k)).reshape(n))
+        off += n

@@ -741,11 +741,12 @@ def test_gap_deltas_scale_blocks_and_shift_influence(tmp_path):
     # 2. fit/predict consistency at non-unit δ: predict rebuilds the design
     #    itself, so a mismatch in the column scaling shows up here.
     m = _fit(gap_delta_2b=3.0, gap_delta_3b=0.5, gap_delta_soap=2.0)
-    Phi = np.stack([gd_fit._phi_frame(
-        [(gd_fit._descriptors(m.builder, [at])[0], m.sparse_desc, v, gd_fit._deltas(m.cfg)[0])],
-        np.asarray(ti), m.xi, gd_fit._gap_q(at, np.asarray(ti), m.cfg), gd_fit._deltas(m.cfg), v=v)
-        for at, ti in zip(frames, assign_type_indices(frames, m.cfg.types))
-        for v in (gd_fit._v_atoms(at, np.asarray(ti), m.cfg),)])
+    def _phi(at, ti):
+        ti = np.asarray(ti); v = gd_fit._v_atoms(at, ti, m.cfg)
+        return gd_fit._phi_frame(
+            [(gd_fit._descriptors(m.builder, [at])[0], m.sparse_desc, v, gd_fit._deltas(m.cfg)[0])],
+            ti, m.xi, gd_fit._gap_q(at, ti, m.cfg), gd_fit._deltas(m.cfg), v=v)
+    Phi = np.stack([_phi(at, ti) for at, ti in zip(frames, assign_type_indices(frames, m.cfg.types))])
     alpha = np.concatenate([a for a in (m.alpha, m.alpha2, m.alpha_gap2b,
                                         m.alpha_gap3b) if a is not None
                             for a in a])
