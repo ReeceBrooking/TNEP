@@ -66,7 +66,8 @@ class Setup:
             self.sparse.append(Dt[idx].copy()); self.sparse_idx.append(idx)
         self.xis = gd._xi_tuple(cfg)
         self.n_vcols = gd._n_vcols(cfg)
-        self.base_factors = gd._prior_factors(cfg, [self.sparse], self.xis, self.n_vcols)
+        self.base_factors = gd._prior_factors(cfg, [(self.sparse, gd._deltas(cfg)[0], self.n_vcols)],
+                                              self.xis, self.n_vcols)
         self.n_base = sum(n for n, _ in self.base_factors)
 
     def prep(self, frames: list[Atoms]):
@@ -77,7 +78,8 @@ class Setup:
         """[3, n_base] production design block (optionally with a custom geometry v)."""
         if v is None:
             v = gd._v_atoms(atoms, ti, self.cfg)
-        return gd._phi_frame([(D, self.sparse)], v, ti, self.xis, None, gd._deltas(self.cfg))
+        deltas = gd._deltas(self.cfg)
+        return gd._phi_frame([(D, self.sparse, v, deltas[0])], ti, self.xis, None, deltas, v=v)
 
     def row_w(self, frames) -> np.ndarray:
         sigma = float(self.cfg.gap_sigma)
@@ -189,11 +191,11 @@ def fit_bond_kernel(setup: Setup, M_b: int, delta_b: float = 1.0):
     Pk = np.stack([_phi_bond(a, ti, D, bonds, cfg, xi) for a, ti, D in zip(setup.frames, setup.tis, setup.descs)])
     F = len(setup.frames)
     Pb, Pk = Pb.reshape(3 * F, -1), Pk.reshape(3 * F, -1)
-    beta = _solve([gd._whiten(Pb, setup.base_factors, setup.n_vcols, False),
+    beta = _solve([gd._whiten(Pb, setup.base_factors, False),
                    _whiten_bond(Pk, Lb, C, False)],
                   setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
     nb = Pb.shape[1]
-    alpha_base = gd._whiten(beta[None, :nb], setup.base_factors, setup.n_vcols, True)[0]
+    alpha_base = gd._whiten(beta[None, :nb], setup.base_factors, True)[0]
     alpha_bond = _whiten_bond(beta[None, nb:], Lb, C, True)[0]
 
     def predict(frames):
@@ -236,8 +238,8 @@ def fit_bilinear_als(setup: Setup, n_iter: int = 3, score=None):
         Phi = np.stack([setup.phi_base(a, ti, D, _weighted_v(a, ti, cfg, w, into))
                         for a, ti, D, w in zip(setup.frames, setup.tis, setup.descs, weights)])
         Phi = Phi.reshape(-1, Phi.shape[-1])
-        beta = _solve([gd._whiten(Phi, setup.base_factors, setup.n_vcols, False)], y, rw)
-        return gd._whiten(beta[None], setup.base_factors, setup.n_vcols, True)[0]
+        beta = _solve([gd._whiten(Phi, setup.base_factors, False)], y, rw)
+        return gd._whiten(beta[None], setup.base_factors, True)[0]
 
     def values(alpha, tis, descs):
         return [_site_values(D, ti, setup.sparse, alpha, setup.xis, setup.n_vcols).reshape(len(D), C, T)

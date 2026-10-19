@@ -315,50 +315,50 @@ def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
     return idx
 
 
-def _phi_frame(scales: list[tuple[np.ndarray, list[np.ndarray]]],
-               v: np.ndarray, ti: np.ndarray, xis: tuple[int, ...],
+def _phi_frame(scales: list, ti: np.ndarray, xis: tuple[int, ...],
                gap_q: tuple[np.ndarray | None, np.ndarray | None] | None = None,
                deltas: tuple[float, float, float] = (1.0, 1.0, 1.0),
-               ) -> np.ndarray:
-    """[D, n_columns] design block for one frame (D = v.shape[1]: 3 dipole
-    components or 6 Voigt polarisability components) — THE column contract for
-    fit AND predict. scales = [(D, sparse_desc)] per length scale; each
-    scale's kernels couple its own descriptors to its own sparse points ONLY
-    (scales never cross, like species). Block order: scale → species → ξ →
-    (m, k); the base Gram is computed once per (scale, species) and raised
-    elementwise to each ξ (sum-of-kernels column blocks). The geometry
-    vectors v are scale-independent (bond basis, dipole_rc).
+               v: np.ndarray | None = None) -> np.ndarray:
+    """[D, n_columns] design block for one frame (D = 3 dipole components or
+    6 Voigt polarisability components) — THE column contract for fit AND
+    predict. scales = [(D, sparse_desc, v, delta)] per site model: each
+    model's kernel couples ITS descriptors to ITS sparse points only (models
+    never cross, like species), reads out through ITS geometry v [N, D, K]
+    and carries δ² on its columns and prior. Block order: model → species → ξ
+    → (m, k); the base Gram is computed once per (model, species) and raised
+    elementwise to each ξ (sum-of-kernels column blocks).
 
     gap_q = (q2 [N, W2] | None, q3 [N, W3] | None) appends the additive
-    TurboGAP blocks AFTER all SOAP columns: gap2b (species → (s, k)) then
+    TurboGAP blocks AFTER all model columns: gap2b (species → (s, k)) then
     gap3b (species → (s, k)) — Σ_{i∈t} q[i, s]·v[i, x, k] — i.e. the 2b/3b
-    site energies with a linear readout, μ-weighted by the bond basis.
+    site energies with a linear readout, μ-weighted by the bond basis `v`.
 
-    deltas = (δ_soap, δ_2b, δ_3b): each body order's kernel carries δ², as in
-    gap.f90 (`delta**2 * alphas * kernel`) and gap_fit's covariance — so the
-    columns here are δ²·k and the coefficients α are in gap_fit's convention.
-    The same δ² sits on the sparse-sparse kernel K_MM that regularises the
-    fit (_prior_factors), which is what makes δ² the prior variance of that
+    deltas = (δ_soap, δ_2b, δ_3b): the 2b/3b kernels carry δ², as in gap.f90
+    (`delta**2 * alphas * kernel`) and gap_fit's covariance — so the columns
+    here are δ²·k and the coefficients α are in gap_fit's convention. Each
+    model's δ comes from its scales entry (callers pass δ_soap for SOAP). The
+    same δ² sits on the sparse-sparse kernel K_MM that regularises the fit
+    (_prior_factors), which is what makes δ² the prior variance of that
     term's site function."""
-    d_soap, d_2b, d_3b = (float(d) for d in deltas)
-    n_rows = v.shape[1]                  # 3 (dipole) or 6 (polarisability)
+    _, d_2b, d_3b = (float(d) for d in deltas)
     cols = []
-    for D, sparse_desc in scales:
+    for D, sparse_desc, vm, dm in scales:
+        n_rows = vm.shape[1]             # 3 (dipole) or 6 (polarisability)
         for t, Dm in enumerate(sparse_desc):
             sel = ti == t
             G = D[sel] @ Dm.T                           # [n_t, M_t] base Gram
-            vt = v[sel]
+            vt = vm[sel]
             for xi in xis:
-                cols.append(d_soap ** 2 * np.einsum("nm,nxk->xmk", G ** xi, vt)
+                cols.append(dm ** 2 * np.einsum("nm,nxk->xmk", G ** xi, vt)
                             .reshape(n_rows, -1))       # [D, M_t·K]
     for q, d_q in zip(gap_q or (), (d_2b, d_3b)):
         if q is not None:
-            # scales[0][1] is the scale-1 sparse list: exactly one entry per
-            # species (_fps_per_species loops range(cfg.num_types)).
+            # scales[0][1] is the first model's sparse list: exactly one entry
+            # per species (_fps_per_species loops range(cfg.num_types)).
             for t in range(len(scales[0][1])):
                 sel = ti == t
                 cols.append(d_q ** 2 * np.einsum("ns,nxk->xsk", q[sel], v[sel])
-                            .reshape(n_rows, -1))       # [D, W·K]
+                            .reshape(v.shape[1], -1))   # [D, W·K]
     return np.concatenate(cols, axis=1)
 
 
@@ -397,17 +397,22 @@ def _gap_q(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig):
             (q3.reshape(len(raw), -1, len(w3)) * w3).reshape(q3.shape) if cfg.gap_3b else None)
 
 
-def _prior_factors(cfg: GAPconfig, scale_sparse: list, xis: tuple, n_vcols: int) -> list:
+def _prior_factors(cfg: GAPconfig, scale_sparse: list, xis: tuple,
+                   tail_vcols: int | None = None) -> list:
     """gap_fit's regulariser, one entry per column block in _phi_frame order:
     (n_columns, L) with K_MM + jitter·I = L·Lᵀ the sparse-sparse covariance of
     that GAP term (gp_predict.F90 gpSparse_fit penalises αᵀ·K_MM·α). A block
     is M sparse points × K readout columns, m-major, and the prior is
     independent across the K columns, so its penalty is kron(K_MM, I_K).
 
-    Terms: one per (scale, species, ξ) for SOAP, K_MM = δ²·(D_m·D_m′)^ξ; one
-    per (species, neighbour species) for 2b and per (species, neighbour pair)
-    for 3b, K_MM = δ²·w_s·w_s′·k(Q_s, Q_s′) with the descriptor's own kernel."""
-    d_soap, d_2b, d_3b = _deltas(cfg)
+    scale_sparse = [(sparse_desc, delta, n_vcols)] per site model, matching
+    _phi_frame's scales: one term per (model, species, ξ), K_MM =
+    δ²·(D_m·D_m′)^ξ, n_vcols the model's readout width K. The TurboGAP tails
+    (cfg.gap_2b / gap_3b) read out through the bond basis of width tail_vcols
+    (required only then): one term per (species, neighbour species) for 2b
+    and per (species, neighbour pair) for 3b, K_MM = δ²·w_s·w_s′·k(Q_s, Q_s′)
+    with the descriptor's own kernel."""
+    _, d_2b, d_3b = _deltas(cfg)
     T = cfg.num_types
 
     def chol(K):
@@ -426,12 +431,14 @@ def _prior_factors(cfg: GAPconfig, scale_sparse: list, xis: tuple, n_vcols: int)
                 jit *= 10.0
 
     out = []
-    for sparse_desc in scale_sparse:
+    for sparse_desc, dm, k in scale_sparse:
         for Dm in sparse_desc:
             base = Dm @ Dm.T
             for xi in xis:
-                out.append((len(Dm) * n_vcols, chol(d_soap ** 2 * base ** xi)))
+                out.append((len(Dm) * k, chol(dm ** 2 * base ** xi)))
     if cfg.gap_2b or cfg.gap_3b:
+        assert tail_vcols is not None, "tail_vcols required with gap_2b/gap_3b"
+        n_vcols = tail_vcols
         Q2, w2, Q3, w3 = _gap_centres(cfg)
         if cfg.gap_2b:
             K2 = d_2b ** 2 * np.outer(w2, w2) * np.exp(
@@ -448,13 +455,15 @@ def _prior_factors(cfg: GAPconfig, scale_sparse: list, xis: tuple, n_vcols: int)
     return out
 
 
-def _whiten(X: np.ndarray, factors: list, n_vcols: int, solve_with_transpose: bool) -> np.ndarray:
+def _whiten(X: np.ndarray, factors: list, solve_with_transpose: bool) -> np.ndarray:
     """Apply each block's prior factor along its sparse-point axis.
     X [R, n_columns]. solve_with_transpose=False: Φ → Φ·(L⁻ᵀ ⊗ I) (design in
-    whitened coefficients β = (Lᵀ ⊗ I)·α). True: β → α = (L⁻ᵀ ⊗ I)·β."""
+    whitened coefficients β = (Lᵀ ⊗ I)·α). True: β → α = (L⁻ᵀ ⊗ I)·β.
+    Each block's readout width is n_columns / M, so blocks may differ."""
     out, off = np.empty_like(X), 0
     for n, L in factors:
         M = len(L)
+        n_vcols = n // M
         blk = X[:, off:off + n].reshape(len(X), M, n_vcols)
         if solve_with_transpose:                               # α[m, k] = (L⁻ᵀ β)[m, k]
             res = np.linalg.solve(L.T, blk[0])[None]
@@ -570,8 +579,12 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
         descs2 = _descriptors(builder2, dataset)
         sparse_desc2 = _fps_per_species(descs2)
 
-    scale_sparse = [sparse_desc] + ([sparse_desc2] if sparse_desc2 else [])
-    sizes = [[len(s) for s in group] for group in scale_sparse]
+    deltas = _deltas(cfg)
+    d_soap = deltas[0]
+    scale_sparse = [(sparse_desc, d_soap, n_vcols)]
+    if sparse_desc2:
+        scale_sparse.append((sparse_desc2, d_soap, n_vcols))
+    sizes = [[len(s) for s in group] for group, _, _ in scale_sparse]
     # α block per (scale, species): M × len(ξ list) × K columns; then the
     # additive GAP blocks, one per species: W2·K (gap_2b) and W3·K (gap_3b).
     sl = gap_slices(cfg)
@@ -587,13 +600,12 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     F = len(dataset)
     D = mu.shape[1]                      # 3 (dipole) or 6 (polarisability)
     Phi = np.empty((F, D, n_columns))
-    deltas = _deltas(cfg)
     for f in range(F):
-        scales = [(descs[f], sparse_desc)]
+        scales = [(descs[f], sparse_desc, vs[f], d_soap)]
         if descs2 is not None:
-            scales.append((descs2[f], sparse_desc2))
-        Phi[f] = _phi_frame(scales, vs[f], tis[f], xis,
-                            _gap_q(dataset[f], tis[f], cfg), deltas)
+            scales.append((descs2[f], sparse_desc2, vs[f], d_soap))
+        Phi[f] = _phi_frame(scales, tis[f], xis,
+                            _gap_q(dataset[f], tis[f], cfg), deltas, v=vs[f])
     Phi_flat = Phi.reshape(D * F, n_columns)
 
     # An unpopulated species-pair slot (or a centre no triplet reaches) gives
@@ -623,11 +635,11 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
         # GPUMD lambda_shear: off-diagonal rows fitted with σ/λ_shear.
         row_w = row_w * np.tile([1.0] * 3 + [float(cfg.gap_lambda_shear)] * 3, F)
     factors = _prior_factors(cfg, scale_sparse, xis, n_vcols)
-    Phi_w = _whiten(Phi_flat, factors, n_vcols, False) * row_w[:, None]
+    Phi_w = _whiten(Phi_flat, factors, False) * row_w[:, None]
     G = Phi_w @ Phi_w.T                                  # [DF, DF]
     G[np.diag_indices_from(G)] += 1.0
     beta = Phi_w.T @ np.linalg.solve(G, mu.reshape(-1) * row_w)
-    alpha_flat = _whiten(beta[None], factors, n_vcols, True)[0]
+    alpha_flat = _whiten(beta[None], factors, True)[0]
     parts = np.split(alpha_flat, np.cumsum(blocks)[:-1])
     # every α group is one block per species
     groups = [parts[i:i + T] for i in range(0, len(parts), T)]
@@ -728,14 +740,16 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
     alpha_flat = np.concatenate(
         model.alpha + list(model.alpha2 or []) + list(model.alpha_gap2b or [])
         + list(model.alpha_gap3b or []))
+    deltas = _deltas(cfg)
     out = None
     for f, (atoms, ti, D) in enumerate(zip(frames, tis, descs)):
         ti = np.asarray(ti)
-        scales = [(D, model.sparse_desc)]
+        v = _v_atoms(atoms, ti, cfg)
+        scales = [(D, model.sparse_desc, v, deltas[0])]
         if descs2 is not None:
-            scales.append((descs2[f], model.sparse_desc2))
-        row = _phi_frame(scales, _v_atoms(atoms, ti, cfg), ti, model.xi,
-                         _gap_q(atoms, ti, cfg), _deltas(cfg)) @ alpha_flat
+            scales.append((descs2[f], model.sparse_desc2, v, deltas[0]))
+        row = _phi_frame(scales, ti, model.xi,
+                         _gap_q(atoms, ti, cfg), deltas, v=v) @ alpha_flat
         if out is None:
             out = np.empty((len(frames), len(row)))     # D = 3 or 6
         out[f] = row

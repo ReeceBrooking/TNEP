@@ -84,18 +84,19 @@ def fit_field_column(setup: gb.Setup, long_range_only: bool, delta_E: float = 1.
     vs = [gd._v_atoms(a, ti, cfg) for a, ti in zip(setup.frames, setup.tis)]
     scale = delta_E * np.sqrt(np.mean([(v ** 2).mean() for v in vs]) / np.mean([(E ** 2).mean() for _, E in feats]))
     K1 = setup.n_vcols + 1
-    factors = gd._prior_factors(cfg, [setup.sparse], setup.xis, K1)
+    factors = gd._prior_factors(cfg, [(setup.sparse, gd._deltas(cfg)[0], K1)], setup.xis, K1)
 
     def design(frames, tis, descs, feats, vs):
         rows = []
         for a, ti, D, (_, E), v in zip(frames, tis, descs, feats, vs):
             v_aug = np.concatenate([v, scale * E[:, :, None]], axis=2)
-            rows.append(gd._phi_frame([(D, setup.sparse)], v_aug, ti, setup.xis, None, gd._deltas(cfg)))
+            rows.append(gd._phi_frame([(D, setup.sparse, v_aug, gd._deltas(cfg)[0])], ti, setup.xis,
+                                      None, gd._deltas(cfg), v=v_aug))
         R_ = np.stack(rows); return R_.reshape(R_.shape[0] * R_.shape[1], -1)
 
     Phi = design(setup.frames, setup.tis, setup.descs, feats, vs)
-    beta = gb._solve([gd._whiten(Phi, factors, K1, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
-    alpha = gd._whiten(beta[None], factors, K1, True)[0]
+    beta = gb._solve([gd._whiten(Phi, factors, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
+    alpha = gd._whiten(beta[None], factors, True)[0]
 
     def predict(frames):
         tis, descs = setup.prep(frames)
@@ -146,8 +147,8 @@ def fit_potential_kernel(setup: gb.Setup, long_range_only: bool, ell_factor: flo
                 jit *= 10
     vs = [gd._v_atoms(a, ti, cfg) for a, ti in zip(setup.frames, setup.tis)]
     Phi = design(setup.frames, setup.tis, setup.descs, feats, vs)
-    beta = gb._solve([gd._whiten(Phi, factors, K, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
-    alpha = gd._whiten(beta[None], factors, K, True)[0]
+    beta = gb._solve([gd._whiten(Phi, factors, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
+    alpha = gd._whiten(beta[None], factors, True)[0]
 
     def predict(frames):
         tis, descs = setup.prep(frames)
@@ -217,17 +218,17 @@ def fit_extra_columns(setup: gb.Setup, feature_fn, delta: float = 1.0):
     rms_v = np.sqrt(np.mean([(v ** 2).mean() for v in vs]))
     scale = delta * rms_v / np.sqrt(np.mean([(x ** 2).mean(axis=(0, 1)) for x in X], axis=0))   # [n_extra]
     K1 = setup.n_vcols + n_extra
-    factors = gd._prior_factors(cfg, [setup.sparse], setup.xis, K1)
+    factors = gd._prior_factors(cfg, [(setup.sparse, gd._deltas(cfg)[0], K1)], setup.xis, K1)
 
     def design(frames, tis, descs, X, vs):
-        rows = [gd._phi_frame([(D, setup.sparse)], np.concatenate([v, x * scale], axis=2), ti,
-                              setup.xis, None, gd._deltas(cfg))
+        rows = [gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * scale], axis=2), gd._deltas(cfg)[0])],
+                              ti, setup.xis, None, gd._deltas(cfg))
                 for ti, D, x, v in zip(tis, descs, X, vs)]
         R_ = np.stack(rows); return R_.reshape(R_.shape[0] * R_.shape[1], -1)
 
     Phi = design(setup.frames, setup.tis, setup.descs, X, vs)
-    beta = gb._solve([gd._whiten(Phi, factors, K1, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
-    alpha = gd._whiten(beta[None], factors, K1, True)[0]
+    beta = gb._solve([gd._whiten(Phi, factors, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
+    alpha = gd._whiten(beta[None], factors, True)[0]
 
     def predict(frames):
         tis, descs = setup.prep(frames)
@@ -278,11 +279,11 @@ def fit_polarise(setup: gb.Setup, split: bool = True, n_iter: int = 1, mix: floa
         n_extra = X[0].shape[2]
         scale = rms_v / np.sqrt(np.mean([(x ** 2).mean(axis=(0, 1)) for x in X], axis=0))
         K1 = K0 + n_extra
-        factors = gd._prior_factors(cfg, [setup.sparse], xi_list, K1)
-        Phi = np.stack([gd._phi_frame([(D, setup.sparse)], np.concatenate([v, x * scale], 2), ti, xi_list, None, gd._deltas(cfg))
+        factors = gd._prior_factors(cfg, [(setup.sparse, gd._deltas(cfg)[0], K1)], xi_list, K1)
+        Phi = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * scale], 2), gd._deltas(cfg)[0])], ti, xi_list, None, gd._deltas(cfg))
                         for ti, D, x, v in zip(setup.tis, setup.descs, X, vs_tr)]).reshape(3 * len(X), -1)
-        beta = gb._solve([gd._whiten(Phi, factors, K1, False)], y, rw)
-        alpha = gd._whiten(beta[None], factors, K1, True)[0]
+        beta = gb._solve([gd._whiten(Phi, factors, False)], y, rw)
+        alpha = gd._whiten(beta[None], factors, True)[0]
         return dict(alpha=alpha, scale=scale, K1=K1)
 
     def induced(stage, frames, tis, descs, X):
@@ -295,7 +296,7 @@ def fit_polarise(setup: gb.Setup, split: bool = True, n_iter: int = 1, mix: floa
 
     def predict_stage(stage, frames, tis, descs, X):
         vs = [gd._v_atoms(a, ti, cfg) for a, ti in zip(frames, tis)]
-        Phi = np.stack([gd._phi_frame([(D, setup.sparse)], np.concatenate([v, x * stage["scale"]], 2), ti, xi_list, None, gd._deltas(cfg))
+        Phi = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * stage["scale"]], 2), gd._deltas(cfg)[0])], ti, xi_list, None, gd._deltas(cfg))
                         for ti, D, x, v in zip(tis, descs, X, vs)])
         return Phi @ stage["alpha"]
 
@@ -440,15 +441,15 @@ def fit_with_v(setup: gb.Setup, v_fn, feature_fn=None, delta: float = 1.0):
     rms_v = np.sqrt(np.mean([(v ** 2).mean() for v in vs]))
     scale = (delta * rms_v / np.sqrt(np.mean([(x ** 2).mean(axis=(0, 1)) for x in X], axis=0))) if n_extra else np.zeros(0)
     K1 = setup.n_vcols + n_extra
-    factors = gd._prior_factors(cfg, [setup.sparse], setup.xis, K1)
+    factors = gd._prior_factors(cfg, [(setup.sparse, gd._deltas(cfg)[0], K1)], setup.xis, K1)
 
     def design(tis, descs, X, vs):
-        Phi_ = np.stack([gd._phi_frame([(D, setup.sparse)], np.concatenate([v, x * scale], 2), ti, setup.xis, None, gd._deltas(cfg))
+        Phi_ = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * scale], 2), gd._deltas(cfg)[0])], ti, setup.xis, None, gd._deltas(cfg))
                          for ti, D, x, v in zip(tis, descs, X, vs)])
         return Phi_.reshape(Phi_.shape[0] * Phi_.shape[1], -1)
     Phi = design(setup.tis, setup.descs, X, vs)
-    beta = gb._solve([gd._whiten(Phi, factors, K1, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
-    alpha = gd._whiten(beta[None], factors, K1, True)[0]
+    beta = gb._solve([gd._whiten(Phi, factors, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
+    alpha = gd._whiten(beta[None], factors, True)[0]
 
     def predict(frames):
         tis, descs = setup.prep(frames)

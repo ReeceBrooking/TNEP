@@ -614,7 +614,7 @@ def test_gapmode_column_count(gap_fitted):
     assert cfg.gap2b_centres is not None and cfg.gap3b_centres is not None
     at = read(WATER_XYZ, index="10")
     ti, D, v, q2, q3 = _frame_inputs(m, at)
-    phi = gap_dipole._phi_frame([(D, m.sparse_desc)], v, ti, m.xi, (q2, q3))
+    phi = gap_dipole._phi_frame([(D, m.sparse_desc, v, 1.0)], ti, m.xi, (q2, q3), v=v)
     assert phi.shape == (3, n_soap + T * W2 * K + T * W3 * K)
 
 
@@ -622,10 +622,10 @@ def test_gapmode_phi_blocks_explicit_loop(gap_fitted):
     _, m, _ = gap_fitted
     at = read(WATER_XYZ, index="10")
     ti, D, v, q2, q3 = _frame_inputs(m, at)
-    scales = [(D, m.sparse_desc)]
-    soap = gap_dipole._phi_frame(scales, v, ti, m.xi)
-    assert np.array_equal(soap, gap_dipole._phi_frame(scales, v, ti, m.xi, gap_q=None))
-    full = gap_dipole._phi_frame(scales, v, ti, m.xi, (q2, q3))
+    scales = [(D, m.sparse_desc, v, 1.0)]
+    soap = gap_dipole._phi_frame(scales, ti, m.xi)
+    assert np.array_equal(soap, gap_dipole._phi_frame(scales, ti, m.xi, gap_q=None))
+    full = gap_dipole._phi_frame(scales, ti, m.xi, (q2, q3), v=v)
     assert np.array_equal(full[:, :soap.shape[1]], soap)
     blocks = []
     for q in (q2, q3):
@@ -638,7 +638,7 @@ def test_gapmode_phi_blocks_explicit_loop(gap_fitted):
             blocks.append(b.reshape(3, -1))
     assert np.allclose(full[:, soap.shape[1]:], np.concatenate(blocks, axis=1), rtol=1e-12, atol=1e-12)
     # 2b-only / 3b-only drop the other block
-    only2 = gap_dipole._phi_frame(scales, v, ti, m.xi, (q2, None))
+    only2 = gap_dipole._phi_frame(scales, ti, m.xi, (q2, None), v=v)
     assert np.array_equal(only2, full[:, :soap.shape[1] + sum(b.shape[1] for b in blocks[:2])])
 
 
@@ -742,10 +742,10 @@ def test_gap_deltas_scale_blocks_and_shift_influence(tmp_path):
     #    itself, so a mismatch in the column scaling shows up here.
     m = _fit(gap_delta_2b=3.0, gap_delta_3b=0.5, gap_delta_soap=2.0)
     Phi = np.stack([gd_fit._phi_frame(
-        [(gd_fit._descriptors(m.builder, [at])[0], m.sparse_desc)],
-        gd_fit._v_atoms(at, np.asarray(ti), m.cfg), np.asarray(ti), m.xi,
-        gd_fit._gap_q(at, np.asarray(ti), m.cfg), gd_fit._deltas(m.cfg))
-        for at, ti in zip(frames, assign_type_indices(frames, m.cfg.types))])
+        [(gd_fit._descriptors(m.builder, [at])[0], m.sparse_desc, v, gd_fit._deltas(m.cfg)[0])],
+        np.asarray(ti), m.xi, gd_fit._gap_q(at, np.asarray(ti), m.cfg), gd_fit._deltas(m.cfg), v=v)
+        for at, ti in zip(frames, assign_type_indices(frames, m.cfg.types))
+        for v in (gd_fit._v_atoms(at, np.asarray(ti), m.cfg),)])
     alpha = np.concatenate([a for a in (m.alpha, m.alpha2, m.alpha_gap2b,
                                         m.alpha_gap3b) if a is not None
                             for a in a])
@@ -762,10 +762,10 @@ def test_gap_deltas_scale_blocks_and_shift_influence(tmp_path):
         for at, ti in zip(frames, tis):
             ti = np.asarray(ti)
             d = gd_fit._descriptors(model.builder, [at])[0]
-            phi = gd_fit._phi_frame([(d, model.sparse_desc)],
-                                    gd_fit._v_atoms(at, ti, model.cfg), ti,
-                                    model.xi, gd_fit._gap_q(at, ti, model.cfg),
-                                    gd_fit._deltas(model.cfg))
+            v = gd_fit._v_atoms(at, ti, model.cfg)
+            phi = gd_fit._phi_frame([(d, model.sparse_desc, v, gd_fit._deltas(model.cfg)[0])],
+                                    ti, model.xi, gd_fit._gap_q(at, ti, model.cfg),
+                                    gd_fit._deltas(model.cfg), v=v)
             n_soap = sum(a.size for a in model.alpha)
             a2 = np.concatenate(model.alpha_gap2b)
             n2b += np.linalg.norm(phi[:, n_soap:n_soap + a2.size] @ a2)

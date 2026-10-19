@@ -445,7 +445,7 @@ def test_fit_is_gap_fit_sparse_gp(tmp_path):
     descs = gap_dipole._descriptors(model.builder, dataset)
     deltas = gap_dipole._deltas(cfg)
     Phi = np.stack([gap_dipole._phi_frame(
-        [(descs[f], model.sparse_desc)], gap_dipole._v_atoms(dataset[f], tis[f], cfg),
+        [(descs[f], model.sparse_desc, gap_dipole._v_atoms(dataset[f], tis[f], cfg), deltas[0])],
         tis[f], model.xi, None, deltas) for f in range(len(dataset))])
     Phi_flat = Phi.reshape(-1, Phi.shape[-1])
     mu = gap_dipole._targets(dataset, cfg)
@@ -689,3 +689,31 @@ def test_site_model_fields_are_gap_only_and_validated():
     gap_dipole._validate(_cfg(gap_site_models=["soap", "2b", "3b"], dipole_radial="chebyshev",
                               dipole_channels=3, gap_cross_channels=2,
                               gap_model_delta={"soap": 1.0, "2b": 0.5, "3b": 0.1}))
+
+
+def test_phi_frame_accepts_per_scale_geometry_and_widths():
+    """Scales may carry their own v (different K) and δ; the prior factors and
+    whitening follow each block's width. Two scales with identical inputs must
+    reproduce the single-scale columns twice."""
+    import gap_dipole
+    rng = np.random.default_rng(0)
+    N, Q = 12, 5
+    D = rng.normal(size=(N, Q)); D /= np.linalg.norm(D, axis=1, keepdims=True)
+    ti = np.array([0, 1] * 6); sparse = [D[ti == 0][:3], D[ti == 1][:3]]
+    v3 = rng.normal(size=(N, 3, 4)); v7 = rng.normal(size=(N, 3, 7))
+    one = gap_dipole._phi_frame([(D, sparse, v3, 1.0)], ti, (2,))
+    two = gap_dipole._phi_frame([(D, sparse, v3, 1.0), (D, sparse, v3, 1.0)], ti, (2,))
+    assert two.shape[1] == 2 * one.shape[1] and np.allclose(two[:, :one.shape[1]], one)
+    mixed = gap_dipole._phi_frame([(D, sparse, v3, 1.0), (D, sparse, v7, 0.5)], ti, (2,))
+    assert mixed.shape[1] == 6 * 4 + 6 * 7
+    cfg = _cfg(); cfg.types, cfg.num_types = [8, 1], 2
+    factors = gap_dipole._prior_factors(cfg, [(sparse, 1.0, 4), (sparse, 0.5, 7)], (2,))
+    assert [n for n, _ in factors] == [12, 12, 21, 21]
+    X = rng.normal(size=(5, mixed.shape[1]))
+    Xw = gap_dipole._whiten(X, factors, False)                     # Φ → Φ·(L⁻ᵀ ⊗ I) per block
+    back, off = np.empty_like(X), 0
+    for n, L in factors:                                           # un-whiten by hand: ·(Lᵀ ⊗ I)
+        M = len(L); k = n // M
+        back[:, off:off + n] = np.einsum("rmk,mn->rnk", Xw[:, off:off + n].reshape(5, M, k), L.T).reshape(5, n)
+        off += n
+    assert np.allclose(back, X)
