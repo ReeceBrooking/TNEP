@@ -67,9 +67,14 @@ class GapDipoleModel:
     """In-memory GAP dipole model — never persisted (refits in seconds).
 
     Column/α block order (one contract, shared by fit + predict via
-    _phi_frame): scale → species → ξ → (m, k). Per (scale, species) the
-    block is [len(xi)·M_t·K] flat, ξ-major. The scale-2 fields are None
-    unless cfg.gap_extra_rcut is set. Then the additive TurboGAP blocks
+    _phi_frame): site model (cfg.gap_site_models order) → species → ξ →
+    (m, k). Per (model, species) the block is [len(xi)·M_t·K_model] flat,
+    ξ-major; K_model is the bond-basis width for soap/2b and the angular
+    kernel width for 3b. site_sparse / site_alpha are keyed by model name;
+    `sparse_desc` / `alpha` are the "soap" entries (read-only views for the
+    callers that only know the SOAP model). The scale-2 fields are None
+    unless cfg.gap_extra_rcut is set (appended after the site models). Then
+    the additive TurboGAP blocks
     (gap_descriptor_plan.md §0.3): alpha_gap2b / alpha_gap3b per species t,
     [W2·K] / [W3·K] flat (s-major), None unless cfg.gap_2b / gap_3b.
 
@@ -81,14 +86,22 @@ class GapDipoleModel:
     space — measured |Δα| ~0.8 between fits even at 200 frames."""
     cfg: GAPconfig
     builder: object                   # descriptor builder from the fitting cfg
-    sparse_desc: list[np.ndarray]     # per type t: [M_t, Q] unit-norm rows
-    alpha: list[np.ndarray]           # per type t: [len(xi)·M_t·K] flat
+    site_sparse: dict                 # model → per type t: [M_t, Q] unit-norm rows
+    site_alpha: dict                  # model → per type t: [len(xi)·M_t·K_model] flat
     xi: tuple[int, ...]               # kernel powers — one column block each
     builder2: object = None           # second-scale builder (gap_extra_rcut)
     sparse_desc2: list[np.ndarray] | None = None
     alpha2: list[np.ndarray] | None = None
     alpha_gap2b: list[np.ndarray] | None = None
     alpha_gap3b: list[np.ndarray] | None = None
+
+    @property
+    def sparse_desc(self) -> list[np.ndarray]:
+        return self.site_sparse["soap"]
+
+    @property
+    def alpha(self) -> list[np.ndarray]:
+        return self.site_alpha["soap"]
 
 
 def _pair_columns(cfg: GAPconfig) -> bool:
@@ -301,6 +314,26 @@ def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
         V = tnep_data._append_field_channel(V, tnep_data.field_channel(atoms, cfg),
                                             float(cfg.dipole_field_scale))
     return _finish_v(V, atoms, ti, cfg)
+
+
+def _site_descriptor(name: str, builder, frames: list[Atoms], tis: list, cfg: GAPconfig) -> list[np.ndarray]:
+    """Per-frame descriptors of one site model (all unit rows): SOAP from the
+    builder, 2b/3b from gap_models (already normalised there)."""
+    if name == "soap":
+        return _descriptors(builder, frames)
+    import gap_models as gm
+    fn = gm.two_body_descriptor if name == "2b" else gm.three_body_descriptor
+    return [fn(a, ti, cfg) for a, ti in zip(frames, tis)]
+
+
+def _site_geometry(name: str, frames: list[Atoms], tis: list, cfg: GAPconfig, bond_v: list) -> list:
+    """Per-frame readout geometry [N, D, K_model]: the bond basis (+ field
+    channel) for soap/2b; the angular kernel for 3b."""
+    if name != "3b":
+        return bond_v
+    import gap_models as gm
+    fn = gm.angular_cross_tensor if int(cfg.target_mode) == 2 else gm.angular_cross_vector
+    return [fn(a, ti, cfg) for a, ti in zip(frames, tis)]
 
 
 def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
@@ -550,9 +583,10 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     # Kernel channels (2·C under target_mode=2: isotropic + traceless groups).
     n_vcols = _n_vcols(cfg)
 
-    # Per-species FPS sparse points, per scale (scale-2 selected on ITS OWN
-    # descriptors — the wider builder — from the same rng stream, after
-    # scale 1, so single-scale FPS is bit-identical to the pre-feature code).
+    # Per-species FPS sparse points, per site model in cfg order, then the
+    # extra SOAP scale (selected on ITS OWN descriptors — the wider builder)
+    # — all from one rng stream, so gap_site_models=["soap"] without
+    # gap_extra_rcut is bit-identical to the pre-feature code.
     rng = np.random.default_rng(cfg.seed)
     M_req = int(cfg.gap_sparse_per_species)
     xis = _xi_tuple(cfg)
@@ -569,7 +603,11 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
             out.append(Dt[_fps(Dt, M_req, rng)].copy())
         return out
 
-    sparse_desc = _fps_per_species(descs)
+    models = list(cfg.gap_site_models)
+    site_descs = {m: descs if m == "soap" else _site_descriptor(m, builder, dataset, tis, cfg)
+                  for m in models}
+    site_sparse = {m: _fps_per_species(site_descs[m]) for m in models}
+    site_geom = {m: _site_geometry(m, dataset, tis, cfg, vs) for m in models}
     builder2 = descs2 = sparse_desc2 = None
     if cfg.gap_extra_rcut is not None:
         # Second SOAP length scale for the KERNEL only (v is untouched):
@@ -583,18 +621,20 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
 
     deltas = _deltas(cfg)
     d_soap = deltas[0]
-    scale_sparse = [(sparse_desc, d_soap, n_vcols)]
+    site_delta = {m: d_soap * float(cfg.gap_model_delta[m]) for m in models}
+    site_k = {m: site_geom[m][0].shape[2] for m in models}          # readout width per model
+    scale_sparse = [(site_sparse[m], site_delta[m], site_k[m]) for m in models]
     if sparse_desc2:
         scale_sparse.append((sparse_desc2, d_soap, n_vcols))
     sizes = [[len(s) for s in group] for group, _, _ in scale_sparse]
-    # α block per (scale, species): M × len(ξ list) × K columns; then the
+    # α block per (model/scale, species): M × len(ξ list) × K columns; then the
     # additive GAP blocks, one per species: W2·K (gap_2b) and W3·K (gap_3b).
     sl = gap_slices(cfg)
     T = cfg.num_types
     w_gap = {k: (sl[k].stop - sl[k].start) * n_vcols if on else 0
              for k, on in (("two_body", cfg.gap_2b),
                            ("three_body", cfg.gap_3b))}
-    blocks = ([n * len(xis) * n_vcols for sz in sizes for n in sz]
+    blocks = ([len(Dm) * len(xis) * k for group, _, k in scale_sparse for Dm in group]
               + [w for w in w_gap.values() if w for _ in range(T)])
     n_columns = sum(blocks)
 
@@ -603,7 +643,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     D = mu.shape[1]                      # 3 (dipole) or 6 (polarisability)
     Phi = np.empty((F, D, n_columns))
     for f in range(F):
-        scales = [(descs[f], sparse_desc, vs[f], d_soap)]
+        scales = [(site_descs[m][f], site_sparse[m], site_geom[m][f], site_delta[m]) for m in models]
         if descs2 is not None:
             scales.append((descs2[f], sparse_desc2, vs[f], d_soap))
         Phi[f] = _phi_frame(scales, tis[f], xis,
@@ -645,14 +685,14 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     parts = np.split(alpha_flat, np.cumsum(blocks)[:-1])
     # every α group is one block per species
     groups = [parts[i:i + T] for i in range(0, len(parts), T)]
-    alpha = groups.pop(0)
+    site_alpha = {m: groups.pop(0) for m in models}
     alpha2 = groups.pop(0) if descs2 is not None else None
     alpha_gap2b = groups.pop(0) if cfg.gap_2b else None
     alpha_gap3b = groups.pop(0) if cfg.gap_3b else None
     assert not groups
 
-    model = GapDipoleModel(cfg=cfg, builder=builder, sparse_desc=sparse_desc,
-                           alpha=alpha, xi=xis, builder2=builder2,
+    model = GapDipoleModel(cfg=cfg, builder=builder, site_sparse=site_sparse,
+                           site_alpha=site_alpha, xi=xis, builder2=builder2,
                            sparse_desc2=sparse_desc2, alpha2=alpha2,
                            alpha_gap2b=alpha_gap2b, alpha_gap3b=alpha_gap3b)
 
@@ -660,7 +700,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
         (Phi_flat @ alpha_flat).reshape(F, D), mu)
     metrics = {"train_rmse": train_rmse, "train_r2": train_r2,
                "n_train_frames": F, "fit_seconds": time.time() - t0}
-    print(f"[gap_dipole] fit M={sizes} xi={list(xis)} sigma={sigma:g} "
+    print(f"[gap_dipole] fit models={models} M={sizes} xi={list(xis)} sigma={sigma:g} "
           f"n_columns={n_columns}: "
           f"train RMSE {train_rmse:.4f}, R² {train_r2:.4f} "
           f"({metrics['fit_seconds']:.1f} s)")
@@ -678,6 +718,13 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
         "config": _serialize_config(cfg),
         "gap": {"sparse_per_species": M_req, "kernel_power": list(xis),
                 "sigma": sigma, "sparse_jitter": float(cfg.gap_sparse_jitter),
+                # summed site models (gap_models.py): kernel per body order,
+                # each with its own FPS set, prior and relative amplitude
+                "site_models": models,
+                "model_delta": {m: float(cfg.gap_model_delta[m]) for m in models},
+                "site_channels": int(cfg.gap_site_channels),
+                "site_lmax": int(cfg.gap_site_lmax),
+                "cross_lmax": int(cfg.gap_cross_lmax),
                 "delta_soap": float(cfg.gap_delta_soap),
                 "delta_2b": float(cfg.gap_delta_2b),
                 "delta_3b": float(cfg.gap_delta_3b),
@@ -706,12 +753,13 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                     "gap2b_centres", "gap3b_centres", "gap2b_sigma",
                     "gap3b_sigma", "gap2b_rcut", "gap3b_rcut", "gap_buffer")}
                    if cfg.gap_2b or cfg.gap_3b else {}),
+                # first site model's sparse-set sizes
                 "M_per_species": {str(z): n
                                   for z, n in zip(cfg.types, sizes[0])},
                 # scale-2 sparse-set sizes, only when gap_extra_rcut is set
                 **({"M_per_species_2": {str(z): n
-                                        for z, n in zip(cfg.types, sizes[1])}}
-                   if len(sizes) > 1 else {})},
+                                        for z, n in zip(cfg.types, sizes[-1])}}
+                   if sparse_desc2 is not None else {})},
         "metrics": metrics,
     }
     os.makedirs("GAP", exist_ok=True)
@@ -735,20 +783,22 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
     Routes through _phi_frame — the SAME design-matrix contraction the fit
     uses (μ = Φα) — so fit and predict cannot drift."""
     cfg = model.cfg
-    tis = tnep_data.assign_type_indices(frames, cfg.types)
-    descs = _descriptors(model.builder, frames)
+    models = list(cfg.gap_site_models)
+    tis = [np.asarray(t) for t in tnep_data.assign_type_indices(frames, cfg.types)]
+    vs = [_v_atoms(a, ti, cfg) for a, ti in zip(frames, tis)]
+    site_descs = {m: _site_descriptor(m, model.builder, frames, tis, cfg) for m in models}
+    site_geom = {m: _site_geometry(m, frames, tis, cfg, vs) for m in models}
     descs2 = (_descriptors(model.builder2, frames)
               if model.builder2 is not None else None)
     alpha_flat = np.concatenate(
-        model.alpha + list(model.alpha2 or []) + list(model.alpha_gap2b or [])
-        + list(model.alpha_gap3b or []))
+        [a for m in models for a in model.site_alpha[m]] + list(model.alpha2 or [])
+        + list(model.alpha_gap2b or []) + list(model.alpha_gap3b or []))
     deltas = _deltas(cfg)
     d_soap = deltas[0]
+    site_delta = {m: d_soap * float(cfg.gap_model_delta[m]) for m in models}
     out = None
-    for f, (atoms, ti, D) in enumerate(zip(frames, tis, descs)):
-        ti = np.asarray(ti)
-        v = _v_atoms(atoms, ti, cfg)
-        scales = [(D, model.sparse_desc, v, d_soap)]
+    for f, (atoms, ti, v) in enumerate(zip(frames, tis, vs)):
+        scales = [(site_descs[m][f], model.site_sparse[m], site_geom[m][f], site_delta[m]) for m in models]
         if descs2 is not None:
             scales.append((descs2[f], model.sparse_desc2, v, d_soap))
         row = _phi_frame(scales, ti, model.xi,

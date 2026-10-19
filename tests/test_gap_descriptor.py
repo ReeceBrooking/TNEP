@@ -650,7 +650,7 @@ def test_gapmode_exact_recovery_known_alpha(tmp_path, flags):
         base = gap_dipole.fit_gap_dipole(_dip_cfg(data_path=p0, **kw))
     assert (base.alpha_gap3b is None) == (not flags["gap_3b"])
     rng = np.random.default_rng(0)
-    star = replace(base, alpha=[np.zeros_like(a) for a in base.alpha],
+    star = replace(base, site_alpha={**base.site_alpha, "soap": [np.zeros_like(a) for a in base.alpha]},
                    alpha_gap2b=[rng.normal(size=len(a)) for a in base.alpha_gap2b],
                    alpha_gap3b=None if base.alpha_gap3b is None
                    else [rng.normal(size=len(a)) for a in base.alpha_gap3b])
