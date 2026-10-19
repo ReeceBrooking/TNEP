@@ -101,6 +101,9 @@ class TNEPconfig:
     #   "gaussian"         : R_n(r) = exp(−(r − μ_n)²/2σ²)·f_c(r), μ_n the
     #                        C interior points of linspace(0, r_c, C+2),
     #                        σ = dipole_gauss_sigma_scale × spacing
+    #   "bessel"           : R_n(r) = sin((n+1)πr/r_c)/(r/r_c)·f_c(r), the
+    #                        spherical Bessel j₀ family (orthogonal on
+    #                        [0, r_c] before the cutoff), C channels
     #   "screened"         : R(r) = r^(ζ−1)·f_c(r) — single channel
     #                        (requires dipole_channels == 1).
     dipole_radial: str = "chebyshev_warped"
@@ -115,6 +118,19 @@ class TNEPconfig:
     # evidence (diagnostics/diag_basis.py): scale 0.5 lowers the C=4 floor
     # 22% (1.16 vs 1.49) while 1.0 edges it at C=10 — the knob matters.
     dipole_gauss_sigma_scale: float = 1.0
+    # Long-range field channel of the neighbour dipole readout (target_mode=1):
+    # one extra kernel channel carrying the Ewald field E_i of fixed reference
+    # charges (dipole_field_charges, e per species; neutral frames), so
+    # μ ⊃ Σ_i s_i^E·E_i — the induced dipole in the TOTAL field. Staged at
+    # data assembly (image-exact Ewald); the in-graph V builders (predict,
+    # spectroscopy fused path) refuse. Convex-floor evidence on bulk water:
+    # 1.56 → 1.08 % RRMSE; neither the near nor the far part alone helps.
+    dipole_field: bool = False
+    dipole_field_charges: dict | None = None        # e.g. SPC/E {8: -0.8476, 1: 0.4238}
+    # Scale on E so the channel matches the radial channels' magnitude; None =
+    # derive once at the first data assembly as RMS(Σ_t' V)/RMS(E) and pin it
+    # here (one constant for every split and the saved model).
+    dipole_field_scale: float | None = None
     # Cutoff function f_c of the neighbor readout, crossable with any
     # radial. Smoothness at r_c is a property of the CUTOFF, not the radial:
     #   "cosine2" : ((1+cos(πr/r_c))/2)² — C³ contact at r_c
@@ -655,6 +671,19 @@ class GAPconfig:
     # evidence (diagnostics/diag_basis.py): scale 0.5 lowers the C=4 floor
     # 22% (1.16 vs 1.49) while 1.0 edges it at C=10 — the knob matters.
     dipole_gauss_sigma_scale: float = 1.0
+    # Long-range field channel of the neighbour dipole readout (target_mode=1):
+    # one extra kernel channel carrying the Ewald field E_i of fixed reference
+    # charges (dipole_field_charges, e per species; neutral frames), so
+    # μ ⊃ Σ_i s_i^E·E_i — the induced dipole in the TOTAL field. Staged at
+    # data assembly (image-exact Ewald); the in-graph V builders (predict,
+    # spectroscopy fused path) refuse. Convex-floor evidence on bulk water:
+    # 1.56 → 1.08 % RRMSE; neither the near nor the far part alone helps.
+    dipole_field: bool = False
+    dipole_field_charges: dict | None = None        # e.g. SPC/E {8: -0.8476, 1: 0.4238}
+    # Scale on E so the channel matches the radial channels' magnitude; None =
+    # derive once at the first data assembly as RMS(Σ_t' V)/RMS(E) and pin it
+    # here (one constant for every split and the saved model).
+    dipole_field_scale: float | None = None
     # Cutoff function f_c of the neighbor readout, crossable with any
     # radial. Smoothness at r_c is a property of the CUTOFF, not the radial:
     #   "cosine2" : ((1+cos(πr/r_c))/2)² — C³ contact at r_c
@@ -878,8 +907,10 @@ def bond_rank(cfg: "TNEPconfig | GAPconfig") -> int:
 
 def kernel_channels(cfg: "TNEPconfig | GAPconfig") -> int:
     """Channel axis of the staged kernel V[N, D, Ck, T]: the C radial
-    channels per kernel group, group-major — Ck = C·bond_rank."""
-    return int(cfg.dipole_channels) * bond_rank(cfg)
+    channels per kernel group, group-major (Ck = C·bond_rank), plus the
+    field channel under dipole_field (last channel, mode 1 only)."""
+    return int(cfg.dipole_channels) * bond_rank(cfg) + (
+        1 if bool(getattr(cfg, "dipole_field", False)) and int(cfg.target_mode) == 1 else 0)
 
 
 def resolved_dipole_rc(cfg: "TNEPconfig | GAPconfig") -> float:

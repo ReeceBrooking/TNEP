@@ -376,6 +376,17 @@ def assemble_data_dict(
             for s, t in tqdm(list(zip(dataset, types_int)),
                              desc="Building neighbor-readout V", unit="struct",
                              disable=len(dataset) < 50)]
+        if bool(getattr(cfg, "dipole_field", False)):
+            if cfg.target_mode != 1:
+                raise ValueError("dipole_field is a dipole (target_mode=1) channel.")
+            Es = [field_channel(s, cfg) for s in dataset]
+            if cfg.dipole_field_scale is None:
+                rms = lambda xs: float(np.sqrt(np.mean([np.mean(x ** 2) for x in xs])))
+                cfg.dipole_field_scale = rms([V.sum(axis=3) for V in data["V_atom"]]) / rms(Es)
+                print(f"  dipole_field: dipole_field_scale = {cfg.dipole_field_scale:.4g} "
+                      f"(RMS(Σ_t' V)/RMS(E), pinned on cfg)")
+            data["V_atom"] = [_append_field_channel(V, E, float(cfg.dipole_field_scale))
+                              for V, E in zip(data["V_atom"], Es)]
 
     # Raw expert input data["nep_raw"] [N, W_raw]: the GPUMD NEP per-atom
     # basis, contracted in-model by c_r/c_a (multi_descriptor_plan.md §0.3),
@@ -531,11 +542,62 @@ def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
         mu = np.linspace(0.0, rc, C + 2)[1:-1]
         sigma = gauss_sigma_scale * rc / (C + 1)
         Rw = np.exp(-(r[:, None] - mu) ** 2 / (2.0 * sigma ** 2)) * fc[:, None]
+    elif radial == "bessel":
+        # spherical Bessel j₀ family: sin((n+1)πr/rc)/(r/rc), finite at r→0
+        n1 = np.arange(1, C + 1)
+        Rw = np.sin(np.pi * n1[None, :] * r[:, None] / rc) / (r[:, None] / rc) * fc[:, None]
     else:
         raise ValueError(f"unknown dipole_radial {radial!r}")
     g = bond_geometry(d, rank)                                # [P, D, G]
     P_, D_, G_ = g.shape
     return i, j, np.einsum("pdg,pn->pdgn", g, Rw).reshape(P_, D_, G_ * Rw.shape[1])
+
+
+def ewald_field(atoms: Atoms, q: np.ndarray, alpha: float = 0.35,
+                r_cut: float = 9.0, k_cut: float = 7.0) -> np.ndarray:
+    """Ewald field E_i [N, 3] (q/Å² units) of point charges q at every atom
+    from all OTHER charges, tin-foil boundary, k = 0 dropped (neutral cells).
+    Real space over the image-exact ASE neighbour list, reciprocal over
+    |k| ≤ k_cut; α-independent to 1e-5 and E = −∇φ verified (gap_ewald tests)."""
+    from scipy.special import erfc
+    N, r = len(atoms), atoms.positions
+    i, j, d, D = neighbor_list("ijdD", atoms, r_cut)          # D = r_j − r_i
+    g = (erfc(alpha * d) / d ** 2 + 2 * alpha / np.sqrt(np.pi) * np.exp(-(alpha * d) ** 2) / d) / d
+    E = np.zeros((N, 3)); np.add.at(E, i, -(q[j] * g)[:, None] * D)
+    cell = np.asarray(atoms.cell.array); V = abs(np.linalg.det(cell))
+    recip = 2 * np.pi * np.linalg.inv(cell).T
+    nmax = int(np.ceil(k_cut / np.min(np.linalg.norm(recip, axis=1)))) + 1
+    rng_ = np.arange(-nmax, nmax + 1)
+    n = np.array(np.meshgrid(rng_, rng_, rng_, indexing="ij")).reshape(3, -1).T
+    k = n @ recip; k2 = (k ** 2).sum(1)
+    keep = (k2 > 1e-12) & (k2 <= k_cut ** 2); k, k2 = k[keep], k2[keep]
+    phase = r @ k.T
+    S = (q[:, None] * np.exp(1j * phase)).sum(0)
+    w = 4 * np.pi / V * np.exp(-k2 / (4 * alpha ** 2)) / k2
+    E -= ((w * (S * np.exp(-1j * phase))).imag[:, :, None] * k[None]).sum(1)
+    return E
+
+
+def field_channel(atoms: Atoms, cfg) -> np.ndarray:
+    """E_i [N, 3] of cfg.dipole_field_charges (per species, e) by Ewald."""
+    ch = cfg.dipole_field_charges
+    if not ch:
+        raise ValueError("dipole_field=True needs cfg.dipole_field_charges "
+                         "({Z: charge in e} per species, neutral frames).")
+    # JSON round-trips (model_io) turn int keys into str: accept both.
+    q = np.array([float(ch[int(z)] if int(z) in ch else ch[str(int(z))]) for z in atoms.numbers])
+    if abs(q.sum()) > 1e-6 * len(atoms):
+        raise ValueError(f"dipole_field: frame has net reference charge {q.sum():+.3g}.")
+    return ewald_field(atoms, q)
+
+
+def _append_field_channel(V: np.ndarray, E: np.ndarray, scale: float) -> np.ndarray:
+    """[N, 3, Ck, T] + E [N, 3] → [N, 3, Ck+1, T]: scale·E in the t′=0 slot of
+    the new last channel (zeros elsewhere), so the species-pair coefficient on
+    it is a per-centre-species scale the site function can already express."""
+    extra = np.zeros(V.shape[:2] + (1, V.shape[3]), dtype=V.dtype)
+    extra[:, :, 0, 0] = scale * E
+    return np.concatenate([V, extra], axis=2)
 
 
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,

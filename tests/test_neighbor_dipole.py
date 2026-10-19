@@ -110,6 +110,7 @@ _MODE_KW = {
     "ordered": dict(dipole_species_pairs="ordered"),
     "chebyshev_warped": dict(dipole_radial="chebyshev_warped"),
     "gaussian": dict(dipole_radial="gaussian"),
+    "bessel": dict(dipole_radial="bessel"),
     "cheb_tanh3": dict(dipole_cutoff="tanh3"),
 }
 
@@ -245,7 +246,7 @@ def test_single_atom_lattice_translation_invariance(mode):
 # ── 13c: four-path forward consistency (the drift alarm) ────────────────────
 
 @pytest.mark.parametrize("mode", ["chebyshev", "screened", "chebyshev_warped",
-                                  "gaussian", "cheb_tanh3"])
+                                  "gaussian", "bessel", "cheb_tanh3"])
 @pytest.mark.parametrize("head", ["vector", "scalar"])
 def test_four_path_consistency(mode, head):
     # The only test cross-checking all three radial dispatch sites (numpy
@@ -1275,3 +1276,97 @@ def test_pol_fit_smoke(optimizer):
     assert not np.allclose(final_model.c_pair.numpy(), before[1])
     metrics, preds = final_model.score(va)
     assert tuple(preds.shape) == (2, 6) and np.isfinite(float(metrics["rmse"]))
+
+
+# ── Long-range field channel (cfg.dipole_field) ─────────────────────────────
+
+SPCE = {8: -0.8476, 1: 0.4238}
+
+
+def _field_cfg(**kw):
+    return _cfg(dipole_field=True, dipole_field_charges=SPCE, dipole_field_scale=None,
+                dipole_species_pairs="symmetric", **kw)
+
+
+@pytest.mark.parametrize("head", ["vector", "scalar"])
+def test_field_channel_shapes_and_forward_identity(head):
+    """V gains one channel (Ck = C+1, scale pinned on cfg), W1/c_pair/SNES follow,
+    and predict_batch == production readout + Σ_i s_i^E c[t_i,0] scale·E_i."""
+    cfg = _field_cfg(dipole_head=head)
+    frames = [read(WATER_XYZ, index="0")]
+    data = prepare_eval_data(frames, cfg)          # pins cfg.dipole_field_scale
+    C, T = cfg.dipole_channels, 2
+    assert cfg.dipole_field_scale is not None and cfg.dipole_field_scale > 0
+    assert tuple(data["V_atom"].shape) == (1, 96, 3, C + 1, T)
+    model = _model(cfg)
+    assert model._kernel_channels == C + 1
+    assert tuple(model.c_pair.shape) == (C + 1, T * (T + 1) // 2)
+    assert tuple(model.W1.shape) == (T, 8, C + 1 if head == "vector" else 2)
+    opt = model.optimizer
+    assert opt._Ch == C + 1 and opt._n_W1 == T * 8 * model._head_slots
+    rng = np.random.default_rng(1)
+    model.c_pair.assign(rng.uniform(0.5, 1.5, size=model.c_pair.shape).astype(np.float32))
+    args = (data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"], data["pair_struct"],
+            data["positions"], data["Z_int"], data["boxes"], data["atom_mask"], model.W0, model.b0, model.W1, model.b1)
+    mu_full = model.predict_batch(*args, W_atom=data["V_atom"])[0].numpy()
+    V = data["V_atom"].numpy()[0].astype(np.float64)
+    V0 = V.copy(); V0[:, :, C, :] = 0.0                   # field channel removed
+    mu_base = model.predict_batch(*args, W_atom=tf.constant(V0[None].astype(np.float32)))[0].numpy()
+    # field term by hand: s^E = head slot of the field channel, c on channel C for pair (t_i, t'=0)
+    desc = data["descriptors"][0].numpy().astype(np.float64); Z = data["Z_int"][0].numpy()
+    h = np.tanh(np.einsum("aq,aqh->ah", desc, model.W0.numpy().astype(np.float64)[Z]) + model.b0.numpy().astype(np.float64)[Z])
+    W1 = model.W1.numpy().astype(np.float64)[Z]            # [A, H, S]
+    sE = np.einsum("ah,ah->a", h, W1[:, :, -1])            # last slot in both heads
+    c = model.c_pair.numpy().astype(np.float64)[C, _pair_index(T)[Z, 0]]
+    E_scaled = V[:, :, C, 0]                                # scale·E_i sits in the t'=0 slot
+    mu_field = np.einsum("a,a,ad->d", sE, c, E_scaled)
+    assert np.allclose(mu_full, mu_base + mu_field, rtol=1e-5, atol=1e-5 * np.abs(mu_full).max())
+    assert np.abs(mu_field).max() > 1e-3 * np.abs(mu_full).max()
+    # candidates path agrees
+    mu_c = model.predict_batch_candidates(data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
+                                          model.W0[None], model.b0[None], model.W1[None], model.b1[None])[0, 0].numpy()
+    assert np.allclose(mu_c, mu_full, rtol=1e-5, atol=1e-5 * np.abs(mu_full).max())
+
+
+def test_field_channel_in_graph_paths_refuse_and_gap_matches_staged():
+    import gap_dipole
+    cfg = _field_cfg()
+    atoms = read(WATER_XYZ, index="2")
+    data = prepare_eval_data([atoms], cfg)
+    model = _model(cfg)
+    args = (data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"], data["pair_struct"],
+            data["positions"], data["Z_int"], data["boxes"], data["atom_mask"], model.W0, model.b0, model.W1, model.b1)
+    with pytest.raises(ValueError, match="dipole_field"):
+        model.predict_batch(*args, W_atom=None)
+    # the GAP geometry helper (GAPconfig) builds the same staged channel
+    from test_gap_dipole import _cfg as _gcfg
+    gcfg = _gcfg(dipole_rc=3.0, dipole_channels=cfg.dipole_channels, dipole_radial="chebyshev",
+                 dipole_cutoff=None, dipole_species_pairs="symmetric", dipole_field=True,
+                 dipole_field_charges=SPCE, dipole_field_scale=cfg.dipole_field_scale)
+    gcfg.types, gcfg.num_types = [8, 1], 2
+    ti = np.array([0 if z == 8 else 1 for z in atoms.numbers])
+    v = gap_dipole._v_atoms(atoms, ti, gcfg)                # [N, 3, (C+1)·T]
+    V = data["V_atom"].numpy()[0]
+    assert v.shape[2] == (cfg.dipole_channels + 1) * 2
+    assert np.allclose(v, V.reshape(96, 3, -1), rtol=1e-5, atol=1e-5 * np.abs(V).max())
+    # str-keyed charges (JSON round trip) are accepted
+    gcfg.dipole_field_charges = {"8": -0.8476, "1": 0.4238}
+    assert np.allclose(gap_dipole._v_atoms(atoms, ti, gcfg), v)
+
+
+def test_field_channel_save_load_and_fit_smoke(tmp_path):
+    import model_io
+    cfg = _field_cfg(optimizer="snes", num_generations=2, val_interval=1, pop_size=6, patience=None,
+                     save_path=None, batch_chunk_size=4)
+    frames = read(WATER_XYZ, index="0:5")
+    tr, va = prepare_eval_data(frames[:3], cfg), prepare_eval_data(frames[3:], cfg)
+    for d in (tr, va):
+        d["types_contained"] = tf.ones((int(d["num_atoms"].shape[0]), 2))
+    model = _model(cfg)
+    history, final_model, _ = model.fit(tr, va)
+    assert np.all(np.isfinite(history["val_loss"]))
+    mu0 = _mu(final_model, frames[4], cfg)
+    p = str(tmp_path / "field.h5"); model_io.save_model(final_model, cfg, path=p)
+    loaded = model_io.load_model(p)
+    assert loaded.cfg.dipole_field and loaded.cfg.dipole_field_scale == cfg.dipole_field_scale
+    assert np.allclose(mu0, _mu(loaded, frames[4], loaded.cfg), atol=1e-5 * max(np.abs(mu0).max(), 1.0))

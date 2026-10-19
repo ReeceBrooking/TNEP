@@ -11,7 +11,7 @@ from typing import Callable, NamedTuple
 from DescriptorBuilder import make_descriptor_builder
 from SNES import SNES
 from TNEPconfig import (TNEPconfig, resolved_dipole_cutoff, resolved_dipole_rc,
-                        neighbor_readout_on, bond_rank)
+                        neighbor_readout_on, bond_rank, kernel_channels)
 from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices,
                             find_q_tf, fn_and_fnp_tf, real_harmonics_tf,
                             real_harmonics_grad_tf, nep_pair_kwargs, NUM_ABC,
@@ -344,8 +344,13 @@ class TNEP(layers.Layer):
         # with an isotropic and a traceless group (_bond_geometry).
         self._bond_rank = bond_rank(cfg)
         self._dipole_channels = int(cfg.dipole_channels)      # radial channels C
-        # Channel axis of V / c_pair / the vector head: C per group, group-major.
-        self._kernel_channels = self._dipole_channels * self._bond_rank
+        # Long-range field channel (mode 1): one extra staged channel after
+        # the radial groups; its own head slot under the scalar head.
+        self._field_channel = (bool(getattr(cfg, "dipole_field", False))
+                               and cfg.target_mode == 1 and self._neighbor_readout)
+        # Channel axis of V / c_pair / the vector head: C per group, group-major,
+        # then the field channel.
+        self._kernel_channels = kernel_channels(cfg)
         self._dipole_radial = str(cfg.dipole_radial)
         self._dipole_zeta = float(cfg.dipole_zeta)
         self._dipole_cutoff = resolved_dipole_cutoff(cfg)
@@ -371,7 +376,7 @@ class TNEP(layers.Layer):
         elif self._dipole_head == "vector":
             self._head_slots = self._kernel_channels
         else:
-            self._head_slots = self._bond_rank
+            self._head_slots = self._bond_rank + int(self._field_channel)
         if (self._neighbor_readout and self._dipole_head == "scalar"
                 and self._species_pairs == "off"):
             warnings.warn(
@@ -385,10 +390,10 @@ class TNEP(layers.Layer):
                     f"cfg.dipole_channels must be ≥ 1, got "
                     f"{self._dipole_channels}.")
             if self._dipole_radial not in ("chebyshev", "chebyshev_warped",
-                                           "gaussian", "screened"):
+                                           "gaussian", "bessel", "screened"):
                 raise ValueError(
                     f"cfg.dipole_radial must be 'chebyshev', "
-                    f"'chebyshev_warped', 'gaussian' or 'screened', "
+                    f"'chebyshev_warped', 'gaussian', 'bessel' or 'screened', "
                     f"got {self._dipole_radial!r}.")
             if self._dipole_cutoff not in ("cosine2", "cosine", "cubic",
                                            "tanh3"):
@@ -1052,6 +1057,9 @@ class TNEP(layers.Layer):
             G = self._site_coeff(
                 self._model_outs(out, nep_raw, Z, atom_mask, c_r, c_a),
                 self.c_pair, Z)                                       # [A, C, T]
+            if self._field_channel:
+                raise ValueError("predict(): cfg.dipole_field needs the staged V "
+                                 "(Ewald field channel); use predict_batch with W_atom.")
             dr, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)          # dr = neighbor − center
             rc = float(self.cfg.dipole_rc)
@@ -2155,6 +2163,14 @@ class TNEP(layers.Layer):
             g = tf.exp(-tf.square(r[..., tf.newaxis] - mu)
                        / (2.0 * self._gauss_sigma ** 2))
             return g * self._fc(r)[..., tf.newaxis]
+        if rad == "bessel":
+            # spherical Bessel j₀ family sin((n+1)πr/rc)/(r/rc); r=0 self-image
+            # entries are masked by the callers, so guard the division only.
+            rc = float(self.cfg.dipole_rc)
+            n1 = tf.constant(np.arange(1, self._dipole_channels + 1), dtype=r.dtype)
+            x = tf.where(r > 0, r, tf.ones_like(r)) / rc
+            return (tf.sin(np.pi * n1 * x[..., tf.newaxis]) / x[..., tf.newaxis]
+                    * self._fc(r)[..., tf.newaxis])
         raise ValueError(f"unknown dipole_radial {rad!r}")
 
     def _bond_geometry(self, d: tf.Tensor) -> tf.Tensor:
@@ -2178,6 +2194,9 @@ class TNEP(layers.Layer):
         repeated over that group's C channels — group-major like V)."""
         if self._head_slots == self._kernel_channels:
             return out
+        if self._field_channel:                      # groups repeated, field slot as is
+            return tf.concat([tf.repeat(out[..., :-1], self._dipole_channels, axis=-1),
+                              out[..., -1:]], axis=-1)
         return tf.repeat(out, self._dipole_channels, axis=-1)
 
     def _c_full(self, c_pair: tf.Tensor, k: int = 0) -> tf.Tensor:
@@ -2201,6 +2220,10 @@ class TNEP(layers.Layer):
         Returns:
             V : [B, A, D, C, T]
         """
+        if self._field_channel:
+            raise ValueError(
+                "in-graph V: cfg.dipole_field needs the staged V (Ewald field "
+                "channel built at data assembly); this path cannot build it.")
         if float(self.cfg.dipole_rc) > float(self.cfg.rcut_hard):
             raise ValueError(
                 f"in-graph V: dipole_rc={self.cfg.dipole_rc} > "

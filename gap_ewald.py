@@ -28,7 +28,7 @@ SPCE = {8: -0.8476, 1: 0.4238}
 
 
 def ewald_phi_E(atoms: Atoms, q: np.ndarray, alpha: float = 0.35, r_cut: float = 9.0,
-                k_cut: float = 7.0) -> tuple[np.ndarray, np.ndarray]:
+                k_cut: float = 7.0, recip_only: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Ewald potential φ_i [N] and field E_i [N, 3] from all OTHER charges
     (Coulomb units q/Å; self term removed, k = 0 dropped: neutral cells). Real space over the image-exact
     ASE neighbour list, reciprocal over |k| ≤ k_cut."""
@@ -51,9 +51,13 @@ def ewald_phi_E(atoms: Atoms, q: np.ndarray, alpha: float = 0.35, r_cut: float =
     S = (q[:, None] * np.exp(1j * phase)).sum(0)               # [K]
     w = 4 * np.pi / V * np.exp(-k2 / (4 * alpha ** 2)) / k2
     e = np.exp(-1j * phase)
-    phi += (w * (S * e)).real.sum(1) - 2 * alpha / np.sqrt(np.pi) * q   # minus the Gaussian self term
-    E -= ((w * (S * e)).imag[:, :, None] * k[None]).sum(1)      # E = −∂φ/∂r_i
-    return phi, E
+    phi_k = (w * (S * e)).real.sum(1) - 2 * alpha / np.sqrt(np.pi) * q   # minus the Gaussian self term
+    E_k = -((w * (S * e)).imag[:, :, None] * k[None]).sum(1)      # E = −∂φ/∂r_i
+    if recip_only:
+        # the reciprocal part alone = the field/potential of Gaussian-smeared
+        # charges of width σ = 1/(√2 α) (LODE-style smoothing), other atoms only
+        return phi_k, E_k
+    return phi + phi_k, E + E_k
 
 
 def ewald_features(frames, tis, cfg, long_range_only: bool):
@@ -87,7 +91,7 @@ def fit_field_column(setup: gb.Setup, long_range_only: bool, delta_E: float = 1.
         for a, ti, D, (_, E), v in zip(frames, tis, descs, feats, vs):
             v_aug = np.concatenate([v, scale * E[:, :, None]], axis=2)
             rows.append(gd._phi_frame([(D, setup.sparse)], v_aug, ti, setup.xis, None, gd._deltas(cfg)))
-        return np.stack(rows).reshape(3 * len(frames), -1)
+        R_ = np.stack(rows); return R_.reshape(R_.shape[0] * R_.shape[1], -1)
 
     Phi = design(setup.frames, setup.tis, setup.descs, feats, vs)
     beta = gb._solve([gd._whiten(Phi, factors, K1, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
@@ -129,7 +133,7 @@ def fit_potential_kernel(setup: gb.Setup, long_range_only: bool, ell_factor: flo
                 G = (D[sel] @ Dm.T) ** xi * kphi(p[sel], phi_m[t], t)
                 cols.append(d_soap ** 2 * np.einsum("nm,nxk->xmk", G, v[sel]).reshape(3, -1))
             rows.append(np.concatenate(cols, 1))
-        return np.stack(rows).reshape(3 * len(frames), -1)
+        R_ = np.stack(rows); return R_.reshape(R_.shape[0] * R_.shape[1], -1)
 
     factors = []
     for t, Dm in enumerate(setup.sparse):
@@ -219,7 +223,7 @@ def fit_extra_columns(setup: gb.Setup, feature_fn, delta: float = 1.0):
         rows = [gd._phi_frame([(D, setup.sparse)], np.concatenate([v, x * scale], axis=2), ti,
                               setup.xis, None, gd._deltas(cfg))
                 for ti, D, x, v in zip(tis, descs, X, vs)]
-        return np.stack(rows).reshape(3 * len(frames), -1)
+        R_ = np.stack(rows); return R_.reshape(R_.shape[0] * R_.shape[1], -1)
 
     Phi = design(setup.frames, setup.tis, setup.descs, X, vs)
     beta = gb._solve([gd._whiten(Phi, factors, K1, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
@@ -228,7 +232,7 @@ def fit_extra_columns(setup: gb.Setup, feature_fn, delta: float = 1.0):
     def predict(frames):
         tis, descs = setup.prep(frames)
         v2 = [gd._v_atoms(a, ti, cfg) for a, ti in zip(frames, tis)]
-        return (design(frames, tis, descs, feature_fn(frames, tis), v2) @ alpha).reshape(len(frames), 3)
+        return (design(frames, tis, descs, feature_fn(frames, tis), v2) @ alpha).reshape(len(frames), -1)
     predict.n_columns = Phi.shape[1]
     return predict
 
@@ -430,7 +434,8 @@ def fit_with_v(setup: gb.Setup, v_fn, feature_fn=None, delta: float = 1.0):
     and optional extra columns feature_fn(frames, tis) → [N, 3, n_extra]."""
     cfg = setup.cfg
     vs = [v_fn(a, ti) for a, ti in zip(setup.frames, setup.tis)]
-    X = feature_fn(setup.frames, setup.tis) if feature_fn else [np.zeros((len(a), 3, 0)) for a in setup.frames]
+    D_ = 6 if int(cfg.target_mode) == 2 else 3
+    X = feature_fn(setup.frames, setup.tis) if feature_fn else [np.zeros((len(a), D_, 0)) for a in setup.frames]
     n_extra = X[0].shape[2]
     rms_v = np.sqrt(np.mean([(v ** 2).mean() for v in vs]))
     scale = (delta * rms_v / np.sqrt(np.mean([(x ** 2).mean(axis=(0, 1)) for x in X], axis=0))) if n_extra else np.zeros(0)
@@ -438,8 +443,9 @@ def fit_with_v(setup: gb.Setup, v_fn, feature_fn=None, delta: float = 1.0):
     factors = gd._prior_factors(cfg, [setup.sparse], setup.xis, K1)
 
     def design(tis, descs, X, vs):
-        return np.stack([gd._phi_frame([(D, setup.sparse)], np.concatenate([v, x * scale], 2), ti, setup.xis, None, gd._deltas(cfg))
-                         for ti, D, x, v in zip(tis, descs, X, vs)]).reshape(3 * len(vs), -1)
+        Phi_ = np.stack([gd._phi_frame([(D, setup.sparse)], np.concatenate([v, x * scale], 2), ti, setup.xis, None, gd._deltas(cfg))
+                         for ti, D, x, v in zip(tis, descs, X, vs)])
+        return Phi_.reshape(Phi_.shape[0] * Phi_.shape[1], -1)
     Phi = design(setup.tis, setup.descs, X, vs)
     beta = gb._solve([gd._whiten(Phi, factors, K1, False)], setup.targets(setup.frames).reshape(-1), setup.row_w(setup.frames))
     alpha = gd._whiten(beta[None], factors, K1, True)[0]
@@ -447,7 +453,94 @@ def fit_with_v(setup: gb.Setup, v_fn, feature_fn=None, delta: float = 1.0):
     def predict(frames):
         tis, descs = setup.prep(frames)
         v2 = [v_fn(a, ti) for a, ti in zip(frames, tis)]
-        X2 = feature_fn(frames, tis) if feature_fn else [np.zeros((len(a), 3, 0)) for a in frames]
-        return (design(tis, descs, X2, v2) @ alpha).reshape(len(frames), 3)
+        X2 = feature_fn(frames, tis) if feature_fn else [np.zeros((len(a), 6 if int(cfg.target_mode) == 2 else 3, 0)) for a in frames]
+        return (design(tis, descs, X2, v2) @ alpha).reshape(len(frames), -1)
     predict.n_columns = Phi.shape[1]
     return predict
+
+
+# ── 5. Applequist / Thole linear response (literature: LODE, SCFNN, LES 2026) ─
+
+def ewald_dipole_tensor(atoms: Atoms, alpha: float = 0.35, r_cut: float = 9.0, k_cut: float = 7.0,
+                        exclude_pairs=None) -> np.ndarray:
+    """Ewald dipole–dipole tensor T [N, N, 3, 3] such that the field at i from
+    point dipoles p_j is E_i = Σ_j T_ij p_j (own-dipole term excluded, the
+    Gaussian self part included as in the standard dipole Ewald self term).
+    Real space over the image-exact neighbour list with f(r) = erfc(αr)/r:
+    T = ∇∇f = f″ r̂r̂ + (f′/r)(I − r̂r̂); reciprocal: (4π/V) Σ_k w_k k kᵀ
+    cos(k·(r_i − r_j)); self: −(4α³/3√π) I. `exclude_pairs` (i, j) arrays are
+    zeroed (intramolecular exclusion, as in polarisable water models)."""
+    N, r = len(atoms), atoms.positions
+    i, j, d, D = neighbor_list("ijdD", atoms, r_cut)        # D = r_j − r_i
+    a2d2 = (alpha * d) ** 2
+    ex = np.exp(-a2d2); erfc_ = erfc(alpha * d)
+    fp = -(erfc_ / d ** 2 + 2 * alpha / np.sqrt(np.pi) * ex / d)                 # f′
+    fpp = 2 * erfc_ / d ** 3 + (4 * alpha / np.sqrt(np.pi)) * ex / d ** 2 + (4 * alpha ** 3 / np.sqrt(np.pi)) * ex   # f″
+    rhat = D / d[:, None]
+    rr = rhat[:, :, None] * rhat[:, None, :]
+    Tp = fpp[:, None, None] * rr + (fp / d)[:, None, None] * (np.eye(3)[None] - rr)   # [P, 3, 3]
+    T = np.zeros((N, N, 3, 3)); np.add.at(T, (i, j), Tp)
+    cell = np.asarray(atoms.cell.array); V = abs(np.linalg.det(cell))
+    recip = 2 * np.pi * np.linalg.inv(cell).T
+    nmax = int(np.ceil(k_cut / np.min(np.linalg.norm(recip, axis=1)))) + 1
+    rng_ = np.arange(-nmax, nmax + 1)
+    n = np.array(np.meshgrid(rng_, rng_, rng_, indexing="ij")).reshape(3, -1).T
+    k = n @ recip; k2 = (k ** 2).sum(1); keep = (k2 > 1e-12) & (k2 <= k_cut ** 2); k, k2 = k[keep], k2[keep]
+    w = 4 * np.pi / V * np.exp(-k2 / (4 * alpha ** 2)) / k2
+    phase = r @ k.T; c, s = np.cos(phase), np.sin(phase)
+    kk = w[:, None, None] * k[:, :, None] * k[:, None, :]                        # [K, 3, 3]
+    # φ_dip = −p·∇G ⇒ E = −(4π/V) Σ_k w k kᵀ cos(k·r_ij)·p: the reciprocal tensor is NEGATIVE
+    T -= np.einsum("ik,kab,jk->ijab", c, kk, c) + np.einsum("ik,kab,jk->ijab", s, kk, s)
+    # The reciprocal sum includes each dipole's own Gaussian cloud, whose field at
+    # its centre is −(4α³/3√π)·p (Hessian of erf(αr)/r at 0): remove it.
+    T[np.arange(N), np.arange(N)] += (4 * alpha ** 3 / (3 * np.sqrt(np.pi))) * np.eye(3)
+    # sign: E = −∇φ, φ_dipole = −p·∇f  ⇒  E_i = Σ_j (∇∇f) p_j with ∇∇f as above
+    if exclude_pairs is not None:
+        T[exclude_pairs[0], exclude_pairs[1]] = 0.0
+    return T
+
+
+def molecules(atoms: Atoms):
+    """(i, j) index arrays of all intramolecular pairs: each H assigned to its
+    nearest O (MIC). Water-specific, used only for the induction exclusion."""
+    Z = atoms.numbers; O = np.where(Z == 8)[0]; H = np.where(Z == 1)[0]
+    from ase.geometry import get_distances
+    _, Dm = get_distances(atoms.positions[H], atoms.positions[O], cell=atoms.cell, pbc=True)
+    owner = O[Dm.argmin(1)]
+    members = {o: [o] for o in O}
+    for h, o in zip(H, owner): members[o].append(h)
+    ii, jj = [], []
+    for m in members.values():
+        for a in m:
+            for b in m:
+                if a != b: ii.append(a); jj.append(b)
+    return np.array(ii), np.array(jj)
+
+
+_T_CACHE: dict = {}
+
+
+def applequist(atoms: Atoms, E0: np.ndarray, alpha_species: dict, exclude_intra: bool = True):
+    """Linear-response induction with fixed scalar polarisabilities α_z (Å³):
+    p = (I − A T)⁻¹ A E0, A = diag(α). Returns (p [N, 3] e·Å, E_eff = E0 + T p,
+    R = (I − A T)⁻¹ A [3N, 3N] for the polarisability columns)."""
+    N = len(atoms)
+    key = (id(atoms), bool(exclude_intra))
+    if key not in _T_CACHE:
+        T = ewald_dipole_tensor(atoms, exclude_pairs=molecules(atoms) if exclude_intra else None)
+        _T_CACHE[key] = T.transpose(0, 2, 1, 3).reshape(3 * N, 3 * N)
+    Tm = _T_CACHE[key]
+    A = np.repeat(np.array([alpha_species.get(int(z), 0.0) for z in atoms.numbers]), 3)
+    R = np.linalg.solve(np.eye(3 * N) - A[:, None] * Tm, np.diag(A))
+    p = (R @ E0.reshape(-1)).reshape(N, 3)
+    return p, E0 + (Tm @ p.reshape(-1)).reshape(N, 3), R
+
+
+def induced_site_tensors(atoms: Atoms, alpha_species: dict, exclude_intra: bool = True) -> np.ndarray:
+    """Per-site induced-coupling tensor W_i = Σ_j R_ij (Voigt [N, 6]), R the
+    Applequist response: Σ_i W_i is the Applequist cell polarisability, so a
+    site-weighted sum Σ_i s_i W_i is a long-range, screened α kernel group."""
+    N = len(atoms)
+    _, _, R = applequist(atoms, np.zeros((N, 3)), alpha_species, exclude_intra)
+    Wi = R.reshape(N, 3, N, 3).sum(2)                        # [N, 3, 3]
+    return np.stack([Wi[:, 0, 0], Wi[:, 1, 1], Wi[:, 2, 2], Wi[:, 0, 1], Wi[:, 1, 2], Wi[:, 2, 0]], 1)

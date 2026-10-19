@@ -81,7 +81,8 @@ class Setup:
 
     def row_w(self, frames) -> np.ndarray:
         sigma = float(self.cfg.gap_sigma)
-        return np.repeat(1.0 / (sigma * np.sqrt([len(a) for a in frames])), 3)
+        D = 6 if int(self.cfg.target_mode) == 2 else 3
+        return np.repeat(1.0 / (sigma * np.sqrt([len(a) for a in frames])), D)
 
     def targets(self, frames) -> np.ndarray:
         return gd._targets(frames, self.cfg)

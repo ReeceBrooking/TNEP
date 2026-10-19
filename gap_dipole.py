@@ -280,6 +280,10 @@ def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
         str(cfg.dipole_radial), float(cfg.dipole_zeta),
         resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale),
         rank=bond_rank(cfg))
+    if bool(getattr(cfg, "dipole_field", False)) and int(cfg.target_mode) == 1:
+        # same staged channel as assemble_data_dict (scale pinned there at fit)
+        V = tnep_data._append_field_channel(V, tnep_data.field_channel(atoms, cfg),
+                                            float(cfg.dipole_field_scale))
     return _finish_v(V, atoms, ti, cfg)
 
 
