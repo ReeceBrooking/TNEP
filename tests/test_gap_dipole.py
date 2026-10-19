@@ -447,7 +447,7 @@ def test_fit_is_gap_fit_sparse_gp(tmp_path):
     deltas = gap_dipole._deltas(cfg)
     Phi = np.stack([gap_dipole._phi_frame(
         [(descs[f], model.sparse_desc, gap_dipole._v_atoms(dataset[f], tis[f], cfg), deltas[0])],
-        tis[f], model.xi, None, deltas) for f in range(len(dataset))])
+        tis[f], model.xi, None, deltas[1:]) for f in range(len(dataset))])
     Phi_flat = Phi.reshape(-1, Phi.shape[-1])
     mu = gap_dipole._targets(dataset, cfg)
     K = Phi.shape[-1] // sum(len(sd) for sd in model.sparse_desc)       # readout columns per sparse point
@@ -679,6 +679,8 @@ def test_site_model_fields_are_gap_only_and_validated():
         gap_dipole._validate(_cfg(gap_site_models=["soap", "4b"]))
     with pytest.raises(ValueError, match="gap_site_models"):
         gap_dipole._validate(_cfg(gap_site_models=[]))
+    with pytest.raises(ValueError, match="gap_site_models"):
+        gap_dipole._validate(_cfg(gap_site_models=["soap", "soap"]))
     with pytest.raises(ValueError, match="gap_model_delta"):
         gap_dipole._validate(_cfg(gap_site_models=["soap", "2b"], gap_model_delta={"soap": 1.0}))
     with pytest.raises(ValueError, match="gap_cross_lmax"):

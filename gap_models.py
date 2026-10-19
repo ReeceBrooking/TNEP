@@ -23,6 +23,14 @@ from gap_descriptor import pair_index
 from TNEPconfig import GAPconfig, resolved_dipole_cutoff
 
 
+def pair_columns(cfg: GAPconfig) -> bool:
+    """True when the neighbor-type axis becomes design columns (any
+    dipole_species_pairs but "off"/legacy False) — THE one definition of T′,
+    shared by the descriptors, the angular kernels and gap_dipole's bond basis."""
+    sp = cfg.dipole_species_pairs
+    return not (sp == "off" or sp is False)
+
+
 def legendre(cos: np.ndarray, lmax: int) -> np.ndarray:
     """P_0..P_lmax(cos) by recurrence → [..., lmax+1]."""
     P = [np.ones_like(cos), cos]
@@ -125,7 +133,7 @@ def angular_cross_tensor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nda
     """α kernel [N, 6, K_x]: Legendre-weighted traceless sym(d_j ⊗ d_k) over
     channel pairs a ≤ b (species-resolved under pair columns) and l ≤ gap_cross_lmax."""
     Cx, L, T = int(cfg.gap_cross_channels), int(cfg.gap_cross_lmax), int(cfg.num_types)
-    pair = str(cfg.dipole_species_pairs) != "off"
+    pair = pair_columns(cfg)
     i, j, d, R, P, K, Pl, starts, ends = _angular_triplets(atoms, cfg, Cx, L)
     Rp = _species_resolved(R, np.asarray(ti)[j], T, pair)                 # [P, K1]
     au, bu = np.triu_indices(Rp.shape[1])
@@ -146,7 +154,7 @@ def angular_cross_vector(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nda
     """μ kernel [N, 3, K_x]: Σ R_a(r_ij) R_b(r_ik) P_l(cos θ) d_ij (odd), l ≥ 1
     (l = 0 collapses to the one-hop basis and is skipped)."""
     Cx, L, T = int(cfg.gap_cross_channels), int(cfg.gap_cross_lmax), int(cfg.num_types)
-    pair = str(cfg.dipole_species_pairs) != "off"
+    pair = pair_columns(cfg)
     i, j, d, R, P, K, Pl, starts, ends = _angular_triplets(atoms, cfg, Cx, L)
     Pl = Pl[:, 1:]                                                        # drop l = 0
     Rp = _species_resolved(R, np.asarray(ti)[j], T, pair)

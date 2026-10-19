@@ -66,8 +66,7 @@ class Setup:
             self.sparse.append(Dt[idx].copy()); self.sparse_idx.append(idx)
         self.xis = gd._xi_tuple(cfg)
         self.n_vcols = gd._n_vcols(cfg)
-        self.deltas = gd._deltas(cfg)
-        self.delta = self.deltas[0]
+        self.delta, *self.tail_deltas = gd._deltas(cfg)      # δ_soap, (δ_2b, δ_3b)
         self.base_factors = gd._prior_factors(cfg, [(self.sparse, self.delta, self.n_vcols)],
                                               self.xis, self.n_vcols)
         self.n_base = sum(n for n, _ in self.base_factors)
@@ -80,7 +79,7 @@ class Setup:
         """[3, n_base] production design block (optionally with a custom geometry v)."""
         if v is None:
             v = gd._v_atoms(atoms, ti, self.cfg)
-        return gd._phi_frame([(D, self.sparse, v, self.delta)], ti, self.xis, None, self.deltas)
+        return gd._phi_frame([(D, self.sparse, v, self.delta)], ti, self.xis, None, self.tail_deltas)
 
     def row_w(self, frames) -> np.ndarray:
         sigma = float(self.cfg.gap_sigma)

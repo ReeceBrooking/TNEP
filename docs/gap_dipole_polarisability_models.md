@@ -315,7 +315,10 @@ SOAP + 2b 16.1 / 17.0, SOAP + 3b 14.9 / 17.0, SOAP + 2b + 3b 15.5 / 15.9, 2b
 alone 24.2 / 19.2, 3b alone (angular kernel only, so no isotropic group)
 18.6 % off-diagonal; every sum pushed the selected $\sigma$ from 0.1 to 0.3
 and none beat the base beyond the ≈ 0.3-point noise. For the dipole it holds
-for the 3b part (SOAP + 3b 1.02 %, within noise of SOAP + 2b + 3b at 1.05)
+for the 3b part (SOAP + 3b 1.02 %, within noise of SOAP + 2b + 3b at 1.05;
+the μ 3b rows also carry the $T\cdot v$ cross group on the SOAP/2b readout,
+$C_x=4$ forced by the 3b kernel where the base has none, which §5 found
+neutral at 1.76 → 1.71 % without the field)
 but a small-amplitude 2b kernel is a real, if modest, gain: 1.08 → 1.00 %
 (§3.4), where the same 2b content as a column block had been neutral at best.
 The difference is regularisation, not information: a separately regularised

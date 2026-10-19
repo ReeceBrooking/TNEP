@@ -34,4 +34,4 @@ Common: gap_site_channels=10, gap_site_lmax=2, M=250 per species per model, ξ=2
 | soap+3b | 3e-3, C_x 4, l_x 1, δ_3b 0.3 | 1.02 % | 75000 | 170 | 0.3, l_x 1 | 14.9/17.0 | 74000 | 174 |
 | soap+2b+3b | 3e-3, C_x 4, l_x 1, δ 0.3 | 1.05 % | 118000 | 166 | 0.3, δ 0.3 | 15.5/15.9 | 112000 | 216 |
 
-The 3b-only α row has no isotropic group (its angular kernel is traceless), so the diagonal is the mean-free prediction and is not a result. Every decomposed α row preferred the larger σ (0.3) while the base preferred 0.1: the extra kernels add variance the 2400 rows cannot pin down.
+The 3b-only α row has no isotropic group (its angular kernel is traceless), so the diagonal is the mean-free prediction and is not a result. Every decomposed α row preferred the larger σ (0.3) while the base preferred 0.1: the extra kernels add variance the 2400 rows cannot pin down. The μ 3b rows also carry the T·v cross group on the soap/2b readout (C_x = 4, forced by the 3b kernel, while the μ base has C_x = 0), which §5 of the docs found neutral (1.76 → 1.71 % without the field).

@@ -23,6 +23,7 @@ from scipy.special import erfc
 
 import gap_bond as gb
 import gap_dipole as gd
+import gap_models as gm
 
 SPCE = {8: -0.8476, 1: 0.4238}
 
@@ -91,7 +92,7 @@ def fit_field_column(setup: gb.Setup, long_range_only: bool, delta_E: float = 1.
         for a, ti, D, (_, E), v in zip(frames, tis, descs, feats, vs):
             v_aug = np.concatenate([v, scale * E[:, :, None]], axis=2)
             rows.append(gd._phi_frame([(D, setup.sparse, v_aug, setup.delta)], ti, setup.xis,
-                                      None, setup.deltas))
+                                      None, setup.tail_deltas))
         R_ = np.stack(rows); return R_.reshape(R_.shape[0] * R_.shape[1], -1)
 
     Phi = design(setup.frames, setup.tis, setup.descs, feats, vs)
@@ -199,7 +200,7 @@ def bond_tensor_dot(frames, tis, cfg, E_list, C_x: int):
             a, ti, float(cfg.dipole_rc or cfg.rcut_hard), C_x, int(cfg.num_types),
             str(cfg.dipole_radial), float(cfg.dipole_zeta), resolved_dipole_cutoff(cfg),
             float(cfg.dipole_gauss_sigma_scale), rank=2)
-        Tv = gd._collapse_V(V2[:, :, C_x:] + V2[:, :, :C_x] / 3.0, gd._pair_columns(cfg))   # [N, 6, K1]
+        Tv = gd._collapse_V(V2[:, :, C_x:] + V2[:, :, :C_x] / 3.0, gm.pair_columns(cfg))   # [N, 6, K1]
         xx, yy, zz, xy, yz, zx = (Tv[:, k] for k in range(6))
         ex, ey, ez = E[:, 0, None], E[:, 1, None], E[:, 2, None]
         out.append(np.stack([xx * ex + xy * ey + zx * ez, xy * ex + yy * ey + yz * ez,
@@ -222,7 +223,7 @@ def fit_extra_columns(setup: gb.Setup, feature_fn, delta: float = 1.0):
 
     def design(frames, tis, descs, X, vs):
         rows = [gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * scale], axis=2), setup.delta)],
-                              ti, setup.xis, None, setup.deltas)
+                              ti, setup.xis, None, setup.tail_deltas)
                 for ti, D, x, v in zip(tis, descs, X, vs)]
         R_ = np.stack(rows); return R_.reshape(R_.shape[0] * R_.shape[1], -1)
 
@@ -280,7 +281,7 @@ def fit_polarise(setup: gb.Setup, split: bool = True, n_iter: int = 1, mix: floa
         scale = rms_v / np.sqrt(np.mean([(x ** 2).mean(axis=(0, 1)) for x in X], axis=0))
         K1 = K0 + n_extra
         factors = gd._prior_factors(cfg, [(setup.sparse, setup.delta, K1)], xi_list, K1)
-        Phi = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * scale], 2), setup.delta)], ti, xi_list, None, setup.deltas)
+        Phi = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * scale], 2), setup.delta)], ti, xi_list, None, setup.tail_deltas)
                         for ti, D, x, v in zip(setup.tis, setup.descs, X, vs_tr)]).reshape(3 * len(X), -1)
         beta = gb._solve([gd._whiten(Phi, factors, False)], y, rw)
         alpha = gd._whiten(beta[None], factors, True)[0]
@@ -296,7 +297,7 @@ def fit_polarise(setup: gb.Setup, split: bool = True, n_iter: int = 1, mix: floa
 
     def predict_stage(stage, frames, tis, descs, X):
         vs = [gd._v_atoms(a, ti, cfg) for a, ti in zip(frames, tis)]
-        Phi = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * stage["scale"]], 2), setup.delta)], ti, xi_list, None, setup.deltas)
+        Phi = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * stage["scale"]], 2), setup.delta)], ti, xi_list, None, setup.tail_deltas)
                         for ti, D, x, v in zip(tis, descs, X, vs)])
         return Phi @ stage["alpha"]
 
@@ -427,7 +428,7 @@ def v_polarised(atoms, ti, cfg, y):
     shift = (y[i] - y[j])                                                   # [P, 3]
     Gs = G - shift[:, :, None] * Rw[:, None, :]
     V = np.zeros((len(atoms), T, 3, C)); np.add.at(V, (i, np.asarray(ti)[j]), Gs)
-    return gd._collapse_V(V.transpose(0, 2, 3, 1), gd._pair_columns(cfg))
+    return gd._collapse_V(V.transpose(0, 2, 3, 1), gm.pair_columns(cfg))
 
 
 def fit_with_v(setup: gb.Setup, v_fn, feature_fn=None, delta: float = 1.0):
@@ -444,7 +445,7 @@ def fit_with_v(setup: gb.Setup, v_fn, feature_fn=None, delta: float = 1.0):
     factors = gd._prior_factors(cfg, [(setup.sparse, setup.delta, K1)], setup.xis, K1)
 
     def design(tis, descs, X, vs):
-        Phi_ = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * scale], 2), setup.delta)], ti, setup.xis, None, setup.deltas)
+        Phi_ = np.stack([gd._phi_frame([(D, setup.sparse, np.concatenate([v, x * scale], 2), setup.delta)], ti, setup.xis, None, setup.tail_deltas)
                          for ti, D, x, v in zip(tis, descs, X, vs)])
         return Phi_.reshape(Phi_.shape[0] * Phi_.shape[1], -1)
     Phi = design(setup.tis, setup.descs, X, vs)

@@ -110,13 +110,6 @@ class GapDipoleModel:
         return self.site_alpha["soap"]
 
 
-def _pair_columns(cfg: GAPconfig) -> bool:
-    """True when the neighbor-type axis of V becomes design columns
-    (any dipole_species_pairs but "off"/legacy False)."""
-    sp = cfg.dipole_species_pairs
-    return not (sp == "off" or sp is False)
-
-
 def _xi_tuple(cfg: GAPconfig) -> tuple[int, ...]:
     """Normalize cfg.gap_kernel_power (int | list[int]) to a tuple.
     Each entry contributes one column block per sparse point (sum-of-kernels:
@@ -169,8 +162,10 @@ def _validate(cfg: GAPconfig) -> None:
         # from an image-exact neighbour list, so r_c > rcut_hard is legal.
         (0.0 < float(cfg.dipole_rc or cfg.rcut_hard),
          f"dipole_rc must be > 0, got {cfg.dipole_rc}"),
-        (bool(cfg.gap_site_models) and set(cfg.gap_site_models) <= {"soap", "2b", "3b"},
-         f"gap_site_models must be a non-empty subset of soap/2b/3b, got {cfg.gap_site_models!r}"),
+        (bool(cfg.gap_site_models) and set(cfg.gap_site_models) <= {"soap", "2b", "3b"}
+         and len(set(cfg.gap_site_models)) == len(cfg.gap_site_models),
+         f"gap_site_models must be a non-empty subset of soap/2b/3b without repeats, "
+         f"got {cfg.gap_site_models!r}"),
         (set(cfg.gap_site_models) <= set(cfg.gap_model_delta)
          and all(float(cfg.gap_model_delta[m]) > 0 for m in cfg.gap_site_models),
          "gap_model_delta needs a positive entry for every entry of gap_site_models"),
@@ -233,7 +228,7 @@ def _cross_group(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
         str(cfg.dipole_radial), float(cfg.dipole_zeta),
         resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale),
         rank=1)                                                 # [N, 3, C_x, T]
-    v = _collapse_V(V1, _pair_columns(cfg))                     # [N, 3, K₁]
+    v = _collapse_V(V1, gm.pair_columns(cfg))                     # [N, 3, K₁]
     a_idx, b_idx = np.triu_indices(v.shape[2])
     a, b = v[:, :, a_idx], v[:, :, b_idx]                       # [N, 3, K_x]
     sym = 0.5 * (a[:, :, None, :] * b[:, None, :, :]
@@ -255,7 +250,7 @@ def _cross_group_dipole(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndar
     args = (atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard), int(cfg.gap_cross_channels),
             int(cfg.num_types), str(cfg.dipole_radial), float(cfg.dipole_zeta),
             resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale))
-    pair = _pair_columns(cfg)
+    pair = gm.pair_columns(cfg)
     V2 = tnep_data._neighbor_dipole_V(*args, rank=2)               # [N, 6, 2C_x, T]
     Cx = int(cfg.gap_cross_channels)
     # full d⊗d = traceless group + isotropic group / 3 (Voigt)
@@ -279,7 +274,7 @@ def _finish_v(V: np.ndarray, atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np
     T·v vectors; polarisability: sym(v⊗v) tensors), scaled by
     gap_group_delta[2]. THE one place fit and predict both go through, so
     the column contract cannot drift."""
-    v = _collapse_V(V, _pair_columns(cfg))
+    v = _collapse_V(V, gm.pair_columns(cfg))
     d_iso, d_tr, d_x = (float(x) for x in cfg.gap_group_delta)
     if int(cfg.target_mode) == 2:
         per_group = v.shape[2] // 2                              # C·T′ channels per group
@@ -296,7 +291,7 @@ def _n_vcols(cfg: GAPconfig) -> int:
     """K: design geometry columns per sparse point (kernel channels × pair
     columns, + the cross group: K₁(K₁+1)/2 symmetric tensor products under
     target_mode=2, K₁² T·v vectors under target_mode=1; K₁ = C_x·T′)."""
-    T_ = cfg.num_types if _pair_columns(cfg) else 1
+    T_ = cfg.num_types if gm.pair_columns(cfg) else 1
     k = kernel_channels(cfg) * T_
     cx = int(cfg.gap_cross_channels)
     if cx > 0:
@@ -376,7 +371,7 @@ def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
 
 def _phi_frame(scales: list, ti: np.ndarray, xis: tuple[int, ...],
                gap_q: tuple[np.ndarray | None, np.ndarray | None] | None = None,
-               deltas: tuple[float, float, float] = (1.0, 1.0, 1.0),
+               tail_deltas: tuple[float, float] = (1.0, 1.0),
                v: np.ndarray | None = None) -> np.ndarray:
     """[D, n_columns] design block for one frame (D = 3 dipole components or
     6 Voigt polarisability components) — THE column contract for fit AND
@@ -392,14 +387,14 @@ def _phi_frame(scales: list, ti: np.ndarray, xis: tuple[int, ...],
     gap3b (species → (s, k)) — Σ_{i∈t} q[i, s]·v[i, x, k] — i.e. the 2b/3b
     site energies with a linear readout, μ-weighted by the bond basis `v`.
 
-    deltas = (ignored, δ_2b, δ_3b): a model's δ comes ONLY from its scales
-    entry; deltas[0] is kept for call-site symmetry with _deltas(cfg). The
-    2b/3b kernels carry δ², as in gap.f90 (`delta**2 * alphas * kernel`) and
-    gap_fit's covariance — so the columns here are δ²·k and the coefficients
-    α are in gap_fit's convention. The same δ² sits on the sparse-sparse
-    kernel K_MM that regularises the fit (_prior_factors), which is what
-    makes δ² the prior variance of that term's site function."""
-    _, d_2b, d_3b = (float(d) for d in deltas)
+    tail_deltas = (δ_2b, δ_3b) of those tails (_deltas(cfg)[1:]); a site
+    model's δ comes ONLY from its scales entry. The 2b/3b kernels carry δ²,
+    as in gap.f90 (`delta**2 * alphas * kernel`) and gap_fit's covariance —
+    so the columns here are δ²·k and the coefficients α are in gap_fit's
+    convention. The same δ² sits on the sparse-sparse kernel K_MM that
+    regularises the fit (_prior_factors), which is what makes δ² the prior
+    variance of that term's site function."""
+    d_2b, d_3b = (float(d) for d in tail_deltas)
     cols = []
     for D, sparse_desc, vm, dm in scales:
         n_rows = vm.shape[1]             # 3 (dipole) or 6 (polarisability)
@@ -604,7 +599,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
         dataset, types_int, descs, [[]] * len(dataset), [[]] * len(dataset),
         cfg)
     mu = np.stack([np.asarray(t, dtype=np.float64) for t in d["targets"]])
-    pair = _pair_columns(cfg)
+    pair = gm.pair_columns(cfg)
     vs = [_finish_v(V, a, t, cfg) for V, a, t in zip(d["V_atom"], dataset, tis)]
     # Kernel channels (2·C under target_mode=2: isotropic + traceless groups).
     n_vcols = _n_vcols(cfg)
@@ -668,7 +663,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     for f in range(F):
         scales = _frame_scales(site, site_sparse, f, descs2, sparse_desc2, vs[f], d_soap)
         Phi[f] = _phi_frame(scales, tis[f], xis,
-                            _gap_q(dataset[f], tis[f], cfg), deltas, v=vs[f])
+                            _gap_q(dataset[f], tis[f], cfg), deltas[1:], v=vs[f])
     Phi_flat = Phi.reshape(D * F, n_columns)
 
     # An unpopulated species-pair slot (or a centre no triplet reaches) gives
@@ -820,7 +815,7 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
     for f, (atoms, ti, v) in enumerate(zip(frames, tis, vs)):
         scales = _frame_scales(site, model.site_sparse, f, descs2, model.sparse_desc2, v, d_soap)
         row = _phi_frame(scales, ti, model.xi,
-                         _gap_q(atoms, ti, cfg), deltas, v=v) @ alpha_flat
+                         _gap_q(atoms, ti, cfg), deltas[1:], v=v) @ alpha_flat
         if out is None:
             out = np.empty((len(frames), len(row)))     # D = 3 or 6
         out[f] = row

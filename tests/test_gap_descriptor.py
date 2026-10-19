@@ -745,7 +745,7 @@ def test_gap_deltas_scale_blocks_and_shift_influence(tmp_path):
         ti = np.asarray(ti); v = gd_fit._v_atoms(at, ti, m.cfg)
         return gd_fit._phi_frame(
             [(gd_fit._descriptors(m.builder, [at])[0], m.sparse_desc, v, gd_fit._deltas(m.cfg)[0])],
-            ti, m.xi, gd_fit._gap_q(at, ti, m.cfg), gd_fit._deltas(m.cfg), v=v)
+            ti, m.xi, gd_fit._gap_q(at, ti, m.cfg), gd_fit._deltas(m.cfg)[1:], v=v)
     Phi = np.stack([_phi(at, ti) for at, ti in zip(frames, assign_type_indices(frames, m.cfg.types))])
     alpha = np.concatenate([a for a in (m.alpha, m.alpha2, m.alpha_gap2b,
                                         m.alpha_gap3b) if a is not None
@@ -766,7 +766,7 @@ def test_gap_deltas_scale_blocks_and_shift_influence(tmp_path):
             v = gd_fit._v_atoms(at, ti, model.cfg)
             phi = gd_fit._phi_frame([(d, model.sparse_desc, v, gd_fit._deltas(model.cfg)[0])],
                                     ti, model.xi, gd_fit._gap_q(at, ti, model.cfg),
-                                    gd_fit._deltas(model.cfg), v=v)
+                                    gd_fit._deltas(model.cfg)[1:], v=v)
             n_soap = sum(a.size for a in model.alpha)
             a2 = np.concatenate(model.alpha_gap2b)
             n2b += np.linalg.norm(phi[:, n_soap:n_soap + a2.size] @ a2)
