@@ -1,0 +1,170 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8x]{inputenc}
+\usepackage[T1]{fontenc}
+%\usepackage{gentium}
+\usepackage{mathptmx} % Use Times Font
+
+\usepackage[pdftex]{graphicx} % Required for including pictures
+\usepackage[swedish]{babel} % Swedish translations
+\usepackage[pdftex,linkcolor=black,pdfborder={0 0 0}]{hyperref} % Format links for pdf
+\usepackage{calc} % To reset the counter in the document after title page
+\usepackage{enumitem} % Includes lists
+
+\frenchspacing % No double spacing between sentences
+\linespread{1.2} % Set linespace
+\usepackage[a4paper, lmargin=0.1666\paperwidth, rmargin=0.1666\paperwidth, tmargin=0.1111\paperheight, bmargin=0.1111\paperheight]{geometry} %margins
+%\usepackage{parskip}
+
+\usepackage[all]{nowidow} % Tries to remove widows
+\usepackage[protrusion=true,expansion=true]{microtype} % Improves typography, load after fontpackage is selected
+
+\usepackage{lipsum} % Used for inserting dummy 'Lorem ipsum' text into the template
+
+% --- needed by this content: maths environments/commands and the results tables ---
+\usepackage{amsmath,amssymb} % align*, \text, \lVert, \tfrac
+\usepackage{booktabs,array}  % \toprule etc., >{...}p{} column specs
+
+\begin{document}
+
+\section{Scope, metric and protocol}\label{sec:scope}
+
+Every result below is a sparse Gaussian-process (GAP) fit in the gap\_fit estimator: for design
+matrix $\Phi$, targets $y$, per-frame observation error $\sigma_\mathrm{obs} = \sigma\sqrt{N}$
+and sparse--sparse prior $K_{MM}$,
+\begin{equation}
+\hat\alpha = \arg\min_\alpha \; \sum_f \frac{\lVert \Phi_f\alpha - y_f\rVert^2}{\sigma_\mathrm{obs}^2} + \alpha^\top K_{MM}\,\alpha ,
+\label{eq:gap-objective}
+\end{equation}
+solved in whitened coordinates $\beta = (L^\top\otimes I)\alpha$ with $K_{MM}=LL^\top$, in the
+dual ($[DF\times DF]$ Gram, $D=3$ or $6$ rows per frame).
+
+Accuracy is quoted as the relative RMSE of the TNEP paper (Xu et al., JCTC 2024),
+\begin{equation}
+\mathrm{RRMSE} = \frac{\mathrm{RMSE}}{\mathrm{std}(\text{reference})},\qquad R^2 = 1-\mathrm{RRMSE}^2 ,
+\label{eq:rrmse}
+\end{equation}
+computed over components (the three Cartesian dipole components; the three diagonal and the three
+off-diagonal components of $\alpha$ separately).
+
+Protocol: hyperparameters ($\sigma$, kernel-group amplitudes) were selected on a 400/100 split of
+the training set and the winner refitted on all 500 frames before scoring the test set. Where a
+table says ``fit 400'', the model was fitted on 400 frames and scored on test directly.
+
+Published reference values: dipole 0.85\,\%; polarisability 16.3\,\% (diagonal) / 20.4\,\%
+(off-diagonal), on the susceptibility $\chi/\rho$.
+
+\section{The readout family}\label{sec:readout}
+
+\begin{equation}
+\mu = \sum_i \sum_k s^{(k)}_i\, \mathbf v^{(k)}_i, \qquad
+\alpha = \sum_i \sum_k s^{(k)}_i\, \mathbf W^{(k)}_i .
+\label{eq:readout}
+\end{equation}
+
+The radial channels are the warped Chebyshev family of the production readout,
+$R_n(r) = T_n\big(2(r/r_c-1)^2-1\big)\,f_c(r)$ with a cosine or squared-cosine cutoff,
+$C = 10$ channels, with independent coefficients per (channel, neighbour species) pair.
+
+\section{Dipole models}\label{sec:dipole}
+
+\subsection{The original model (baseline)}\label{sec:dip-original}
+
+A bond basis of $C=10$ warped Chebyshev channels per neighbour species on $r_c=3.0$~\AA{} with a
+squared-cosine cutoff, each channel with its own site function: a sparse kernel on the compressed
+$l_{\max}=\alpha_{\max}=4$ SOAP (hard/soft cutoff 3.5/3.0~\AA{}), $M=250$ farthest-point
+environments per species, $\xi=2$, $\sigma=10^{-3}$. 10\,000 columns. \textbf{Test RRMSE 1.76\,\%}
+on 500 training frames (1.86\,\% on 400); 0.28~ms/atom.
+
+\subsection{Best local model (no field)}\label{sec:dip-local}
+
+Two changes to Section~\ref{sec:dip-original}, both inside the site function; the readout is untouched.
+
+\begin{enumerate}[leftmargin=*,nosep]
+\item \textbf{A richer descriptor.} $l_{\max}=\alpha_{\max}=7$ with no compression (the full
+  840-dimensional power spectrum instead of the 4-4 compressed one). 1.76 $\rightarrow$
+  \textbf{1.56\,\%} (fit 500; 1.67 on 400). The selected $\sigma$ stays pinned at the smallest
+  value scanned, the signature of a capacity-limited site function, which is why more descriptor
+  helped and why $M=500$ did not (saturated at 250).
+\item \textbf{A summed two-body site model} (Section~\ref{sec:2b}). The site function becomes
+  $s_i=\sum_m\alpha_m(\hat D_i\cdot\hat D_m)^2+\delta_{2b}\sum_{m'}\beta_{m'}(\hat{\mathbf q}^{(2)}_i\cdot\hat{\mathbf q}^{(2)}_{m'})^2$
+  with $q^{(2)}_{i,nt'}=\sum_{j\in t'}R_n(r_{ij})$ the 20-number radial distribution of the
+  environment on the same 3~\AA{}, its own FPS set ($M=250$) and its own prior,
+  $\delta_{2b}=0.1$. 1.56 $\rightarrow$ \textbf{1.49\,\%} (fit 500; 1.56 on 400) at
+  $\sigma=3\times10^{-3}$. Columns double to 20\,000; the forward pass is unchanged within noise.
+\end{enumerate}
+
+\subsection{Results (test set, 500 training frames unless stated)}\label{sec:dip-results}
+
+\begin{center}\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.4cm}cccccc@{}}
+\toprule
+Model & \multicolumn{2}{c}{RRMSE} & \multicolumn{2}{c}{RMSE (fit 500)} & columns & ms/atom \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+ & fit 400 & fit 500 & $e\cdot a_0$/cell & $10^{-3}\,e\cdot a_0$/mol & & \\
+\midrule
+Original (Sec.~\ref{sec:dip-original}): $l=\alpha=4$ compressed SOAP, bond basis & 1.86\,\% & 1.76\,\% & 0.110 & 3.4 & 10\,000 & 0.28 \\
+$l=\alpha=7$ uncompressed SOAP & 1.67\,\% & 1.56\,\% & 0.097 & 3.0 & 10\,000 & 0.43 \\
+\textbf{Best local (Sec.~\ref{sec:dip-local}): + 2b site model, $\delta_{2b}=0.1$} & 1.56\,\% & \textbf{1.49\,\%} & \textbf{0.093} & 2.9 & 20\,000 & 0.45 \\
+Published TNEP (NEP descriptors, 6~\AA{} radial / 4~\AA{} angular, 200k SNES generations) & & 0.85\,\% & 0.053 & 1.7 & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{The summed 2b site model and its probes}\label{sec:2b}
+
+The site function of Section~\ref{sec:dip-original} is a single sparse kernel on the SOAP vector. The
+NEP decomposition of the site energy by body order suggests the sum
+\begin{equation}
+s_i = \sum_m \alpha_m\,(\hat{\mathbf q}_i\cdot\hat{\mathbf q}_m)^{2}
+\;+\;\delta_{2b}\sum_{m'} \beta_{m'}\,(\hat{\mathbf q}^{(2)}_i\cdot\hat{\mathbf q}^{(2)}_{m'})^{2},
+\qquad
+q^{(2)}_{i,\,n t'} = \sum_{j\in t'} R_n(r_{ij}),
+\label{eq:2b-site}
+\end{equation}
+a SOAP kernel plus a kernel on the radial distribution of the environment ($C=10$ warped Chebyshev
+channels per neighbour species, 20 numbers), each with its own FPS sparse set ($M=250$ per
+species); $\delta_{2b}$ is the relative prior amplitude.
+
+\section{Polarisability models}\label{sec:pol}
+
+\subsection{Form}\label{sec:pol-form}
+
+The \textbf{original model} is the first two terms below --- the isotropic and traceless bond
+groups, $C=10$ channels each on $r_c=4$~\AA{} with a cosine cutoff, site functions on the
+$l=\alpha=7$ compressed SOAP, $M=250$, $\sigma=0.1$, 20\,000 columns: \textbf{16.6 / 19.9\,\%}
+diagonal / off-diagonal on 500 training frames (16.9 / 20.2 on 400), 0.63~ms/atom. Every later
+number is measured against it. The full model has three even kernel groups, each with its own site
+function:
+\begin{align}
+\alpha ={}& \sum_i\sum_{n,t'}\Big[
+ s^{(n,t')}_i \sum_{j\in t'} R_n(r_{ij})\,|\mathbf d_{ij}|^2\,\mathbf I
+\;+\;
+ u^{(n,t')}_i \sum_{j\in t'} R_n(r_{ij})\Big(\mathbf d_{ij}\mathbf d_{ij}^\top - \tfrac{|\mathbf d_{ij}|^2}{3}\mathbf I\Big)\Big] \notag\\
+&+\;\sum_i\sum_{a\le b} w^{(ab)}_i\,\mathrm{sym}\big(\mathbf v^{(a)}_i\otimes\mathbf v^{(b)}_i\big)_{\text{traceless}} .
+\label{eq:pol-form}
+\end{align}
+The first two are the isotropic and traceless \emph{bond} groups ($C=10$ channels each,
+$r_c = 4$~\AA{}, cosine cutoff); the third is the \emph{cross} group built from four radial
+channels of the dipole kernel vector $\mathbf v^{(a)}_i=\sum_j R_a(r_{ij})\mathbf d_{ij}$.
+
+\subsection{Results (test set, diagonal / off-diagonal; all fits on 500 frames unless stated)}\label{sec:pol-results}
+
+\begin{center}\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{5.0cm}ccccc@{}}
+\toprule
+Model & \multicolumn{2}{c}{RRMSE} & \multicolumn{2}{c}{RMSE (\AA{}$^3$/cell)} & ms/atom \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+ & diag & off-diag & diag & off-diag & \\
+\midrule
+Two bond groups, SNES-trained ANN (15 neurons, 25\,k parameters, $\sigma_0=0.02$, 20\,000 generations) & 35.7\,\% & 27.5\,\% & 0.317 & 0.129 & \\
+\textbf{Two bond groups (iso + traceless): the original model, Sec.~\ref{sec:pol-form}} & 16.6\,\% & 19.9\,\% & 0.147 & 0.093 & 0.63 \\
++ cross group, 4 channels (the base) & 14.9\,\% & 16.0\,\% & 0.132 & 0.075 & 0.86 \\
++ second SOAP scale at 6.5~\AA{}, $\sigma=0.3$ & 13.9\,\% & 16.2\,\% & 0.123 & 0.076 & 2.5 \\
++ induced coupling + quadrupole + 6.5~\AA{} scale, $\sigma=0.3$ & 13.0\,\% & 15.2\,\% & 0.115 & 0.071 & 2.6 \\
+\quad same, $\sigma=0.1$ & 13.9\,\% & 14.6\,\% & 0.123 & 0.068 & 2.6 \\
+Published TNEP (susceptibility $\chi/\rho$ per molecule; its own RMSE $54\times10^{-3}$ / $37\times10^{-3}$ bohr$^3$) & 16.3\,\% & 20.4\,\% & & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
