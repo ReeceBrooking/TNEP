@@ -70,37 +70,131 @@ $R_n(r) = T_n\!\big(2(r/r_c-1)^2-1\big)\,f_c(r)$ with a cosine or squared-cosine
 cutoff, $C = 10$ channels, with independent coefficients per (channel, neighbour
 species) pair.
 
-## 3. Best dipole model
+## 3. Dipole models
 
-### 3.1 Form
+Three models are documented: the original neighbour-basis GAP (the baseline
+every change is measured against), the best *local* model, which keeps the
+3 Å readout and adds nothing long-ranged, and the best model overall, which
+adds the Ewald field of fixed reference charges as one extra readout column.
+All three share the same readout, so switching between them is a change of
+configuration, not of code.
+
+### 3.1 The original model (baseline)
 
 $$
-\mu = \underbrace{\sum_i\sum_{n,t'} s^{(n,t')}_i \sum_{j\in t'} R_n(r_{ij})\,\mathbf d_{ij}}_{\text{bond basis, } r_c = 3\ \text{Å}}
-\;+\;
-\underbrace{\sum_i s^{(E)}_i\,\lambda_E\,\mathbf E_i}_{\text{Ewald field column}}
+\mu=\sum_i\sum_{n,t'} s^{(n,t')}_i\sum_{j\in t'}R_n(r_{ij})\,\mathbf d_{ij},
+\qquad
+s^{(n,t')}_i=\sum_m\alpha^{(n,t')}_m\big(\hat D_i\cdot\hat D_m\big)^2 .
 $$
 
-with $\mathbf E_i$ the Ewald field at atom $i$ of fixed SPC/E reference charges
-($q_\mathrm{O}=-0.8476$, $q_\mathrm H = +0.4238$) from all other charges and all
-periodic images, and $\lambda_E$ a single scale chosen once so the column has
-the RMS of the bond-basis columns. Site functions on the $l_\max=\alpha_\max=7$,
-uncompressed SOAP ($840$-dimensional), $M=250$ per species, $\sigma = 10^{-3}$.
+A bond basis of $C=10$ warped Chebyshev channels per neighbour species on
+$r_c=3.0$ Å with a squared-cosine cutoff, each channel with its own site
+function: a sparse kernel on the compressed $l_\max=\alpha_\max=4$ SOAP
+(hard/soft cutoff 3.5/3.0 Å), $M=250$ farthest-point environments per species,
+$\xi=2$, $\sigma=10^{-3}$. 10 000 columns. **Test RRMSE 1.76 %** on 500
+training frames (1.86 % on 400); 0.28 ms/atom.
 
-### 3.2 Results (test set)
+### 3.2 Best local model (no field)
 
-| Model | RRMSE | RMSE per component |
-|---|---|---|
-| Production bond basis, $l=\alpha=4$, compressed | 1.76 % | — |
-| Same, $l=\alpha=7$ uncompressed | 1.56 % | — |
-| + Ewald field column, fit 400 | 1.17 % | — |
-| + Ewald field column, fit 500 | 1.08 % | $0.067\ e\cdot a_0$ per cell, $2.1\times10^{-3}\ e\cdot a_0$ per molecule, 5.4 mD |
-| + 2b site model, $\delta_{2b}=0.3$, fit 500 (§3.4) | 1.00 % | $0.062\ e\cdot a_0$ per cell |
-| **+ 2b site model, $\delta_{2b}=0.05$–$0.1$, $\sigma=1.5$–$2\times10^{-3}$, fit 500 (§3.4)** | **0.96–0.97 %** | $0.060\ e\cdot a_0$ per cell |
-| Published TNEP (6 Å radial cutoff, 200k SNES generations) | 0.85 % | $1.7\times10^{-3}\ e\cdot a_0$ per molecule |
+Two changes to §3.1, both inside the site function; the readout is untouched.
 
-$R^2 = 0.99988$.
+1. **A richer descriptor.** $l_\max=\alpha_\max=7$ with no compression (the
+   full 840-dimensional power spectrum instead of the 4-4 compressed one).
+   1.76 → **1.56 %** (fit 500; 1.67 on 400). The selected $\sigma$ stays pinned
+   at the smallest value scanned, the signature of a capacity-limited site
+   function, which is why more descriptor helped and why $M=500$ did not
+   (saturated at 250).
+2. **A summed two-body site model** (§3.7). The site function becomes
+   $s_i=\sum_m\alpha_m(\hat D_i\!\cdot\!\hat D_m)^2+\delta_{2b}\sum_{m'}\beta_{m'}(\hat{\mathbf q}^{(2)}_i\!\cdot\!\hat{\mathbf q}^{(2)}_{m'})^2$
+   with $q^{(2)}_{i,nt'}=\sum_{j\in t'}R_n(r_{ij})$ the 20-number radial
+   distribution of the environment on the same 3 Å, its own FPS set
+   ($M=250$) and its own prior, $\delta_{2b}=0.1$. 1.56 → **1.49 %** (fit 500;
+   1.56 on 400) at $\sigma=3\times10^{-3}$. Columns double to 20 000; the
+   forward pass is unchanged within noise.
 
-### 3.3 Why it works
+The result is a fully local model — 3 Å neighbourhoods, no charges, no
+periodic sums — at **1.49 %**, 0.45 ms/atom. Everything else that was tried
+on the local model (longer readout, longer 2b range, more channels, a second
+SOAP scale, bilinear and bond kernels, the TurboGAP 2b/3b blocks, φ kernels,
+QEq columns) is in §3.7, §5 and §7 and did not beat it.
+
+### 3.3 Best model: the Ewald field column
+
+$$
+\mu=\sum_i\sum_{n,t'} s^{(n,t')}_i\sum_{j\in t'}R_n(r_{ij})\,\mathbf d_{ij}
+\;+\;\sum_i s^{(E)}_i\,\lambda_E\,\mathbf E_i ,
+$$
+
+with the site functions of §3.2 (SOAP-7 kernel plus the $\delta_{2b}$ 2b
+kernel, now with $\delta_{2b}=0.05$–$0.1$ and $\sigma=1.5$–$2\times10^{-3}$)
+and one new column: $\mathbf E_i$, the Ewald field at atom $i$ of fixed SPC/E
+reference charges ($q_\mathrm O=-0.8476$, $q_\mathrm H=+0.4238$) from all
+other atoms and all periodic images, scaled once by $\lambda_E$ so that the
+column has the RMS of the bond columns. The field column gets its own site
+function $s^{(E)}_i$ like every bond channel, so it is one more column per
+sparse environment: 11 000 columns without the 2b model, 22 000 with it.
+**Test RRMSE 0.96–0.97 %** (fit 500; 1.05 on 400); 1.08 % without the 2b
+model. 1.47 ms/atom, of which the Python Ewald sum is ≈ 1.0.
+
+### 3.4 Results (test set, 500 training frames unless stated)
+
+| Model | fit 400 | fit 500 | columns | ms/atom |
+|---|---|---|---|---|
+| §3.1 original: $l=\alpha=4$ compressed SOAP, bond basis | 1.86 % | 1.76 % | 10 000 | 0.28 |
+| $l=\alpha=7$ uncompressed SOAP | 1.67 % | 1.56 % | 10 000 | 0.43 |
+| **§3.2 best local: + 2b site model, $\delta_{2b}=0.1$** | 1.56 % | **1.49 %** | 20 000 | 0.45 |
+| $l=\alpha=7$ + Ewald field column | 1.17 % | 1.08 % | 11 000 | 1.45 |
+| **§3.3 best: + field + 2b site model, $\delta_{2b}=0.05$–$0.1$** | 1.05 % | **0.96–0.97 %** | 22 000 | 1.47 |
+| Published TNEP (NEP descriptors, 6 Å radial / 4 Å angular, 200k SNES generations) | | 0.85 % | | |
+
+Per-component RMSE of the best model: $0.060\ e\cdot a_0$ per cell,
+$1.9\times10^{-3}\ e\cdot a_0$ per molecule (TNEP: $1.7\times10^{-3}$);
+$R^2=0.9999$.
+
+### 3.5 Field versus no field
+
+The two best models differ by exactly one column and by 0.52 points of
+RRMSE, a third of the local model's error. What that column is, and is not:
+
+- **It is the only long-range ingredient that transferred.** Every other way
+  of giving the model reach failed on the test set: a second SOAP scale at
+  4.5 or 6 Å (1.21–1.55 % on 400, against 1.17 with the field), the 2b
+  descriptor on 4–6 Å (monotonically worse), and above all a *longer
+  readout*. Widening the bond basis itself to 4.5 or 6 Å — the TNEP's
+  mechanism, a learned 6 Å two-body readout — drives the training error from
+  0.60 to 0.03 % and the test error from 0.97 to 1.11 and 1.41 %. Without the
+  field a 6 Å readout reaches 1.42 % against the 3 Å model's 1.49, and with it
+  the field adds nothing (1.41 vs 1.42): the long basis can fit on the
+  training set what the field describes, and cannot carry it to new frames.
+  With one independent site function per channel and species the basis has
+  too much freedom for 500 frames. The field column has one site function.
+- **It is the total field, not the near or the far part.** Decomposed, the
+  bare Coulomb field of neighbours within 3, 4.5 or 6 Å gives 1.62–1.66 %,
+  the Ewald field minus its 3 Å part gives 1.68, the full field 1.17 (all fit
+  400, base 1.67). Near and far cancel in a dielectric; the induced dipole
+  responds to the small total. A local basis reconstructs only the near part.
+- **It is not sensitive to how the charges are placed.** Gaussian-smeared
+  sources with $\sigma=0.5$ Å give the same 1.17 %, $\sigma=1.0$ Å 1.20; a
+  Thole-screened field is worse (1.64); the SPC/E values are not tuned. A
+  learned QEq charge column instead of fixed charges was neutral (§5).
+- **What it costs.** The model needs the charges, the periodic cell and an
+  Ewald sum at inference; the local model needs neighbour lists within 3 Å.
+  Here that is 1.47 against 0.45 ms/atom, almost all of it the pure-Python
+  Ewald sum. In a compiled code the field is a standard $O(N\log N)$ term and
+  the ratio would be far smaller; the structural cost is that the model is no
+  longer local.
+- **The 2b site model helps both tracks by the same amount** (0.07–0.11
+  points) and for the same reason (§3.7): a weak, smooth, separately
+  regularised two-body prior that lets the composite tolerate a larger
+  $\sigma$. It does not interact with the field.
+
+The gap to the published TNEP (0.85 %) is 0.11 points with the field and 0.64
+without it. The non-field model is therefore not competitive with TNEP on
+accuracy; it is the right model when locality is a requirement, and it shows
+what the 3 Å environment alone determines: about 98.5 % of the dipole
+variance.
+
+### 3.6 Why the field column works
 
 The single most informative experiment of the study was the decomposition of
 the field column:
@@ -136,7 +230,7 @@ the signature of a capacity-limited site function; and the warped Chebyshev
 radial family (or Gaussians with $C=20$, $\sigma$-scale 0.5) outperformed plain
 Chebyshev, wide Gaussians and spherical Bessel functions by 7–60 %.
 
-### 3.4 A summed 2b site model
+### 3.7 The summed 2b site model and its probes
 
 The site function of §3.1 is a single sparse kernel on the SOAP vector. The
 NEP decomposition of the site energy by body order suggests the sum
@@ -184,7 +278,7 @@ neighbour count (val 1.17, test 1.00–1.01). A second SOAP scale
 (`gap_extra_rcut`) does not help the dipole: alone, 4.5 Å gives 1.18–1.24 on
 val but 1.21–1.33 on test (against 1.17) and 6.0 Å is clearly worse
 (1.43–1.55); stacked on SOAP + 2b it lowers val to 1.04 but the test stays at
-1.00 %. So the 2b term is what §3.4 said it is — a weak, smooth, short-range
+1.00 %. So the 2b term is what this section said it is — a weak, smooth, short-range
 prior — and the long range of the dipole is already carried by the field
 column.
 
@@ -211,11 +305,17 @@ the range because every channel is the derivative of a single 1097-parameter
 scalar field. In a kernel model the long range has to enter as a fixed
 physics column with one site function, which is what the field column is.
 
-## 4. Best polarisability model
+## 4. Polarisability models
 
 ### 4.1 Form
 
-Three even kernel groups, each with its own site function:
+The **original model** is the first two terms below — the isotropic and
+traceless bond groups, $C=10$ channels each on $r_c=4$ Å with a cosine cutoff,
+site functions on the $l=\alpha=7$ compressed SOAP, $M=250$, $\sigma=0.1$,
+20 000 columns: **16.6 / 19.9 %** diagonal / off-diagonal on 500 training
+frames (16.9 / 20.2 on 400), 0.63 ms/atom. Every later number is measured
+against it. The full model has four even kernel groups, each with its own
+site function:
 
 $$
 \alpha = \sum_i\sum_{n,t'}\Big[
@@ -249,7 +349,7 @@ to the base and nothing else, costs no forward time, and takes
 |---|---|---|---|
 | Predict the component means | 100 % | 100 % | |
 | Single $\mathbf d\otimes\mathbf d$ kernel (SNES, 5900 generations) | at the mean-predictor floor | | |
-| Two bond groups (iso + traceless), fit 400 | 16.6 % | 19.9 % | |
+| **Two bond groups (iso + traceless): the original model, §4.1** | 16.6 % | 19.9 % | 0.63 |
 | + cross group, 4 channels (the base) | 14.9 % | 16.0 % | 0.86 |
 | **+ traceless induced-coupling group (§4.1, recommended)** | **14.0 %** | **14.6 %** | 0.80 |
 | + induced coupling + field quadrupole (§4.5) | 13.9 % | 14.5 % | 0.82 |
@@ -369,7 +469,7 @@ last 0.1 matters; the three null groups should not be used.
 | QEq "polarise" (bonds built on $\mathbf d-(\mathbf y_i-\mathbf y_j)$) | 3.6–4.9 % | Over-relaxes: bond shifts of 0.6 Å RMS at $H=10$ eV/e$^2$. |
 | TurboGAP 2b block (Gaussians on $r_{ij}$) | neutral at small amplitude (1.18 %), worse at $\delta_{2b}\ge1$ | See §7. |
 | TurboGAP 3b block (triplet kernel) | 1.75–3.6 % at every $\delta_{3b}$, $\sigma$ and kernel tried | Train RMSE drops to $10^{-4}$: the block interpolates the training set. See §7. |
-| 2b or 3b *site model* alone (own kernel, §3.4) | 1.76 % / 2.65 % | A radial distribution or an $l\le2$ angular spectrum is not a sufficient environment descriptor for $\mu$; SOAP is. |
+| 2b or 3b *site model* alone (own kernel, §3.7) | 1.76 % / 2.65 % | A radial distribution or an $l\le2$ angular spectrum is not a sufficient environment descriptor for $\mu$; SOAP is. |
 | Summed site models at $\delta=1$ | 1.19–1.37 % (fit 400, vs 1.17) | Equal prior weight on the weaker kernel inflates the variance; only $\delta\approx0.3$ helps (§3.4). |
 | Spherical Bessel radial family | 1.85 % (vs 1.17 warped Chebyshev) | Oscillatory over the whole $[0, r_c]$ with large amplitude at short range. |
 | More channels ($C=20$) or more sparse points ($M=500$) | 1.75 % / 1.55 % | Kernel resolution saturates; extra columns need $\sigma$ re-selection and gain nothing. |
@@ -438,7 +538,7 @@ the μ 3b rows also carry the $T\cdot v$ cross group on the SOAP/2b readout,
 $C_x=4$ forced by the 3b kernel where the base has none, which §5 found
 neutral at 1.76 → 1.71 % without the field)
 but a small-amplitude 2b kernel is a real, if modest, gain: 1.08 → 1.00 %
-(§3.4), where the same 2b content as a column block had been neutral at best.
+(§3.7), where the same 2b content as a column block had been neutral at best.
 The difference is regularisation, not information: a separately regularised
 two-body site function with a weak prior ($\delta_{2b}=0.3$) can be smooth
 where the SOAP kernel is not, whereas 20 Gaussian columns inside the SOAP
@@ -470,7 +570,7 @@ Commits a32cdec … 02d0899 on `ExperimentalPolarisability`. Drivers in
 `diagnostics/gap_experiments/` (README lists each script and its outcome).
 Production: `gap_dipole.py` with `dipole_field`, `gap_cross_channels`,
 `gap_group_delta`, `gap_lambda_shear`, `gap_site_models` / `gap_model_delta` /
-`gap_site_rcut` (summed site models, §3.4), `gap_extra_rcut` (second scale,
+`gap_site_rcut` (summed site models, §3.7), `gap_extra_rcut` (second scale,
 §4.4), `pol_field_groups` / `pol_induced_alpha` / `pol_field_scale` (§4.5;
 drivers `gap_site_models_scan.py`, `gap_2b_probe.py`, `gap_pol_groups_scan.py`);
 experimental: `gap_bond.py` (bond kernel,
