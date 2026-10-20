@@ -94,7 +94,8 @@ uncompressed SOAP ($840$-dimensional), $M=250$ per species, $\sigma = 10^{-3}$.
 | Same, $l=\alpha=7$ uncompressed | 1.56 % | — |
 | + Ewald field column, fit 400 | 1.17 % | — |
 | + Ewald field column, fit 500 | 1.08 % | $0.067\ e\cdot a_0$ per cell, $2.1\times10^{-3}\ e\cdot a_0$ per molecule, 5.4 mD |
-| **+ 2b site model, $\delta_{2b}=0.3$, fit 500 (§3.4)** | **1.00 %** | $0.062\ e\cdot a_0$ per cell |
+| + 2b site model, $\delta_{2b}=0.3$, fit 500 (§3.4) | 1.00 % | $0.062\ e\cdot a_0$ per cell |
+| **+ 2b site model, $\delta_{2b}=0.05$–$0.1$, $\sigma=1.5$–$2\times10^{-3}$, fit 500 (§3.4)** | **0.96–0.97 %** | $0.060\ e\cdot a_0$ per cell |
 | Published TNEP (6 Å radial cutoff, 200k SNES generations) | 0.85 % | $1.7\times10^{-3}\ e\cdot a_0$ per molecule |
 
 $R^2 = 0.99988$.
@@ -170,6 +171,28 @@ mechanism the TurboGAP 2b *column block* of §7 could not deliver: there the
 distance features were linear columns inside the one SOAP site function; here
 the 2b term is a separately regularised site function of its own.
 
+**Probe of the 2b knobs and of multiscale** (`gap_2b_probe.py`, same
+protocol, forward-pass cost from `predict_timed`). The amplitude keeps
+improving down to $\delta_{2b}=0.05$–$0.1$ with $\sigma=1.5$–$2\times10^{-3}$
+(test 0.96–0.97 %, val 1.07 against 1.08–1.13 for $\delta_{2b}=0.1$–$0.5$),
+then plateaus. Everything that makes the 2b kernel richer makes it worse:
+evaluating $q^{(2)}$ on a longer cutoff than the readout ($r_c^{(2)}=4,5,6$ Å:
+val 1.23, 1.38, 1.49 % against 1.10 at 3 Å, monotone), 20 channels (1.29) or
+6 (1.21), $\xi\in\{2,4\}$ (1.18), $M=500$ (1.10, no change), and the raw
+polynomial kernel on the un-normalised distribution, which keeps the
+neighbour count (val 1.17, test 1.00–1.01). A second SOAP scale
+(`gap_extra_rcut`) does not help the dipole: alone, 4.5 Å gives 1.18–1.24 on
+val but 1.21–1.33 on test (against 1.17) and 6.0 Å is clearly worse
+(1.43–1.55); stacked on SOAP + 2b it lowers val to 1.04 but the test stays at
+1.00 %. So the 2b term is what §3.4 said it is — a weak, smooth, short-range
+prior — and the long range of the dipole is already carried by the field
+column.
+
+*Cost.* The forward pass (neighbour lists, SOAP, 2b descriptor, geometry and
+kernel columns; two processes sharing 16 cores) is 1.45 ms/atom for SOAP
+alone and 1.47–1.54 ms/atom with the 2b model (+2–7 %); a 6 Å 2b cutoff costs
+1.6×, a second SOAP scale at 4.5 Å 1.5× and at 6 Å 1.85×.
+
 ## 4. Best polarisability model
 
 ### 4.1 Form
@@ -203,6 +226,8 @@ $l=\alpha=7$ compressed SOAP, $M=250$, $\sigma=0.1$.
 | Single $\mathbf d\otimes\mathbf d$ kernel (SNES, 5900 generations) | at the mean-predictor floor | |
 | Two bond groups (iso + traceless) | 16.6 % | 19.9 % |
 | + cross group, 4 channels (fit 500) | 14.9 % | 16.0 % |
+| **+ second SOAP scale at 6.5 Å, $\sigma=0.3$ (fit 500, §4.4)** | **13.9 %** | 16.2 % |
+| + second SOAP scale at 5.5 Å, $\sigma=0.3$ (fit 500) | 14.2 % | 16.1 % |
 | **+ traceless induced-coupling group (fit 400)** | **14.5 %** | **15.0 %** |
 | Published TNEP | 16.3 % | 20.4 % |
 
@@ -240,6 +265,31 @@ group and made the diagonal worse (16.7 %). The result was identical for
 $\alpha_\mathrm O = 1.0$ and $1.45$ Å$^3$, i.e. the geometry of the coupling
 matters and its amplitude is absorbed by the site function.
 
+### 4.4 A second SOAP scale
+
+The one addition that moved the polarisability in the 2026-10-20 probes is
+multiscale: a second SOAP site function on the same $l=\alpha=7$ compressed
+descriptor built with a longer hard cutoff (`gap_extra_rcut`), its own FPS set
+and prior, reading out through the same three groups. Val-selected and refit
+on 500 frames: 5.5 Å 14.2 / 16.1 %, **6.5 Å 13.9 / 16.2 %**, 7.5 Å
+14.0 / 16.2 % (SOAP alone 14.9 / 16.0). The gain is on the diagonal only and
+saturates at 6.5 Å; the selected $\sigma$ moves from 0.1 to 0.3; $\sigma=0.5$
+is worse (14.1 / 17.2). This is consistent with §4.3: the isotropic
+polarisability of a molecule depends on its wider environment (the
+learning curve said the diagonal was data-limited, i.e. there was information
+the 4 Å SOAP could not reach), whereas the anisotropy is a form limit that
+neither more data nor a longer descriptor touches — the induced-coupling group
+of §4.1 remains the only thing that has moved the off-diagonal. The 2b site
+model, by contrast, hurts $\alpha$ at every amplitude and range tried
+($\delta_{2b}=0.1$: 16.2 / 17.8 val; $\delta_{2b}=0.3$ on a 6 Å cutoff:
+16.0 / 18.0; stacked on the 5.5 Å scale: 16.1 / 17.6).
+
+*Cost.* 0.76 ms/atom for the base, 1.9 ms/atom with the 5.5 Å scale, 2.4 with
+6.5 Å and 3.0 with 7.5 Å (the SOAP build dominates; columns double to 76 000).
+Combining the 6.5 Å scale with the traceless induced-coupling group (14.5 /
+15.0 on a 15.3 / 16.3 base, §4.1) is the natural next model and has not been
+fitted.
+
 ## 5. What did not work: dipole
 
 | Proposal | Result | Diagnosis |
@@ -270,7 +320,8 @@ matters and its amplitude is absorbed by the site function.
 | Cross group wider than 4 channels | flat diagonal, off-diagonal 16.0 → 17.1 % at 10 | Angular information is low-dimensional; extra columns fit noise. |
 | Full (non-traceless) induced-coupling tensor | 16.7 / 15.2 % | Its isotropic part competes with the isotropic bond group. |
 | TurboGAP 2b / 3b blocks | 23–31 % diagonal at every $\sigma$ | See §7. |
-| 2b site model alone / summed with SOAP ($\delta_{2b}=0.3$) | 24.2 / 19.2 % · 16.1 / 17.0 % (vs 14.9 / 16.0) | The radial distribution carries no anisotropy; added to SOAP it only dilutes the prior. |
+| 2b site model alone / summed with SOAP ($\delta_{2b}=0.3$; also $\delta_{2b}=0.1$, a 6 Å 2b cutoff, and stacked on a 5.5 Å second scale) | 24.2 / 19.2 % · 16.1 / 17.0 % (vs 14.9 / 16.0); val 16.0–16.2 / 17.6–18.0 for the variants | The radial distribution carries no anisotropy; added to SOAP it only dilutes the prior. |
+| Second SOAP scale at 7.5 Å, or 6.5 Å with $\sigma=0.5$ | 14.0 / 16.2 % · 14.1 / 17.2 % | No better than 6.5 Å with $\sigma=0.3$ (§4.4) at 1.25× the cost. |
 | 3b site model through its angular kernel, alone / + SOAP ($l_x\le1$) / + SOAP + 2b | off-diagonal 18.6 % (no isotropic group) · 14.9 / 17.0 % · 15.5 / 15.9 % | The $l=0$ member *is* the cross group already in the base; the $l=1$ member and the 2b/3b descriptors add columns (74k–112k) that the fit cannot pin down — $\sigma$ moves to 0.3. See §7. |
 
 ## 7. The 2b/3b blocks: correct, and still harmful

@@ -745,6 +745,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                 "model_delta": {m: float(cfg.gap_model_delta[m]) for m in models},
                 "site_channels": int(cfg.gap_site_channels),
                 "site_lmax": int(cfg.gap_site_lmax),
+                "site_rcut": cfg.gap_site_rcut,
                 "cross_lmax": int(cfg.gap_cross_lmax),
                 "delta_soap": float(cfg.gap_delta_soap),
                 "delta_2b": float(cfg.gap_delta_2b),

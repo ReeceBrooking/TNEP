@@ -20,6 +20,7 @@ the repo root (`python diagnostics/gap_experiments/<script>.py`), output in
 | gap_2b3b_scan.py / _delta.py / _sigma.py / _cond.py | TurboGAP 2b/3b blocks on μ (field on) and α (two-group + cross): amplitudes, σ, jitter, centre spacing | μ +2b neutral at δ≤0.1, worse at δ≥1; +3b 1.75–3.6 % at every setting (train RMSE 1e-4: interpolates); α +2b 21–27 %, +3b 30–64 % vs 15–16 % base; jitter and well-conditioned centres change nothing |
 | gap_leak_bisect.py / gap_path_check.py | audit: do 2b/3b hyperparameters leak into the base; do the production and experimental fit paths agree | no leak (all 15.1/17.6); paths agree to 6e-12. A one-row discrepancy was a race on a shared training file between concurrent scans |
 | gap_site_models_scan.py (`mu` / `pol`, separate processes and record dirs) | NEP-style site-model decomposition (`gap_site_models`: soap / 2b / 3b, each its own kernel + FPS set; 3b via its angular kernel): does splitting the body orders beat the single SOAP site function? | μ: soap+2b (δ_2b 0.3) 1.08 → **1.00 %**, soap+3b 1.02, soap+2b+3b 1.05 (δ = 1 worse than the base in every case); 2b-only 1.76, 3b-only 2.65. α: nothing beats 14.9/16.0 — soap+3b 14.9/17.0, soap+2b+3b 15.5/15.9, soap+2b 16.1/17.0; 2b-only 24.2/19.2; 3b-only has no isotropic group (diagonal undefined, off-diag 18.6) |
+| gap_2b_probe.py (`mu` / `pol`; `PROBE_ROWS=` for follow-ups; prints µs/atom from `gap_dipole.predict_timed`) | push the 2b site model (δ, range `gap_site_rcut`, channels, M, ξ, raw kernel) and multiscale (`gap_extra_rcut`) alone and stacked; forward-pass cost per model | μ: soap+2b at δ_2b 0.05–0.1, σ 1.5–2e-3 → **0.96–0.97 %** (soap 1.08) at +2–7 % µs/atom; longer 2b range, more/fewer channels, M 500, ξ [2,4], raw kernel and multiscale all worse or neutral. α: 2b hurts at every setting; a second SOAP scale helps the diagonal — 5.5 Å 14.2/16.1 (2.5× cost), **6.5 Å 13.9/16.2** (3.2×), 7.5 Å 14.0/16.2 (4×); off-diagonal unchanged |
 
 ### gap_site_models_scan.py results (2026-10-20; val-selected on train 400/100, refit on 500, test RRMSE)
 
@@ -35,3 +36,38 @@ Common: gap_site_channels=10, gap_site_lmax=2, M=250 per species per model, ξ=2
 | soap+2b+3b | 3e-3, C_x 4, l_x 1, δ 0.3 | 1.05 % | 118000 | 166 | 0.3, δ 0.3 | 15.5/15.9 | 112000 | 216 |
 
 The 3b-only α row has no isotropic group (its angular kernel is traceless), so the diagonal is the mean-free prediction and is not a result. Every decomposed α row preferred the larger σ (0.3) while the base preferred 0.1: the extra kernels add variance the 2400 rows cannot pin down. The μ 3b rows also carry the T·v cross group on the soap/2b readout (C_x = 4, forced by the 3b kernel, while the μ base has C_x = 0), which §5 of the docs found neutral (1.76 → 1.71 % without the field).
+
+### gap_2b_probe.py results (2026-10-20; stage A = fit 400 → val, stage C = val-selected σ refit on 500 → test; µs/atom = `predict_timed` on the test set, two processes sharing 16 cores at OMP 8, so relative numbers are the reliable ones)
+
+μ (base = soap, l=α=7 uncompressed, rc 3.0, Ewald field; 2b: gap_site_channels 10 on rc 3.0 unless listed; σ_A = 3e-3 unless listed):
+
+| tag | σ | val (400) | test (400) | test (500, selected σ) | ncols | fit s | µs/atom |
+|---|---|---|---|---|---|---|---|
+| soap | 1e-3 | 1.28 % | 1.17 % | 1.08 % | 11000 | 64 | 1445 |
+| soap+2b δ 0.05 | 1.5e-3 | 1.07 | 1.04 | **0.96 %** | 22000 | 71 | 1541 |
+| soap+2b δ 0.1 | 2e-3 (1.5e-3) | 1.07 (1.07) | 1.05 | **0.97 %** (0.97) | 22000 | 76 | 1468 |
+| soap+2b δ 0.2 | 2e-3 | 1.08 | 1.07 | 0.99 % | 22000 | 67 | 1483 |
+| soap+2b δ 0.3 / 0.5 | 3e-3 | 1.10 / 1.13 | 1.09 / 1.12 | (1.00 % from the site-model scan) | 22000 | 60 | 1533 / 1658 |
+| soap+2b δ 0.3, gap_site_rcut 4.0 / 5.0 / 6.0 | 3e-3 | 1.23 / 1.38 / 1.49 | 1.21 / 1.36 / 1.43 | — | 22000 | 49–77 | 1608 / 2150 / 2292 |
+| soap+2b δ 0.3, C 6 / 20 | 3e-3 | 1.21 / 1.29 | 1.15 / 1.31 | — | 22000 | 58 | 1547 / 1527 |
+| soap+2b δ 0.3, M 500 | 3e-3 | 1.10 | 1.09 | 1.00 % | 44000 | 71 | 1508 |
+| soap+2b δ 0.3, ξ [2, 4] | 3e-3 | 1.18 | 1.20 | — | 44000 | 59 | 1660 |
+| soap+2b raw kernel (un-normalised q⁽²⁾), δ 0.1 / 0.3 | 2e-3 / 3e-3 | 1.17 / 1.16 | 1.07 / 1.07 | 1.00 / 1.01 % | 22000 | 66 | 1468 |
+| soap, gap_extra_rcut 4.5 | 1e-3 / 3e-3 | 1.24 / 1.18 | 1.33 / 1.21 | — | 22000 | 80 | 2244 |
+| soap, gap_extra_rcut 6.0 | 1e-3 / 3e-3 | 1.60 / 1.48 | 1.55 / 1.43 | — | 22000 | 97 | 2679 |
+| soap+2b δ 0.3, gap_extra_rcut 4.5 | 5e-3 (3e-3) | 1.04 (1.07) | 1.10 (1.12) | 1.00 % | 33000 | 92 | 2228 |
+| soap+2b δ 0.3, gap_site_rcut 5.0, gap_extra_rcut 4.5 | 3e-3 | 1.31 | 1.36 | — | 33000 | 99 | 2699 |
+
+α (base = soap, l=α=7 trivial, rc 4.0, cross C_x 4; σ_A = 0.1):
+
+| tag | σ | val (400) | test (400) | test (500, selected σ) | ncols | fit s | µs/atom |
+|---|---|---|---|---|---|---|---|
+| soap | 0.1 | 15.1/17.6 | 15.3/16.3 | 14.9/16.0 | 38000 | 40 | 764 |
+| soap+2b δ 0.1 | 0.1 | 16.2/17.8 | 16.6/16.6 | — | 76000 | 50 | 929 |
+| soap+2b δ 0.3, gap_site_rcut 6.0 | 0.1 | 16.0/18.0 | 16.1/16.2 | — | 76000 | 71 | 1796 |
+| soap, gap_extra_rcut 5.5 | 0.1 / 0.3 | 14.7/17.1 / 14.1/17.5 | 15.2/16.0 / 14.6/16.6 | 14.2/16.1 (σ 0.3) | 76000 | 101 | 1935 |
+| soap, gap_extra_rcut 6.5 | 0.1 / 0.3 / 0.5 | 14.4/17.9 / 14.0/18.1 / 14.1/19.2 | 15.3/16.1 / 14.6/16.7 / 14.7/17.7 | **13.9/16.2** (σ 0.3); 14.1/17.2 (σ 0.5) | 76000 | 137 | 2444 |
+| soap, gap_extra_rcut 7.5 | 0.3 | 13.4/18.1 | 14.7/16.7 | 14.0/16.2 | 76000 | 141 | 3034 |
+| soap+2b δ 0.3, gap_site_rcut 6.0, gap_extra_rcut 5.5 | 0.1 | 16.1/17.6 | 15.8/16.0 | — | 114000 | 118 | 3056 |
+
+Reading: the 2b gain is a small-amplitude short-range prior — it wants δ_2b ≤ 0.1, the readout cutoff (every longer `gap_site_rcut` is monotonically worse), 10 channels, the normalised kernel, and it is saturated at M 250; multiscale does not help μ alone (the Ewald field already carries the long range) and does not stack with 2b on test. For α the opposite: 2b never helps, a second SOAP scale lifts the diagonal by a point (saturating at 6.5 Å; σ moves 0.1 → 0.3) and leaves the off-diagonal alone — the anisotropy stays a form limit (§4.3 of the docs). Logs: out/probe_{mu,pol}.log, out/probe2_{mu,pol}.log; records out/probe_{mu,pol}/GAP/.
