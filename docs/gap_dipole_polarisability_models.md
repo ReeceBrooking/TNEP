@@ -138,18 +138,20 @@ model. 1.47 ms/atom, of which the Python Ewald sum is ≈ 1.0.
 
 ### 3.4 Results (test set, 500 training frames unless stated)
 
-| Model | fit 400 | fit 500 | columns | ms/atom |
-|--------------------------------------------|-----------|-----------|---------------|---------------|
-| §3.1 original: $l=\alpha=4$ compressed SOAP, bond basis | 1.86 % | 1.76 % | 10 000 | 0.28 |
-| $l=\alpha=7$ uncompressed SOAP | 1.67 % | 1.56 % | 10 000 | 0.43 |
-| **§3.2 best local: + 2b site model, $\delta_{2b}=0.1$** | 1.56 % | **1.49 %** | 20 000 | 0.45 |
-| $l=\alpha=7$ + Ewald field column | 1.17 % | 1.08 % | 11 000 | 1.45 |
-| **§3.3 best: + field + 2b site model, $\delta_{2b}=0.05$–$0.1$** | 1.05 % | **0.96–0.97 %** | 22 000 | 1.47 |
-| Published TNEP (NEP descriptors, 6 Å radial / 4 Å angular, 200k SNES generations) | | 0.85 % | | |
+RMSE is RRMSE × the test-set spread: 6.24 $e\cdot a_0$ per cell for a dipole component (0.195 per molecule, 32 molecules).
 
-Per-component RMSE of the best model: $0.060\ e\cdot a_0$ per cell,
-$1.9\times10^{-3}\ e\cdot a_0$ per molecule (TNEP: $1.7\times10^{-3}$);
-$R^2=0.9999$.
+| Model | RRMSE, fit 400 | RRMSE, fit 500 | RMSE, fit 500 ($e\cdot a_0$ / cell) | per molecule ($10^{-3}\,e\cdot a_0$) | columns | ms/atom |
+|-------------------------------|------|------|------|------|------|-----|
+| §3.1 original: $l=\alpha=4$ compressed SOAP, bond basis | 1.86 % | 1.76 % | 0.110 | 3.4 | 10 000 | 0.28 |
+| $l=\alpha=7$ uncompressed SOAP | 1.67 % | 1.56 % | 0.097 | 3.0 | 10 000 | 0.43 |
+| **§3.2 best local: + 2b site model, $\delta_{2b}=0.1$** | 1.56 % | **1.49 %** | **0.093** | 2.9 | 20 000 | 0.45 |
+| $l=\alpha=7$ + Ewald field column | 1.17 % | 1.08 % | 0.067 | 2.1 | 11 000 | 1.45 |
+| **§3.3 best: + field + 2b site model, $\delta_{2b}=0.05$–$0.1$** | 1.05 % | **0.96–0.97 %** | **0.060** | 1.9 | 22 000 | 1.47 |
+| Published TNEP (NEP descriptors, 6 Å radial / 4 Å angular, 200k SNES generations) | | 0.85 % | 0.053 | 1.7 | | |
+
+$R^2=0.9999$ for the best model. The TNEP row's RMSE is the paper's own
+$1.7\times10^{-3}\,e$ per molecule; the label spread is the same as ours, so
+the two RMSE columns are directly comparable.
 
 ### 3.5 Field versus no field
 
@@ -343,20 +345,24 @@ Site functions on the $l=\alpha=7$ compressed SOAP, $M=250$, $\sigma=0.1$,
 to the base and nothing else, costs no forward time, and takes
 1.9 points off the diagonal and 1.4 off the off-diagonal (§4.2).
 
-### 4.2 Results (test set, diagonal / off-diagonal RRMSE; all fits on 500 frames unless stated)
+### 4.2 Results (test set, diagonal / off-diagonal; all fits on 500 frames unless stated)
 
-| Model | Diagonal | Off-diagonal | ms/atom |
-|----------------------------------------------------|--------------|------------------|--------------|
-| Predict the component means | 100 % | 100 % | |
-| Single $\mathbf d\otimes\mathbf d$ kernel (SNES, 5900 generations) | at the mean-predictor floor | | |
-| **Two bond groups (iso + traceless): the original model, §4.1** | 16.6 % | 19.9 % | 0.63 |
-| + cross group, 4 channels (the base) | 14.9 % | 16.0 % | 0.86 |
-| **+ traceless induced-coupling group (§4.1, recommended)** | **14.0 %** | **14.6 %** | 0.80 |
-| + induced coupling + field quadrupole (§4.5) | 13.9 % | 14.5 % | 0.82 |
-| + all five long-range groups (§4.5) | 13.9 % | 14.3 % | 0.84 |
-| + second SOAP scale at 6.5 Å, $\sigma=0.3$ (§4.4) | 13.9 % | 16.2 % | 2.5 |
-| + induced coupling + quadrupole + 6.5 Å scale, $\sigma=0.3$ / $0.1$ | 13.0 % / 13.9 % | 15.2 % / 14.6 % | 2.6 |
-| Published TNEP | 16.3 % | 20.4 % | |
+RMSE is RRMSE × the test-set spread of the cell tensor's components:
+0.887 Å$^3$ for a diagonal component (about the isotropic $44.4\pm0.7$ Å$^3$),
+0.468 Å$^3$ for an off-diagonal one; per molecule divide by 32.
+
+| Model | RRMSE diag | RRMSE off-diag | RMSE diag (Å$^3$ / cell) | RMSE off-diag (Å$^3$ / cell) | ms/atom |
+|-----------------------------------|------|------|------|------|-----|
+| Predict the component means | 100 % | 100 % | 0.887 | 0.468 | |
+| Single $\mathbf d\otimes\mathbf d$ kernel (SNES, 5900 generations) | at the mean-predictor floor | | | | |
+| **Two bond groups (iso + traceless): the original model, §4.1** | 16.6 % | 19.9 % | 0.147 | 0.093 | 0.63 |
+| + cross group, 4 channels (the base) | 14.9 % | 16.0 % | 0.132 | 0.075 | 0.86 |
+| **+ traceless induced-coupling group (§4.1, recommended)** | **14.0 %** | **14.6 %** | **0.124** | **0.068** | 0.80 |
+| + induced coupling + field quadrupole (§4.5) | 13.9 % | 14.5 % | 0.123 | 0.068 | 0.82 |
+| + all five long-range groups (§4.5) | 13.9 % | 14.3 % | 0.123 | 0.067 | 0.84 |
+| + second SOAP scale at 6.5 Å, $\sigma=0.3$ (§4.4) | 13.9 % | 16.2 % | 0.123 | 0.076 | 2.5 |
+| + induced coupling + quadrupole + 6.5 Å scale, $\sigma=0.3$ / $0.1$ | 13.0 % / 13.9 % | 15.2 % / 14.6 % | 0.115 / 0.123 | 0.071 / 0.068 | 2.6 |
+| Published TNEP (susceptibility $\chi/\rho$ per molecule; its own RMSE $54\times10^{-3}$ / $37\times10^{-3}$ bohr$^3$) | 16.3 % | 20.4 % | | | |
 
 Forward-pass cost from `predict_timed` on the 96-atom test frames, one process
 on 12 threads; per-frame Python overhead dominates at this size, so only the
