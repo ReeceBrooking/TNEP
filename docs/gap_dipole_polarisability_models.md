@@ -1,6 +1,6 @@
 # GAP models for the dipole and polarisability of liquid water: what worked and why
 
-*Branch `ExperimentalPolarisability`, 18–19 October 2026. All numbers are convex
+*Branch `ExperimentalPolarisability`, 18–20 October 2026. All numbers are convex
 sparse-kernel fits (gap_dipole.py and the experimental modules gap_bond.py,
 gap_ewald.py), evaluated on the 500-frame test set of the 32-molecule bulk-water
 data (96 atoms, cubic cell $L \approx 9.94$ Å, 500 training frames).*
@@ -89,7 +89,7 @@ $$
 
 A bond basis of $C=10$ warped Chebyshev channels per neighbour species on
 $r_c=3.0$ Å with a squared-cosine cutoff, each channel with its own site
-function: a sparse kernel on the compressed $l_\max=\alpha_\max=4$ SOAP
+function: a sparse kernel on the compressed $l_{\max}=\alpha_{\max}=4$ SOAP
 (hard/soft cutoff 3.5/3.0 Å), $M=250$ farthest-point environments per species,
 $\xi=2$, $\sigma=10^{-3}$. 10 000 columns. **Test RRMSE 1.76 %** on 500
 training frames (1.86 % on 400); 0.28 ms/atom.
@@ -98,7 +98,7 @@ training frames (1.86 % on 400); 0.28 ms/atom.
 
 Two changes to §3.1, both inside the site function; the readout is untouched.
 
-1. **A richer descriptor.** $l_\max=\alpha_\max=7$ with no compression (the
+1. **A richer descriptor.** $l_{\max}=\alpha_{\max}=7$ with no compression (the
    full 840-dimensional power spectrum instead of the 4-4 compressed one).
    1.76 → **1.56 %** (fit 500; 1.67 on 400). The selected $\sigma$ stays pinned
    at the smallest value scanned, the signature of a capacity-limited site
@@ -139,7 +139,7 @@ model. 1.47 ms/atom, of which the Python Ewald sum is ≈ 1.0.
 ### 3.4 Results (test set, 500 training frames unless stated)
 
 | Model | fit 400 | fit 500 | columns | ms/atom |
-|---|---|---|---|---|
+|--------------------------------------------|-----------|-----------|---------------|---------------|
 | §3.1 original: $l=\alpha=4$ compressed SOAP, bond basis | 1.86 % | 1.76 % | 10 000 | 0.28 |
 | $l=\alpha=7$ uncompressed SOAP | 1.67 % | 1.56 % | 10 000 | 0.43 |
 | **§3.2 best local: + 2b site model, $\delta_{2b}=0.1$** | 1.56 % | **1.49 %** | 20 000 | 0.45 |
@@ -200,7 +200,7 @@ The single most informative experiment of the study was the decomposition of
 the field column:
 
 | Field column | Test RRMSE |
-|---|---|
+|------------------------------------------------------------------------|----------------------------|
 | none | 1.67 % (fit 400) |
 | bare Coulomb field of neighbours within 3.0 / 4.5 / 6.0 Å only | 1.62 / 1.66 / 1.62 % |
 | Ewald field minus the 3 Å near part (beyond-cutoff only) | 1.68 % |
@@ -346,7 +346,7 @@ to the base and nothing else, costs no forward time, and takes
 ### 4.2 Results (test set, diagonal / off-diagonal RRMSE; all fits on 500 frames unless stated)
 
 | Model | Diagonal | Off-diagonal | ms/atom |
-|---|---|---|---|
+|----------------------------------------------------|--------------|------------------|--------------|
 | Predict the component means | 100 % | 100 % | |
 | Single $\mathbf d\otimes\mathbf d$ kernel (SNES, 5900 generations) | at the mean-predictor floor | | |
 | **Two bond groups (iso + traceless): the original model, §4.1** | 16.6 % | 19.9 % | 0.63 |
@@ -433,7 +433,7 @@ SPC/E reference charges or the fixed Applequist response, each scaled once to
 the RMS of the bond columns:
 
 | group | tensor | columns | fit 400 → test ($\sigma=0.1$) | fit 500 → test |
-|---|---|---|---|---|
+|------------|------------------------------------------|----------|------------------|------------------|
 | none (base) | | 38 000 | 15.3 / 16.3 | 14.9 / 16.0 |
 | `induced` | $[\tfrac12(\mathbf R_i+\mathbf R_i^\top)]_{\text{traceless}}$ | +500 | **14.5 / 14.9** | **14.0 / 14.6** |
 | `grad` | $[\nabla\mathbf E_i]_{\text{traceless}}$, Ewald field gradient of the charges | +500 | 15.3 / 16.2 | |
@@ -457,7 +457,7 @@ last 0.1 matters; the three null groups should not be used.
 ## 5. What did not work: dipole
 
 | Proposal | Result | Diagnosis |
-|---|---|---|
+|------------------------------------|--------------------------|--------------------------------------|
 | Bond-angle charge flux $(\sum_j R_a\mathbf d\mathbf d^\top)\cdot\mathbf v^{(b)}$ (cross group for $\mu$) | 1.76 → 1.71 % | The one-hop basis already carries what the dipole needs from angles; $\sigma$ pinned at the floor, so the site function, not the geometry, was starved. |
 | Antisymmetric bond kernel on sparse bonds, 17k–25k columns | ≤ 2 % gain | Same: bond-level site functions are not the limiter. |
 | Rank-1 bilinear $a_ib_j-a_jb_i$ by alternating fits | 1.97 → 2.16 % (val), worse every step | Adds flexibility without regularising it; the convex superset above already showed no information to gain. |
@@ -470,16 +470,15 @@ last 0.1 matters; the three null groups should not be used.
 | TurboGAP 2b block (Gaussians on $r_{ij}$) | neutral at small amplitude (1.18 %), worse at $\delta_{2b}\ge1$ | See §7. |
 | TurboGAP 3b block (triplet kernel) | 1.75–3.6 % at every $\delta_{3b}$, $\sigma$ and kernel tried | Train RMSE drops to $10^{-4}$: the block interpolates the training set. See §7. |
 | 2b or 3b *site model* alone (own kernel, §3.7) | 1.76 % / 2.65 % | A radial distribution or an $l\le2$ angular spectrum is not a sufficient environment descriptor for $\mu$; SOAP is. |
-| Summed site models at $\delta=1$ | 1.19–1.37 % (fit 400, vs 1.17) | Equal prior weight on the weaker kernel inflates the variance; only $\delta\approx0.3$ helps (§3.4). |
+| Summed site models at $\delta=1$ | 1.19–1.37 % (fit 400, vs 1.17) | Equal prior weight on the weaker kernel inflates the variance; only $\delta\le0.3$ helps (§3.7). |
 | Spherical Bessel radial family | 1.85 % (vs 1.17 warped Chebyshev) | Oscillatory over the whole $[0, r_c]$ with large amplitude at short range. |
 | More channels ($C=20$) or more sparse points ($M=500$) | 1.75 % / 1.55 % | Kernel resolution saturates; extra columns need $\sigma$ re-selection and gain nothing. |
-
-| Bond basis widened to 4.5 / 6 Å (10 or 20 channels), SOAP + 2b site functions, ± field | 1.11 / 1.41–1.46 % with the field, 1.42–1.50 without (vs 0.97 / 1.49 at 3 Å) | Training error collapses to 0.03–0.26 %: independent site functions per channel let a 6 Å basis interpolate 500 frames. See §3.4. |
+| Bond basis widened to 4.5 / 6 Å (10 or 20 channels), SOAP + 2b site functions, ± field | 1.11 / 1.41–1.46 % with the field, 1.42–1.50 without (vs 0.97 / 1.49 at 3 Å) | Training error collapses to 0.03–0.26 %: independent site functions per channel let a 6 Å basis interpolate 500 frames. See §3.5. |
 
 ## 6. What did not work: polarisability
 
 | Proposal | Result | Diagnosis |
-|---|---|---|
+|------------------------------------|--------------------------|--------------------------------------|
 | Single $\mathbf d\otimes\mathbf d$ kernel | mean-predictor floor | Isotropic and anisotropic parts locked to one coefficient. |
 | Group amplitudes $\delta$ and shear weight $\lambda_\mathrm{shear}$ in the GAP | ± 0.5 points | The per-channel prior already handles scale. |
 | 6 Å kernel with a 6 Å kernel-only SOAP scale | 16.5 / 18.3 % (vs 16.6 / 19.9) | Modest, 4× slower, and worse when combined with the cross group without re-selecting $\sigma$ (17.4 / 20.5). |
