@@ -370,17 +370,17 @@ Both read out through the same bond basis and field column. A 3b model (angular 
 \(\sum_{j,k\ne j}R_aR_b\,P_l(\cos\theta_{jik})\,\mathbf d_{ij}\) instead, so that the bond vector
 stays uncontracted.
 
-Val-selected on 400/100 and refit on 500 frames (test RRMSE): SOAP 1.08 \%; \textbf{SOAP + 2b,
-\(\delta_{2b}=0.3\), \(\sigma=3\times10^{-3}\): 1.00 \%}; SOAP + 3b (\(\delta_{3b}=0.3\)) 1.02 \%;
-SOAP + 2b + 3b (\(\delta=0.3\)) 1.05 \%. Alone, the 2b model reaches 1.76 \% and the 3b model 2.65
-\%, i.e.~neither replaces SOAP, and at \(\delta=1\) every sum is worse than SOAP alone (1.19--1.37
-\% on 400 frames against 1.17). The gain is modest (0.08 points, \(\approx\) 3\(\times\) the
-\(\sigma\)-to-\(\sigma\) noise) and comes with a shift of the selected \(\sigma\) from \(10^{-3}\)
-to \(3\times10^{-3}\): a small-amplitude, smooth two-body component lets the composite tolerate
-stronger regularisation, which is where the improvement appears. It costs 2\(\times\) the columns
-(22 000) and nothing in fit time. This is the mechanism the TurboGAP 2b \emph{column block} of §7
-could not deliver: there the distance features were linear columns inside the one SOAP site
-function; here the 2b term is a separately regularised site function of its own.
+Val-selected on 400/100 and refit on 500 frames, all with the Ewald field column (test RRMSE): SOAP
+1.08 \%; \textbf{SOAP + 2b, \(\delta_{2b}=0.3\), \(\sigma=3\times10^{-3}\): 1.00 \%}; SOAP + 3b
+(\(\delta_{3b}=0.3\)) 1.02 \%; SOAP + 2b + 3b (\(\delta=0.3\)) 1.05 \%. Alone, the 2b model reaches
+1.76 \% and the 3b model 2.65 \%, i.e.~neither replaces SOAP, and at \(\delta=1\) every sum is worse
+than SOAP alone (1.19--1.37 \% on 400 frames against 1.17). The gain is modest (0.08 points,
+\(\approx\) 3\(\times\) the \(\sigma\)-to-\(\sigma\) noise) and comes with a shift of the selected
+\(\sigma\) from \(10^{-3}\) to \(3\times10^{-3}\): a small-amplitude, smooth two-body component lets
+the composite tolerate stronger regularisation, which is where the improvement appears. It costs
+2\(\times\) the columns (22 000) and nothing in fit time. This is the mechanism the TurboGAP 2b
+\emph{column block} of §7 could not deliver: there the distance features were linear columns inside
+the one SOAP site function; here the 2b term is a separately regularised site function of its own.
 
 \textbf{Probe of the 2b knobs and of multiscale} (\texttt{gap\_2b\_probe.py}, same protocol,
 forward-pass cost from \texttt{predict\_timed}). The amplitude keeps improving down to

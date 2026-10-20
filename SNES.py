@@ -1679,8 +1679,12 @@ class SNES:
         B_f = tf.cast(B, tf.float32)
         eval_chunk_fn = self._evaluate_chunk
 
-        # SS_tot for RRMSE: total target magnitude² over the batch (computed once).
-        ss_tot_batch = tf.reduce_sum(tf.square(batch_data["targets"]))
+        # SS_tot for RRMSE: centred per component over the batch (computed once), so
+        # RRMSE = RMSE / std(reference) as in the TNEP paper and R² = 1 − RRMSE².
+        # (Before 2026-10-21 this was the raw Σ targets², which for α is dominated
+        # by the 44 Å³ isotropic trace and is not comparable to published values.)
+        _t = batch_data["targets"]
+        ss_tot_batch = tf.reduce_sum(tf.square(_t - tf.reduce_mean(_t, axis=0, keepdims=True)))
         ss_tot_batch = tf.maximum(ss_tot_batch, 1e-12)
 
         all_fitness = []

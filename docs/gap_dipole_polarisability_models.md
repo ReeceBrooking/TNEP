@@ -253,7 +253,7 @@ spectrum $q_{nn'l}$, $l\le2$) reads out through an angular kernel
 $\sum_{j,k\ne j}R_aR_b\,P_l(\cos\theta_{jik})\,\mathbf d_{ij}$ instead, so that the
 bond vector stays uncontracted.
 
-Val-selected on 400/100 and refit on 500 frames (test RRMSE): SOAP 1.08 %;
+Val-selected on 400/100 and refit on 500 frames, all with the Ewald field column (test RRMSE): SOAP 1.08 %;
 **SOAP + 2b, $\delta_{2b}=0.3$, $\sigma=3\times10^{-3}$: 1.00 %**; SOAP + 3b
 ($\delta_{3b}=0.3$) 1.02 %; SOAP + 2b + 3b ($\delta=0.3$) 1.05 %. Alone, the
 2b model reaches 1.76 % and the 3b model 2.65 %, i.e. neither replaces SOAP,
