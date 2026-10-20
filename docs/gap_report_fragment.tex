@@ -20,8 +20,7 @@
 
 \usepackage{lipsum} % Used for inserting dummy 'Lorem ipsum' text into the template
 
-% --- needed by this content: maths environments/commands and the results tables ---
-\usepackage{amsmath,amssymb} % align*, \text, \lVert, \tfrac
+% --- needed by this content: the results tables (maths uses base LaTeX only) ---
 \usepackage{booktabs,array}  % \toprule etc., >{...}p{} column specs
 
 \begin{document}
@@ -32,7 +31,7 @@ Every result below is a sparse Gaussian-process (GAP) fit in the gap\_fit estima
 matrix $\Phi$, targets $y$, per-frame observation error $\sigma_\mathrm{obs} = \sigma\sqrt{N}$
 and sparse--sparse prior $K_{MM}$,
 \begin{equation}
-\hat\alpha = \arg\min_\alpha \; \sum_f \frac{\lVert \Phi_f\alpha - y_f\rVert^2}{\sigma_\mathrm{obs}^2} + \alpha^\top K_{MM}\,\alpha ,
+\hat\alpha = \arg\min_\alpha \; \sum_f \frac{\| \Phi_f\alpha - y_f\|^2}{\sigma_\mathrm{obs}^2} + \alpha^\top K_{MM}\,\alpha ,
 \label{eq:gap-objective}
 \end{equation}
 solved in whitened coordinates $\beta = (L^\top\otimes I)\alpha$ with $K_{MM}=LL^\top$, in the
@@ -40,7 +39,7 @@ dual ($[DF\times DF]$ Gram, $D=3$ or $6$ rows per frame).
 
 Accuracy is quoted as the relative RMSE of the TNEP paper (Xu et al., JCTC 2024),
 \begin{equation}
-\mathrm{RRMSE} = \frac{\mathrm{RMSE}}{\mathrm{std}(\text{reference})},\qquad R^2 = 1-\mathrm{RRMSE}^2 ,
+\mathrm{RRMSE} = \frac{\mathrm{RMSE}}{\mathrm{std}(\mathrm{reference})},\qquad R^2 = 1-\mathrm{RRMSE}^2 ,
 \label{eq:rrmse}
 \end{equation}
 computed over components (the three Cartesian dipole components; the three diagonal and the three
@@ -135,14 +134,16 @@ $l=\alpha=7$ compressed SOAP, $M=250$, $\sigma=0.1$, 20\,000 columns: \textbf{16
 diagonal / off-diagonal on 500 training frames (16.9 / 20.2 on 400), 0.63~ms/atom. Every later
 number is measured against it. The full model has three even kernel groups, each with its own site
 function:
-\begin{align}
-\alpha ={}& \sum_i\sum_{n,t'}\Big[
+\begin{equation}
+\begin{array}{rl}
+\alpha = & \displaystyle \sum_i\sum_{n,t'}\Big[
  s^{(n,t')}_i \sum_{j\in t'} R_n(r_{ij})\,|\mathbf d_{ij}|^2\,\mathbf I
 \;+\;
- u^{(n,t')}_i \sum_{j\in t'} R_n(r_{ij})\Big(\mathbf d_{ij}\mathbf d_{ij}^\top - \tfrac{|\mathbf d_{ij}|^2}{3}\mathbf I\Big)\Big] \notag\\
-&+\;\sum_i\sum_{a\le b} w^{(ab)}_i\,\mathrm{sym}\big(\mathbf v^{(a)}_i\otimes\mathbf v^{(b)}_i\big)_{\text{traceless}} .
+ u^{(n,t')}_i \sum_{j\in t'} R_n(r_{ij})\Big(\mathbf d_{ij}\mathbf d_{ij}^\top - \frac{|\mathbf d_{ij}|^2}{3}\mathbf I\Big)\Big] \\[2ex]
+ & \displaystyle +\;\sum_i\sum_{a\le b} w^{(ab)}_i\,\mathrm{sym}\big(\mathbf v^{(a)}_i\otimes\mathbf v^{(b)}_i\big)_{\mathrm{traceless}} .
+\end{array}
 \label{eq:pol-form}
-\end{align}
+\end{equation}
 The first two are the isotropic and traceless \emph{bond} groups ($C=10$ channels each,
 $r_c = 4$~\AA{}, cosine cutoff); the third is the \emph{cross} group built from four radial
 channels of the dipole kernel vector $\mathbf v^{(a)}_i=\sum_j R_a(r_{ij})\mathbf d_{ij}$.
