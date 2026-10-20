@@ -121,8 +121,9 @@ def _within(pairs, rcut):
 def _triplets(N, pairs, rcut, buffer):
     """All unordered neighbour pairs j < k centred on each atom, both within
     rcut (pairs = _pairs() at any cutoff ≥ rcut). Returns (centre [P], ja [P],
-    jb [P], q [P, 3], w [P]) with ja/jb the neighbour atom indices,
-    q = [r_ij + r_ik, (r_ij − r_ik)², r_jk] and w = f(r_ij) f(r_ik).
+    jb [P], q [P, 3], w [P], Da [P, 3], Db [P, 3]) with ja/jb the neighbour
+    atom indices, q = [r_ij + r_ik, (r_ij − r_ik)², r_jk], w = f(r_ij) f(r_ik)
+    and Da/Db the image-exact bond vectors r_j − r_i, r_k − r_i.
     Vectorised over a padded [N, M] neighbour table."""
     i, j, D, r = _within(pairs, rcut)
     counts = np.bincount(i, minlength=N)
@@ -136,10 +137,27 @@ def _triplets(N, pairs, rcut, buffer):
     valid = mask[:, :, None] & mask[:, None, :] & np.triu(np.ones((M, M), dtype=bool), k=1)
     ci, a, b = np.nonzero(valid)
     ra, rb = rt[ci, a], rt[ci, b]
-    rjk = np.linalg.norm(Dt[ci, b] - Dt[ci, a], axis=1)
+    Da, Db = Dt[ci, a], Dt[ci, b]
+    rjk = np.linalg.norm(Db - Da, axis=1)
     q = np.stack([ra + rb, (ra - rb) ** 2, rjk], axis=1)
     w = f_cut(ra, rcut, buffer) * f_cut(rb, rcut, buffer)
-    return ci, j[t[ci, a]], j[t[ci, b]], q, w
+    return ci, j[t[ci, a]], j[t[ci, b]], q, w, Da, Db
+
+
+def kernel_3b(q, w, cfg):
+    """[P, M3] cutoff-weighted 3b kernel w·k_s(q) at cfg.gap3b_centres, "exp"
+    or "pol" per cfg.gap3b_kernel, widths cfg.gap3b_sigma (q, w from _triplets)."""
+    Q3 = np.asarray(cfg.gap3b_centres, dtype=np.float64)
+    s3 = np.asarray(cfg.gap3b_sigma, dtype=np.float64)
+    # ponytail: per-dimension accumulation keeps the peak at one [P, M3] (P ≈ N·M²/2
+    # triplets per frame, ~11k×50 for water at 3.5 Å); chunk over P if frames get large
+    d2 = sum(((q[:, d, None] - Q3[None, :, d]) / s3[d]) ** 2 for d in range(3))
+    if str(getattr(cfg, "gap3b_kernel", "exp")) == "pol":
+        # TurboGAP's cov_pp(r, 3, 1) (gap.f90:760-788): compact support,
+        # exactly zero beyond a scaled distance of 1 (σ is the support radius).
+        r3 = np.sqrt(d2)
+        return w[:, None] * np.where(r3 < 1.0, (1.0 - r3) ** 4 * (4.0 * r3 + 1.0), 0.0)
+    return w[:, None] * np.exp(-0.5 * d2)
 
 
 # ── descriptors ─────────────────────────────────────────────────────────
@@ -151,8 +169,6 @@ def gap_raw_numpy(atoms, types_int, cfg):
     N, T = len(atoms), cfg.num_types
     types_int = np.asarray(types_int)
     Q2 = np.asarray(cfg.gap2b_centres, dtype=np.float64)
-    Q3 = np.asarray(cfg.gap3b_centres, dtype=np.float64)
-    s3 = np.asarray(cfg.gap3b_sigma, dtype=np.float64)
 
     pairs = _pairs(atoms, max(cfg.gap2b_rcut, cfg.gap3b_rcut))
     i, j, _, r = _within(pairs, cfg.gap2b_rcut)
@@ -161,19 +177,10 @@ def gap_raw_numpy(atoms, types_int, cfg):
     q2 = np.zeros((N, T, len(Q2)))
     np.add.at(q2, (i, types_int[j]), k2)
 
-    ci, ja, jb, q, w = _triplets(N, pairs, cfg.gap3b_rcut, cfg.gap_buffer)
-    # ponytail: per-dimension accumulation keeps the peak at one [P, M3] (P ≈ N·M²/2
-    # triplets per frame, ~11k×50 for water at 3.5 Å); chunk over P if frames get large
-    d2 = sum(((q[:, d, None] - Q3[None, :, d]) / s3[d]) ** 2 for d in range(3))
-    if str(getattr(cfg, "gap3b_kernel", "exp")) == "pol":
-        # TurboGAP's cov_pp(r, 3, 1) (gap.f90:760-788): compact support,
-        # exactly zero beyond a scaled distance of 1 (σ is the support radius).
-        r3 = np.sqrt(d2)
-        k3 = w[:, None] * np.where(r3 < 1.0, (1.0 - r3) ** 4 * (4.0 * r3 + 1.0), 0.0)
-    else:
-        k3 = w[:, None] * np.exp(-0.5 * d2)
+    ci, ja, jb, q, w, _, _ = _triplets(N, pairs, cfg.gap3b_rcut, cfg.gap_buffer)
+    k3 = kernel_3b(q, w, cfg)
     slot = pair_index(T)[types_int[ja], types_int[jb]]
-    q3 = np.zeros((N, T * (T + 1) // 2, len(Q3)))
+    q3 = np.zeros((N, T * (T + 1) // 2, k3.shape[1]))
     np.add.at(q3, (ci, slot), k3)
 
     return np.concatenate([q2.reshape(N, -1), q3.reshape(N, -1)], axis=1).astype(np.float32)

@@ -508,6 +508,7 @@ def test_configs_are_independent():
                 "gap_group_delta", "gap_lambda_shear", "gap_cross_channels",
                 "gap_site_models", "gap_model_delta", "gap_site_channels",
                 "gap_site_lmax", "gap_cross_lmax", "gap_site_rcut", "gap_angular_cross",
+                "gap_triplet_tensor",
                 "pol_field_groups", "pol_field_scale", "pol_induced_alpha"}
     missing = (set(GAPconfig.__annotations__)
                - set(TNEPconfig.__annotations__) - gap_only)
@@ -936,6 +937,63 @@ def test_angular_cross_group_width_fit_and_record(tmp_path):
 def test_angular_cross_validation_raises(kw, msg):
     with pytest.raises(ValueError, match=msg):
         gap_dipole._validate(_cfg(**kw))
+
+
+# ── triplet-tensor polarisability group (gap_triplet_tensor) ────────────────
+
+TT_KW = dict(POL_KW, gap_triplet_tensor=True, gap3b_kernel="exp", gap3b_n_centres=5)
+TT_CENTRES = [[3.0, 0.0, 1.5], [4.0, 0.5, 2.5], [5.0, 1.0, 3.0], [4.5, 0.2, 4.0], [3.5, 2.0, 2.0]]
+
+
+def test_triplet_tensor_group_equivariance_structure_and_hand_loop():
+    """Every column tensor rotates as Q W Qᵀ and is translation invariant (pure
+    float64); isotropic columns ∝ I, traceless ones trace-free; and one centre
+    equals a direct loop over the j < k triplets with the 3b kernel and cutoffs."""
+    from scipy.spatial.transform import Rotation
+    from gap_descriptor import f_cut
+    at = read(WATER_XYZ, index="3")
+    cfg = _cfg(**TT_KW, gap3b_centres=TT_CENTRES)
+    cfg.types, cfg.num_types = [8, 1], 2
+    ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
+    Q = Rotation.random(random_state=np.random.default_rng(1)).as_matrix()
+    rot = at.copy(); rot.set_cell(at.cell.array @ Q.T); rot.positions = at.positions @ Q.T
+    sh = at.copy(); sh.positions += [0.37, -1.2, 2.9]
+    f = lambda a: gap_dipole._triplet_tensor_group(a, ti, cfg)
+    W = f(at)
+    assert W.shape == (len(at), 6, 10)
+    assert np.abs(np.einsum("ab,nbcg,dc->nadg", Q, _voigt_mat(W), Q) - _voigt_mat(f(rot))).max() < 1e-10
+    assert np.abs(f(sh) - W).max() < 1e-10
+    iso, tr = W[:, :, :5], W[:, :, 5:]
+    assert np.abs(iso[:, 3:]).max() == 0.0 and np.allclose(iso[:, :3], iso[:, :1], atol=1e-12)
+    assert np.abs(tr[:, :3].sum(1)).max() < 1e-10
+    # hand loop, atom 0, centre s = 1: W = Σ_{j<k} f(r_ij) f(r_ik) exp(-½|(q−Q_s)/σ|²) sym(d_ij⊗d_ik)
+    i0, s = 0, 1
+    ii, D = neighbor_list("iD", at, 3.5)
+    Ds = [d for i, d in zip(ii, D) if i == i0 and 0 < np.linalg.norm(d) < 3.5]
+    M = np.zeros((3, 3))
+    for a in range(len(Ds)):
+        for b in range(a + 1, len(Ds)):
+            ra, rb = np.linalg.norm(Ds[a]), np.linalg.norm(Ds[b])
+            q = np.array([ra + rb, (ra - rb) ** 2, np.linalg.norm(Ds[b] - Ds[a])])
+            k = np.exp(-0.5 * np.sum(((q - TT_CENTRES[s]) / 0.5) ** 2))
+            M += f_cut(ra, 3.5, 0.5) * f_cut(rb, 3.5, 0.5) * k * 0.5 * (np.outer(Ds[a], Ds[b]) + np.outer(Ds[b], Ds[a]))
+    assert np.allclose(_voigt_mat(W)[i0, :, :, s] + _voigt_mat(W)[i0, :, :, 5 + s], M, atol=1e-12)
+
+
+def test_triplet_tensor_group_width_fit_and_record(tmp_path):
+    assert gap_dipole._n_vcols(_cfg(**TT_KW, num_types=2)) - gap_dipole._n_vcols(_cfg(**POL_KW, num_types=2)) == 10
+    frames = read(WATER_XYZ, index="0:6")
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(_cfg(**TT_KW, gap_sparse_per_species=6))
+        rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
+    assert rec["gap"]["triplet_tensor"] is True
+    assert np.shape(rec["gap"]["gap3b_centres"]) == (5, 3) and rec["config"]["gap3b_centres"] == m.cfg.gap3b_centres
+    assert gap_dipole.predict(m, frames).shape == (6, 6)
+
+
+def test_triplet_tensor_validation_raises():
+    with pytest.raises(ValueError, match="target_mode"):
+        gap_dipole._validate(_cfg(**dict(TT_KW, target_mode=1)))
 
 
 @pytest.mark.parametrize("kw,msg", [

@@ -63,7 +63,7 @@ from ase.io import read
 import data as tnep_data
 import gap_models as gm
 from DescriptorBuilder import make_descriptor_builder
-from gap_descriptor import (f_cut, gap_raw_numpy, gap_slices, select_centres,
+from gap_descriptor import (_pairs, _triplets, f_cut, gap_raw_numpy, gap_slices, kernel_3b, select_centres,
                             validate_gap_cfg)
 from TNEPconfig import GAPconfig, resolved_dipole_cutoff, bond_rank, kernel_channels
 
@@ -188,6 +188,8 @@ def _validate(cfg: GAPconfig) -> None:
          "gap_angular_cross is a polarisability (target_mode=2) group"),
         (not cfg.gap_angular_cross or (int(cfg.gap_cross_channels) >= 1 and int(cfg.gap_cross_lmax) >= 1),
          "gap_angular_cross needs gap_cross_channels >= 1 and gap_cross_lmax >= 1"),
+        (not cfg.gap_triplet_tensor or int(cfg.target_mode) == 2,
+         "gap_triplet_tensor is a polarisability (target_mode=2) group"),
         (not cfg.pol_field_groups or int(cfg.target_mode) == 2,
          "pol_field_groups are polarisability (target_mode=2) columns"),
         (set(cfg.pol_field_groups) <= set(tnep_data.POL_FIELD_GROUPS)
@@ -202,7 +204,7 @@ def _validate(cfg: GAPconfig) -> None:
     bad = [msg for ok, msg in checks if not ok]
     if bad:
         raise ValueError("fit_gap_dipole config violation: " + "; ".join(bad))
-    if cfg.gap_2b or cfg.gap_3b:
+    if cfg.gap_2b or cfg.gap_3b or cfg.gap_triplet_tensor:
         validate_gap_cfg(cfg)          # centres may still be None: fit selects them
 
 
@@ -277,10 +279,33 @@ def _angular_cross_group(w: np.ndarray, v: np.ndarray, cfg: GAPconfig) -> np.nda
     S = 0.5 * (w[:, :, None, :, None] * v[:, None, :, None, :]
                + v[:, :, None, None, :] * w[:, None, :, :, None])          # [N, 3, 3, P, C_x]
     S = S.reshape(N, 3, 3, -1)                                               # g = p·C_x + c
-    tr3 = (S[:, 0, 0] + S[:, 1, 1] + S[:, 2, 2]) / 3.0
-    iso = np.stack([tr3, tr3, tr3] + [np.zeros_like(tr3)] * 3, axis=1)      # [N, 6, G]
-    sym = np.stack([S[:, 0, 0], S[:, 1, 1], S[:, 2, 2], S[:, 0, 1], S[:, 1, 2], S[:, 2, 0]], axis=1)
+    return _split_iso(np.stack([S[:, 0, 0], S[:, 1, 1], S[:, 2, 2], S[:, 0, 1], S[:, 1, 2], S[:, 2, 0]], axis=1))
+
+
+def _split_iso(sym: np.ndarray) -> np.ndarray:
+    """Voigt [N, 6, G] → [N, 6, 2G]: all isotropic columns (tr/3)·I, then the
+    traceless remainders."""
+    tr3 = (sym[:, 0] + sym[:, 1] + sym[:, 2]) / 3.0
+    iso = np.stack([tr3, tr3, tr3] + [np.zeros_like(tr3)] * 3, axis=1)
     return np.concatenate([iso, sym - iso], axis=2)
+
+
+def _triplet_tensor_group(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
+    """Triplet-tensor polarisability group [N, 6, 2·M3] (gap_triplet_tensor):
+    W_i^s = Σ_{j<k} k_s(q_ijk) f(r_ij) f(r_ik) sym(d_ij ⊗ d_ik) — the TurboGAP
+    3b block's triplets, kernel (gap3b_centres/sigma/kernel) and cutoff factors
+    verbatim (gap_descriptor._triplets, kernel_3b), species-summed, with the
+    tensor character from the bond vectors (sym(d_ij⊗d_ik) = sym(D_a⊗D_b) is
+    even in the bond sign). Isotropic columns (s-major) then traceless, Voigt."""
+    N = len(atoms)
+    ci, _, _, q, w, Da, Db = _triplets(N, _pairs(atoms, cfg.gap3b_rcut), cfg.gap3b_rcut, cfg.gap_buffer)
+    k3 = kernel_3b(q, w, cfg)                                                # [P, M3]
+    o = lambda a, b: 0.5 * (Da[:, a] * Db[:, b] + Da[:, b] * Db[:, a])       # [P]
+    sym = [o(0, 0), o(1, 1), o(2, 2), o(0, 1), o(1, 2), o(2, 0)]
+    W = np.zeros((N, 6, k3.shape[1]))
+    for c in range(6):                                 # per component: peak one [P, M3]
+        np.add.at(W[:, c], ci, sym[c][:, None] * k3)
+    return _split_iso(W)
 
 
 def _cross_group_dipole(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
@@ -317,8 +342,9 @@ def _finish_v(V: np.ndarray, atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np
     to pair columns, then scale each polarisability kernel group by its
     gap_group_delta (target_mode=2) and append the cross group (dipole:
     T·v vectors; polarisability: sym(v⊗v) tensors), scaled by
-    gap_group_delta[2], and the angular-cross group (gap_angular_cross, same
-    amplitude); then the long-range pol_field_groups (target_mode=2),
+    gap_group_delta[2], the angular-cross group (gap_angular_cross) and the
+    triplet-tensor group (gap_triplet_tensor), both at the same amplitude;
+    then the long-range pol_field_groups (target_mode=2),
     each group × its pol_field_scale (unscaled while None — the fit pins it,
     _pin_pol_field_scale). THE one place fit and predict both go through, so
     the column contract cannot drift."""
@@ -337,6 +363,8 @@ def _finish_v(V: np.ndarray, atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np
     if pol and cfg.gap_angular_cross:
         w = gm.angular_cross_vector(atoms, ti, cfg)
         v = np.concatenate([v, d_x * _angular_cross_group(w, v1, cfg)], axis=2)
+    if pol and cfg.gap_triplet_tensor:
+        v = np.concatenate([v, d_x * _triplet_tensor_group(atoms, ti, cfg)], axis=2)
     if pol and cfg.pol_field_groups:
         scale = cfg.pol_field_scale or {}
         X = tnep_data.pol_field_groups(atoms, ti, cfg, v1)
@@ -371,7 +399,8 @@ def _n_vcols(cfg: GAPconfig) -> int:
     """K: design geometry columns per sparse point (kernel channels × pair
     columns, + the cross group: K₁(K₁+1)/2 symmetric tensor products under
     target_mode=2, K₁² T·v vectors under target_mode=1; K₁ = C_x·T′; + the angular-cross
-    group 2·C_x³·L and the pol_field_groups block, target_mode=2)."""
+    group 2·C_x³·L, the triplet-tensor group 2·M3 and the pol_field_groups
+    block, target_mode=2)."""
     T_ = cfg.num_types if gm.pair_columns(cfg) else 1
     k = kernel_channels(cfg) * T_
     cx = int(cfg.gap_cross_channels)
@@ -381,6 +410,8 @@ def _n_vcols(cfg: GAPconfig) -> int:
     if int(cfg.target_mode) == 2:
         if cfg.gap_angular_cross:
             k += 2 * cx ** 3 * int(cfg.gap_cross_lmax)
+        if cfg.gap_triplet_tensor:
+            k += 2 * int(cfg.gap3b_n_centres)
         k += tnep_data.pol_group_width(cfg)
     return k
 
@@ -671,8 +702,8 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     # Mutating cfg (here and the seed above) is deliberate: the centres are
     # part of the descriptor definition, so they must travel with the model
     # (model.cfg → predict) and into the run record's "config" block.
-    if (cfg.gap_2b or cfg.gap_3b) and (cfg.gap2b_centres is None
-                                       or cfg.gap3b_centres is None):
+    gap_centres = cfg.gap_2b or cfg.gap_3b or cfg.gap_triplet_tensor
+    if gap_centres and (cfg.gap2b_centres is None or cfg.gap3b_centres is None):
         c2, c3 = select_centres(dataset, cfg)
         cfg.gap2b_centres, cfg.gap3b_centres = c2.tolist(), c3.tolist()
 
@@ -849,6 +880,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                 **({"group_delta": [float(x) for x in cfg.gap_group_delta],
                     "lambda_shear": float(cfg.gap_lambda_shear),
                     "angular_cross": bool(cfg.gap_angular_cross),
+                    "triplet_tensor": bool(cfg.gap_triplet_tensor),
                     "pol_field_groups": list(cfg.pol_field_groups),
                     "pol_field_scale": cfg.pol_field_scale}
                    if int(cfg.target_mode) == 2 else {}),
@@ -860,7 +892,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                 **({k: getattr(cfg, k) for k in (
                     "gap2b_centres", "gap3b_centres", "gap2b_sigma",
                     "gap3b_sigma", "gap2b_rcut", "gap3b_rcut", "gap_buffer")}
-                   if cfg.gap_2b or cfg.gap_3b else {}),
+                   if gap_centres else {}),
                 # sparse-set sizes per site model
                 "M_per_species": {m: {str(z): n for z, n in zip(cfg.types, sz)}
                                   for m, sz in zip(models, sizes)},

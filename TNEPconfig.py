@@ -796,6 +796,10 @@ class GAPconfig:
     # cutoff gap_site_rcut or dipole_rc) and the dipole kernel vector, species-summed,
     # iso + traceless columns; polarisability only.
     gap_angular_cross: bool = False
+    # Σ_{j<k} k_s(q_ijk) sym(d_ij⊗d_ik) on the TurboGAP 3b centres/kernel (gap3b_*),
+    # species-summed, iso + traceless columns; polarisability only. Centres
+    # auto-selected at fit like gap_3b.
+    gap_triplet_tensor: bool = False
     # Regularisation, as gap_fit: the expected ABSOLUTE error of a dipole
     # component per √atom (gap_fit's default_sigma with
     # sigma_per_atom=T: σ_obs = gap_sigma·√N_atoms), and the jitter added to
