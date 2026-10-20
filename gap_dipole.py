@@ -172,6 +172,10 @@ def _validate(cfg: GAPconfig) -> None:
         (int(cfg.gap_site_channels) >= 1 and int(cfg.gap_site_lmax) >= 0,
          "gap_site_channels >= 1 and gap_site_lmax >= 0 required"),
         (int(cfg.gap_cross_lmax) >= 0, "gap_cross_lmax must be >= 0"),
+        (cfg.gap_site_rcut is None or float(cfg.gap_site_rcut) > 0,
+         f"gap_site_rcut must be > 0, got {cfg.gap_site_rcut}"),
+        (cfg.gap_site_rcut is None or {"2b", "3b"} & set(cfg.gap_site_models),
+         "gap_site_rcut only applies to the 2b/3b site models"),
         ("3b" not in cfg.gap_site_models or int(cfg.gap_cross_channels) >= 1,
          "the 3b site model reads out through the angular kernel: gap_cross_channels >= 1 required"),
         ("3b" not in cfg.gap_site_models or int(cfg.target_mode) == 2 or int(cfg.gap_cross_lmax) >= 1,
@@ -820,6 +824,13 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
             out = np.empty((len(frames), len(row)))     # D = 3 or 6
         out[f] = row
     return out
+
+
+def predict_timed(model: GapDipoleModel, frames: list[Atoms]) -> tuple[np.ndarray, float]:
+    """predict() plus wall time per atom (µs/atom) of the full forward pass:
+    neighbour lists, descriptors, geometry and kernel columns."""
+    t0 = time.perf_counter(); P = predict(model, frames)
+    return P, 1e6 * (time.perf_counter() - t0) / sum(len(a) for a in frames)
 
 
 if __name__ == "__main__":

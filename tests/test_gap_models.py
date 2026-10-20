@@ -54,6 +54,14 @@ def test_two_body_descriptor_matches_hand_sum_and_is_normalised():
     assert np.allclose(q, ref, atol=1e-6)
 
 
+def test_gap_site_rcut_widens_the_descriptor_cutoff():
+    cfg, at, ti = _setup(gap_site_models=["soap", "2b"], gap_site_rcut=5.0)
+    i, j, _, _ = gm._site_pairs(at, cfg, 3)
+    assert len(i) == len(neighbor_list("i", at, 5.0)) > len(neighbor_list("i", at, 3.0))
+    q5, q3 = gm.two_body_descriptor(at, ti, cfg), gm.two_body_descriptor(at, ti, _setup()[0])
+    assert q5.shape == q3.shape and not np.allclose(q5, q3)
+
+
 def test_three_body_descriptor_matches_triplet_loop_and_symmetries():
     cfg, at, ti = _setup()
     q = gm.three_body_descriptor(at, ti, cfg)                 # [N, T(T+1)/2 · C·C · (L+1)]

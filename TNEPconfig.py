@@ -770,6 +770,9 @@ class GAPconfig:
     # readout channels stay dipole_channels). Width: 2b T·C, 3b T(T+1)/2·C²·(L+1).
     gap_site_channels: int = 6
     gap_site_lmax: int = 2
+    # Cutoff (Å) of the 2b/3b site DESCRIPTORS (pairs and radial family);
+    # None → dipole_rc, the readout cutoff.
+    gap_site_rcut: float | None = None
     # Legendre order L of the 3b model's angular kernel: channels (a ≤ b, l),
     # l = 1..L for μ (target_mode 1), 0..L for α; the α l = 0 member is the
     # sym(v⊗v) cross group without its j = k term.

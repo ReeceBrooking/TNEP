@@ -505,7 +505,7 @@ def test_configs_are_independent():
                 # polarisability kernel-group knobs of the linear fit
                 "gap_group_delta", "gap_lambda_shear", "gap_cross_channels",
                 "gap_site_models", "gap_model_delta", "gap_site_channels",
-                "gap_site_lmax", "gap_cross_lmax"}
+                "gap_site_lmax", "gap_cross_lmax", "gap_site_rcut"}
     missing = (set(GAPconfig.__annotations__)
                - set(TNEPconfig.__annotations__) - gap_only)
     assert not missing, missing
@@ -672,7 +672,8 @@ def test_dipole_cross_group_identity_and_fit(tmp_path):
 
 def test_site_model_fields_are_gap_only_and_validated():
     from TNEPconfig import GAPconfig, TNEPconfig
-    for f in ("gap_site_models", "gap_model_delta", "gap_site_channels", "gap_site_lmax", "gap_cross_lmax"):
+    for f in ("gap_site_models", "gap_model_delta", "gap_site_channels", "gap_site_lmax",
+              "gap_cross_lmax", "gap_site_rcut"):
         assert hasattr(GAPconfig, f) and not hasattr(TNEPconfig, f)
     assert GAPconfig.gap_site_models == ["soap"]            # default = today's model
     with pytest.raises(ValueError, match="gap_site_models"):
@@ -689,6 +690,9 @@ def test_site_model_fields_are_gap_only_and_validated():
         gap_dipole._validate(_cfg(gap_site_models=["3b"], dipole_radial="chebyshev", dipole_channels=3))
     with pytest.raises(ValueError, match="multi-channel radial"):
         gap_dipole._validate(_cfg(gap_site_models=["2b"]))          # _cfg default radial is "screened"
+    for rc in (-1.0, 5.0):                                           # ≤ 0, and set without 2b/3b
+        with pytest.raises(ValueError, match="gap_site_rcut"):
+            gap_dipole._validate(_cfg(gap_site_models=["soap"], gap_site_rcut=rc))
     gap_dipole._validate(_cfg(gap_site_models=["soap", "2b", "3b"], dipole_radial="chebyshev",
                               dipole_channels=3, gap_cross_channels=2,
                               gap_model_delta={"soap": 1.0, "2b": 0.5, "3b": 0.1}))
@@ -777,3 +781,6 @@ def test_site_models_3b_alone_dipole_runs_and_record(tmp_path):
         rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
     assert rec["gap"]["site_models"] == ["3b"] and set(m.site_alpha) == {"3b"}
     assert gap_dipole.predict(m, [read(WATER_XYZ, index="3")]).shape == (1, 3)
+    P, us = gap_dipole.predict_timed(m, [read(WATER_XYZ, index="3")])
+    assert np.array_equal(P, gap_dipole.predict(m, [read(WATER_XYZ, index="3")]))
+    assert isinstance(us, float) and us > 0

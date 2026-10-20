@@ -5,7 +5,8 @@ Descriptors (invariant, row-normalised; the GAP kernel is (q̂_i·q̂_m)^ξ on
 descriptors of the SAME body order only):
     2b  q_n^{t'}(i)        = Σ_{j∈t'} R_n(r_ij)
     3b  q_{nn'l}^{t't''}(i) = Σ_{j∈t'} Σ_{k∈t'', k≠j} R_n(r_ij) R_n'(r_ik) P_l(cos θ_jik)
-with R_n the readout's radial family on dipole_rc (data._radial_weights).
+with R_n the readout's radial family on gap_site_rcut (default dipole_rc;
+data._radial_weights).
 
 Angular geometric kernels for the 3b model (equivariance by construction: the
 angle enters as an invariant weight, the tensor character comes from the
@@ -40,9 +41,10 @@ def legendre(cos: np.ndarray, lmax: int) -> np.ndarray:
 
 
 def _site_pairs(atoms: Atoms, cfg: GAPconfig, C: int):
-    """(i, j, d [P,3], R [P,C]) over image pairs within dipole_rc with the
-    readout's radial family evaluated for C channels (data._radial_weights)."""
-    rc = float(cfg.dipole_rc or cfg.rcut_hard)
+    """(i, j, d [P,3], R [P,C]) over image pairs within gap_site_rcut (default
+    dipole_rc) with the readout's radial family evaluated for C channels
+    (data._radial_weights)."""
+    rc = float(cfg.gap_site_rcut or cfg.dipole_rc or cfg.rcut_hard)
     i, j, D = tnep_data._neighbor_pairs(atoms, rc)
     keep = i != j
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
