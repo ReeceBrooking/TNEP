@@ -71,3 +71,20 @@ The 3b-only α row has no isotropic group (its angular kernel is traceless), so 
 | soap+2b δ 0.3, gap_site_rcut 6.0, gap_extra_rcut 5.5 | 0.1 | 16.1/17.6 | 15.8/16.0 | — | 114000 | 118 | 3056 |
 
 Reading: the 2b gain is a small-amplitude short-range prior — it wants δ_2b ≤ 0.1, the readout cutoff (every longer `gap_site_rcut` is monotonically worse), 10 channels, the normalised kernel, and it is saturated at M 250; multiscale does not help μ alone (the Ewald field already carries the long range) and does not stack with 2b on test. For α the opposite: 2b never helps, a second SOAP scale lifts the diagonal by a point (saturating at 6.5 Å; σ moves 0.1 → 0.3) and leaves the off-diagonal alone — the anisotropy stays a form limit (§4.3 of the docs). Logs: out/probe_{mu,pol}.log, out/probe2_{mu,pol}.log; records out/probe_{mu,pol}/GAP/.
+
+### gap_2b_probe.py follow-up 2 (2026-10-20): a TNEP-like long READOUT basis (`dipole_rc`), 2b descriptor pinned at 3 Å (`gap_site_rcut=3.0`), ± Ewald field
+
+Question: the published TNEP reads the dipole out through the derivative of a learned 6 Å two-body basis; does a 6 Å bond basis in the GAP recover the field column's gain, or add to it? σ_A ∈ {2e-3, 3e-3}; all rows soap+2b δ_2b 0.1 unless listed; "train" = RRMSE on the 500 training frames of the refit.
+
+| readout r_c, C | field | val (400) | test (400) | train (500) | test (500) | ncols | fit s | µs/atom |
+|---|---|---|---|---|---|---|---|---|
+| 3.0, 10 (best model) | on | 1.07 | 1.05 | 0.60 | **0.97 %** | 22000 | 76 | 1468 |
+| 4.5, 10 | on | 1.26 | 1.19 | 0.43 | 1.11 % | 22000 | 66 | 1481 |
+| 6.0, 10 | on | 1.64 | 1.56 | 0.24 | 1.41 % | 22000 | 98 | 2278 |
+| 6.0, 20 | on | 1.40 | 1.53 | 0.03 | 1.46 % | 42000 | 102 | 2256 |
+| 3.0, 10 | off | 1.64 | 1.56 | 1.05 | 1.49 % | 20000 | 22 | 452 |
+| 6.0, 10 | off | 1.67 | 1.56 | 0.26 | 1.42 % | 20000 | 54 | 1211 |
+| 6.0, 20 | off | 1.47 | 1.58 | 0.04 | 1.50 % | 40000 | 59 | 1264 |
+| 6.0, 10, soap only | off | 2.03 | 2.00 | 0.59 | 1.89 % | 10000 | 52 | 1151 |
+
+Reading: widening the readout is monotonically worse (0.97 → 1.11 → 1.41 %) and the training error collapses (0.60 → 0.03 %): with independent site functions per (channel, species) the 6 Å bond basis has enough freedom to interpolate 500 frames and generalises worse. At 6 Å the field column stops mattering (1.41 with, 1.42 without), i.e. the long bond basis can fit what the field explains on the training set but not transferably. The TNEP's 6 Å readout works because its site functions are tied — all channels are ∂U_i/∂q of one 1097-parameter network — not because of the range itself; in a kernel model long range has to enter as a fixed physics column with one site function (the field). Cost: the Ewald field column is ≈ 1.0 ms/atom of the 1.47 ms/atom forward pass (452 µs/atom without it) — the single largest cost item in the best dipole model, and a pure-Python Ewald sum.

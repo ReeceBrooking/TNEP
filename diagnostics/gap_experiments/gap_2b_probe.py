@@ -57,7 +57,15 @@ ROWS = {
            ("soap+2b d0.05", dict(S2, d2b=0.05), (1.5e-3, 2e-3)),
            ("soap+2b d0.1 s1.5e-3", dict(S2, d2b=0.1), (1.5e-3,)),
            ("soap+2b raw d0.1", dict(S2, d2b=0.1, raw2b=True), (2e-3, 3e-3)),
-           ("soap+2b raw d0.3", dict(S2, d2b=0.3, raw2b=True), (3e-3,))],
+           ("soap+2b raw d0.3", dict(S2, d2b=0.3, raw2b=True), (3e-3,)),
+           # follow-up 2 (PROBE_ROWS): TNEP-like long READOUT basis (dipole_rc) with the 2b descriptor pinned at 3 Å, ± field
+           ("soap+2b d0.1 ro4.5", dict(S2, d2b=0.1, dipole_rc=4.5, gap_site_rcut=3.0), (2e-3, 3e-3)),
+           ("soap+2b d0.1 ro6.0", dict(S2, d2b=0.1, dipole_rc=6.0, gap_site_rcut=3.0), (2e-3, 3e-3)),
+           ("soap+2b d0.1 ro6.0 C20", dict(S2, d2b=0.1, dipole_rc=6.0, gap_site_rcut=3.0, dipole_channels=20), (2e-3, 3e-3)),
+           ("soap+2b d0.1 nofield", dict(S2, d2b=0.1, dipole_field=False), (2e-3, 3e-3)),
+           ("soap+2b d0.1 ro6.0 nofield", dict(S2, d2b=0.1, dipole_rc=6.0, gap_site_rcut=3.0, dipole_field=False), (2e-3, 3e-3)),
+           ("soap+2b d0.1 ro6.0 C20 nofield", dict(S2, d2b=0.1, dipole_rc=6.0, gap_site_rcut=3.0, dipole_channels=20, dipole_field=False), (2e-3, 3e-3)),
+           ("soap ro6.0 nofield", dict(S, dipole_rc=6.0, dipole_field=False), (1e-3, 3e-3))],
     "pol": [("soap", S, (0.1,)),
             ("soap+2b d0.1", dict(S2, d2b=0.1), (0.1,)),
             ("soap+2b rc6", dict(S2, d2b=0.3, gap_site_rcut=6.0), (0.1,)),
@@ -68,7 +76,7 @@ ROWS = {
             ("soap ms6.5 s0.5", dict(S, gap_extra_rcut=6.5), (0.5,))],
 }[prop]
 GRID = {"mu": (2e-3, 3e-3, 5e-3), "pol": (0.1, 0.3)}[prop]
-K = {"mu": 4, "pol": 2}[prop]
+K = int(os.environ.get("PROBE_K", {"mu": 4, "pol": 2}[prop]))
 if SMOKE: ROWS = [ROWS[0], ROWS[-1]]; K = 1
 only = os.environ.get("PROBE_ROWS")
 if only: ROWS = [r for r in ROWS if r[0] in only.split(",")]; GRID = ()      # follow-ups: listed σ only

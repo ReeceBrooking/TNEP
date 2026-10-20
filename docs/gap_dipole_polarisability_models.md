@@ -191,7 +191,25 @@ column.
 *Cost.* The forward pass (neighbour lists, SOAP, 2b descriptor, geometry and
 kernel columns; two processes sharing 16 cores) is 1.45 ms/atom for SOAP
 alone and 1.47–1.54 ms/atom with the 2b model (+2–7 %); a 6 Å 2b cutoff costs
-1.6×, a second SOAP scale at 4.5 Å 1.5× and at 6 Å 1.85×.
+1.6×, a second SOAP scale at 4.5 Å 1.5× and at 6 Å 1.85×. The Ewald
+field column is the largest single item: 1.47 ms/atom with it against
+0.45 ms/atom without, in a pure-Python Ewald sum.
+
+**A long readout basis does not transfer.** The published TNEP reads the
+dipole out through $\partial U_i/\partial\mathbf r_{ij}$ of a learned 6 Å
+two-body basis, i.e. a bond basis with learned radial functions reaching 6 Å
+and site functions tied to one network. The kernel analogue — the same SOAP +
+2b site functions reading out through a bond basis with $r_c=4.5$ or 6 Å,
+2b descriptor kept at 3 Å — is monotonically worse: 0.97 → 1.11 → 1.41 % at
+10 channels, 1.46 % at 20, while the training RRMSE falls from 0.60 to 0.03 %.
+Without the field column the 6 Å readout gives 1.42 % against 1.49 % at 3 Å,
+so the field's whole gain disappears once the basis can reach 6 Å: the long
+bond basis fits what the field explains on the training set and does not
+transfer it. With one independent site function per (channel, species) the
+long basis simply has too much freedom for 500 frames; the TNEP can afford
+the range because every channel is the derivative of a single 1097-parameter
+scalar field. In a kernel model the long range has to enter as a fixed
+physics column with one site function, which is what the field column is.
 
 ## 4. Best polarisability model
 
@@ -309,6 +327,8 @@ fitted.
 | Summed site models at $\delta=1$ | 1.19–1.37 % (fit 400, vs 1.17) | Equal prior weight on the weaker kernel inflates the variance; only $\delta\approx0.3$ helps (§3.4). |
 | Spherical Bessel radial family | 1.85 % (vs 1.17 warped Chebyshev) | Oscillatory over the whole $[0, r_c]$ with large amplitude at short range. |
 | More channels ($C=20$) or more sparse points ($M=500$) | 1.75 % / 1.55 % | Kernel resolution saturates; extra columns need $\sigma$ re-selection and gain nothing. |
+
+| Bond basis widened to 4.5 / 6 Å (10 or 20 channels), SOAP + 2b site functions, ± field | 1.11 / 1.41–1.46 % with the field, 1.42–1.50 without (vs 0.97 / 1.49 at 3 Å) | Training error collapses to 0.03–0.26 %: independent site functions per channel let a 6 Å basis interpolate 500 frames. See §3.4. |
 
 ## 6. What did not work: polarisability
 
