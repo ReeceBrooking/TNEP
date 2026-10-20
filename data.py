@@ -607,6 +607,186 @@ def _append_field_channel(V: np.ndarray, E: np.ndarray, scale: float) -> np.ndar
     return np.concatenate([V, extra], axis=2)
 
 
+# ── long-range polarisability site tensors (GAP pol_field_groups) ─────────
+
+def ewald_dipole_tensor(atoms: Atoms, alpha: float = 0.35, r_cut: float = 9.0, k_cut: float = 7.0,
+                        exclude_pairs=None) -> np.ndarray:
+    """Ewald dipole–dipole tensor T [N, N, 3, 3] such that the field at i from
+    point dipoles p_j is E_i = Σ_j T_ij p_j (own-dipole term excluded, the
+    Gaussian self part included as in the standard dipole Ewald self term).
+    Real space over the image-exact neighbour list with f(r) = erfc(αr)/r:
+    T = ∇∇f = f″ r̂r̂ + (f′/r)(I − r̂r̂); reciprocal: (4π/V) Σ_k w_k k kᵀ
+    cos(k·(r_i − r_j)); self: −(4α³/3√π) I. `exclude_pairs` (i, j) arrays are
+    zeroed (intramolecular exclusion, as in polarisable water models).
+    Validated against finite differences of ewald_field to 1.7e-4 (relative)."""
+    from scipy.special import erfc
+    N, r = len(atoms), atoms.positions
+    i, j, d, D = neighbor_list("ijdD", atoms, r_cut)        # D = r_j − r_i
+    a2d2 = (alpha * d) ** 2
+    ex = np.exp(-a2d2); erfc_ = erfc(alpha * d)
+    fp = -(erfc_ / d ** 2 + 2 * alpha / np.sqrt(np.pi) * ex / d)                 # f′
+    fpp = 2 * erfc_ / d ** 3 + (4 * alpha / np.sqrt(np.pi)) * ex / d ** 2 + (4 * alpha ** 3 / np.sqrt(np.pi)) * ex   # f″
+    rhat = D / d[:, None]
+    rr = rhat[:, :, None] * rhat[:, None, :]
+    Tp = fpp[:, None, None] * rr + (fp / d)[:, None, None] * (np.eye(3)[None] - rr)   # [P, 3, 3]
+    T = np.zeros((N, N, 3, 3)); np.add.at(T, (i, j), Tp)
+    cell = np.asarray(atoms.cell.array); V = abs(np.linalg.det(cell))
+    recip = 2 * np.pi * np.linalg.inv(cell).T
+    nmax = int(np.ceil(k_cut / np.min(np.linalg.norm(recip, axis=1)))) + 1
+    rng_ = np.arange(-nmax, nmax + 1)
+    n = np.array(np.meshgrid(rng_, rng_, rng_, indexing="ij")).reshape(3, -1).T
+    k = n @ recip; k2 = (k ** 2).sum(1); keep = (k2 > 1e-12) & (k2 <= k_cut ** 2); k, k2 = k[keep], k2[keep]
+    w = 4 * np.pi / V * np.exp(-k2 / (4 * alpha ** 2)) / k2
+    phase = r @ k.T; c, s = np.cos(phase), np.sin(phase)
+    kk = w[:, None, None] * k[:, :, None] * k[:, None, :]                        # [K, 3, 3]
+    # φ_dip = −p·∇G ⇒ E = −(4π/V) Σ_k w k kᵀ cos(k·r_ij)·p: the reciprocal tensor is NEGATIVE
+    T -= np.einsum("ik,kab,jk->ijab", c, kk, c) + np.einsum("ik,kab,jk->ijab", s, kk, s)
+    # The reciprocal sum includes each dipole's own Gaussian cloud, whose field at
+    # its centre is −(4α³/3√π)·p (Hessian of erf(αr)/r at 0): remove it.
+    T[np.arange(N), np.arange(N)] += (4 * alpha ** 3 / (3 * np.sqrt(np.pi))) * np.eye(3)
+    # sign: E = −∇φ, φ_dipole = −p·∇f  ⇒  E_i = Σ_j (∇∇f) p_j with ∇∇f as above
+    if exclude_pairs is not None:
+        T[exclude_pairs[0], exclude_pairs[1]] = 0.0
+    return T
+
+
+def molecules(atoms: Atoms):
+    """(i, j) index arrays of all intramolecular pairs: each H assigned to its
+    nearest O (MIC). Water-specific, used only for the induction exclusion."""
+    from ase.geometry import get_distances
+    Z = atoms.numbers; O = np.where(Z == 8)[0]; H = np.where(Z == 1)[0]
+    _, Dm = get_distances(atoms.positions[H], atoms.positions[O], cell=atoms.cell, pbc=True)
+    owner = O[Dm.argmin(1)]
+    members = {o: [o] for o in O}
+    for h, o in zip(H, owner): members[o].append(h)
+    ii, jj = [], []
+    for m in members.values():
+        for a in m:
+            for b in m:
+                if a != b: ii.append(a); jj.append(b)
+    return np.array(ii), np.array(jj)
+
+
+# one-entry cache of the [3N, 3N] Ewald tensor, keyed by frame CONTENT (not
+# id(): a freed frame's id is reused), so α scans on one frame reuse it.
+_T_CACHE: list = [None, None]
+
+
+def applequist(atoms: Atoms, E0: np.ndarray, alpha_species: dict, exclude_intra: bool = True):
+    """Linear-response induction with fixed scalar polarisabilities α_z (Å³):
+    p = (I − A T)⁻¹ A E0, A = diag(α). Returns (p [N, 3] e·Å, E_eff = E0 + T p,
+    R = (I − A T)⁻¹ A [3N, 3N] for the polarisability columns)."""
+    N = len(atoms)
+    key = (bool(exclude_intra), atoms.numbers.tobytes(), atoms.cell.array.tobytes(), atoms.positions.tobytes())
+    if _T_CACHE[0] != key:
+        T = ewald_dipole_tensor(atoms, exclude_pairs=molecules(atoms) if exclude_intra else None)
+        _T_CACHE[:] = key, T.transpose(0, 2, 1, 3).reshape(3 * N, 3 * N)
+    Tm = _T_CACHE[1]
+    A = np.repeat(np.array([alpha_species.get(int(z), 0.0) for z in atoms.numbers]), 3)
+    R = np.linalg.solve(np.eye(3 * N) - A[:, None] * Tm, np.diag(A))
+    p = (R @ E0.reshape(-1)).reshape(N, 3)
+    return p, E0 + (Tm @ p.reshape(-1)).reshape(N, 3), R
+
+
+def _voigt(W: np.ndarray) -> np.ndarray:
+    """[N, 3, 3] symmetric → Voigt [N, 6] (xx, yy, zz, xy, yz, zx)."""
+    return np.stack([W[:, 0, 0], W[:, 1, 1], W[:, 2, 2], W[:, 0, 1], W[:, 1, 2], W[:, 2, 0]], 1)
+
+
+def _iso_traceless(Wv: np.ndarray) -> np.ndarray:
+    """Voigt [N, 6] → [N, 6, 2]: the isotropic part (tr/3)·I and the traceless
+    remainder — the two kernel-group columns of bond_geometry."""
+    tr3 = Wv[:, :3].mean(1, keepdims=True)
+    iso = np.concatenate([tr3.repeat(3, 1), np.zeros_like(tr3).repeat(3, 1)], 1)
+    return np.stack([iso, Wv - iso], 2)
+
+
+def induced_site_tensors(atoms: Atoms, alpha_species: dict, exclude_intra: bool = True) -> np.ndarray:
+    """Per-site induced-coupling tensor W_i = Σ_j R_ij (Voigt [N, 6]), R the
+    Applequist response: Σ_i W_i is the Applequist cell polarisability, so a
+    site-weighted sum Σ_i s_i W_i is a long-range, screened α kernel group.
+    Only the total is symmetric; each W_i is symmetrised (the Voigt column
+    must be a symmetric tensor to rotate covariantly)."""
+    N = len(atoms)
+    _, _, R = applequist(atoms, np.zeros((N, 3)), alpha_species, exclude_intra)
+    W = R.reshape(N, 3, N, 3).sum(2)
+    return _voigt(0.5 * (W + W.transpose(0, 2, 1)))
+
+
+POL_FIELD_GROUPS = ("induced", "grad", "cross", "quad", "qeq")
+
+
+def pol_group_width(cfg, groups=None) -> int:
+    """Columns of the pol_field_groups block (cfg.pol_field_groups, or `groups`):
+    induced 1, grad 1, cross 2·C_x, quad 2, qeq 2."""
+    w = {"induced": 1, "grad": 1, "cross": 2 * int(cfg.gap_cross_channels), "quad": 2, "qeq": 2}
+    return sum(w[g] for g in (cfg.pol_field_groups if groups is None else groups))
+
+
+def qeq_site_tensors(atoms: Atoms, cutoff: float = 6.0, hardness: float = 10.0) -> np.ndarray:
+    """Charge-flow polarisability site tensors W_i = −½ Σ_j L⁺_ij d_ij⊗d_ij
+    [N, 3, 3]: L = hardness·I + the short-range smeared Coulomb (Gaussian
+    charges of covalent-radius width, cosine cutoff, image pairs within
+    `cutoff`), L⁺ its pseudo-inverse on the charge-conserving subspace. Σ_i W_i
+    is the QEq polarisability of a charge-flow model whose electronegativity
+    responds to the field; Σ_j L⁺_ij = 0 makes W_i translation invariant."""
+    from ase.data import covalent_radii
+    from scipy.special import erf
+    N = len(atoms)
+    i, j, d, D = neighbor_list("ijdD", atoms, cutoff)
+    keep = i != j; i, j, d, D = i[keep], j[keep], d[keep], D[keep]
+    sig = covalent_radii[atoms.numbers]
+    gam = np.sqrt(sig[i] ** 2 + sig[j] ** 2)
+    fc = (1.0 + np.cos(np.pi * d / cutoff)) / 2.0
+    L = np.zeros((N, N)); np.add.at(L, (i, j), 14.399645 * erf(d / (np.sqrt(2.0) * gam)) / d * fc)
+    L[np.diag_indices(N)] += 14.399645 / (sig * np.sqrt(np.pi)) + float(hardness)
+    P = np.eye(N) - 1.0 / N
+    Lp = P @ np.linalg.pinv(P @ L @ P) @ P
+    W = np.zeros((N, 3, 3)); np.add.at(W, i, -0.5 * Lp[i, j][:, None, None] * D[:, :, None] * D[:, None, :])
+    return W
+
+
+def pol_field_groups(atoms: Atoms, ti: np.ndarray, cfg, v_cross: np.ndarray | None) -> np.ndarray:
+    """Long-range polarisability columns [N, 6, G] (Voigt), the groups of
+    cfg.pol_field_groups in order, UNscaled (the caller applies
+    cfg.pol_field_scale). E_i is the Ewald field of dipole_field_charges
+    (field_channel); v_cross [N, 3, K₁] the cross group's dipole kernel vectors
+    v^a_i = Σ_j R_a d_ij (species-resolved under pair columns; summed over
+    neighbour species here, K₁ = C_x·T′, C-major), needed for "cross" only.
+      induced : traceless Applequist tensor (induced_site_tensors, pol_induced_alpha)
+      grad    : traceless field gradient ∇E_i = −Σ_j q_j T_ij (ewald_dipole_tensor)
+      cross   : (E·v^a)·I for a < C_x, then traceless sym(E ⊗ v^a)
+      quad    : |E|²·I and traceless E⊗E
+      qeq     : isotropic and traceless parts of qeq_site_tensors"""
+    groups = list(cfg.pol_field_groups)
+    N = len(atoms)
+    need_E = {"grad", "cross", "quad"} & set(groups)
+    E = field_channel(atoms, cfg) if need_E else None
+    cols = []
+    for g in groups:
+        if g == "induced":
+            alpha = {int(z): float(a) for z, a in cfg.pol_induced_alpha.items()}
+            cols.append(_iso_traceless(induced_site_tensors(atoms, alpha))[:, :, 1:])
+        elif g == "grad":
+            ch = cfg.dipole_field_charges
+            q = np.array([float(ch[int(z)] if int(z) in ch else ch[str(int(z))]) for z in atoms.numbers])
+            gradE = -np.einsum("j,ijab->iab", q, ewald_dipole_tensor(atoms))
+            cols.append(_iso_traceless(_voigt(gradE))[:, :, 1:])
+        elif g == "cross":
+            Cx = int(cfg.gap_cross_channels)
+            v = v_cross.reshape(N, 3, Cx, -1).sum(3)                        # [N, 3, C_x]
+            S = 0.5 * (E[:, :, None, None] * v[:, None, :, :] + v[:, :, None, :] * E[:, None, :, None])
+            parts = np.stack([_iso_traceless(_voigt(S[:, :, :, a])) for a in range(Cx)], 3)   # [N, 6, 2, C_x]
+            cols.append(parts.reshape(N, 6, 2 * Cx))                        # (E·v^a)I for all a, then traceless
+        elif g == "quad":
+            cols.append(_iso_traceless(_voigt(E[:, :, None] * E[:, None, :])))
+        elif g == "qeq":
+            cols.append(_iso_traceless(_voigt(qeq_site_tensors(atoms))))
+        else:
+            raise ValueError(f"unknown pol_field_group {g!r}")
+    return np.concatenate(cols, 2) if cols else np.zeros((N, 6, 0))
+
+
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
                        C: int, T: int, radial: str = "chebyshev",
                        zeta: float = -2.0,

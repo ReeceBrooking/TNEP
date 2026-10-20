@@ -184,6 +184,16 @@ def _validate(cfg: GAPconfig) -> None:
          "2b/3b site models need a multi-channel radial (screened is single-channel)"),
         (not (cfg.gap_2b or cfg.gap_3b) or list(cfg.gap_site_models)[:1] == ["soap"],
          "the TurboGAP 2b/3b tails read out through the bond basis of the first (soap) site model"),
+        (not cfg.pol_field_groups or int(cfg.target_mode) == 2,
+         "pol_field_groups are polarisability (target_mode=2) columns"),
+        (set(cfg.pol_field_groups) <= set(tnep_data.POL_FIELD_GROUPS)
+         and len(set(cfg.pol_field_groups)) == len(cfg.pol_field_groups),
+         f"pol_field_groups must be a subset of {list(tnep_data.POL_FIELD_GROUPS)} without repeats, "
+         f"got {cfg.pol_field_groups!r}"),
+        ("cross" not in cfg.pol_field_groups or int(cfg.gap_cross_channels) >= 1,
+         "pol_field_groups 'cross' contracts the cross group's vectors: gap_cross_channels >= 1 required"),
+        (not cfg.pol_field_groups or bool(cfg.dipole_field_charges),
+         "pol_field_groups need dipole_field_charges ({Z: charge in e} per species)"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     if bad:
@@ -218,21 +228,27 @@ def _collapse_V(V: np.ndarray, pair_columns: bool) -> np.ndarray:
     return V.sum(axis=-1)
 
 
-def _cross_group(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
-    """Third polarisability kernel group [N, 6, K_x] (gap_cross_channels C_x):
-    the dipole kernel v_i^a = Σ_j R_a(r_ij) d_ij over its first C_x radial
-    channels (species-resolved under pair columns, K₁ = C_x·T′ vectors),
-    combined as traceless symmetric products sym(v^a ⊗ v^b) − tr/3 for a ≤ b,
-    K_x = K₁(K₁+1)/2. Expanding v⊗v = Σ_j Σ_k R_a R_b d_j⊗d_k shows it carries
-    the two-neighbour cross tensors the bond-axis groups lack. Even under
-    inversion, covariant, image-exact, linear in the site coefficient."""
+def _cross_vectors(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
+    """Dipole kernel vectors of the cross group v_i^a = Σ_j R_a(r_ij) d_ij over
+    the first C_x radial channels, [N, 3, K₁] (K₁ = C_x·T′ under pair columns)."""
     V1 = tnep_data._neighbor_dipole_V(
         atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard),
         int(cfg.gap_cross_channels), int(cfg.num_types),
         str(cfg.dipole_radial), float(cfg.dipole_zeta),
         resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale),
         rank=1)                                                 # [N, 3, C_x, T]
-    v = _collapse_V(V1, gm.pair_columns(cfg))                     # [N, 3, K₁]
+    return _collapse_V(V1, gm.pair_columns(cfg))
+
+
+def _cross_group(v: np.ndarray) -> np.ndarray:
+    """Third polarisability kernel group [N, 6, K_x] (gap_cross_channels C_x):
+    the dipole kernel v_i^a = Σ_j R_a(r_ij) d_ij over its first C_x radial
+    channels (species-resolved under pair columns, K₁ = C_x·T′ vectors),
+    combined as traceless symmetric products sym(v^a ⊗ v^b) − tr/3 for a ≤ b,
+    K_x = K₁(K₁+1)/2. Expanding v⊗v = Σ_j Σ_k R_a R_b d_j⊗d_k shows it carries
+    the two-neighbour cross tensors the bond-axis groups lack. Even under
+    inversion, covariant, image-exact, linear in the site coefficient.
+    Takes v = _cross_vectors(...) [N, 3, K₁] (shared with pol_field_groups)."""
     a_idx, b_idx = np.triu_indices(v.shape[2])
     a, b = v[:, :, a_idx], v[:, :, b_idx]                       # [N, 3, K_x]
     sym = 0.5 * (a[:, :, None, :] * b[:, None, :, :]
@@ -276,31 +292,65 @@ def _finish_v(V: np.ndarray, atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np
     to pair columns, then scale each polarisability kernel group by its
     gap_group_delta (target_mode=2) and append the cross group (dipole:
     T·v vectors; polarisability: sym(v⊗v) tensors), scaled by
-    gap_group_delta[2]. THE one place fit and predict both go through, so
+    gap_group_delta[2]; then the long-range pol_field_groups (target_mode=2),
+    each group × its pol_field_scale (unscaled while None — the fit pins it,
+    _pin_pol_field_scale). THE one place fit and predict both go through, so
     the column contract cannot drift."""
     v = _collapse_V(V, gm.pair_columns(cfg))
     d_iso, d_tr, d_x = (float(x) for x in cfg.gap_group_delta)
-    if int(cfg.target_mode) == 2:
+    pol = int(cfg.target_mode) == 2
+    if pol:
         per_group = v.shape[2] // 2                              # C·T′ channels per group
         v = v.copy()
         v[:, :, :per_group] *= d_iso
         v[:, :, per_group:] *= d_tr
+    v1 = _cross_vectors(atoms, ti, cfg) if pol and int(cfg.gap_cross_channels) > 0 else None
     if int(cfg.gap_cross_channels) > 0:
-        cross = (_cross_group if int(cfg.target_mode) == 2 else _cross_group_dipole)
-        v = np.concatenate([v, d_x * cross(atoms, ti, cfg)], axis=2)
+        cross = _cross_group(v1) if pol else _cross_group_dipole(atoms, ti, cfg)
+        v = np.concatenate([v, d_x * cross], axis=2)
+    if pol and cfg.pol_field_groups:
+        scale = cfg.pol_field_scale or {}
+        X = tnep_data.pol_field_groups(atoms, ti, cfg, v1)
+        k0 = 0
+        for g in cfg.pol_field_groups:
+            w = tnep_data.pol_group_width(cfg, [g])
+            X[:, :, k0:k0 + w] *= float(scale.get(g, 1.0))
+            k0 += w
+        v = np.concatenate([v, X], axis=2)
     return v
+
+
+def _pin_pol_field_scale(cfg: GAPconfig, vs: list) -> None:
+    """Pin cfg.pol_field_scale on the training geometry (groups appended
+    UNscaled by _finish_v while it is None): per group RMS(bond basis)/RMS(group),
+    as dipole_field_scale for μ; rescales the group columns of vs in place."""
+    rms = lambda cols: float(np.sqrt(np.mean([np.mean(v[:, :, cols] ** 2) for v in vs])))
+    k0 = _n_vcols(cfg) - tnep_data.pol_group_width(cfg)
+    bond = rms(slice(0, k0))
+    cfg.pol_field_scale = {}
+    for g in cfg.pol_field_groups:
+        w = tnep_data.pol_group_width(cfg, [g])
+        cfg.pol_field_scale[g] = bond / rms(slice(k0, k0 + w))
+        for v in vs:
+            v[:, :, k0:k0 + w] *= cfg.pol_field_scale[g]
+        k0 += w
+    print(f"  pol_field_groups: pol_field_scale = "
+          f"{ {g: round(x, 4) for g, x in cfg.pol_field_scale.items()} } (pinned on cfg)")
 
 
 def _n_vcols(cfg: GAPconfig) -> int:
     """K: design geometry columns per sparse point (kernel channels × pair
     columns, + the cross group: K₁(K₁+1)/2 symmetric tensor products under
-    target_mode=2, K₁² T·v vectors under target_mode=1; K₁ = C_x·T′)."""
+    target_mode=2, K₁² T·v vectors under target_mode=1; K₁ = C_x·T′; + the pol_field_groups
+    block, target_mode=2)."""
     T_ = cfg.num_types if gm.pair_columns(cfg) else 1
     k = kernel_channels(cfg) * T_
     cx = int(cfg.gap_cross_channels)
     if cx > 0:
         k1 = cx * T_
         k += k1 * (k1 + 1) // 2 if int(cfg.target_mode) == 2 else k1 * k1
+    if int(cfg.target_mode) == 2:
+        k += tnep_data.pol_group_width(cfg)
     return k
 
 
@@ -605,6 +655,8 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     mu = np.stack([np.asarray(t, dtype=np.float64) for t in d["targets"]])
     pair = gm.pair_columns(cfg)
     vs = [_finish_v(V, a, t, cfg) for V, a, t in zip(d["V_atom"], dataset, tis)]
+    if cfg.pol_field_groups and cfg.pol_field_scale is None:
+        _pin_pol_field_scale(cfg, vs)
     # Kernel channels (2·C under target_mode=2: isotropic + traceless groups).
     n_vcols = _n_vcols(cfg)
 
@@ -764,7 +816,9 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                 "pair_columns": pair,
                 "cross_channels": int(cfg.gap_cross_channels),
                 **({"group_delta": [float(x) for x in cfg.gap_group_delta],
-                    "lambda_shear": float(cfg.gap_lambda_shear)}
+                    "lambda_shear": float(cfg.gap_lambda_shear),
+                    "pol_field_groups": list(cfg.pol_field_groups),
+                    "pol_field_scale": cfg.pol_field_scale}
                    if int(cfg.target_mode) == 2 else {}),
                 "extra_rcut": cfg.gap_extra_rcut,
                 "n_columns": n_columns,

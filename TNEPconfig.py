@@ -684,6 +684,21 @@ class GAPconfig:
     # derive once at the first data assembly as RMS(Σ_t' V)/RMS(E) and pin it
     # here (one constant for every split and the saved model).
     dipole_field_scale: float | None = None
+    # Long-range polarisability columns (target_mode=2, GAP only): per-site
+    # Voigt tensors of the fixed reference charges (dipole_field_charges),
+    # appended after the cross group, one site function per column
+    # (data.pol_field_groups). Ordered subset of:
+    #   "induced" : traceless Applequist induced-coupling tensor Σ_j R_ij (pol_induced_alpha)
+    #   "grad"    : traceless field gradient ∇E_i of the reference charges (Ewald)
+    #   "cross"   : (E_i·v^a)·I and traceless sym(E_i ⊗ v^a) per cross channel a (needs gap_cross_channels ≥ 1)
+    #   "quad"    : |E_i|²·I and traceless E_i ⊗ E_i
+    #   "qeq"     : charge-flow tensor −½ Σ_j L⁺_ij d⊗d (isotropic + traceless), L the short-range QEq matrix
+    pol_field_groups: list[str] = []
+    # Per-group scale on the columns, RMS(bond basis)/RMS(group); None = derive
+    # on the training frames at fit and pin here (as dipole_field_scale).
+    pol_field_scale: dict | None = None
+    # Species polarisabilities (Å³) of the Applequist response ("induced"), by Z.
+    pol_induced_alpha: dict = {8: 1.45, 1: 0.0}
     # Cutoff function f_c of the neighbor readout, crossable with any
     # radial. Smoothness at r_c is a property of the CUTOFF, not the radial:
     #   "cosine2" : ((1+cos(πr/r_c))/2)² — C³ contact at r_c

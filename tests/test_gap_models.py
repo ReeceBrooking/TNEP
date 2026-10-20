@@ -97,7 +97,7 @@ def test_angular_cross_tensor_l0_equals_existing_cross_group_and_is_covariant():
     import gap_dipole
     cfg, at, ti = _setup(target_mode=2, gap_cross_channels=2, gap_cross_lmax=0)
     W = gm.angular_cross_tensor(at, ti, cfg)                 # [N, 6, K1(K1+1)/2]
-    X = gap_dipole._cross_group(at, ti, cfg)                 # sym(v⊗v), traceless
+    X = gap_dipole._cross_group(gap_dipole._cross_vectors(at, ti, cfg))   # sym(v⊗v), traceless
     # v⊗v = Σ_{j,k} d_j d_k (INCLUDING j = k); the l=0 angular kernel excludes
     # j = k, so add the bond-axis part back: Σ_j R_a R_b (d_j d_jᵀ)_traceless.
     i, j, d, R = gm._site_pairs(at, cfg, 2)
