@@ -488,6 +488,8 @@ ms/atom
 Predict the component means & 100 \% & 100 \% & 0.887 & 0.468 & \\
 Single \(\mathbf d\otimes\mathbf d\) kernel (SNES, 5900 generations) & at the mean-predictor floor &
 & & & \\
+Two bond groups, SNES-trained ANN (15 neurons, 25 k parameters, \(\sigma_0=0.02\), 20 000
+generations) & 35.7 \% & 27.5 \% & 0.317 & 0.129 & \\
 \textbf{Two bond groups (iso + traceless): the original model, §4.1} & 16.6 \% & 19.9 \% & 0.147 &
 0.093 & 0.63 \\
 + cross group, 4 channels (the base) & 14.9 \% & 16.0 \% & 0.132 & 0.075 & 0.86 \\
@@ -505,6 +507,13 @@ Published TNEP (susceptibility \(\chi/\rho\) per molecule; its own RMSE \(54\tim
 
 Forward-pass cost from \texttt{predict\_timed} on the 96-atom test frames, one process on 12
 threads; per-frame Python overhead dominates at this size, so only the ratios are meaningful.
+
+The SNES row is the same two-group basis as the original GAP model, trained as a network instead of
+solved as a kernel: the final-generation checkpoint
+(\texttt{models/n15\_q840\_pop100\_20261018\_231703}) scored on the test set gives a pooled RMSE of
+0.2395 \AA{}\(^3\) and per-component \(R^2\) of 0.87--0.88 (diagonal) and 0.91--0.93 (off-diagonal),
+i.e.~about twice the diagonal floor and 1.4\(\times\) the off-diagonal floor of its own basis after
+20 000 generations. This is the optimiser gap of §8, not a basis limit.
 
 \subsubsection{4.3 Why it works}\label{why-it-works}
 

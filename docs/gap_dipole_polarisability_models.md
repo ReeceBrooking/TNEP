@@ -355,6 +355,7 @@ RMSE is RRMSE × the test-set spread of the cell tensor's components:
 |-----------------------------------|------|------|------|------|-----|
 | Predict the component means | 100 % | 100 % | 0.887 | 0.468 | |
 | Single $\mathbf d\otimes\mathbf d$ kernel (SNES, 5900 generations) | at the mean-predictor floor | | | | |
+| Two bond groups, SNES-trained ANN (15 neurons, 25 k parameters, $\sigma_0=0.02$, 20 000 generations) | 35.7 % | 27.5 % | 0.317 | 0.129 | |
 | **Two bond groups (iso + traceless): the original model, §4.1** | 16.6 % | 19.9 % | 0.147 | 0.093 | 0.63 |
 | + cross group, 4 channels (the base) | 14.9 % | 16.0 % | 0.132 | 0.075 | 0.86 |
 | **+ traceless induced-coupling group (§4.1, recommended)** | **14.0 %** | **14.6 %** | **0.124** | **0.068** | 0.80 |
@@ -367,6 +368,14 @@ RMSE is RRMSE × the test-set spread of the cell tensor's components:
 Forward-pass cost from `predict_timed` on the 96-atom test frames, one process
 on 12 threads; per-frame Python overhead dominates at this size, so only the
 ratios are meaningful.
+
+The SNES row is the same two-group basis as the original GAP model, trained
+as a network instead of solved as a kernel: the final-generation checkpoint
+(`models/n15_q840_pop100_20261018_231703`) scored on the test set gives a
+pooled RMSE of 0.2395 Å$^3$ and per-component $R^2$ of 0.87–0.88 (diagonal)
+and 0.91–0.93 (off-diagonal), i.e. about twice the diagonal floor and 1.4×
+the off-diagonal floor of its own basis after 20 000 generations. This is the
+optimiser gap of §8, not a basis limit.
 
 ### 4.3 Why it works
 
