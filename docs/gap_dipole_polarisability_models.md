@@ -469,6 +469,39 @@ not carry. Ranked by gain per unit of added complexity, the induced group alone
 is the model to take forward; the quadrupole is a cheap second column if the
 last 0.1 matters; the three null groups should not be used.
 
+### 4.6 Triplet-form groups
+
+Two further geometric kernels built from triplets were tested as additions to
+the bond groups and the cross group (both on a 2-channel cross base, which is
+what the memory budget allowed: a 4-channel version of either group is
+$2C_x^3L\ge128$ columns per sparse point).
+
+*Angular vector ⊗ dipole vector.* With $\mathbf w^{(ab,l)}_i=\sum_{j,k\ne j}R_a(r_{ij})R_b(r_{ik})P_l(\cos\theta_{jik})\,\mathbf d_{ij}$
+the 3b angular kernel vector and $\mathbf v^{(c)}_i$ the dipole kernel vector,
+the columns $(\mathbf w\cdot\mathbf v)\,\mathbf I$ and $\mathrm{sym}(\mathbf w\otimes\mathbf v)_{\text{traceless}}$
+(species-summed, $l=1..L$; `gap_angular_cross`). At $l=0$ this is the cross
+group, so $l\ge1$ is the new content. Fit 400 → test: 15.5 / 17.2 (base) →
+15.6 / 16.8 ($L=1$) → 15.3 / 16.7 ($L=2$); with the induced-coupling column,
+refit on 500: 14.4 / 15.2 against 14.0 / 14.6 for the induced column on the
+4-channel base. Marginal at best, and it does not replace the two cross
+channels it costs.
+
+*TurboGAP triplet coordinates as the weight.* Replacing the bond vector of the
+dipole readout by the 3b coordinates $\mathbf q=[r_{ij}+r_{ik},(r_{ij}-r_{ik})^2,r_{jk}]$
+cannot give a tensor — $\mathbf q$ is three invariants, so any array built
+from it alone is unchanged by rotation and can only fit the isotropic part.
+The equivariant form keeps $\mathbf q$ as the weight and takes the tensor
+from the triplet's bond vectors,
+$\mathbf W^{(s)}_i=\sum_{j<k}k_s(\mathbf q_{ijk})\,\mathrm{sym}(\mathbf d_{ij}\otimes\mathbf d_{ik})$,
+with $k_s$ the 3b block's kernel on its farthest-point centres
+(`gap_triplet_tensor`, iso + traceless columns). It is null to harmful: refit
+on 500, 15.1 / 16.8 (base) → 15.5 / 17.0 (10 centres), 16.3 / 17.7 (20),
+15.5 / 16.5 with the induced column (14.4 / 15.2 without the triplet group),
+and worse at wider kernels or with the pol kernel; the in-sample error
+collapses from 9.1 to 4.9–5.9 %, the interpolation signature of §7. The
+triplet geometry within 4 Å is what the cross group and the SOAP site function
+already resolve; a kernel on it adds freedom without information.
+
 ## 5. What did not work: dipole
 
 | Proposal | Result | Diagnosis |
@@ -502,6 +535,8 @@ last 0.1 matters; the three null groups should not be used.
 | Full (non-traceless) induced-coupling tensor | 16.7 / 15.2 % | Its isotropic part competes with the isotropic bond group. |
 | TurboGAP 2b / 3b blocks | 23–31 % diagonal at every $\sigma$ | See §7. |
 | 2b site model alone / summed with SOAP ($\delta_{2b}=0.3$; also $\delta_{2b}=0.1$, a 6 Å 2b cutoff, and stacked on a 5.5 Å second scale) | 24.2 / 19.2 % · 16.1 / 17.0 % (vs 14.9 / 16.0); val 16.0–16.2 / 17.6–18.0 for the variants | The radial distribution carries no anisotropy; added to SOAP it only dilutes the prior. |
+| Angular vector ⊗ dipole vector group, $l\le2$ (§4.6) | 15.3 / 16.7 vs 15.5 / 17.2 (fit 400, 2-channel base); 14.4 / 15.2 with induced coupling (fit 500) | Within noise; the cross group already holds the two-neighbour anisotropy. |
+| Triplet-coordinate kernel $\sum_{j<k}k_s(\mathbf q)\,\mathrm{sym}(\mathbf d_{ij}\otimes\mathbf d_{ik})$ on 10–20 TurboGAP centres (§4.6) | 15.5 / 17.0 – 16.3 / 17.7 vs 15.1 / 16.8 (fit 500) | Interpolates (in-sample 4.9–5.9 % vs 9.1); same mechanism as the 3b block of §7. |
 | Second SOAP scale at 7.5 Å, or 6.5 Å with $\sigma=0.5$ | 14.0 / 16.2 % · 14.1 / 17.2 % | No better than 6.5 Å with $\sigma=0.3$ (§4.4) at 1.25× the cost. |
 | 3b site model through its angular kernel, alone / + SOAP ($l_x\le1$) / + SOAP + 2b | off-diagonal 18.6 % (no isotropic group) · 14.9 / 17.0 % · 15.5 / 15.9 % | The $l=0$ member *is* the cross group already in the base; the $l=1$ member and the 2b/3b descriptors add columns (74k–112k) that the fit cannot pin down — $\sigma$ moves to 0.3. See §7. |
 
@@ -577,15 +612,21 @@ worth 7 % on the dipole and nothing on the polarisability.
    connected cluster.
 6. **Concurrent scans must not share a training file or run-record directory**;
    one baseline row and the column counts of one scan were corrupted by a race.
+7. **One fit per process.** Memory accumulates across fits inside one Python
+   process (identical 35–45k-column fits peak at 4–5 GB fresh and 9–11 GB late
+   in a long scan; ≈ 200 kB per design column at 3000 rows); two scans took the
+   machine down before this was understood. The drivers now fork one process
+   per fit under an RSS watchdog.
 
 ## 9. Reproduction
 
-Commits a32cdec … 02d0899 on `ExperimentalPolarisability`. Drivers in
+Commits a32cdec … 5ebd7d0 on `ExperimentalPolarisability`. Drivers in
 `diagnostics/gap_experiments/` (README lists each script and its outcome).
 Production: `gap_dipole.py` with `dipole_field`, `gap_cross_channels`,
 `gap_group_delta`, `gap_lambda_shear`, `gap_site_models` / `gap_model_delta` /
 `gap_site_rcut` (summed site models, §3.7), `gap_extra_rcut` (second scale,
-§4.4), `pol_field_groups` / `pol_induced_alpha` / `pol_field_scale` (§4.5;
+§4.4), `pol_field_groups` / `pol_induced_alpha` / `pol_field_scale` (§4.5),
+`gap_angular_cross` / `gap_triplet_tensor` (§4.6;
 drivers `gap_site_models_scan.py`, `gap_2b_probe.py`, `gap_pol_groups_scan.py`);
 experimental: `gap_bond.py` (bond kernel,
 bilinear ALS), `gap_ewald.py` (Ewald field/potential, Applequist response,

@@ -23,6 +23,7 @@ the repo root (`python diagnostics/gap_experiments/<script>.py`), output in
 | gap_2b_probe.py (`mu` / `pol`; `PROBE_ROWS=` for follow-ups; prints µs/atom from `gap_dipole.predict_timed`) | push the 2b site model (δ, range `gap_site_rcut`, channels, M, ξ, raw kernel) and multiscale (`gap_extra_rcut`) alone and stacked; forward-pass cost per model | μ: soap+2b at δ_2b 0.05–0.1, σ 1.5–2e-3 → **0.96–0.97 %** (soap 1.08) at +2–7 % µs/atom; longer 2b range, more/fewer channels, M 500, ξ [2,4], raw kernel and multiscale all worse or neutral. α: 2b hurts at every setting; a second SOAP scale helps the diagonal — 5.5 Å 14.2/16.1 (2.5× cost), **6.5 Å 13.9/16.2** (3.2×), 7.5 Å 14.0/16.2 (4×); off-diagonal unchanged |
 | gap_pol_groups_scan.py (`POL_FINALS=` for follow-ups) | α: long-range column groups `pol_field_groups` (induced / grad / cross / quad / qeq) alone, paired, all five, and on the 6.5 Å two-scale model | induced is the only group that moves the off-diagonal: base 14.9/16.0 → **+induced 14.0/14.6** (500 frames, +500 columns, no cost); +induced+quad 13.9/14.5; all five 13.9/14.3; grad / cross / qeq null. Stacked on the 6.5 Å scale: 13.3/15.5 (+induced, σ 0.3), 13.0/15.2 (+induced+quad). Two rows (all-five two-scale, shear-weighted variants) not run: the process OOM-killed WSL twice |
 | gap_mu_baselines.py / gap_pol_twogroup.py | the ORIGINAL models on the 500-frame protocol, for the docs' baselines (run alone under an 8 GB RSS watchdog) | μ original (l=α=4 trivial, bond basis, no field) 1.76 % (1.86 on 400), 0.28 ms/atom; SOAP-7 uncompressed no field 1.56 % (1.67), 0.43 ms/atom. α two bond groups only 16.6/19.9 (16.9/20.2 on 400), 0.63 ms/atom. Peak RSS 2.3–4.1 GB for 10k–20k columns ≈ 200 kB per column at 3000 rows: the 90k-column model needs ~18 GB, which is the first OOM |
+| gap_angular_cross_scan.py / gap_triplet_tensor_scan.py + _driver.sh | α: two triplet-form groups — sym(w⊗v) of the 3b angular vector and the dipole kernel vector (`gap_angular_cross`), and Σ k_s(q_ijk) sym(d_ij⊗d_ik) on the TurboGAP 3b centres (`gap_triplet_tensor`); C_x = 2 base for memory; the driver runs ONE FIT PER PROCESS under a 10 GB RSS watchdog | both null: on the 2-channel base (fit 500: 15.1/16.8) w⊗v L1+induced 14.4/15.2 (vs 14.0/14.6 for induced on the 4-channel base), triplet tensor 15.5/17.0 (M10), 16.3/17.7 (M20), +induced 15.5/16.5, in-sample error collapses 9.1 → 4.9–5.9 (interpolation). Memory: identical 35–45k-column fits peak at 3.9–4.8 GB in a fresh process vs 9–11 GB late in a long one — memory accumulates across fits inside a process; always one process per fit |
 
 ### gap_site_models_scan.py results (2026-10-20; val-selected on train 400/100, refit on 500, test RRMSE)
 
@@ -110,3 +111,20 @@ Reading: widening the readout is monotonically worse (0.97 → 1.11 → 1.41 %) 
 | +induced+quad, gap_extra_rcut 6.5 | | | 13.9/14.6 | **13.0**/15.2 | 79000 | 2571 |
 
 Val selected σ 0.1 for every off-diagonal and 0.3 for every diagonal. Log: out/polgroups.log. Not run: all five on the two-scale model (90 000 columns; the process took WSL down), and the gap_lambda_shear rows meant to decouple the two σ preferences (second crash before its first fit; cause not yet identified — the solver is dual, so it is not the column count).
+
+### Triplet-form α groups (2026-10-21; C_x = 2 base = two bond groups + cross; fit 400 → val/test at σ 0.1 / 0.3; refit 500 → test)
+
+| model | val σ 0.1 | test σ 0.1 (400) | test σ 0.3 (400) | test (500, σ 0.1) | ncols | µs/atom |
+|---|---|---|---|---|---|---|
+| 2groups cross2 (reference) | 15.3/19.0 | 15.5/17.2 | 15.4/18.7 | 15.1/16.8 | 25000 | 658 |
+| + angular cross sym(w⊗v), L 1 | 14.7/18.4 | 15.6/16.8 | 15.4/18.2 | | 33000 | 752 |
+| + angular cross, L 2 | 14.7/18.2 | 15.3/16.7 | 15.2/18.1 | (killed by the watchdog at 11.4 GB in the long process) | 41000 | 844 |
+| + angular cross L 1 + induced | 13.5/17.6 | 14.8/15.5 | 14.8/17.0 | 14.4/15.2 | 33500 | 1703 |
+| + triplet tensor M10 σ 0.5 exp | 15.0/19.0 | 15.9/17.4 | 15.6/18.5 | 15.5/17.0 | 35000 | 897 |
+| + triplet tensor M20 σ 0.5 exp | 15.3/18.9 | 16.6/17.8 | 15.9/17.9 | 16.3/17.7 | 45000 | 1053 |
+| + triplet tensor M20 σ 1.0 exp | 18.3/20.2 | 18.1/18.7 | 16.8/17.8 | | 45000 | 1096 |
+| + triplet tensor M20 pol σ 2 | 15.7/19.2 | 16.8/17.9 | 16.0/17.9 | | 45000 | 1644 |
+| + triplet tensor M20 + induced | 13.9/18.1 | 15.7/16.5 | 15.1/16.8 | 15.5/16.5 | 45500 | 1932 |
+| + triplet tensor M20 + angular cross L1 | 15.6/18.7 | 17.3/17.6 | 16.4/17.5 | | 53000 | 1159 |
+
+"bond-off" rows (bond groups at prior amplitude 1e-6) are invalid — the column scaling and prior scaling together blow the whitening up (4600 % diagonal) — and are omitted. Logs: out/angcross.log, out/triplet.log.
