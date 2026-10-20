@@ -21,6 +21,7 @@ the repo root (`python diagnostics/gap_experiments/<script>.py`), output in
 | gap_leak_bisect.py / gap_path_check.py | audit: do 2b/3b hyperparameters leak into the base; do the production and experimental fit paths agree | no leak (all 15.1/17.6); paths agree to 6e-12. A one-row discrepancy was a race on a shared training file between concurrent scans |
 | gap_site_models_scan.py (`mu` / `pol`, separate processes and record dirs) | NEP-style site-model decomposition (`gap_site_models`: soap / 2b / 3b, each its own kernel + FPS set; 3b via its angular kernel): does splitting the body orders beat the single SOAP site function? | μ: soap+2b (δ_2b 0.3) 1.08 → **1.00 %**, soap+3b 1.02, soap+2b+3b 1.05 (δ = 1 worse than the base in every case); 2b-only 1.76, 3b-only 2.65. α: nothing beats 14.9/16.0 — soap+3b 14.9/17.0, soap+2b+3b 15.5/15.9, soap+2b 16.1/17.0; 2b-only 24.2/19.2; 3b-only has no isotropic group (diagonal undefined, off-diag 18.6) |
 | gap_2b_probe.py (`mu` / `pol`; `PROBE_ROWS=` for follow-ups; prints µs/atom from `gap_dipole.predict_timed`) | push the 2b site model (δ, range `gap_site_rcut`, channels, M, ξ, raw kernel) and multiscale (`gap_extra_rcut`) alone and stacked; forward-pass cost per model | μ: soap+2b at δ_2b 0.05–0.1, σ 1.5–2e-3 → **0.96–0.97 %** (soap 1.08) at +2–7 % µs/atom; longer 2b range, more/fewer channels, M 500, ξ [2,4], raw kernel and multiscale all worse or neutral. α: 2b hurts at every setting; a second SOAP scale helps the diagonal — 5.5 Å 14.2/16.1 (2.5× cost), **6.5 Å 13.9/16.2** (3.2×), 7.5 Å 14.0/16.2 (4×); off-diagonal unchanged |
+| gap_pol_groups_scan.py (`POL_FINALS=` for follow-ups) | α: long-range column groups `pol_field_groups` (induced / grad / cross / quad / qeq) alone, paired, all five, and on the 6.5 Å two-scale model | induced is the only group that moves the off-diagonal: base 14.9/16.0 → **+induced 14.0/14.6** (500 frames, +500 columns, no cost); +induced+quad 13.9/14.5; all five 13.9/14.3; grad / cross / qeq null. Stacked on the 6.5 Å scale: 13.3/15.5 (+induced, σ 0.3), 13.0/15.2 (+induced+quad). Two rows (all-five two-scale, shear-weighted variants) not run: the process OOM-killed WSL twice |
 
 ### gap_site_models_scan.py results (2026-10-20; val-selected on train 400/100, refit on 500, test RRMSE)
 
@@ -88,3 +89,23 @@ Question: the published TNEP reads the dipole out through the derivative of a le
 | 6.0, 10, soap only | off | 2.03 | 2.00 | 0.59 | 1.89 % | 10000 | 52 | 1151 |
 
 Reading: widening the readout is monotonically worse (0.97 → 1.11 → 1.41 %) and the training error collapses (0.60 → 0.03 %): with independent site functions per (channel, species) the 6 Å bond basis has enough freedom to interpolate 500 frames and generalises worse. At 6 Å the field column stops mattering (1.41 with, 1.42 without), i.e. the long bond basis can fit what the field explains on the training set but not transferably. The TNEP's 6 Å readout works because its site functions are tied — all channels are ∂U_i/∂q of one 1097-parameter network — not because of the range itself; in a kernel model long range has to enter as a fixed physics column with one site function (the field). Cost: the Ewald field column is ≈ 1.0 ms/atom of the 1.47 ms/atom forward pass (452 µs/atom without it) — the single largest cost item in the best dipole model, and a pure-Python Ewald sum.
+
+### gap_pol_groups_scan.py results (2026-10-20; fit 400 → val/test at σ ∈ {0.1, 0.3}, then refit on 500 → test; base = two bond groups + cross C_x 4, l=α=7 trivial, rc 4.0, M 250; SPC/E charges, α_O 1.45 Å³)
+
+| model | fit 400 test σ 0.1 | fit 400 test σ 0.3 | fit 500 test σ 0.1 | fit 500 test σ 0.3 | ncols | µs/atom |
+|---|---|---|---|---|---|---|
+| base | 15.3/16.3 | 15.1/17.7 | 14.9/16.0 | | 38000 | 857 |
+| +induced | 14.5/14.9 | 14.4/16.5 | **14.0/14.6** | | 38500 | 802 |
+| +grad | 15.3/16.2 | 15.1/17.5 | | | 38500 | |
+| +cross | 15.4/16.4 | 14.7/17.4 | | | 42000 | |
+| +quad | 15.0/16.2 | 14.9/17.5 | | | 39000 | |
+| +qeq | 15.4/16.4 | 14.9/17.8 | | | 39000 | |
+| +induced+quad | 14.2/14.8 | 14.1/16.2 | 13.9/14.5 | | 39500 | 821 |
+| +induced+qeq | 14.6/15.0 | 14.1/16.5 | | | 39500 | |
+| +quad+qeq | 15.3/16.3 | 14.8/17.5 | | | 40000 | |
+| +all five | 14.4/14.8 | 13.7/15.9 | 13.9/14.3 | | 45000 | 837 |
+| base, gap_extra_rcut 6.5 | | | 14.7/15.6 | 13.9/16.2 | 76000 | 2500 |
+| +induced, gap_extra_rcut 6.5 | | | 14.0/14.7 | 13.3/15.5 | 77000 | 2500 |
+| +induced+quad, gap_extra_rcut 6.5 | | | 13.9/14.6 | **13.0**/15.2 | 79000 | 2571 |
+
+Val selected σ 0.1 for every off-diagonal and 0.3 for every diagonal. Log: out/polgroups.log. Not run: all five on the two-scale model (90 000 columns; the process took WSL down), and the gap_lambda_shear rows meant to decouple the two σ preferences (second crash before its first fit; cause not yet identified — the solver is dual, so it is not the column count).

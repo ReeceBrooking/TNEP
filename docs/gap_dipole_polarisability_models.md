@@ -231,25 +231,36 @@ $$
 The first two are the isotropic and traceless *bond* groups ($C=10$ channels
 each, $r_c = 4$ Å, cosine cutoff); the third is the *cross* group built from
 four radial channels of the dipole kernel vector $\mathbf v^{(a)}_i=\sum_j R_a(r_{ij})\mathbf d_{ij}$;
-the fourth is the traceless part of the Applequist induced-coupling tensor with
-fixed oxygen polarisability $\alpha_\mathrm O$ and the Ewald dipole–dipole
-tensor $\mathbf T$ (intramolecular pairs excluded). Site functions on the
-$l=\alpha=7$ compressed SOAP, $M=250$, $\sigma=0.1$.
+the fourth is the traceless part of the symmetrised Applequist induced-coupling
+site tensor $\mathbf W_i=\tfrac12(\mathbf R_i+\mathbf R_i^\top)$,
+$\mathbf R_i=\sum_j\big[(\mathbf I-\mathbf A\mathbf T)^{-1}\mathbf A\big]_{ij}$, with fixed
+$\alpha_\mathrm O=1.45$ Å$^3$, $\alpha_\mathrm H=0$ and the Ewald dipole–dipole
+tensor $\mathbf T$ (intramolecular pairs excluded); it is one extra column per
+site function, scaled once to the RMS of the bond columns (production:
+`pol_field_groups=["induced"]`, `pol_induced_alpha`, pinned `pol_field_scale`).
+Site functions on the $l=\alpha=7$ compressed SOAP, $M=250$, $\sigma=0.1$,
+38 500 columns. This is the recommended model: it adds a single physics column
+to the base and nothing else, costs no forward time, and takes
+1.9 points off the diagonal and 1.4 off the off-diagonal (§4.2).
 
-### 4.2 Results (test set, diagonal / off-diagonal RRMSE)
+### 4.2 Results (test set, diagonal / off-diagonal RRMSE; all fits on 500 frames unless stated)
 
-| Model | Diagonal | Off-diagonal |
-|---|---|---|
-| Predict the component means | 100 % | 100 % |
-| Single $\mathbf d\otimes\mathbf d$ kernel (SNES, 5900 generations) | at the mean-predictor floor | |
-| Two bond groups (iso + traceless) | 16.6 % | 19.9 % |
-| + cross group, 4 channels (fit 500) | 14.9 % | 16.0 % |
-| **+ second SOAP scale at 6.5 Å, $\sigma=0.3$ (fit 500, §4.4)** | **13.9 %** | 16.2 % |
-| + second SOAP scale at 5.5 Å, $\sigma=0.3$ (fit 500) | 14.2 % | 16.1 % |
-| **+ traceless induced-coupling group (fit 400)** | **14.5 %** | **15.0 %** |
-| Published TNEP | 16.3 % | 20.4 % |
+| Model | Diagonal | Off-diagonal | ms/atom |
+|---|---|---|---|
+| Predict the component means | 100 % | 100 % | |
+| Single $\mathbf d\otimes\mathbf d$ kernel (SNES, 5900 generations) | at the mean-predictor floor | | |
+| Two bond groups (iso + traceless), fit 400 | 16.6 % | 19.9 % | |
+| + cross group, 4 channels (the base) | 14.9 % | 16.0 % | 0.86 |
+| **+ traceless induced-coupling group (§4.1, recommended)** | **14.0 %** | **14.6 %** | 0.80 |
+| + induced coupling + field quadrupole (§4.5) | 13.9 % | 14.5 % | 0.82 |
+| + all five long-range groups (§4.5) | 13.9 % | 14.3 % | 0.84 |
+| + second SOAP scale at 6.5 Å, $\sigma=0.3$ (§4.4) | 13.9 % | 16.2 % | 2.5 |
+| + induced coupling + quadrupole + 6.5 Å scale, $\sigma=0.3$ / $0.1$ | 13.0 % / 13.9 % | 15.2 % / 14.6 % | 2.6 |
+| Published TNEP | 16.3 % | 20.4 % | |
 
-(The fit-400 base for the last comparison is 15.3 / 16.3 %.)
+Forward-pass cost from `predict_timed` on the 96-atom test frames, one process
+on 12 threads; per-frame Python overhead dominates at this size, so only the
+ratios are meaningful.
 
 ### 4.3 Why it works
 
@@ -304,9 +315,44 @@ model, by contrast, hurts $\alpha$ at every amplitude and range tried
 
 *Cost.* 0.76 ms/atom for the base, 1.9 ms/atom with the 5.5 Å scale, 2.4 with
 6.5 Å and 3.0 with 7.5 Å (the SOAP build dominates; columns double to 76 000).
-Combining the 6.5 Å scale with the traceless induced-coupling group (14.5 /
-15.0 on a 15.3 / 16.3 base, §4.1) is the natural next model and has not been
-fitted.
+Combined with the induced-coupling group (§4.5) the two gains stack on the
+diagonal: 13.3 / 15.5 at $\sigma=0.3$, 13.0 / 15.2 with the quadrupole group as
+well, against 14.0 / 14.6 for the same groups without the second scale. The
+price is the one the whole section describes — three times the forward cost,
+twice the columns — and the off-diagonal is better *without* the scale at
+$\sigma=0.1$ (14.6 vs 15.2), because the two components want different
+$\sigma$ once the model is this large.
+
+### 4.5 Long-range column groups
+
+The induced-coupling group of §4.1 is one member of a family: fixed,
+parameter-free rank-2 tensors of the environment that enter as single columns
+with their own site function, in the way the Ewald field enters the dipole
+(§3). Five were built as production columns (`pol_field_groups`), all from the
+SPC/E reference charges or the fixed Applequist response, each scaled once to
+the RMS of the bond columns:
+
+| group | tensor | columns | fit 400 → test ($\sigma=0.1$) | fit 500 → test |
+|---|---|---|---|---|
+| none (base) | | 38 000 | 15.3 / 16.3 | 14.9 / 16.0 |
+| `induced` | $[\tfrac12(\mathbf R_i+\mathbf R_i^\top)]_{\text{traceless}}$ | +500 | **14.5 / 14.9** | **14.0 / 14.6** |
+| `grad` | $[\nabla\mathbf E_i]_{\text{traceless}}$, Ewald field gradient of the charges | +500 | 15.3 / 16.2 | |
+| `cross` | $(\mathbf E_i\!\cdot\!\mathbf v^{(a)}_i)\,\mathbf I$ and $\mathrm{sym}(\mathbf E_i\otimes\mathbf v^{(a)}_i)_{\text{traceless}}$, $a<4$ | +4000 | 15.4 / 16.4 | |
+| `quad` | $|\mathbf E_i|^2\,\mathbf I$ and $[\mathbf E_i\otimes\mathbf E_i]_{\text{traceless}}$ | +1000 | 15.0 / 16.2 | |
+| `qeq` | $-\tfrac12\sum_j L^{+}_{ij}\,\mathbf d_{ij}\otimes\mathbf d_{ij}$, charge-flow polarisability of a 6 Å QEq hardness matrix | +1000 | 15.4 / 16.4 | |
+| `induced` + `quad` | | +1500 | 14.2 / 14.8 | 13.9 / 14.5 |
+| all five | | +7000 | 14.4 / 14.8 | 13.9 / 14.3 |
+
+Only the induced coupling moves the off-diagonal, and it carries almost the
+whole gain; the field quadrupole adds a tenth or two, and the field gradient,
+the field–bond cross and the charge-flow tensor are null within the 0.3-point
+noise. Every group preferred $\sigma=0.1$ for the off-diagonal and $0.3$ for
+the diagonal. The reading is the same as in §4.3: the anisotropy of liquid
+water's polarisability is set by dipole–dipole coupling between molecules,
+which the local basis cannot represent and the charges' own field tensors do
+not carry. Ranked by gain per unit of added complexity, the induced group alone
+is the model to take forward; the quadrupole is a cheap second column if the
+last 0.1 matters; the three null groups should not be used.
 
 ## 5. What did not work: dipole
 
@@ -338,6 +384,7 @@ fitted.
 | Group amplitudes $\delta$ and shear weight $\lambda_\mathrm{shear}$ in the GAP | ± 0.5 points | The per-channel prior already handles scale. |
 | 6 Å kernel with a 6 Å kernel-only SOAP scale | 16.5 / 18.3 % (vs 16.6 / 19.9) | Modest, 4× slower, and worse when combined with the cross group without re-selecting $\sigma$ (17.4 / 20.5). |
 | Cross group wider than 4 channels | flat diagonal, off-diagonal 16.0 → 17.1 % at 10 | Angular information is low-dimensional; extra columns fit noise. |
+| Ewald field-gradient, field × bond and QEq charge-flow column groups (§4.5) | 15.3 / 16.2 · 15.4 / 16.4 · 15.4 / 16.4 (fit 400, base 15.3 / 16.3) | The charges' own field tensors and a hardness-matrix charge flow carry no anisotropy the base lacks; only the induced dipole–dipole coupling does. |
 | Full (non-traceless) induced-coupling tensor | 16.7 / 15.2 % | Its isotropic part competes with the isotropic bond group. |
 | TurboGAP 2b / 3b blocks | 23–31 % diagonal at every $\sigma$ | See §7. |
 | 2b site model alone / summed with SOAP ($\delta_{2b}=0.3$; also $\delta_{2b}=0.1$, a 6 Å 2b cutoff, and stacked on a 5.5 Å second scale) | 24.2 / 19.2 % · 16.1 / 17.0 % (vs 14.9 / 16.0); val 16.0–16.2 / 17.6–18.0 for the variants | The radial distribution carries no anisotropy; added to SOAP it only dilutes the prior. |
@@ -419,10 +466,14 @@ worth 7 % on the dipole and nothing on the polarisability.
 
 ## 9. Reproduction
 
-Commits a32cdec … 4de7a6f on `ExperimentalPolarisability`. Drivers in
+Commits a32cdec … 02d0899 on `ExperimentalPolarisability`. Drivers in
 `diagnostics/gap_experiments/` (README lists each script and its outcome).
 Production: `gap_dipole.py` with `dipole_field`, `gap_cross_channels`,
-`gap_group_delta`, `gap_lambda_shear`; experimental: `gap_bond.py` (bond kernel,
+`gap_group_delta`, `gap_lambda_shear`, `gap_site_models` / `gap_model_delta` /
+`gap_site_rcut` (summed site models, §3.4), `gap_extra_rcut` (second scale,
+§4.4), `pol_field_groups` / `pol_induced_alpha` / `pol_field_scale` (§4.5;
+drivers `gap_site_models_scan.py`, `gap_2b_probe.py`, `gap_pol_groups_scan.py`);
+experimental: `gap_bond.py` (bond kernel,
 bilinear ALS), `gap_ewald.py` (Ewald field/potential, Applequist response,
 induced site tensors, QEq columns). The ANN kernel inherits the field column
 through `cfg.dipole_field` (staged channel on V, own head slot).
