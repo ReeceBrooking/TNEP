@@ -17,6 +17,7 @@ from ase.neighborlist import neighbor_list
 
 import data
 import gap_dipole
+import gap_models as gm
 from TNEPconfig import GAPconfig
 
 WATER_XYZ = os.path.join(ROOT, "datasets", "train_waterbulk.xyz")
@@ -506,7 +507,7 @@ def test_configs_are_independent():
                 # polarisability kernel-group knobs of the linear fit
                 "gap_group_delta", "gap_lambda_shear", "gap_cross_channels",
                 "gap_site_models", "gap_model_delta", "gap_site_channels",
-                "gap_site_lmax", "gap_cross_lmax", "gap_site_rcut",
+                "gap_site_lmax", "gap_cross_lmax", "gap_site_rcut", "gap_angular_cross",
                 "pol_field_groups", "pol_field_scale", "pol_induced_alpha"}
     missing = (set(GAPconfig.__annotations__)
                - set(TNEPconfig.__annotations__) - gap_only)
@@ -885,6 +886,56 @@ def test_pol_field_groups_column_count_fit_and_pinned_scale(tmp_path):
     assert refit.cfg.pol_field_scale == scale
     assert np.allclose(gap_dipole.predict(refit, frames), a_star,
                        atol=1e-8 * max(np.abs(a_star).max(), 1.0))
+
+
+# ── angular-cross polarisability group (gap_angular_cross) ──────────────────
+
+def test_angular_cross_group_equivariance_and_structure():
+    """Every column tensor rotates as Q W Qᵀ; isotropic columns ∝ I, traceless
+    ones have zero trace, all symmetric by construction (Voigt)."""
+    from scipy.spatial.transform import Rotation
+    at = read(WATER_XYZ, index="3")
+    cfg = _cfg(**dict(POL_SITE, gap_cross_lmax=2), gap_angular_cross=True)
+    cfg.types, cfg.num_types = [8, 1], 2
+    ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
+    Q = Rotation.random(random_state=np.random.default_rng(1)).as_matrix()
+    rot = at.copy(); rot.set_cell(at.cell.array @ Q.T); rot.positions = at.positions @ Q.T
+    f = lambda a: gap_dipole._angular_cross_group(gm.angular_cross_vector(a, ti, cfg),
+                                                  gap_dipole._cross_vectors(a, ti, cfg), cfg)
+    W, Wr = f(at), f(rot)
+    Cx, L = 2, 2
+    G = Cx ** 3 * L
+    assert W.shape == (len(at), 6, 2 * G)
+    tol = 1e-6 * np.abs(W).max()                                      # cross vectors are staged float32
+    assert np.abs(np.einsum("ab,nbcg,dc->nadg", Q, _voigt_mat(W), Q) - _voigt_mat(Wr)).max() < tol
+    iso, tr = W[:, :, :G], W[:, :, G:]
+    assert np.abs(iso[:, 3:]).max() == 0.0 and np.allclose(iso[:, :3], iso[:, :1], atol=1e-10)
+    assert np.abs(tr[:, :3].sum(1)).max() < 1e-10 * np.abs(W).max()
+
+
+def test_angular_cross_group_width_fit_and_record(tmp_path):
+    for Cx, L in ((2, 2), (3, 1)):
+        kw = dict(POL_SITE, gap_cross_channels=Cx, gap_cross_lmax=L, num_types=2)
+        off = gap_dipole._n_vcols(_cfg(**kw))
+        on = gap_dipole._n_vcols(_cfg(**kw, gap_angular_cross=True))
+        assert on - off == 2 * Cx ** 3 * L
+    frames = read(WATER_XYZ, index="0:6")
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(_cfg(**POL_SITE, gap_angular_cross=True,
+                                           gap_sparse_per_species=6))
+        rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
+    assert rec["gap"]["angular_cross"] is True
+    assert gap_dipole.predict(m, frames).shape == (6, 6)
+
+
+@pytest.mark.parametrize("kw,msg", [
+    (dict(target_mode=1, gap_cross_channels=2, gap_angular_cross=True), "target_mode"),
+    (dict(POL_KW, gap_cross_channels=0, gap_angular_cross=True), "gap_cross_channels"),
+    (dict(POL_KW, gap_cross_channels=2, gap_cross_lmax=0, gap_angular_cross=True), "gap_cross_lmax"),
+])
+def test_angular_cross_validation_raises(kw, msg):
+    with pytest.raises(ValueError, match=msg):
+        gap_dipole._validate(_cfg(**kw))
 
 
 @pytest.mark.parametrize("kw,msg", [

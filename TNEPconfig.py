@@ -792,6 +792,10 @@ class GAPconfig:
     # l = 1..L for μ (target_mode 1), 0..L for α; the α l = 0 member is the
     # sym(v⊗v) cross group without its j = k term.
     gap_cross_lmax: int = 1
+    # sym(w⊗v) of the 3b angular kernel vector (l = 1..gap_cross_lmax, gap_cross_channels,
+    # cutoff gap_site_rcut or dipole_rc) and the dipole kernel vector, species-summed,
+    # iso + traceless columns; polarisability only.
+    gap_angular_cross: bool = False
     # Regularisation, as gap_fit: the expected ABSOLUTE error of a dipole
     # component per √atom (gap_fit's default_sigma with
     # sigma_per_atom=T: σ_obs = gap_sigma·√N_atoms), and the jitter added to
