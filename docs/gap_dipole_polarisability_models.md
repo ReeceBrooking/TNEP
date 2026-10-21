@@ -352,11 +352,14 @@ RMSE is RRMSE × the test-set spread of the cell tensor's components:
 0.468 Å$^3$ for an off-diagonal one; per molecule divide by 32. The TNEP
 paper's $\chi/\rho$ per molecule is the same cell tensor divided by the 32
 molecules (ρ is the molecular number density, so the varying cell volume
-cancels), and its RMSE follows GPUMD's convention of summing the squared
-error over the tensor components per structure, i.e. $\sqrt3$ times the
-per-component value; with that conversion its own RRMSEs are reproduced on
-this test set to within a point (16.7 / 21.6 vs 16.3 / 20.4), so the RRMSE
-columns are directly comparable.
+cancels). GPUMD itself prints a single per-component RMSE pooled over all six
+components, so the paper's diagonal / off-diagonal RMSEs were post-processed
+with a convention the paper does not state; read as per-component values they
+would imply 28.9 / 48 % on these frames, read as the per-structure norm over
+the three components ($\sqrt3$ × per-component) they reproduce the paper's own
+RRMSEs to within a point (16.7 / 21.6 vs 16.3 / 20.4). The latter reading is
+used for the converted RMSE in the table; the RRMSE columns are comparable
+either way, since the dataset and the RRMSE definition are the same.
 
 | Model | RRMSE diag | RRMSE off-diag | RMSE diag (Å$^3$ / cell) | RMSE off-diag (Å$^3$ / cell) | ms/atom |
 |-----------------------------------|------|------|------|------|-----|
@@ -370,7 +373,7 @@ columns are directly comparable.
 | + all five long-range groups (§4.5) | 13.9 % | 14.3 % | 0.123 | 0.067 | 0.84 |
 | + second SOAP scale at 6.5 Å, $\sigma=0.3$ (§4.4) | 13.9 % | 16.2 % | 0.123 | 0.076 | 2.5 |
 | + induced coupling + quadrupole + 6.5 Å scale, $\sigma=0.3$ / $0.1$ | 13.0 % / 13.9 % | 15.2 % / 14.6 % | 0.115 / 0.123 | 0.071 / 0.068 | 2.6 |
-| Published TNEP (same 500/500 frames; paper RMSE $54\times10^{-3}$ / $37\times10^{-3}$ bohr$^3$ per molecule is a 3-component norm, converted here per component per cell) | 16.3 % | 20.4 % | 0.148 | 0.101 | |
+| Published TNEP (same 500/500 frames; paper RMSE $54\times10^{-3}$ / $37\times10^{-3}$ bohr$^3$ per molecule, read as a 3-component norm and converted per component per cell, see note) | 16.3 % | 20.4 % | 0.148 | 0.101 | |
 
 Forward-pass cost from `predict_timed` on the 96-atom test frames, one process
 on 12 threads; per-frame Python overhead dominates at this size, so only the
