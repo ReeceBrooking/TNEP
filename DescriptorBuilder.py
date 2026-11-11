@@ -439,7 +439,6 @@ class DescriptorBuilder(layers.Layer):
                 os.environ.pop('OMP_NUM_THREADS', None)
 
 
-
 # ── backend dispatcher ──
 
 class _SoapFreeBuilder:

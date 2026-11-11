@@ -5,7 +5,6 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
-import pytest
 from ase.io import read
 from ase.neighborlist import neighbor_list
 import gap_models as gm

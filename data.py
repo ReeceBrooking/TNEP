@@ -943,59 +943,6 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     return result
 
 
-def pack_chunk_from_flat(frame_results: list, dim_q: int,
-                          max_atoms: int | None = None) -> dict:
-    """Per-frame (soap [N, Q], grad [P, 3, Q], pair_atom [P], pair_gidx [P]) TF
-    tensors from build_descriptors_flat → chunk dict {descriptors [B, A, Q],
-    grad_values [P, 3, Q], pair_atom/pair_gidx (frame-local), pair_struct
-    (chunk-local)} for _evaluate_chunk. max_atoms=None pads to the chunk's own
-    max; pass the dataset-wide A_max to match positions/Z_int. Clears frame_results."""
-    S = len(frame_results)
-    atom_counts = [int(r[0].shape[0]) for r in frame_results]
-    chunk_max_atoms = max(atom_counts) if atom_counts else 0
-    if max_atoms is None:
-        max_atoms = chunk_max_atoms
-    elif max_atoms < chunk_max_atoms:
-        raise ValueError(
-            f"pack_chunk_from_flat: max_atoms={max_atoms} is smaller than the "
-            f"chunk's own max(atom_counts)={chunk_max_atoms}.")
-    pair_counts = [int(r[1].shape[0]) for r in frame_results]
-    pair_counts_arr = np.array(pair_counts, dtype=np.int32)
-    N_pairs = int(pair_counts_arr.sum())
-
-    if N_pairs > 0:
-        grad_values_t = tf.concat([r[1] for r in frame_results], axis=0)
-        pair_atom_t   = tf.concat([r[2] for r in frame_results], axis=0)
-        pair_gidx_t   = tf.concat([r[3] for r in frame_results], axis=0)
-        pair_struct_t = tf.repeat(tf.range(S, dtype=tf.int32),
-                                   tf.constant(pair_counts_arr, dtype=tf.int32))
-    else:
-        grad_values_t = tf.zeros((0, 3, dim_q), dtype=tf.float32)
-        pair_atom_t   = tf.zeros((0,), dtype=tf.int32)
-        pair_gidx_t   = tf.zeros((0,), dtype=tf.int32)
-        pair_struct_t = tf.zeros((0,), dtype=tf.int32)
-
-    if S:
-        soap_concat = tf.concat([r[0] for r in frame_results], axis=0)
-        frame_results.clear()
-        desc_ragged = tf.RaggedTensor.from_row_lengths(
-            soap_concat, tf.constant(atom_counts, dtype=tf.int64))
-        desc_t = desc_ragged.to_tensor(default_value=0.0,
-                                        shape=(S, max_atoms, dim_q))
-        del soap_concat, desc_ragged
-    else:
-        desc_t = tf.zeros((0, 0, dim_q), dtype=tf.float32)
-        frame_results.clear()
-
-    return {
-        "descriptors": desc_t,
-        "grad_values": grad_values_t,
-        "pair_atom":   pair_atom_t,
-        "pair_gidx":   pair_gidx_t,
-        "pair_struct": pair_struct_t,
-    }
-
-
 def _is_contiguous_range(arr: np.ndarray) -> bool:
     """True iff every diff is +1 (a true slice; the size check alone accepts permutations)."""
     if arr.size == 0:
@@ -1242,7 +1189,6 @@ def _gpu_device_ctx():
     except Exception:
         pass
     return _NullCtx()
-
 
 
 def move_data_to_gpu(data: dict) -> None:

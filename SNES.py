@@ -110,8 +110,6 @@ class SNES:
         self.n_typed = _T * per_type
         self._n_expert = [_T * _block_per_type(b) for b in self._blocks[1:]]   # 0 outside "sum"
         self.n_expert = sum(self._n_expert)
-        # Type t's rows of every block: denominator of the per-type penalty.
-        self._n_per_type = per_type
         self.n_primary = self.n_typed + n_b1 + self.n_c
         self._n_W0 = n_W0
         self._n_b0 = n_b0
@@ -316,10 +314,6 @@ class SNES:
         self.eta_sigma = self.cfg.eta_sigma if self.cfg.eta_sigma is not None else self.compute_eta_sigma()
         self.utilities = tf.constant(self.compute_utilities(), dtype=tf.float32)
 
-        # μ_eff = 1/Σ w_i² over positive recombination weights (Hansen 2016 Eq. 5).
-        recomb_w_np = self._recomb_w.numpy()
-        self._mu_eff = float(1.0 / np.sum(recomb_w_np ** 2))
-
     def _build_reg_layout(self) -> list:
         """Penalty layout, one row per model (model._models order):
         (type_slices [T] of [(start, end)], n_type, global_slices, n_global).
@@ -433,10 +427,10 @@ class SNES:
         return mu
 
     def _maybe_adapt_lambda(self, gen: int, data_loss: float,
-                            l1: float, l2: float, l_orth: float = 0.0) -> None:
+                            l1: float, l2: float) -> None:
         """Dynamic (-1) lambdas only, every lambda_adapt_interval gens:
         λ ← clip(λ · (target_ratio · data_loss / penalty)^damping, λ_min, λ_max).
-        damping < 1 suppresses oscillation; l_orth is ignored.
+        damping < 1 suppresses oscillation.
         """
         if not (self._dyn_lambda_1 or self._dyn_lambda_2):
             return
@@ -479,20 +473,6 @@ class SNES:
             U = tf.linalg.solve(I - A, I + A)
         return U - I
 
-    def _extract_type_params(self, pv: tf.Tensor, t: int) -> tf.Tensor:
-        """Type-t rows of every typed block of pv [dim] → concat(W0_t, b0_t, W1_t)."""
-        return tf.concat([pv[s:e] for s, e in self._type_slices(t)], axis=0)
-
-    def _type_slices(self, t: int) -> list:
-        """(start, end) of type t's rows in W0 / b0 / W1 of every typed ANN
-        block (slab order)."""
-        T = self.cfg.num_types
-        out, off = [], 0
-        for b in self._blocks:
-            for n in (b.dim_in * b.hidden, b.hidden, b.hidden * self._Hw):
-                out.append((off + t * n, off + (t + 1) * n))
-                off += T * n
-        return out
 
     def _build_type_of_variable(self) -> np.ndarray:
         """Atom-type label per param → [dim] int32: typed W0/b0/W1 rows get t,
@@ -724,7 +704,6 @@ class SNES:
         train_rmse = float('inf')
         sigma_min = sigma_max = sigma_mean = sigma_median = float(cfg.init_sigma)
         # Last finite RRMSE values, carried so the history series stays finite.
-        last_best_rrmse = last_avg_rrmse = 0.0
 
         # SIGTERM (Slurm walltime): flip a flag so the in-flight gen finishes,
         # then checkpoint and break. Hooked only with save_path; restored at exit.
@@ -819,7 +798,6 @@ class SNES:
             sigma_max = float(metrics_np[6])
             sigma_mean = float(metrics_np[7])
             sigma_median = float(metrics_np[8])
-            last_best_rrmse, last_avg_rrmse = best_rrmse, avg_rrmse
 
             t2 = time.perf_counter()
 
@@ -834,8 +812,7 @@ class SNES:
                 gen_l1, gen_l2, gen_lorth = self.compute_regularization(self.mu)
                 if do_adapt_now:
                     # best-RMSE as reference: the mean is dominated by bad candidates early.
-                    self._maybe_adapt_lambda(gen, best_rmse,
-                                             gen_l1, gen_l2, gen_lorth)
+                    self._maybe_adapt_lambda(gen, best_rmse, gen_l1, gen_l2)
             elif not cfg.toggle_regularization:
                 gen_l1, gen_l2, gen_lorth = 0, 0, 0
 
@@ -1412,9 +1389,6 @@ class SNES:
 
         return reg
 
-    def _extract_type_params_batched(self, param_vectors: tf.Tensor, t: int) -> tf.Tensor:
-        """Extract type-t params from batched flat vectors → [P, n_per_type]."""
-        return tf.concat([param_vectors[:, s:e] for s, e in self._type_slices(t)], axis=1)
 
     def evaluate_population(self, samples_tf: tf.Tensor, batch_data: dict[str, tf.Tensor],
                             return_per_type: bool = False) -> tf.Tensor:
@@ -1459,7 +1433,6 @@ class SNES:
         for chunk_idx, (s_start, s_end, chunk) in enumerate(prefetched_chunks(
                 batch_data, ranges,
                 pin_to_cpu=self.cfg.pin_data_to_cpu)):
-            B_chunk = s_end - s_start
             chunk_lo = s_start
             chunk_hi = s_end
 

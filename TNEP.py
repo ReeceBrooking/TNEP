@@ -15,7 +15,7 @@ from TNEPconfig import (TNEPconfig, resolved_dipole_cutoff, resolved_dipole_rc,
 from nep_descriptor import (validate_nep_cfg, nep_dim, nep_raw_width, nep_slices,
                             find_q_tf, fn_and_fnp_tf, real_harmonics_tf,
                             real_harmonics_grad_tf, nep_pair_kwargs, NUM_ABC,
-                            EXPERT_WEIGHTS, nep_gram_on, nep_gram_n_pairs,
+                            nep_gram_on, nep_gram_n_pairs,
                             gram_pairs, q3b_from_gram_tf)
 
 
@@ -1180,7 +1180,7 @@ class TNEP(layers.Layer):
             cfg_for_load.total_N = int(max_structures)
 
         print(f"score_from_file: loading {path} ...")
-        dataset, ti_loaded = collect(cfg_for_load)
+        dataset, _ = collect(cfg_for_load)
         if max_structures is not None and len(dataset) > max_structures:
             dataset = dataset[:max_structures]
 
@@ -1272,30 +1272,6 @@ class TNEP(layers.Layer):
                 except OSError:
                     pass
 
-    def score_summary(self, test_data: dict[str, tf.Tensor]) -> dict:
-        """Print per-atom (GPUMD loss.out) and total-dipole (NEP-paper) metrics.
-        RRMSE = √(1 − R²) is centred, unlike the SNES training RRMSE (Σy²
-        denominator); they agree only when target means are small.
-        """
-        metrics, preds = self.score(test_data)
-        m = {k: (float(v.numpy()) if hasattr(v, "numpy") else float(v))
-             for k, v in metrics.items()
-             if v is not None and getattr(v, "shape", ())  == ()}
-        rrmse_pa = (1.0 - m["r2"]) ** 0.5
-        print(f"  PER-ATOM space (matches GPUMD loss.out 'rmse_virial'):")
-        print(f"    RMSE  = {m['rmse']:.6f}  e·bohr / atom / component")
-        print(f"    R²    = {m['r2']:.6f}")
-        print(f"    RRMSE = √(1−R²) = {rrmse_pa:.4%}")
-        if "total_rmse" in m and "total_r2" in m:
-            rrmse_tot = (1.0 - m["total_r2"]) ** 0.5
-            print(f"  TOTAL-DIPOLE space (matches NEP paper headline RMSE / R²):")
-            print(f"    RMSE  = {m['total_rmse']:.6f}  e·bohr / structure / component")
-            print(f"    R²    = {m['total_r2']:.6f}")
-            print(f"    RRMSE = √(1−R²) = {rrmse_tot:.4%}")
-        if "cos_sim_mean" in m:
-            print(f"  Vector quality:")
-            print(f"    cos_sim_mean = {m['cos_sim_mean']:.6f}")
-        return metrics
 
     @tf.function(reduce_retracing=True)
     def predict_batch(self, descriptors: tf.Tensor, grad_values: tf.Tensor,

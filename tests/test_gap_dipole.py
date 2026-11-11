@@ -17,7 +17,6 @@ from ase.neighborlist import neighbor_list
 
 import data
 import gap_dipole
-import gap_models as gm
 from gap_config import GAPconfig
 
 WATER_XYZ = os.path.join(ROOT, "datasets", "train_waterbulk.xyz")
@@ -237,10 +236,6 @@ def test_determinism(tmp_path):
         m2 = gap_dipole.fit_gap_dipole(_cfg())
     for a1, a2 in zip(m1.alpha, m2.alpha):
         assert np.array_equal(a1, a2)
-
-
-
-
 
 
 # ── multi-scale second cutoff ──────────────────────────────────────────────

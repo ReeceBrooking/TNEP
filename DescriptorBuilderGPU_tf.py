@@ -19,7 +19,6 @@ from descriptor_layout import (
     build_neighbour_list_numpy,
     build_multiplicity_array,
     make_compress_mask,
-    make_compress_mask_trivial,
     _get_preflm,
     _N_a,
 )
@@ -1656,13 +1655,6 @@ class DescriptorBuilderGPUTF:
             coeffs_t  = tf.constant(cache["mask_info"]["coeffs"], dtype=dtype)
             preflm_t  = tf.constant(cache["preflm_np"], dtype=dtype)
 
-        # Outside callers read self._W_t etc.
-        self._W_t = W_t
-        self._mult_t = mult_t
-        self._comp_idx_t = comp_idx_t
-        self._coeffs_t = coeffs_t
-        self._preflm_t = preflm_t
-
         common_static = dict(
             kept_triples=kept_triples,
             n_species=n_species, alpha_max=int(sp["alpha_max"]),
@@ -1764,9 +1756,6 @@ class DescriptorBuilderGPUTF:
                 return soap, tf.zeros([tf.shape(rjs)[0], 3, 0], soap.dtype)
 
         self._compute_fns[(dtype, bool(jit_compile))] = (with_grad_fn, fwd_only_fn)
-        # Aliases for the most recently built pair.
-        self._with_grad_fn = with_grad_fn
-        self._fwd_only_fn = fwd_only_fn
 
     # Per-call budget for auto batch sizing; leaves headroom for the model's own
     # GPU work during trajectory inference. Override via memory_budget_bytes.

@@ -1,38 +1,15 @@
 """Descriptor layout rules (dim_q, species-pair blocks, q_scale_*, learned
 radial basis) shared by TNEP/SNES/spectroscopy, plus the NumPy SOAP-turbo
 tables the TF builder reuses (poly3 orthonormalisation, compress masks,
-multiplicity, _N_a, _get_preflm, neighbour list) and power_spectrum_numpy,
-the oracle of tests/test_radial_basis.py.
+multiplicity, _N_a, _get_preflm, neighbour list).
 """
 
 from __future__ import annotations
 
-import os
 import numpy as np
-from ase import Atoms
-from ase.build import bulk, molecule
-from quippy.descriptors import Descriptor
-from scipy.special import erf
 
 
 # Reference-fixture SOAP params (mirror TNEPconfig defaults; keep stable).
-REFERENCE_SOAP_PARAMS = dict(
-    l_max=4,
-    alpha_max=4,
-    rcut_hard=6.0,
-    rcut_soft=5.5,
-    atom_sigma_r=0.5,
-    atom_sigma_t=0.5,
-    atom_sigma_r_scaling=0.0,
-    atom_sigma_t_scaling=0.0,
-    amplitude_scaling=1.0,
-    central_weight=1.0,
-    radial_enhancement=1,
-    basis="poly3",
-    scaling_mode="polynomial",
-    compress_mode="trivial",
-)
-
 
 def build_overlap_matrix_poly3(alpha_max: int) -> np.ndarray:
     """Poly3 overlap S[i,j] = sqrt((5+2i)(5+2j))/(5+i+j), 1-indexed, [α, α]; SPD for α ≲ 10."""
@@ -529,51 +506,6 @@ def _get_preflm(l_max: int) -> np.ndarray:
     return out
 
 
-def power_spectrum_numpy(
-    cnk: np.ndarray,                # [k_max, n_max, n_sites] complex
-    multiplicity_array: np.ndarray, # [n_active] real
-    skip_mask: np.ndarray,          # [n_uncompressed] bool
-    compressed_idx: np.ndarray,     # [P_nonzero] int — destination
-    uncompressed_idx: np.ndarray,   # [P_nonzero] int — source channel
-    coeffs: np.ndarray,             # [P_nonzero] real — sparse projection coefficients
-    n_compressed: int,
-    n_max: int,
-    l_max: int,
-) -> np.ndarray:                    # [n_sites, n_compressed] real
-    """Per-atom SOAP power spectrum from cnk[k, n, i] = 4π Σ_p radial[n,p]·angular[k,p]
-    (soap_turbo.f90:539-697): this_soap[(n,n',l)] = Σ_m mult·Re(cnk_n·conj(cnk_n')),
-    then sparse compression and per-atom L2 normalisation."""
-    n_sites = cnk.shape[2]
-    n_unc = n_max * (n_max + 1) // 2 * (l_max + 1)
-    this_soap = np.zeros((n_unc, n_sites), dtype=np.float64)
-
-    # Fortran order (n, n', l, m); counter → skip_mask, counter2 → multiplicity (kept only).
-    counter = 0
-    counter2 = 0
-    for n in range(n_max):
-        for nprime in range(n, n_max):
-            for l in range(l_max + 1):
-                if not skip_mask[counter]:
-                    k_start = l * (l + 1) // 2
-                    k_end = k_start + (l + 1)            # m = 0..l
-                    prod = (cnk[k_start:k_end, n, :]
-                            * np.conj(cnk[k_start:k_end, nprime, :]))
-                    mult_lm = multiplicity_array[counter2:counter2 + l + 1]
-                    this_soap[counter] = np.sum(mult_lm[:, None] * np.real(prod), axis=0)
-                    counter2 += l + 1
-                counter += 1
-
-    soap = np.zeros((n_compressed, n_sites), dtype=np.float64)
-    np.add.at(soap, compressed_idx,
-              coeffs[:, None] * this_soap[uncompressed_idx, :])
-
-    # L2-normalise per atom (Fortran empty-sphere guard)
-    norms = np.linalg.norm(soap, axis=0)
-    norms = np.where(norms < 1e-5, 1.0, norms)
-    soap = soap / norms[None, :]
-    return soap.T  # [n_sites, n_compressed], quippy convention
-
-
 def build_neighbour_list_numpy(
     positions: np.ndarray,        # [n_atoms, 3]
     cell: np.ndarray,             # [3, 3]
@@ -617,7 +549,6 @@ def build_neighbour_list_numpy(
         indexing="ij",
     ), axis=-1).reshape(-1, 3)                                       # [N_img, 3] int
     image_vectors = image_int.astype(np.float64) @ cell              # [N_img, 3]
-    N_img = image_vectors.shape[0]
     zero_image_idx = int(np.argmin(np.linalg.norm(image_vectors, axis=1)))
 
     # disps[i, j, k] = positions[j] + image_vectors[k] - positions[i]   [N, N, N_img, 3]

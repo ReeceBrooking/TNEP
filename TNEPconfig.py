@@ -370,7 +370,6 @@ class TNEPconfig:
             self.indices = indices
 
 
-
 def neighbor_readout_on(cfg: "TNEPconfig | GAPconfig") -> bool:   # GAPconfig: gap_config.py
     """THE neighbour-readout predicate: mode 2, or mode 1 with dipole_readout="neighbor"."""
     return int(cfg.target_mode) == 2 or (

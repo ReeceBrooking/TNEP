@@ -85,13 +85,13 @@ from plotting import (plot_snes_history, plot_log_val_fitness, plot_sigma_histor
                       plot_timing, plot_correlation, plot_cosine_similarity,
                       plot_loss_breakdown, plot_error_vs_magnitude,
                       plot_error_decomposition)
-from model_io import save_model, save_history, setup_run_directory, load_model
+from model_io import save_model, save_history, setup_run_directory
 from spectroscopy import (predict_trajectory_batch,
                            compute_ir_spectrum, plot_ir_spectrum, plot_power_spectrum,
-                           compute_raman_spectrum, plot_raman_spectrum, ir_spectrum_from_file)
+                           compute_raman_spectrum, plot_raman_spectrum)
 from DescriptorBuilder import make_descriptor_builder
 from tqdm import tqdm
-from ase.io import read, iread, write
+from ase.io import read, iread
 
 
 def _apply_csc_overrides(cfg: TNEPconfig) -> None:
@@ -884,106 +884,6 @@ def process_trajectory(
                             trajectory_path=trajectory_path, model_label=model_label)
         return {"polarizabilities": pols, "freq_cm": freq_cm,
                 "I_VV": I_VV, "I_VH": I_VH, "I_iso": I_iso, "I_aniso": I_aniso}
-
-def filter_dataset_by_species(input_xyz: str,
-                                output_xyz: str,
-                                allowed_species: list[int | str],
-                                mode: str = "subset") -> int:
-    """Write the structures of input_xyz whose species are a subset of
-    allowed_species (mode "subset") or exactly that set ("exact") to output_xyz.
-    allowed_species: atomic numbers or symbols. Returns the number written.
-    """
-    from ase.data import atomic_numbers, chemical_symbols
-    allowed_Z = set(atomic_numbers[z] if isinstance(z, str) else int(z)
-                    for z in allowed_species)
-    allowed_str = ", ".join(f"{chemical_symbols[z]}(Z={z})" for z in sorted(allowed_Z))
-
-    dataset = read(input_xyz, index=":")
-    n_in = len(dataset)
-    kept = []
-    seen_outside = set()
-    for s in dataset:
-        species = set(int(z) for z in s.numbers)
-        if mode == "exact":
-            keep = species == allowed_Z
-        else:
-            keep = species.issubset(allowed_Z)
-        if keep:
-            kept.append(s)
-        else:
-            seen_outside.update(species - allowed_Z)
-
-    n_out = len(kept)
-    print(f"Filter ({mode}) → {{ {allowed_str} }}")
-    print(f"  read    {n_in:6d} structures from {input_xyz}")
-    print(f"  kept    {n_out:6d}")
-    print(f"  dropped {n_in - n_out:6d}", end="")
-    if seen_outside:
-        sym = ", ".join(f"{chemical_symbols[z]}(Z={z})" for z in sorted(seen_outside))
-        print(f"  (offending species: {sym})")
-    else:
-        print()
-
-    if n_out == 0:
-        raise ValueError(
-            f"No structures match filter — refusing to write empty {output_xyz}.")
-
-    os.makedirs(os.path.dirname(output_xyz) or ".", exist_ok=True)
-    write(output_xyz, kept)
-    print(f"  wrote   {n_out:6d} structures → {output_xyz}")
-    return n_out
-
-
-def dump_dipole_predictions(model_path: str,
-                             test_xyz: str,
-                             out_path: str = "datasets/dipole_test.out") -> None:
-    """Score `model_path` on `test_xyz` and write per-atom dipoles to disk.
-
-    Output columns: pred_xyz | ref_xyz | N_atoms. Structures with species
-    outside the model's cfg.types are dropped (with a summary line).
-    """
-    model = load_model(model_path)
-    cfg = model.cfg
-
-    dataset = read(test_xyz, index=":")
-    print(f"Loaded {len(dataset)} structures from {test_xyz}")
-
-    # Drop frames containing species the model doesn't know.
-    known_Z = set(int(z) for z in cfg.types)
-    kept = [s for s in dataset
-            if set(int(z) for z in s.numbers).issubset(known_Z)]
-    dropped = len(dataset) - len(kept)
-    if dropped:
-        from ase.data import chemical_symbols
-        offending = set()
-        for s in dataset:
-            extra = set(int(z) for z in s.numbers) - known_Z
-            offending.update(extra)
-        sym = ", ".join(f"{chemical_symbols[z]}(Z={z})" for z in sorted(offending))
-        print(f"  Dropped {dropped}/{len(dataset)} structures containing species "
-              f"outside model types {sorted(known_Z)}: {sym}")
-    if not kept:
-        raise ValueError(
-            f"No structures in {test_xyz} match model species "
-            f"{sorted(known_Z)} — all {dropped} were dropped.")
-    dataset = kept
-
-    data = prepare_eval_data(dataset, cfg)
-    metrics, preds = model.score(data)            # [S, 3] per-atom dipoles
-    print_score_summary(metrics, cfg, prefix=f"Test ({test_xyz})")
-
-    preds_np  = preds.numpy() if hasattr(preds, "numpy") else np.asarray(preds)
-    refs_np   = (data["targets"].numpy() if hasattr(data["targets"], "numpy")
-                 else np.asarray(data["targets"]))
-    natoms_np = (data["num_atoms"].numpy() if hasattr(data["num_atoms"], "numpy")
-                 else np.asarray(data["num_atoms"]))
-
-    table = np.column_stack([preds_np, refs_np, natoms_np.astype(np.int32)])
-    header = ("pred_x pred_y pred_z   ref_x ref_y ref_z   N_atoms  "
-              f"(units: {model.cfg.dipole_units if not getattr(cfg, 'convert_dipole_to_eangstrom', True) else 'e*angstrom'}, per-atom)")
-    fmt = ["%.8e"] * 6 + ["%d"]
-    np.savetxt(out_path, table, fmt=fmt, header=header)
-    print(f"Wrote {out_path}  ({len(dataset)} rows)")
 
 
 if __name__ == '__main__':

@@ -151,11 +151,6 @@ def real_harmonics(xhat, yhat, zhat):
     return _real_harmonics(*_np64(xhat, yhat, zhat), np)[0]
 
 
-def real_harmonics_grad(xhat, yhat, zhat):
-    """[P, 3, 24] float64: ∂P_c/∂(x̂, ŷ, ẑ) as free variables."""
-    return _real_harmonics(*_np64(xhat, yhat, zhat), np)[1]
-
-
 def real_harmonics_tf(xhat, yhat, zhat):
     return _real_harmonics(*_tf32(xhat, yhat, zhat), tf)[0]
 
@@ -164,34 +159,13 @@ def real_harmonics_grad_tf(xhat, yhat, zhat):
     return _real_harmonics(*_tf32(xhat, yhat, zhat), tf)[1]
 
 
-# ── invariant forms (find_q_one<L>, find_q) ────────────────────────────────
-def find_q(s, four_body, five_body):
-    """s [..., 24] → q [..., 4 (+1) (+1)] in GPUMD order L=1..4, 4-body, 5-body."""
-    s = np.asarray(s, dtype=np.float64)
-    q = []
-    for L in range(1, 5):
-        i0 = L * L - 1
-        q.append(C3B[i0] * s[..., i0] ** 2
-                 + 2.0 * np.sum(C3B[i0 + 1:i0 + 2 * L + 1] * s[..., i0 + 1:i0 + 2 * L + 1] ** 2, -1))
-    if four_body:
-        s3, s4, s5, s6, s7 = (s[..., k] for k in range(3, 8))
-        q.append(C4B[0] * s3 * s3 * s3 + C4B[1] * s3 * (s4 * s4 + s5 * s5)
-                 + C4B[2] * s3 * (s6 * s6 + s7 * s7) + C4B[3] * s6 * (s5 * s5 - s4 * s4)
-                 + C4B[4] * s4 * s5 * s7)
-    if five_body:
-        s0_sq = s[..., 0] ** 2
-        s12 = s[..., 1] ** 2 + s[..., 2] ** 2
-        q.append(C5B[0] * s0_sq * s0_sq + C5B[1] * s0_sq * s12 + C5B[2] * s12 * s12)
-    return np.stack(q, -1)
-
-
 _C3B_TF = C3B.astype(np.float32)   # NumPy: TF ops accept them; no eager context at import
 _C4B_TF = C4B.astype(np.float32)
 _C5B_TF = C5B.astype(np.float32)
 
 
 def find_q_tf(s, four_body, five_body):
-    """TF twin of find_q: s [..., 24] float32 → q [..., 4 (+1) (+1)], same columns."""
+    """s [..., 24] float32 → q [..., 4 (+1) (+1)] in GPUMD order L=1..4, 4-body, 5-body."""
     q = []
     for L in range(1, 5):
         i0 = L * L - 1
@@ -444,68 +418,3 @@ def nep_pairs_numpy(atoms, cfg, pairs=None):
                 nep_pair_ang=np.linalg.norm(D, axis=1) < float(cfg.nep_rc_angular))
 
 
-def nep_contract_numpy(raw, types_int, c_r, c_a, cfg):
-    """[N, dim_nep]: GPUMD contraction with c_r [T,T,n_r+1,K_r+1], c_a [T,T,n_a+1,K_a+1]
-    (index [t_centre, t_neighbour, n, k]). NumPy reference for the TF twin."""
-    N, T = raw.shape[0], int(cfg.num_types)
-    Kr, Ka = int(cfg.nep_basis_size_radial), int(cfg.nep_basis_size_angular)
-    raw = np.asarray(raw, dtype=np.float64)
-    types_int = np.asarray(types_int)
-    wr = T * (Kr + 1)
-    raw_r = raw[:, :wr].reshape(N, T, Kr + 1)
-    raw_a = raw[:, wr:].reshape(N, T, Ka + 1, NUM_ABC)
-    c_r = np.asarray(c_r, dtype=np.float64)[types_int]          # [N, T, n, k]
-    c_a = np.asarray(c_a, dtype=np.float64)[types_int]
-    q_r = np.einsum("atk,atnk->an", raw_r, c_r)
-    s = np.einsum("atkc,atnk->anc", raw_a, c_a)                  # [N, n, 24]
-    q_a = find_q(s, cfg.nep_four_body, cfg.nep_five_body)        # [N, n, num_L]
-    return np.concatenate([q_r, q_a.transpose(0, 2, 1).reshape(N, -1)], 1)   # l-major
-
-
-# ── nep.txt reader ─────────────────────────────────────────────────────────
-def read_nep_txt(path):
-    """Parse a GPUMD nep.txt → dict(species, nep_* cfg fields, ann [count],
-    c_r [T,T,n_r+1,K_r+1], c_a [T,T,n_a+1,K_a+1], q_scaler [dim])."""
-    with open(path) as f:
-        lines = [ln.split() for ln in f if ln.strip()]
-    head = {}
-    n_head = 0
-    for ln in lines:
-        if ln[0].startswith("nep"):
-            head["species"] = ln[2:2 + int(ln[1])]
-        elif ln[0] in ("cutoff", "n_max", "basis_size", "l_max", "ANN"):
-            head[ln[0]] = [float(v) for v in ln[1:]]
-        else:
-            try:
-                float(ln[0])
-            except ValueError:
-                raise ValueError(f"{path}: unexpected header line {ln!r}") from None
-            break
-        n_head += 1
-    vals = np.array([float(ln[0]) for ln in lines[n_head:]], dtype=np.float64)
-    T = len(head["species"])
-    n_r, n_a = (int(v) for v in head["n_max"])
-    K_r, K_a = (int(v) for v in head["basis_size"])
-    l_max = [int(v) for v in head["l_max"]]
-    out = dict(
-        species=head["species"],
-        nep_rc_radial=head["cutoff"][0], nep_rc_angular=head["cutoff"][1],
-        nep_n_max_radial=n_r, nep_n_max_angular=n_a,
-        nep_basis_size_radial=K_r, nep_basis_size_angular=K_a,
-        nep_l_max=l_max[0],
-        nep_four_body=len(l_max) > 1 and l_max[1] == 2,
-        nep_five_body=len(l_max) > 2 and l_max[2] == 1,
-        nep_num_neurons=int(head["ANN"][0]),
-    )
-    num_L = 4 + out["nep_four_body"] + out["nep_five_body"]
-    dim = (n_r + 1) + (n_a + 1) * num_L
-    n_cr, n_ca = T * T * (n_r + 1) * (K_r + 1), T * T * (n_a + 1) * (K_a + 1)
-    n_ann = vals.shape[0] - n_cr - n_ca - dim
-    if n_ann <= 0:
-        raise ValueError(f"{path}: {vals.shape[0]} parameters < c ({n_cr + n_ca}) + q_scaler ({dim}).")
-    # GPUMD c index: (n*(K+1)+k)*T² + t1*T + t2  →  [n, k, t1, t2] → [t1, t2, n, k]
-    c_r = vals[n_ann:n_ann + n_cr].reshape(n_r + 1, K_r + 1, T, T).transpose(2, 3, 0, 1)
-    c_a = vals[n_ann + n_cr:n_ann + n_cr + n_ca].reshape(n_a + 1, K_a + 1, T, T).transpose(2, 3, 0, 1)
-    out.update(ann=vals[:n_ann], c_r=np.ascontiguousarray(c_r),
-               c_a=np.ascontiguousarray(c_a), q_scaler=vals[-dim:], dim=dim)
-    return out
