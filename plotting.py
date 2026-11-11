@@ -5,8 +5,7 @@ import re
 
 import numpy as np
 
-# Select Agg when headless (no DISPLAY/MPLBACKEND) so batch jobs don't
-# fail at import; interactive use keeps the default backend.
+# Agg when headless so batch jobs don't fail at import.
 if not os.environ.get("MPLBACKEND") and not os.environ.get("DISPLAY"):
     import matplotlib
     matplotlib.use("Agg")
@@ -18,12 +17,8 @@ from data import component_labels
 
 
 def unit_label(cfg: TNEPconfig) -> str:
-    """Return the unit string for the current target mode.
-
-    Returns "eV" (PES), the dipole unit (mode 1), or "Å³" (polarisability).
-    Dipole is "e·Å" when convert_dipole_to_eangstrom is set, else the
-    dataset-native unit from cfg.dipole_units.
-    """
+    """Unit string per target mode: "eV", the dipole unit ("e·Å" when
+    convert_dipole_to_eangstrom else cfg.dipole_units), or "Å³"."""
     if cfg.target_mode == 0:
         return "eV"
     if cfg.target_mode == 2:
@@ -31,7 +26,6 @@ def unit_label(cfg: TNEPconfig) -> str:
     if cfg.target_mode == 1:
         if getattr(cfg, "convert_dipole_to_eangstrom", True):
             return "e\u00b7\u00c5"
-        # Dataset-native dipole label when conversion is disabled.
         return {
             "e*angstrom": "e\u00b7\u00c5",
             "e*bohr":     "e\u00b7a\u2080",   # e\u00b7a\u2080
@@ -41,11 +35,7 @@ def unit_label(cfg: TNEPconfig) -> str:
 
 
 def _make_plot_filename(cfg: TNEPconfig, plot_name: str) -> str:
-    """Build an automatic plot filename from config and plot name.
-
-    Format: {plot_name}_{mode}_pop{pop_size}_n{num_neurons}_l{l_max}.png
-    e.g. "snes_fitness_dipole_pop80_n30_l4.png".
-    """
+    """{plot_name}_{mode}_pop{pop_size}_n{num_neurons}_l{l_max}.png"""
     mode_names = {0: "pes", 1: "dipole", 2: "polar"}
     mode = mode_names.get(cfg.target_mode, f"mode{cfg.target_mode}")
     return (f"{plot_name}_{mode}_pop{cfg.pop_size}_n{cfg.num_neurons}"
@@ -138,10 +128,7 @@ def plot_sigma_history(history: dict, cfg: TNEPconfig,
 def plot_loss_breakdown(history: dict, cfg: TNEPconfig,
                         save_plots: str | None = None,
                         show_plots: bool = True) -> None:
-    """Plot total loss, train/val RMSE and L1/L2 terms vs generation (log-log).
-
-    Bails silently when L1/L2 history columns are missing.
-    """
+    """Total loss, train/val RMSE and L1/L2 vs generation (log-log); no-op without L1/L2."""
     if "L1" not in history or "L2" not in history:
         return
     g = np.asarray(history["generation"], dtype=np.float64) + 1  # shift so gen 0 → 1 (avoids log(0))
@@ -178,8 +165,8 @@ def plot_timing(history: dict, cfg: TNEPconfig,
     if not timing or not timing.get("evaluate"):
         return
 
-    # Use actual generation indices (correct under any val_interval);
-    # fall back to record index for older history dicts.
+    # Actual generation indices (correct under any val_interval); older histories
+    # fall back to the record index.
     n = len(timing["evaluate"])
     gens_recorded = history.get("generation", [])
     g = (np.asarray(gens_recorded[:n])
@@ -196,7 +183,7 @@ def plot_timing(history: dict, cfg: TNEPconfig,
     ax1.set_ylabel("Time (s)")
     ax1.legend(loc="upper left")
     ax1.set_title("Per-generation timing breakdown")
-    # Cap y-axis at 99th percentile to prevent TF warmup outliers from hiding data
+    # Cap y at the 99th percentile so TF warmup outliers don't hide the data.
     totals_per_gen = sum(data)
     if len(totals_per_gen) > 1:
         ax1.set_ylim(bottom=0, top=np.percentile(totals_per_gen, 99) * 1.1)
@@ -251,25 +238,12 @@ def plot_correlation(targets: np.ndarray, predictions: np.ndarray, metrics: dict
                      cfg: TNEPconfig, save_plots: str | None = None,
                      show_plots: bool = True, suffix: str | None = None,
                      shared_axis_scale: bool = False) -> None:
-    """Plot target vs prediction correlation, one panel per component.
-
-    Scalar targets (PES) get a single panel; vector targets (dipole [3],
-    polarizability [6]) get one panel each.
-
-    Args:
-        targets     : [S, T] target values
-        predictions : [S, T] predicted values
-        metrics     : dict from TNEP.score() with r2, rmse, r2_components
-        cfg         : TNEPconfig
-        save_plots  : directory to save into (None = don't save)
-        show_plots  : True to display interactively
-    """
+    """Target vs prediction, one panel per component (targets/predictions [S, T])."""
     T = targets.shape[1]
     rmse = float(metrics["rmse"])
     r2 = float(metrics["r2"])
     r2_comp = metrics["r2_components"].numpy()
-    # RRMSE is pre-computed by the caller and scale-independent, so the
-    # same value appears on per-atom and total panels.
+    # RRMSE is caller-computed and scale-independent (same on per-atom and total).
     rrmse = float(metrics["rrmse"])
     rrmse_comp = np.asarray(metrics["rrmse_components"])
 
@@ -325,15 +299,7 @@ def plot_cosine_similarity(metrics: dict, cfg: TNEPconfig,
                            save_plots: str | None = None,
                            show_plots: bool = True,
                            suffix: str | None = None) -> None:
-    """Plot cosine-similarity histogram for vector targets.
-
-    Args:
-        metrics    : dict from TNEP.score() with cos_sim_all, cos_sim_mean
-        cfg        : TNEPconfig
-        save_plots : directory to save into (None = don't save)
-        show_plots : True to display interactively
-        suffix     : appended to filename
-    """
+    """Cosine-similarity histogram for vector targets (no-op without cos_sim_all)."""
     if "cos_sim_all" not in metrics:
         return
 
@@ -358,19 +324,8 @@ def plot_cosine_similarity(metrics: dict, cfg: TNEPconfig,
 def plot_error_vs_magnitude(targets: np.ndarray, predictions: np.ndarray,
                             cfg: TNEPconfig, save_plots: str | None = None,
                             show_plots: bool = True, suffix: str | None = None) -> None:
-    """Plot per-structure absolute error vs target magnitude with a linear fit.
-
-    Vector targets use the vector norm. Diagnoses whether errors scale with
-    target magnitude (capacity-limited) or are roughly constant (accuracy floor).
-
-    Args:
-        targets     : [S, T] target values
-        predictions : [S, T] predicted values
-        cfg         : TNEPconfig
-        save_plots  : directory to save into (None = don't save)
-        show_plots  : True to display interactively
-        suffix      : appended to filename
-    """
+    """Per-structure |error| vs |target| (vector norm) with a linear fit: tells
+    capacity-limited (error ∝ magnitude) from an accuracy floor (constant)."""
     T = targets.shape[1]
 
     if T == 1:
@@ -411,35 +366,19 @@ def plot_error_decomposition(targets: np.ndarray, predictions: np.ndarray,
                              cfg: TNEPconfig, save_plots: str | None = None,
                              show_plots: bool = True,
                              suffix: str | None = None) -> None:
-    """Split the vector error into a magnitude part and a direction part.
-
-    Exact identity, per structure:
+    """Split the vector error into magnitude and direction parts (vector targets
+    only). Exact identity per structure:
 
         |μ̂ − μ|²  =  (|μ̂| − |μ|)²  +  2|μ̂||μ|(1 − cos θ)
 
-    Dividing by |μ|² and taking θ small, the magnitude term wins exactly when
-    the relative magnitude error exceeds the angle in radians — so a high mean
-    cosine alone does NOT imply a scale-limited fit (cos = 0.9999 is 0.81°,
-    the same error budget as a 1.4% magnitude error).
+    For small θ the magnitude term wins when the relative magnitude error exceeds
+    θ in radians, so a high mean cosine alone does NOT imply a scale-limited fit
+    (cos = 0.9999 is 0.81°, the budget of a 1.4 % magnitude error).
 
-    Three panels:
-      1. MSE budget — what fraction of the error is scale vs direction.
-      2. |μ̂| vs |μ| with the OLS slope. Slope < 1 is systematic shrinkage (a
-         regularisation artefact, fixable with λ or one output scale); slope
-         ≈ 1 with scatter is magnitude variance the model cannot predict (an
-         information/capacity deficit).
-      3. Per-structure relative magnitude error vs angle, with the ε = θ
-         diagonal — points above it are magnitude-limited.
-
-    Vector targets only (no-op for scalar modes).
-
-    Args:
-        targets     : [S, T] target values (T ≥ 2)
-        predictions : [S, T] predicted values
-        cfg         : TNEPconfig
-        save_plots  : directory to save into (None = don't save)
-        show_plots  : True to display interactively
-        suffix      : appended to filename
+    Panels: 1. MSE budget (scale vs direction). 2. |μ̂| vs |μ| with OLS slope —
+    < 1 is shrinkage (regularisation artefact), ≈ 1 with scatter is unpredicted
+    magnitude variance (capacity deficit). 3. relative magnitude error vs angle
+    with the ε = θ diagonal — points above it are magnitude-limited.
     """
     if targets.shape[1] < 2:
         return

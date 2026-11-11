@@ -1,16 +1,10 @@
 """Adam trainer for TNEP (cfg.optimizer = "adam").
 
-Gradient-based alternative to SNES: tf.GradientTape through predict_batch,
-so every learnable tensor the forward reads — the ANN weights, c_pair, the
-descriptor-mixing tail (the same flat skew/dense parameters SNES searches,
-mapped to V by SNES._reconstruct_one_mixing_layer, so cayley/expm stay
-structural), the learned radial basis M_radial and the NEP contraction
-coefficients c_r / c_a — is trained by autodiff,
-including through soap_from_raw. Objective = RMSE + L1 + L2 on the ANN core,
-the same quantity SNES ranks on.
-
-Same (history, final_model, best_val_model) contract and history keys as
-SNES.fit so the driver, plots and save_history work unchanged (sigma
+tf.GradientTape through predict_batch: ANN weights, c_pair, the mixing tail
+(SNES's flat skew/dense params mapped to V by SNES._reconstruct_one_mixing_layer,
+so cayley/expm stay structural), M_radial and NEP c_r / c_a. Objective =
+RMSE + L1 + L2 on the ANN core, the quantity SNES ranks on. Same (history,
+final_model, best_val_model) contract and history keys as SNES.fit (sigma
 columns are 0). Not supported: checkpoint/resume, dynamic lambda (-1).
 """
 from __future__ import annotations
@@ -26,16 +20,14 @@ from nep_descriptor import nep_pair_kwargs
 
 
 def _tf_var(v):
-    """Keras-3 layer weights wrap a tf.Variable in `.value`; the tape, the
-    optimizer and tf.function arguments need the tf.Variable itself."""
+    """Unwrap Keras-3 `.value`: the tape, optimizer and tf.function need the tf.Variable."""
     return v.value if isinstance(getattr(v, "value", None), tf.Variable) else v
 
 
 def _trainable(model) -> dict:
-    """name -> tf.Variable for everything predict_batch reads, in a fixed
-    order (the best-val snapshot relies on it). M_radial is a non-trainable
-    tf.Variable by construction (SNES owns it), so the tape watches the list
-    explicitly."""
+    """name -> tf.Variable for everything predict_batch reads, in a fixed order
+    (the best-val snapshot relies on it). M_radial is non-trainable (SNES owns
+    it), so the tape watches the list explicitly."""
     vs = {"W0": model.W0, "b0": model.b0, "W1": model.W1, "b1": model.b1}
     if model._experts_on:
         vs.update({k: getattr(model, k) for k in model.expert_keys})
@@ -53,9 +45,8 @@ def _trainable(model) -> dict:
 
 
 def _ann_core(model) -> list:
-    """Weights the L1/L2 penalty covers — the ANN(s) only (b1 and the
-    c_pair / U_pair / M_radial / c_r / c_a tails excluded, as in SNES's multi-type
-    per-type penalty)."""
+    """Weights the L1/L2 penalty covers: the ANN(s) only, as in SNES (b1 and
+    the tails excluded)."""
     core = [model.W0, model.b0, model.W1]
     if model._experts_on:
         core += list(model.expert_weights)
@@ -77,9 +68,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
 
     snes = model.optimizer            # resolved lambdas, validate(), tf_rng
     named = _trainable(model)
-    # Descriptor mixing: train SNES's flat tail (skew upper triangles under
-    # cayley/expm, dense entries under "off") and map it to V exactly as
-    # SNES does, so the parameterisation stays structural. V = 0 at init.
+    # Mixing: train SNES's flat tail and map it to V as SNES does; V = 0 at init.
     mix_flat = None
     if model.descriptor_mixing and model.U_pair is not None:
         mix_flat = tf.Variable(tf.zeros([snes.n_U_pair], tf.float32),
@@ -106,8 +95,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
     S_train = int(train_data["num_atoms"].shape[0])
 
     def _forward(chunk):
-        # Only tf.Variables / tensors go into the forward (Keras variables
-        # are not valid tf.function arguments).
+        # Keras variables are not valid tf.function arguments.
         U = _mixing_V() if mix_flat is not None else None
         b0 = model._b0_eff(named["b0"], named["W0"])    # centring fold (stored W0)
         W0 = model._W0_eff(named["W0"], U)     # U fold (if mixing) + q-scale fold
@@ -143,12 +131,10 @@ def fit_adam(model, train_data: dict, val_data: dict,
                 # strength; per-model lambdas are SNES-only (SNES._reg_terms).
                 l1 = snes.lambda_1[0] * tf.reduce_sum(tf.abs(flat)) / n_core
                 l2 = snes.lambda_2[0] * tf.sqrt(tf.reduce_sum(tf.square(flat)) / n_core)
-            # SNES ranks on RMSE + penalty; use the same objective so the
-            # lambda scale means the same thing under both optimizers.
+            # Same objective SNES ranks on, so λ means the same under both.
             loss = tf.sqrt(mse + 1e-12) + l1 + l2
         grads = tape.gradient(loss, variables)
-        # b1 has no gradient under the neighbor readout (excluded from s by
-        # design); skip None grads instead of letting Keras warn every step.
+        # Skip None grads (frozen tails) instead of letting Keras warn every step.
         opt.apply_gradients([(g, v) for g, v in zip(grads, variables)
                              if g is not None])
         return mse, l1, l2
@@ -202,9 +188,8 @@ def fit_adam(model, train_data: dict, val_data: dict,
                       f"Returning the best-val weights so far.")
                 break
             if getattr(snes, "_gpumd_path", False):
-                # GPUMD path: the monitor set IS the test set — report it, and
-                # never select on it (cfg.gpumd_path). The snapshot tracks the
-                # CURRENT step, so best == final and patience is inert.
+                # GPUMD path: the monitor IS the test set — report, never select
+                # on it; snapshot tracks the current step (patience inert).
                 best_val = val_rmse
                 best_snapshot = [v.numpy() for v in variables]
             elif val_rmse < best_val:
@@ -233,8 +218,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
                   f"  {_mon} RMSE: {val_rmse:.6f}"
                   + ("" if _mon == "test" else f"  best val RMSE: {best_val:.6f}")
                   + f"  L1: {gen_l1:.2e}  L2: {gen_l2:.2e}", flush=True)
-            # Fires on the val tick at/after each plot_interval boundary
-            # (val_interval need not divide plot_interval).
+            # Val tick at/after each plot_interval boundary (need not divide).
             if (plot_callback is not None and cfg.plot_interval
                     and (gen + 1) // cfg.plot_interval > last_plot):
                 last_plot = (gen + 1) // cfg.plot_interval
@@ -244,8 +228,7 @@ def fit_adam(model, train_data: dict, val_data: dict,
                       f"(no improvement for {cfg.patience} validation ticks)")
                 break
 
-    # final_model = a fresh model with the last weights; the in-place model is
-    # restored to best-val (same convention as SNES.fit).
+    # final_model = last weights; the in-place model ← best-val (as SNES.fit).
     from TNEP import TNEP
     final_model = TNEP(cfg)
     _sync_U_pair()

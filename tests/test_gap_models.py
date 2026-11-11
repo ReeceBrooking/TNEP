@@ -43,7 +43,7 @@ def test_two_body_descriptor_matches_hand_sum_and_is_normalised():
     q = gm.two_body_descriptor(at, ti, cfg)                   # [N, T·C]
     assert q.shape == (96, 2 * 3)
     assert np.allclose(np.linalg.norm(q, axis=1), 1.0)
-    rc, C = float(cfg.dipole_rc), 3
+    rc, C = float(cfg.rcut_hard), 3
     i, j, d = neighbor_list("ijd", at, rc)
     keep = i != j; i, j, d = i[keep], j[keep], d[keep]
     x = 2.0 * d / rc - 1.0
@@ -54,21 +54,13 @@ def test_two_body_descriptor_matches_hand_sum_and_is_normalised():
     assert np.allclose(q, ref, atol=1e-6)
 
 
-def test_gap_site_rcut_widens_the_descriptor_cutoff():
-    cfg, at, ti = _setup(gap_site_models=["soap", "2b"], gap_site_rcut=5.0)
-    i, j, _, _ = gm._site_pairs(at, cfg, 3)
-    assert len(i) == len(neighbor_list("i", at, 5.0)) > len(neighbor_list("i", at, 3.0))
-    q5, q3 = gm.two_body_descriptor(at, ti, cfg), gm.two_body_descriptor(at, ti, _setup()[0])
-    assert q5.shape == q3.shape and not np.allclose(q5, q3)
-
-
 def test_three_body_descriptor_matches_triplet_loop_and_symmetries():
     cfg, at, ti = _setup()
     q = gm.three_body_descriptor(at, ti, cfg)                 # [N, T(T+1)/2 · C·C · (L+1)]
     assert q.shape == (96, 3 * 9 * 3)
     assert np.allclose(np.linalg.norm(q, axis=1), 1.0)
     # explicit triplet loop for one atom
-    rc, C, L = float(cfg.dipole_rc), 3, 2
+    rc, C, L = float(cfg.rcut_hard), 3, 2
     i, j, D = neighbor_list("ijD", at, rc); keep = i != j; i, j, D = i[keep], j[keep], -D[keep]
     a = 5; sel = i == a; js, ds = j[sel], D[sel]
     r = np.linalg.norm(ds, axis=1); x = 2 * r / rc - 1

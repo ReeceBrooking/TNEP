@@ -29,6 +29,7 @@ TNEP/
 ├── MasterTNEP.py        # Entry point — train_model() and process_trajectory()
 ├── TNEP.py              # Core model: per-type ANN, predict_batch (COO), score
 ├── TNEPconfig.py        # Configuration dataclass — all hyperparameters in one place
+├── GAPconfig.py         # Config for the GAP kernel fit — independent duplicate of the shared fields
 ├── DescriptorBuilder.py # SOAP-turbo descriptor + gradient computation via quippy
 ├── SNES.py              # Separable Natural Evolution Strategy optimiser
 ├── data.py              # Loading, filtering, splitting, COO pad-and-stack
@@ -86,7 +87,6 @@ num_generations  = 60000
 batch_size       = None        # None = full train set per generation
 eta_sigma        = None        # None = auto from problem dimension
 patience         = None        # Early stopping (None = disabled)
-loss_type        = "mse"       # "mse" or "mae"
 
 # SOAP-turbo descriptor
 l_max            = 4

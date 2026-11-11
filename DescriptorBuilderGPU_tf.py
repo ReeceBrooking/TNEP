@@ -1,11 +1,10 @@
-"""TF GPU SOAP-turbo port of DescriptorBuilderGPU.py (fp64 internal, fp32 out).
+"""TF GPU SOAP-turbo builder (fp64 internal, fp32 out): descriptor_mode=1.
 
-Same algorithm as the NumPy backend with the hot per-pair compute (radial +
-angular recursion, cnk scatter-sum, power spectrum, derivatives, Cartesian
-conversion) rewritten in tf.* so @tf.function folds it into one GPU graph.
-CPU-only helpers (basis matrices, compress mask, multiplicity, NL builder)
-are reused from the NumPy module. reduce_retracing=True caches across P.
-run_phase11_validation() checks output vs the NumPy reference on 7 fixtures.
+The per-pair compute (radial + angular recursion, cnk scatter-sum, power
+spectrum, derivatives, Cartesian conversion) in tf.* so @tf.function folds it
+into one GPU graph. CPU-only tables (basis matrices, compress mask,
+multiplicity, the NumPy neighbour list) come from descriptor_layout.py.
+reduce_retracing=True caches across P.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import tensorflow as tf
 from tqdm import tqdm
 
 # Reuse CPU-only helpers and NumPy reference from the main module
-from DescriptorBuilderGPU import (
+from descriptor_layout import (
     build_orthonormalization_matrix_poly3,
     build_neighbour_list_numpy,
     build_multiplicity_array,
@@ -23,16 +22,10 @@ from DescriptorBuilderGPU import (
     make_compress_mask_trivial,
     _get_preflm,
     _N_a,
-    load_fixture,
-    compute_soap_with_grad_from_positions_numpy,
 )
 
 
-# =========================================================================
-# Precision helper. Each SOAP helper derives its working dtype from a leading
-# tensor arg; _matching_complex maps real dtype -> complex dtype so fp64 and
-# fp32 paths share the same source.
-# =========================================================================
+# ── precision ── helpers take their dtype from the leading tensor arg, so fp64/fp32 share source.
 
 
 def _matching_complex(real_dtype: tf.DType) -> tf.DType:
@@ -41,9 +34,7 @@ def _matching_complex(real_dtype: tf.DType) -> tf.DType:
     return tf.complex128
 
 
-# =========================================================================
-# Radial expansion (TF)
-# =========================================================================
+# ── radial expansion ──
 
 
 def _radial_first_integral_tf(
@@ -350,9 +341,7 @@ def radial_expansion_coeff_poly3_with_der_tf(
     return radial, radial_der
 
 
-# =========================================================================
-# Angular expansion (TF)
-# =========================================================================
+# ── angular expansion ──
 
 
 def _get_plm_array_tf(x: tf.Tensor, l_max: int) -> tf.Tensor:
@@ -588,9 +577,7 @@ def angular_expansion_coeff_with_der_tf(
     return exp_coeff, exp_coeff_rad_der, exp_coeff_azi_der, exp_coeff_pol_der
 
 
-# =========================================================================
-# cnk + power spectrum (TF)
-# =========================================================================
+# ── cnk + power spectrum ──
 
 
 def aggregate_cnk_der_only_tf(
@@ -601,12 +588,8 @@ def aggregate_cnk_der_only_tf(
     A_azi_der: tf.Tensor,
     A_pol_der: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Per-pair cnk derivatives only (cnk = 4pi A R), no atom-scatter forward.
-
-    Pair-tiled gradient path: forward cnk is computed once; per tile only the
-    three [k_max, n_max, P_tile] derivative tensors are built.
-    Returns (cnk_rad_der, cnk_azi_der, cnk_pol_der), each [k_max, n_max, P_tile].
-    """
+    """Per-pair cnk derivatives for one pair tile (cnk = 4π·A·R), no atom scatter.
+    Returns (cnk_rad_der, cnk_azi_der, cnk_pol_der), each [k_max, n_max, P_tile]."""
     dtype = R.dtype
     fac = tf.complex(tf.constant(4.0 * np.pi, dtype=dtype),
                      tf.constant(0.0, dtype=dtype))
@@ -650,10 +633,7 @@ def aggregate_cnk_with_der_tf(
 
 
 def _build_kept_triples(skip_mask: np.ndarray, n_max: int, l_max: int) -> list[tuple]:
-    """Pre-enumerate kept (n, n', l, mult_start, mult_count) tuples.
-
-    Python list unrolled at trace time over channels surviving the compress mask.
-    """
+    """Kept (n, n', l, mult_start, mult_count) tuples; a Python list unrolled at trace time."""
     out = []
     counter = 0
     counter2 = 0
@@ -682,13 +662,10 @@ def power_spectrum_with_grad_tf(
     l_max: int = None,                # accepted for sig parity (unused here)
     normalize: bool = True,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Power spectrum p_{nn'l} = Σ_m c_nlm·conj(c_n'lm), plus its 3 spherical
-    derivatives, both L2-normalised (normalize=False: raw, cfg.radial_basis_norm
-    "none").
-    Returns (soap_norm [n_sites, n_compressed], soap_*_der each [n_compressed, P]).
-    """
-    # Per-triple Python loop reduced immediately (small live memory); unrolled
-    # and fused under XLA at trace time.
+    """Power spectrum p_{nn'l} = Σ_m c_nlm·conj(c_n'lm) and its 3 spherical derivatives,
+    L2-normalised unless normalize=False (cfg.radial_basis_norm="none").
+    Returns (soap_norm [n_sites, n_compressed], soap_*_der each [n_compressed, P])."""
+    # Per-triple loop reduces immediately (small live memory); XLA fuses it at trace time.
     cnk_at = tf.gather(cnk, pair_atom, axis=2)                       # [k_max, n_max, P]
     fwd_rows = []
     rad_rows = []
@@ -750,9 +727,8 @@ def power_spectrum_with_grad_tf(
     )
 
     if not normalize:
-        # radial_basis_norm="none": raw soap_unnorm, no scale factor (unlike
-        # the learned basis's scale²), and the derivatives stay un-projected —
-        # (I − q̂q̂ᵀ)/‖q‖ below is exactly ∂(q/‖q‖)/∂q, so skipping it gives ∂q/∂r.
+        # Raw spectrum; derivatives stay un-projected — (I − q̂q̂ᵀ)/‖q‖ below is
+        # exactly ∂(q/‖q‖)/∂q, so skipping it yields ∂q/∂r.
         return tf.transpose(soap_unnorm), soap_rad_der, soap_azi_der, soap_pol_der
     norms = tf.linalg.norm(soap_unnorm, axis=0)
     sqrt_dot_p = tf.where(norms < 1e-5, tf.ones_like(norms), norms)
@@ -819,11 +795,8 @@ def _aggregate_self_derivative_tf(
     pair_is_central: tf.Tensor,       # [P] bool — strict rj=0 self-pair flag
     n_sites: int,
 ) -> tf.Tensor:
-    """Translational invariance: central slot i gets -Σ_{p≠central} grad.
-
-    Image self-pairs (same atom, non-zero displacement) count as regular
-    neighbours. Returns soap_cart_der [P, 3, n_compressed] with self slots filled.
-    """
+    """Translational invariance: the rj=0 self slot gets -Σ of the other pairs' grads.
+    Image self-pairs (same atom, non-zero displacement) count as regular neighbours."""
     is_central_f = tf.cast(pair_is_central, soap_cart_der.dtype)[:, None, None]   # [P, 1, 1]
     non_central = soap_cart_der * (1.0 - is_central_f)
     centre_sum = tf.math.unsorted_segment_sum(non_central, pair_atom, n_sites)
@@ -833,9 +806,7 @@ def _aggregate_self_derivative_tf(
     return soap_cart_der + self_grad_to_add
 
 
-# =========================================================================
-# Top-level driver (TF, GPU)
-# =========================================================================
+# ── forward + gradient driver ──
 
 
 def power_spectrum_grad_only_tile_tf(
@@ -854,13 +825,9 @@ def power_spectrum_grad_only_tile_tf(
     l_max: int = None,
     normalize: bool = True,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Pair-tile derivative branch of the power spectrum.
-
-    Mirrors the derivative branch of `power_spectrum_with_grad_tf` but on a
-    tile of pairs (peak memory ~ P_tile, not full P), L2-corrected against the
-    full forward soap_unnorm / sqrt_dot_p (normalize=False: un-projected).
-    Returns (soap_rad_der, soap_azi_der, soap_pol_der), each [n_compressed, P_tile].
-    """
+    """Derivative branch of power_spectrum_with_grad_tf on one pair tile, L2-corrected
+    against the full forward soap_unnorm / sqrt_dot_p (normalize=False: un-projected).
+    Returns (soap_rad_der, soap_azi_der, soap_pol_der), each [n_compressed, P_tile]."""
     cnk_at = tf.gather(cnk, pair_atom, axis=2)  # [k_max, n_max, P_tile]
 
     rad_rows = []; azi_rows = []; pol_rows = []
@@ -924,12 +891,11 @@ def _compute_soap_with_grad_inner_tf(
     pair_tile_size: int = 0,
     normalize: bool = True,
 ):
-    """Inner forward+grad TF compute (TF tensor inputs, Python/NumPy constants).
+    """Forward + gradient kernel (tensor inputs, Python constants captured at trace).
 
-    fp32 outer dtype still runs the radial I_n recursion in fp64: its +/- terms
-    suffer catastrophic cancellation in fp32 (cast up, recurse, cast back).
-    pair_tile_size > 0 builds the dominant [k_max, n_max, P] cnk_*_der tensors
-    P_tile pairs at a time (peak VRAM ~ O(P_tile/P)); <= 0 is single-shot.
+    The radial I_n recursion always runs in fp64: its ± terms cancel catastrophically
+    in fp32 (cast up, recurse, cast back). pair_tile_size > 0 builds the dominant
+    [k_max, n_max, P] cnk_*_der tensors P_tile pairs at a time; <= 0 is single-shot.
     """
     is_fp32 = rjs.dtype == tf.float32
     if is_fp32:
@@ -957,7 +923,6 @@ def _compute_soap_with_grad_inner_tf(
     )
 
     if pair_tile_size <= 0:
-        # Single-shot: all per-pair derivative tensors at once (high peak VRAM).
         cnk, cnk_rad, cnk_azi, cnk_pol = aggregate_cnk_with_der_tf(
             R_full, A_full, R_der_full, A_rad_full, A_azi_full, A_pol_full,
             pair_atom, n_atoms,
@@ -976,10 +941,7 @@ def _compute_soap_with_grad_inner_tf(
             grad_cart, pair_atom, pair_is_central, n_atoms)
         return soap_norm, grad_cart
 
-    # ---- Pair-tiled gradient path -----------------------------------------
-    # 1) One full forward: cnk (per-atom), soap_unnorm, sqrt_dot_p, soap_norm.
-    # Inline forward power-spectrum + L2 norm, keeping soap_unnorm / sqrt_dot_p
-    # alive across the pair tiles.
+    # Tiled path. 1) one full forward; soap_unnorm / sqrt_dot_p stay alive across tiles.
     cnk = aggregate_cnk_tf(R_full, A_full, pair_atom, n_atoms)
     l_max_eff = l_max if l_max is not None else max(t[2] for t in kept_triples)
     fwd_rows = []
@@ -1005,9 +967,8 @@ def _compute_soap_with_grad_inner_tf(
         sqrt_dot_p = None                      # unused by the un-projected tiles
         soap_norm = tf.transpose(soap_unnorm)
 
-    # 2) Pair-tiled derivative loop. Caller padded P to a multiple of
-    # pair_tile_size so every tile is exactly P_TILE long (XLA fuses one reused
-    # kernel); parallel_iterations=1 keeps one tile's intermediates live.
+    # 2) derivative loop. The caller padded P to a multiple of pair_tile_size so every
+    # tile has the static shape XLA compiles once; parallel_iterations=1 bounds live memory.
     P = tf.shape(rjs)[0]
     P_TILE = int(pair_tile_size)               # Python int (constant at trace)
     P_tile_const = tf.constant(P_TILE, dtype=tf.int32)
@@ -1020,7 +981,7 @@ def _compute_soap_with_grad_inner_tf(
     )
 
     def _body(i, ta_):
-        # Fixed-size tile: tf.slice with a Python-int size is XLA-compatible.
+        # tf.slice with a Python-int size keeps the tile shape static for XLA.
         start = i * P_tile_const
         rjs_t          = tf.slice(rjs,            [start], [P_TILE])
         thetas_t       = tf.slice(thetas,         [start], [P_TILE])
@@ -1029,7 +990,6 @@ def _compute_soap_with_grad_inner_tf(
         pair_active_t  = tf.slice(pair_active,    [start], [P_TILE])
         pair_central_t = tf.slice(pair_is_central, [start], [P_TILE])
 
-        # 2-D slice along the pair axis of the full [., P] tensors (static shape).
         R_t     = tf.slice(R_full,     [0, start], [tf.shape(R_full)[0],     P_TILE])
         R_der_t = tf.slice(R_der_full, [0, start], [tf.shape(R_der_full)[0], P_TILE])
         A_t     = tf.slice(A_full,     [0, start], [tf.shape(A_full)[0],     P_TILE])
@@ -1064,9 +1024,7 @@ def _compute_soap_with_grad_inner_tf(
     return soap_norm, grad_cart
 
 
-# =========================================================================
-# Forward-only TF helpers (skip derivative computation entirely)
-# =========================================================================
+# ── forward-only twins (no derivative tensors) ──
 
 
 def radial_expansion_coeff_poly3_tf(
@@ -1086,7 +1044,6 @@ def radial_expansion_coeff_poly3_tf(
     pair_active = in_cutoff
     if not do_central:
         pair_active = pair_active & ~pair_is_central
-    # Reuse the with_der amplitude — discard amp_der (cheap to compute)
     amplitude, _ = _radial_amplitude_with_der_tf(
         rj_n, atom_sigma_scaled, atom_sigma_r_scaling, pair_is_central,
         central_weight, amplitude_scaling, radial_enhancement,
@@ -1199,8 +1156,7 @@ def _compute_soap_inner_tf(
     radial_enhancement, nf, do_central, n_compressed, n_max,
     normalize: bool = True,
 ):
-    """Forward-only inner pipeline (no derivatives)."""
-    # fp32 caveat as in _compute_soap_with_grad_inner_tf: radial recursion in fp64.
+    """Forward-only kernel; radial recursion in fp64 as in the gradient kernel."""
     is_fp32 = rjs.dtype == tf.float32
     if is_fp32:
         rjs_r = tf.cast(rjs, tf.float64)
@@ -1241,13 +1197,12 @@ def _compute_cnk_inner_tf(
     atom_sigma_r, atom_sigma_r_scaling, atom_sigma_t, atom_sigma_t_scaling,
     amplitude_scaling, central_weight, radial_enhancement, nf, do_central,
 ):
-    """Learned-radial-basis forward: raw centre coefficients over the n_basis
-    orthonormal poly3 functions, stopping before the power spectrum (which
-    TNEP.soap_from_raw forms per candidate). Returns float32
-    [n_atoms, S·K·k_max·2] laid out (species, κ, k=(l,m), re/im)."""
+    """Learned radial basis: raw centre coefficients over n_basis orthonormal poly3
+    functions, before the power spectrum (TNEP.soap_from_raw forms it per candidate).
+    Returns float32 [n_atoms, S·K·k_max·2] laid out (species, κ, k=(l,m), re/im)."""
     is_fp32 = rjs.dtype == tf.float32
     rjs_r = tf.cast(rjs, tf.float64) if is_fp32 else rjs
-    # W_K is always fp64 (cond(W_K) ~ 1e6 at K = 8; fp32 rounding costs ~1e-3).
+    # W_K stays fp64: cond(W_K) ~ 1e6 at K = 8, fp32 rounding costs ~1e-3.
     R = radial_expansion_coeff_poly3_tf(
         rjs_r, pair_neighbour_species, pair_is_central,
         n_species=n_species, alpha_max=n_basis,
@@ -1274,8 +1229,7 @@ def _compute_cnk_inner_tf(
 
 
 def _build_cfg_cache(species_Z: list[int], soap_params: dict) -> dict:
-    """Cfg-only constants (depend only on species_Z, alpha_max, l_max), cacheable
-    across frames and consumed identically by forward and forward+grad paths."""
+    """Cfg-only constants (species_Z, alpha_max, l_max), shared by every frame and path."""
     alpha_max = int(soap_params["alpha_max"])
     l_max = int(soap_params["l_max"])
     n_species = len(species_Z)
@@ -1299,112 +1253,18 @@ def _build_cfg_cache(species_Z: list[int], soap_params: dict) -> dict:
     )
 
 
-def compute_soap_with_grad_from_positions_tf(
-    positions: np.ndarray,
-    cell: np.ndarray,
-    pbc: np.ndarray,
-    numbers: np.ndarray,
-    species_Z: list[int],
-    soap_params: dict,
-    *,
-    nf: float = 4.0,
-    cache: dict | None = None,
-) -> tuple[tf.Tensor, tf.Tensor, np.ndarray, np.ndarray]:
-    """End-to-end forward + Cartesian gradient on GPU when available.
-
-    Pass cache=_build_cfg_cache(...) to skip the per-call constant recompute.
-    Returns (soap [n_atoms, n_compressed] f32, grad [P, 3, n_compressed] f32,
-             pair_atom [P] int32, pair_gidx [P] int32).
-    """
-    n_atoms = positions.shape[0]
-    alpha_max = int(soap_params["alpha_max"])
-    l_max = int(soap_params["l_max"])
-    rcut_hard = float(soap_params["rcut_hard"])
-
-    if cache is None:
-        cache = _build_cfg_cache(species_Z, soap_params)
-    n_species = cache["n_species"]
-    n_max = cache["n_max"]
-    z_to_idx = cache["z_to_idx"]
-    W_np = cache["W_np"]
-    mask_info = cache["mask_info"]
-    multiplicity_np = cache["multiplicity_np"]
-    preflm_np = cache["preflm_np"]
-    kept_triples = cache["kept_triples"]
-
-    pair_atom_np, pair_gidx_np, rjs_np, thetas_np, phis_np = build_neighbour_list_numpy(
-        positions, cell, pbc, rcut_hard
-    )
-    # Strict self-pair: same atom AND zero displacement (Fortran's j==1 convention)
-    pair_is_central_np = (pair_atom_np == pair_gidx_np) & (rjs_np < 1e-10)
-    pair_active_np = rjs_np < rcut_hard
-    pair_neighbour_species_np = np.asarray(
-        [z_to_idx[int(numbers[int(j)])] for j in pair_gidx_np], dtype=np.int32
-    )
-
-    # Convert to TF tensors (float64/int32). Place on GPU if available.
-    device = "/GPU:0" if tf.config.list_physical_devices("GPU") else "/CPU:0"
-    with tf.device(device):
-        rjs = tf.constant(rjs_np, dtype=tf.float64)
-        thetas = tf.constant(thetas_np, dtype=tf.float64)
-        phis = tf.constant(phis_np, dtype=tf.float64)
-        pair_atom = tf.constant(pair_atom_np, dtype=tf.int32)
-        pair_gidx = tf.constant(pair_gidx_np, dtype=tf.int32)
-        pair_neighbour_species = tf.constant(pair_neighbour_species_np, dtype=tf.int32)
-        pair_is_central = tf.constant(pair_is_central_np)
-        pair_active = tf.constant(pair_active_np)
-        W_single = tf.constant(W_np, dtype=tf.float64)
-        multiplicity_array = tf.constant(multiplicity_np, dtype=tf.float64)
-        compressed_idx = tf.constant(mask_info["compressed_idx"], dtype=tf.int32)
-        uncompressed_idx = tf.constant(mask_info["uncompressed_idx"], dtype=tf.int32)
-        coeffs = tf.constant(mask_info["coeffs"], dtype=tf.float64)
-        preflm = tf.constant(preflm_np, dtype=tf.float64)
-
-        soap_norm, grad_cart = _compute_soap_with_grad_inner_tf(
-            rjs, thetas, phis, pair_atom, pair_gidx, pair_neighbour_species,
-            pair_is_central, pair_active,
-            W_single, multiplicity_array, compressed_idx, coeffs, preflm,
-            kept_triples=kept_triples,
-            n_atoms=n_atoms, n_species=n_species, alpha_max=alpha_max, l_max=l_max,
-            rcut_hard=rcut_hard, rcut_soft=float(soap_params["rcut_soft"]),
-            atom_sigma_r=float(soap_params["atom_sigma_r"]),
-            atom_sigma_r_scaling=float(soap_params["atom_sigma_r_scaling"]),
-            atom_sigma_t=float(soap_params["atom_sigma_t"]),
-            atom_sigma_t_scaling=float(soap_params["atom_sigma_t_scaling"]),
-            amplitude_scaling=float(soap_params["amplitude_scaling"]),
-            central_weight=float(soap_params["central_weight"]),
-            radial_enhancement=int(soap_params["radial_enhancement"]),
-            nf=nf,
-            do_central=(float(soap_params["central_weight"]) != 0.0),
-            n_compressed=int(mask_info["n_compressed"]), n_max=n_max,
-        )
-        # Cast to float32 at output boundary
-        soap_norm = tf.cast(soap_norm, tf.float32)
-        grad_cart = tf.cast(grad_cart, tf.float32)
-    return soap_norm, grad_cart, pair_atom_np, pair_gidx_np
-
-
-# =========================================================================
-# Phase 4: TF-native neighbour list (O(N²) on GPU)
-# =========================================================================
-
-
 def _compute_image_vectors(cell: np.ndarray, pbc: np.ndarray, rcut: float):
-    """Build the image-vector lattice and locate the zero-displacement entry.
-
-    Runs in NumPy once per frame. Returns (image_vectors [N_img, 3],
-    zero_image_idx); the zero image masks the (i, i, image=0) self-pair.
-    """
+    """(image_vectors [N_img, 3], zero_image_idx) in NumPy, once per frame; the zero
+    image masks the (i, i, image=0) self-pair."""
     if not bool(np.any(pbc)):
         return np.zeros((1, 3), dtype=np.float64), 0
-    # Singular cell with pbc=True (xyz quirk): treat as non-periodic (quippy match).
+    # Singular cell with pbc=True (xyz quirk): non-periodic, as quippy does.
     try:
         cell_inv = np.linalg.inv(cell)
     except np.linalg.LinAlgError:
         return np.zeros((1, 3), dtype=np.float64), 0
-    # Reciprocal vectors are COLUMNS of inv(cell) → per-axis norm is axis=0;
-    # axis=1 under-counts periodic images for non-orthogonal cells (no-op for
-    # orthorhombic). Mirrors build_neighbour_list_numpy.
+    # Reciprocal vectors are COLUMNS of inv(cell): axis=0. axis=1 under-counts
+    # images for non-orthogonal cells. Mirrors build_neighbour_list_numpy.
     b_norms = np.linalg.norm(cell_inv, axis=0)
     n_imgs = np.where(pbc, np.ceil(rcut * b_norms).astype(np.int32), 0)
     nx, ny, nz = int(n_imgs[0]), int(n_imgs[1]), int(n_imgs[2])
@@ -1429,19 +1289,11 @@ _NL_TF_KERNEL_SIG = [
 
 @tf.function(input_signature=_NL_TF_KERNEL_SIG, reduce_retracing=False)
 def _nl_tf_kernel(positions, image_vectors, zero_image_idx, rcut):
-    """All-pairs O(N²·N_img) neighbour list, fully on the compute device.
+    """All-pairs O(N²·N_img) neighbour list on the compute device.
 
-    Mirrors `build_neighbour_list_numpy` layout:
-      - Each centre i emits its self-pair (i,i,image=0,rj=0) first.
-      - Then all (i,j,k) pairs with rj < rcut, sorted stably by centre.
-
-    Inputs:
-        positions      : [N, 3]    centre positions (float64)
-        image_vectors  : [N_img,3] precomputed image lattice (float64)
-        zero_image_idx : scalar    index of the (0,0,0) image
-        rcut           : scalar    cutoff radius (float64)
-    Returns:
-        pair_atom, pair_gidx, rjs, thetas, phis — all [P]
+    Same layout as build_neighbour_list_numpy: each centre i emits its self-pair
+    (i, i, image=0, rj=0) first, then its rj < rcut pairs, stably sorted by centre.
+    Returns pair_atom, pair_gidx, rjs, thetas, phis — all [P].
     """
     n_atoms = tf.shape(positions)[0]
     n_img = tf.shape(image_vectors)[0]
@@ -1453,7 +1305,6 @@ def _nl_tf_kernel(positions, image_vectors, zero_image_idx, rcut):
     disps = pos_j + img_k - pos_i                        # [N, N, N_img, 3]
     rs = tf.linalg.norm(disps, axis=-1)                  # [N, N, N_img]
 
-    # Mask self-pair at (i, i, zero_image)
     keep = rs < rcut
     eye2 = tf.eye(n_atoms, dtype=tf.bool)                # [N, N]
     img_is_zero = tf.equal(tf.range(n_img), zero_image_idx)
@@ -1461,7 +1312,6 @@ def _nl_tf_kernel(positions, image_vectors, zero_image_idx, rcut):
                       & img_is_zero[tf.newaxis, tf.newaxis, :])
     keep = keep & tf.logical_not(self_pair_mask)
 
-    # Extract surviving (i, j, k) triples
     flat_idx = tf.where(keep)                            # [P_neigh, 3] int64
     i_neigh = tf.cast(flat_idx[:, 0], tf.int32)
     j_neigh = tf.cast(flat_idx[:, 1], tf.int32)
@@ -1469,14 +1319,14 @@ def _nl_tf_kernel(positions, image_vectors, zero_image_idx, rcut):
     disp_flat = tf.gather_nd(disps, flat_idx)            # [P_neigh, 3]
     rs_flat = tf.gather_nd(rs, flat_idx)                 # [P_neigh]
 
-    # Stable sort by centre (matches build_neighbour_list_numpy ordering)
+    # Stable sort by centre (NumPy NL ordering)
     order = tf.argsort(i_neigh, stable=True)
     i_neigh = tf.gather(i_neigh, order)
     j_neigh = tf.gather(j_neigh, order)
     disp_neigh = tf.gather(disp_flat, order)
     rs_neigh = tf.gather(rs_flat, order)
 
-    # Spherical angles. rj=0 protected by tf.where masks (no NaN at the pole).
+    # Spherical angles; tf.where keeps rj=0 NaN-free at the pole.
     safe_inv = tf.where(rs_neigh > 1e-10,
                         1.0 / tf.maximum(rs_neigh, 1e-300), 0.0)
     cos_theta = tf.clip_by_value(disp_neigh[:, 2] * safe_inv, -1.0, 1.0)
@@ -1487,8 +1337,7 @@ def _nl_tf_kernel(positions, image_vectors, zero_image_idx, rcut):
         tf.zeros_like(rs_neigh),
     )
 
-    # Build per-centre block layout: self-pair at start of each block,
-    # neighbours after. n_per_centre is shape [N], block_offsets [N+1].
+    # Per-centre blocks: self-pair first, then neighbours. block_offsets is [N+1].
     n_per_centre = tf.cast(
         tf.math.bincount(i_neigh, minlength=n_atoms, maxlength=n_atoms),
         tf.int32)
@@ -1497,16 +1346,13 @@ def _nl_tf_kernel(positions, image_vectors, zero_image_idx, rcut):
 
     P = block_offsets[n_atoms]
 
-    # Destination index for each neighbour pair: block_offsets[centre] + 1
-    # + (intra-block index). i_neigh is centre-sorted, so intra index is a
-    # running counter that resets per centre.
+    # Neighbour slot = block_offsets[centre] + 1 + intra-block running index.
     csum = tf.cumsum(n_per_centre)
     intra_idx = (tf.range(tf.shape(i_neigh)[0], dtype=tf.int32)
                  - tf.gather(csum, i_neigh)
                  + tf.gather(n_per_centre, i_neigh))
     neigh_pos = tf.gather(block_offsets, i_neigh) + 1 + intra_idx
 
-    # Scatter self-pairs and neighbour pairs into the final flat layout.
     centre_idx = tf.range(n_atoms, dtype=tf.int32)
     all_pos = tf.concat([centre_self_pos, neigh_pos], axis=0)[:, tf.newaxis]
 
@@ -1530,12 +1376,8 @@ def _nl_tf_kernel(positions, image_vectors, zero_image_idx, rcut):
 
 
 def _wrap_to_cell(positions: np.ndarray, cell: np.ndarray, pbc: np.ndarray) -> np.ndarray:
-    """Wrap atom positions into the primary unit cell.
-
-    The NL image-search range (ceil(rcut/proj_d) images/axis) only covers rcut
-    around atoms inside the cell, so out-of-cell atoms would miss neighbours.
-    Matches quippy's internal wrap for translation-invariant parity.
-    """
+    """Wrap positions into the cell: the image range ceil(rcut/proj_d) only covers
+    rcut around in-cell atoms, so out-of-cell atoms would miss neighbours (quippy wraps too)."""
     if not bool(np.any(pbc)):
         return np.asarray(positions, dtype=np.float64)
     try:
@@ -1544,8 +1386,7 @@ def _wrap_to_cell(positions: np.ndarray, cell: np.ndarray, pbc: np.ndarray) -> n
         return np.asarray(positions, dtype=np.float64)
     pos = np.asarray(positions, dtype=np.float64)
     frac = pos @ cell_inv
-    # Wrap ONLY periodic axes (a [T,T,F] slab must not have its z wrapped);
-    # mirrors build_neighbour_list_numpy and the per-axis n_imgs handling.
+    # Periodic axes only: a [T,T,F] slab must not have its z wrapped.
     frac -= np.floor(frac) * np.asarray(pbc, dtype=frac.dtype)
     return frac @ cell
 
@@ -1556,13 +1397,8 @@ def build_neighbour_list_tf(
     pbc: np.ndarray,
     rcut: float,
 ):
-    """TF-on-GPU neighbour list, same layout as build_neighbour_list_numpy but
-    the heavy tensor ops run on the compute device; returns on-device TF tensors.
-
-    Returns:
-        pair_atom, pair_gidx : [P] int32
-        rjs, thetas, phis    : [P] float64
-    """
+    """Image-enumeration NL on the compute device; returns on-device
+    (pair_atom, pair_gidx [P] int32, rjs, thetas, phis [P] float64)."""
     image_vectors, zero_image_idx = _compute_image_vectors(cell, pbc, rcut)
     positions = _wrap_to_cell(positions, cell, pbc)
     pos_t = tf.constant(positions)
@@ -1572,11 +1408,8 @@ def build_neighbour_list_tf(
     return _nl_tf_kernel(pos_t, img_t, z_t, r_t)
 
 
-# =========================================================================
-# Phase 5: minimum-image-convention all-pairs NL — eliminates the 27× image
-# factor when rcut < L/2 along every periodic direction. Fall back to the
-# full Phase-4 NL when this guard fails (small cells / large rcut).
-# =========================================================================
+# ── MIC neighbour list ── drops the 27× image factor when rcut < L/2 on every
+# periodic axis; otherwise fall back to the image-enumeration NL above.
 
 
 _NL_MIC_KERNEL_SIG = [
@@ -1589,13 +1422,9 @@ _NL_MIC_KERNEL_SIG = [
 
 @tf.function(input_signature=_NL_MIC_KERNEL_SIG, reduce_retracing=False)
 def _nl_mic_kernel(positions, cell, cell_inv, rcut):
-    """All-pairs NL via minimum-image convention (no image enumeration).
-
-    Builds [N, N, 3] MIC displacements instead of [N, N, N_img, 3], so cost
-    scales as N² not 27·N². Layout matches the Phase-4 / NumPy NL.
-    Caller must guarantee rcut < L_d/2 for every periodic dir d
-    (L_d = 1/||cell_inv[d]||), else genuine neighbours are missed.
-    """
+    """All-pairs NL via minimum-image convention: [N, N, 3] displacements instead of
+    [N, N, N_img, 3]; same layout as _nl_tf_kernel. Caller guarantees rcut < L_d/2 for
+    every periodic axis (L_d = 1/||cell_inv[:, d]||), else neighbours are missed."""
     n_atoms = tf.shape(positions)[0]
     frac = positions @ cell_inv                          # [N, 3]
     df = frac[tf.newaxis, :, :] - frac[:, tf.newaxis, :]  # [N, N, 3]
@@ -1665,19 +1494,15 @@ def _nl_mic_kernel(positions, cell, cell_inv, rcut):
 
 
 def _mic_is_safe(cell: np.ndarray, pbc: np.ndarray, rcut: float) -> bool:
-    """True if MIC suffices: rcut < half inter-plane distance for every PBC dim.
-
-    1/||cell_inv[d]|| is the perpendicular distance between opposite cell faces.
-    """
+    """True if rcut < half the inter-plane distance on every periodic axis."""
     if not bool(np.any(pbc)):
         return True  # non-periodic: no images at all (caller skips MIC path)
     try:
         cell_inv = np.linalg.inv(cell)
     except np.linalg.LinAlgError:
         return False  # degenerate cell — fall back to image-enumeration NL
-    # Inter-plane spacing along axis d = 1/|b_d|, b_d = COLUMN d of inv(cell),
-    # so norm over axis=0. axis=1 gives the wrong spacing for triclinic cells and
-    # can wrongly deem MIC "safe" (no-op for orthorhombic).
+    # Inter-plane spacing = 1/|b_d| with b_d a COLUMN of inv(cell) (axis=0);
+    # axis=1 wrongly deems MIC safe for triclinic cells.
     proj = 1.0 / np.linalg.norm(cell_inv, axis=0)  # [3]
     for d in range(3):
         if bool(pbc[d]) and rcut >= 0.5 * proj[d]:
@@ -1691,8 +1516,7 @@ def build_neighbour_list_fast_tf(
     pbc: np.ndarray,
     rcut: float,
 ):
-    """Fast TF NL: MIC path when safe (~27x cheaper for typical 3D-PBC cells),
-    else falls back to the full image-enumeration build_neighbour_list_tf."""
+    """MIC NL when safe (~27x cheaper for 3D-PBC cells), else build_neighbour_list_tf."""
     if _mic_is_safe(cell, pbc, rcut) and bool(np.any(pbc)):
         positions = _wrap_to_cell(positions, cell, pbc)
         pos_t = tf.constant(positions)
@@ -1703,19 +1527,13 @@ def build_neighbour_list_fast_tf(
     return build_neighbour_list_tf(positions, cell, pbc, rcut)
 
 
-# =========================================================================
-# Class wrapper
-# =========================================================================
+# ── class wrapper ──
 
 
 class DescriptorBuilderGPUTF:
-    """TF GPU-backed SOAP-turbo descriptor builder.
-
-    Drop-in replacement for DescriptorBuilder (same build_descriptors_flat API).
-    SOAP compute runs on GPU; the neighbour list stays on CPU (Python).
-    Restrictions: basis="poly3", compress_mode "trivial"/"none", uniform per-species
-    hyperparameters.
-    """
+    """TF GPU SOAP-turbo builder, drop-in for DescriptorBuilder (same API); the
+    neighbour list stays on CPU. Only basis="poly3", compress_mode "trivial"/"none",
+    uniform per-species hyperparameters."""
 
     def __init__(self, cfg) -> None:
         if getattr(cfg, "basis", "poly3") != "poly3":
@@ -1728,8 +1546,7 @@ class DescriptorBuilderGPUTF:
                 f"or 'none', got '{cfg.compress_mode}' — set descriptor_mode=0"
             )
         self.cfg = cfg
-        # Use cfg.types verbatim (do NOT sort): quippy assigns species indices
-        # in cfg-order; sorting permutes the species mapping vs quippy.
+        # cfg.types verbatim, NOT sorted: quippy assigns species indices in cfg order.
         self._species_Z = ([int(z) for z in cfg.types]
                            if getattr(cfg, "types", None) else None)
         self._soap_params = dict(
@@ -1748,32 +1565,25 @@ class DescriptorBuilderGPUTF:
             compress_mode=str(getattr(cfg, "compress_mode", "trivial")),
         )
         self._learn_radial = self._soap_params["radial_basis_size"] is not None
-        # Per-atom L2 normalisation of the fixed power spectrum ("l2") or the
-        # raw spectrum ("none"); "sqrt" is learned-basis only (∂/∂r singular
-        # at q=0). The learned basis normalises in TNEP.soap_from_raw instead.
+        # "sqrt" is learned-basis only (∂/∂r singular at q=0; normalised in TNEP.soap_from_raw).
         rb_norm = str(getattr(cfg, "radial_basis_norm", "l2"))
         if not self._learn_radial and rb_norm not in ("l2", "none"):
             raise ValueError(
                 f"cfg.radial_basis_norm={rb_norm!r}: the fixed SOAP builder "
                 f"supports 'l2' or 'none' ('sqrt' needs cfg.radial_basis_size).")
         self._normalize = rb_norm != "none"
-        # Precision: float64 (quippy/Fortran) or float32 (~2x faster, ~half VRAM).
-        # Compute fns are cached by (dtype, jit_compile).
+        # float64 (quippy parity) or float32 (~2x faster, ~half VRAM).
         self._real_dtype = (tf.float32
                             if str(getattr(cfg, "descriptor_precision",
                                             "float64")).lower() == "float32"
                             else tf.float64)
-        # Pair-tile size for the gradient path: 0 = single-shot (higher VRAM);
-        # >0 = tile pairs in P_tile chunks (lower peak VRAM). Part of the
-        # compute-fn cache key, so changes force a retrace.
+        # Gradient-path pair tile: 0 = single-shot (higher VRAM), >0 = P_tile chunks.
         self._pair_tile_size = int(getattr(cfg, "descriptor_pair_tile_size", 0))
 
-        # Cfg-only constants, built lazily (cfg.types may be unset at init) and
-        # rebuilt if cfg.types changes.
+        # Cfg constants, built lazily (cfg.types may be unset) and rebuilt if types change.
         self._cache = None
         self._cache_species_key = None
-        # Locked-signature @tf.function pair, keyed by (dtype, jit_compile);
-        # fp64/no-JIT built eagerly, other variants lazily.
+        # Locked-signature @tf.function pairs keyed by (dtype, jit_compile).
         self._compute_fns: dict = {}
         if self._species_Z is not None:
             self._cache = _build_cfg_cache(self._species_Z, self._soap_params)
@@ -1781,23 +1591,19 @@ class DescriptorBuilderGPUTF:
             self._build_locked_compute_fns(jit_compile=False)
 
     def set_pair_tile_size(self, pair_tile_size: int) -> None:
-        """Set the per-pair tile size for the gradient path.
-
-        0 = no tiling (single-shot, high peak VRAM); >0 = tile pairs in chunks,
-        cutting peak VRAM to O(pair_tile_size/P). Typical 600-atom frame: 5000-20000.
-        """
+        """Gradient-path pair tile: 0 = single-shot; >0 cuts peak VRAM to
+        O(pair_tile_size/P). Typical 600-atom frame: 5000-20000."""
         size = int(pair_tile_size)
         if size < 0:
             raise ValueError(f"pair_tile_size must be >=0, got {size}")
         if size == self._pair_tile_size:
             return
         self._pair_tile_size = size
-        # pair_tile_size is captured as a Python constant, so a change retraces.
+        # Captured as a Python constant, so a change retraces.
         self._compute_fns = {}
 
     def set_precision(self, precision: str) -> None:
-        """Switch GPU compute precision ("float64" default / "float32") in place;
-        clears the compute-fn cache so the next build traces in the new dtype."""
+        """Switch compute precision ("float64" / "float32") in place; next build retraces."""
         precision = str(precision).lower()
         if precision not in ("float64", "float32"):
             raise ValueError(f"descriptor_precision must be 'float64' or "
@@ -1806,13 +1612,11 @@ class DescriptorBuilderGPUTF:
         if new_dtype is self._real_dtype:
             return
         self._real_dtype = new_dtype
-        # Locked fns close over the old dtype's device constants, so rebuild.
+        # Locked fns close over the old dtype's constants, so rebuild.
         self._compute_fns = {}
 
     def _ensure_cache(self):
-        """Build (or rebuild if cfg.types changed) the constant cache and the
-        per-instance input_signature @tf.function wrappers. The locked signature
-        traces once per (cfg, dtype, jit, do_grad), avoiding per-call retracing."""
+        """Build (or rebuild on a cfg.types change) the constant cache and locked fns."""
         current_key = (tuple(int(z) for z in self.cfg.types)
                        if getattr(self.cfg, "types", None) else None)
         if current_key is None:
@@ -1834,8 +1638,8 @@ class DescriptorBuilderGPUTF:
         return self._compute_fns[key]
 
     def _build_locked_compute_fns(self, jit_compile: bool = False):
-        """Build and cache the (with_grad, fwd_only) @tf.function pair for the
-        current dtype + jit_compile, each traced once per (cfg, dtype, jit)."""
+        """Build and cache the (with_grad, fwd_only) @tf.function pair for dtype + jit;
+        the fixed input_signature means one trace per (cfg, dtype, jit)."""
         cache = self._cache
         sp = self._soap_params
         kept_triples = cache["kept_triples"]
@@ -1845,8 +1649,6 @@ class DescriptorBuilderGPUTF:
         device = "/GPU:0" if tf.config.list_physical_devices("GPU") else "/CPU:0"
 
         dtype = self._real_dtype
-        # Pre-place cfg-constant tensors on the device once per dtype (closure
-        # captures stable handles held on self).
         with tf.device(device):
             W_t       = tf.constant(cache["W_np"], dtype=dtype)
             mult_t    = tf.constant(cache["multiplicity_np"], dtype=dtype)
@@ -1854,14 +1656,13 @@ class DescriptorBuilderGPUTF:
             coeffs_t  = tf.constant(cache["mask_info"]["coeffs"], dtype=dtype)
             preflm_t  = tf.constant(cache["preflm_np"], dtype=dtype)
 
-        # Backwards-compat: outside callers may read self._W_t / etc.
+        # Outside callers read self._W_t etc.
         self._W_t = W_t
         self._mult_t = mult_t
         self._comp_idx_t = comp_idx_t
         self._coeffs_t = coeffs_t
         self._preflm_t = preflm_t
 
-        # Common Python-int / float kwargs captured by closure (constants per cfg)
         common_static = dict(
             kept_triples=kept_triples,
             n_species=n_species, alpha_max=int(sp["alpha_max"]),
@@ -1905,8 +1706,7 @@ class DescriptorBuilderGPUTF:
             )
 
         sig_fwd = [s for s in sig if s.name != "pair_gidx"]
-        # Forward-only kernel does not tile pairs (no per-pair derivative
-        # tensors to bound), so it takes no pair_tile_size.
+        # No per-pair derivative tensors to bound, so no pair_tile_size.
         fwd_static = {k: v for k, v in common_static.items()
                       if k != "pair_tile_size"}
 
@@ -1921,9 +1721,8 @@ class DescriptorBuilderGPUTF:
             )
 
         if self._learn_radial:
-            # Learned radial basis: the forward emits raw centre coefficients
-            # (TNEP.soap_from_raw finishes the descriptor); gradients through
-            # the learned basis are not implemented yet (spec §5).
+            # Forward emits raw centre coefficients (TNEP.soap_from_raw finishes the
+            # descriptor); gradients through the learned basis are not implemented.
             with tf.device(device):
                 W_K_t = tf.constant(cache["W_K_np"], dtype=tf.float64)
             cnk_static = dict(
@@ -1959,25 +1758,21 @@ class DescriptorBuilderGPUTF:
                         "the learned radial basis are not implemented (PES / "
                         "tnep readout / polarizability). Use the neighbor "
                         "dipole readout, or set radial_basis_size=None.")
-                # Neighbor readout on the trajectory path: it needs the
-                # pair index stream (V is built in-graph) but no gradient
-                # values.
+                # Neighbor readout: needs the pair index stream, not gradient values.
                 soap = fwd_only_fn(rjs, thetas, phis, pair_atom, pair_neigh,
                                    pair_central, pair_active, n_atoms)
                 return soap, tf.zeros([tf.shape(rjs)[0], 3, 0], soap.dtype)
 
         self._compute_fns[(dtype, bool(jit_compile))] = (with_grad_fn, fwd_only_fn)
-        # Backwards-compat aliases for the most-recently-built pair.
+        # Aliases for the most recently built pair.
         self._with_grad_fn = with_grad_fn
         self._fwd_only_fn = fwd_only_fn
 
-    # Default memory budget per @tf.function call (bytes). Tuned to leave
-    # headroom for the model's own GPU activity in the trajectory inference
-    # pipeline. Callers can override per-call via memory_budget_bytes.
+    # Per-call budget for auto batch sizing; leaves headroom for the model's own
+    # GPU work during trajectory inference. Override via memory_budget_bytes.
     DEFAULT_AUTO_BATCH_MEMORY_BUDGET_BYTES = 6 * (1 << 30)   # 6 GiB
 
-    # Sentinel: distinguishes "user didn't pass an explicit value, fall back
-    # to cfg default" from "user passed None to enable auto-sizing".
+    # "not passed" (use the cfg default) vs None (auto-size).
     _UNSET = object()
 
     def build_descriptors_flat(
@@ -1992,24 +1787,13 @@ class DescriptorBuilderGPUTF:
         progress_desc: str = "Building descriptors",
         use_tf_nl: bool | None = None,
     ) -> list:
-        """Per-frame flat COO output, with optional gradient computation.
+        """Per-frame flat COO (soap, grad, pair_atom, pair_gidx), gradients optional.
 
-        Args:
-            dataset             : list of ase.Atoms
-            calc_gradients      : if False, gradient/pair arrays are empty.
-            batch_frames        : frames per TF call. 1 = per-frame (lowest mem);
-                                  >=2 = batch (amortise launch overhead);
-                                  None = auto-size to the memory budget.
-            memory_budget_bytes : auto-sizer budget when batch_frames is None
-                                  (falls back to the class default). Else ignored.
-            return_tf           : if True, per-frame outputs stay as on-device TF
-                                  tensors (no GPU->CPU copy); False keeps NumPy.
-
-        Multi-frame batches are concatenated into one TF call with global
-        atom-index offsets, then unpacked per frame.
+        batch_frames frames go into one TF call with global atom offsets (None =
+        auto-size to memory_budget_bytes, default the class budget). return_tf=True
+        keeps per-frame outputs on-device instead of NumPy.
         """
         self._ensure_cache()
-        # Resolve cfg defaults when caller didn't pass an explicit value.
         if batch_frames is self._UNSET:
             batch_frames = getattr(self.cfg, "descriptor_batch_frames", 1)
         if memory_budget_bytes is self._UNSET:
@@ -2022,12 +1806,9 @@ class DescriptorBuilderGPUTF:
             )
         elif batch_frames < 1:
             raise ValueError(f"batch_frames must be >= 1 or None, got {batch_frames}")
-        # Resolve / build the locked compute fn pair for the requested
-        # (dtype, jit) combination. Cached after first call.
         with_grad_fn, fwd_only_fn = self._get_compute_fns(jit_compile)
         results = []
         chunk_starts = list(range(0, len(dataset), batch_frames))
-        # Progress bar only when requested and there are >=2 chunks.
         iterator = chunk_starts
         if progress and len(chunk_starts) >= 2:
             iterator = tqdm(chunk_starts, desc=progress_desc, unit="chunk",
@@ -2042,15 +1823,8 @@ class DescriptorBuilderGPUTF:
         return results
 
     def _estimate_mem_per_frame_bytes(self, atoms, calc_gradients: bool) -> int:
-        """Rough estimate of peak GPU bytes for one frame's SOAP compute.
-
-        Dominant terms (with gradients):
-          - 3× cnk_*_der          [k_max, n_max, P]           complex128 (16 B)
-          - intermediate prods    [P, k_max, n_max]           complex128 (16 B)
-          - power-spec per-pair   3 × [n_compressed, P]       float64    (8 B)
-          - Cartesian der          [P, 3, n_compressed]       float64    (8 B)
-        Forward-only drops the gradient terms.
-        """
+        """Rough peak GPU bytes for one frame; with gradients the per-pair complex
+        [k_max, n_max, P] tensors dominate."""
         rcut = float(self._soap_params["rcut_hard"])
         pa, _, _, _, _ = build_neighbour_list_numpy(
             np.asarray(atoms.positions, dtype=np.float64),
@@ -2066,14 +1840,12 @@ class DescriptorBuilderGPUTF:
         n_max = cache["n_max"]
         n_compressed = int(cache["mask_info"]["n_compressed"])
         if self._learn_radial:
-            # Raw centre coefficients over the K basis, no derivative tensors.
             n_basis = int(cache["n_basis"]) * cache["n_species"]
             return 16 * k_max * n_basis * n_atoms + 4 * 2 * k_max * n_basis * n_atoms
-        # Forward (always present): cnk + soap output
+        # Forward: cnk + soap output
         fwd = 16 * k_max * n_max * n_atoms + 8 * n_compressed * n_atoms
         if not calc_gradients:
             return fwd
-        # Gradient: dominated by per-pair complex tensors
         grad = (
             4 * 16 * k_max * n_max * n_pairs        # cnk + 3 derivatives
             + 2 * 16 * n_pairs * k_max * n_max      # intermediate products
@@ -2087,12 +1859,7 @@ class DescriptorBuilderGPUTF:
         calc_gradients: bool,
         memory_budget_bytes: int | None = None,
     ) -> int:
-        """Choose batch_frames so per-call memory fits the memory budget.
-
-        Estimates from the first frame; assumes other frames have similar size.
-        Returns at least 1 and at most len(dataset). When memory_budget_bytes
-        is None, falls back to DEFAULT_AUTO_BATCH_MEMORY_BUDGET_BYTES.
-        """
+        """batch_frames fitting the budget, estimated from the first frame; in [1, len(dataset)]."""
         if not dataset:
             return 1
         per_frame = self._estimate_mem_per_frame_bytes(dataset[0], calc_gradients)
@@ -2108,21 +1875,14 @@ class DescriptorBuilderGPUTF:
                           return_tf: bool = False,
                           with_grad_fn=None, fwd_only_fn=None,
                           use_tf_nl: bool | None = None) -> list:
-        """Process a chunk of frames in one TF call.
+        """One TF call for a chunk of frames: pair lists concatenated with global atom
+        offsets, outputs unpacked per frame (on-device slices when return_tf).
 
-        Multi-frame chunks concatenate pair lists with global atom offsets and
-        unpack outputs after. return_tf=True keeps per-frame slices as on-device
-        TF tensors (no host round-trip).
-
-        use_tf_nl selects the NL backend (None/False = NumPy NL). The TF NL runs
-        on GPU but materialises back to host for the NumPy bookkeeping below, so
-        it only pays off for already-on-device positions.
-        with_grad_fn / fwd_only_fn are the locked compute fns for the current
-        (dtype, jit); default (fp64, no JIT) if not supplied.
+        use_tf_nl=True runs the NL on GPU but materialises it back to host for the
+        bookkeeping below, so it only pays off for already-on-device positions.
         """
         if with_grad_fn is None or fwd_only_fn is None:
             with_grad_fn, fwd_only_fn = self._get_compute_fns(jit_compile=False)
-        # ---- Build pair lists for all frames; concatenate with global offsets ----
         rcut_hard = float(self._soap_params["rcut_hard"])
         z_to_idx = self._cache["z_to_idx"]
         per_frame_n_atoms = []
@@ -2131,8 +1891,6 @@ class DescriptorBuilderGPUTF:
         all_pa, all_pg, all_pneigh = [], [], []
         all_central, all_active = [], []
         atom_offset = 0
-        # NumPy NL is the default; TF NL only adds GPU<->CPU sync for CPU-
-        # resident atoms. Opt in via use_tf_nl=True for on-device positions.
         if use_tf_nl is None:
             use_tf_nl = False
         for atoms in chunk:
@@ -2145,8 +1903,6 @@ class DescriptorBuilderGPUTF:
                 pa_t, pg_t, rjs_t, thetas_t, phis_t = build_neighbour_list_fast_tf(
                     positions, cell, pbc, rcut_hard
                 )
-                # Materialise once per frame; the GPU parts (disps, sort,
-                # scatter) already ran, NumPy bookkeeping below is unchanged.
                 pa = pa_t.numpy(); pg = pg_t.numpy()
                 rjs = rjs_t.numpy(); thetas = thetas_t.numpy(); phis = phis_t.numpy()
             else:
@@ -2179,12 +1935,10 @@ class DescriptorBuilderGPUTF:
         pneigh_c = np.concatenate(all_pneigh)
         central_c = np.concatenate(all_central)
         active_c = np.concatenate(all_active)
-        # all_pa / all_pg kept alive for the per-frame return_tf path; rest freed.
         del all_rjs, all_thetas, all_phis, all_pneigh, all_central, all_active
 
-        # Pair tiling: pad the global pair list to a multiple of pair_tile_size
-        # with no-op pairs (pair_active=False, so zero contribution) so the
-        # while_loop body has a fixed P_TILE shape XLA can compile once.
+        # Pad pairs to a multiple of pair_tile_size with inactive no-op pairs so the
+        # tiled while_loop has a static P_TILE shape XLA compiles once.
         n_pairs_real = pa_c.shape[0]
         ptile = int(getattr(self, "_pair_tile_size", 0))
         if calc_gradients and ptile > 0 and n_pairs_real % ptile != 0:
@@ -2197,13 +1951,10 @@ class DescriptorBuilderGPUTF:
             pneigh_c = np.concatenate([pneigh_c, np.zeros(pad, dtype=pneigh_c.dtype)])
             central_c = np.concatenate([central_c, np.zeros(pad, dtype=bool)])
             active_c  = np.concatenate([active_c,  np.zeros(pad, dtype=bool)])
-            # per_frame_n_pairs is slicing-only; the padded tail is dropped below.
+            # per_frame_n_pairs slicing drops the padded tail below.
 
-        # ---- Single TF call via the locked-signature wrapper ----
         device = "/GPU:0" if tf.config.list_physical_devices("GPU") else "/CPU:0"
         with tf.device(device):
-            # Push pair-list to device in the kernel's working dtype (consistent
-            # dtype across the graph).
             rjs_t = tf.constant(rjs_c, dtype=self._real_dtype)
             thetas_t = tf.constant(thetas_c, dtype=self._real_dtype)
             phis_t = tf.constant(phis_c, dtype=self._real_dtype)
@@ -2213,7 +1964,6 @@ class DescriptorBuilderGPUTF:
             central_t = tf.constant(central_c)
             active_t = tf.constant(active_c)
             n_atoms_t = tf.constant(total_atoms, dtype=tf.int32)
-            # *_c copied into device constants; free (pa_c / pg_c kept for slicing).
             del rjs_c, thetas_c, phis_c, pneigh_c, central_c, active_c
 
             if calc_gradients:
@@ -2230,13 +1980,10 @@ class DescriptorBuilderGPUTF:
                 )
                 soap_t = tf.cast(soap_t, tf.float32)
                 grad_t = None
-            # Free kernel inputs before slicing so peak VRAM is soap_t / grad_t only.
+            # Free inputs before slicing: peak VRAM is then soap_t / grad_t only.
             del rjs_t, thetas_t, phis_t, pair_atom_t, pair_gidx_t, pair_neigh_t
             del central_t, active_t, n_atoms_t
 
-            # ---- Split outputs back per frame ----
-            # return_tf=False drops to NumPy (training / quippy parity);
-            # True keeps tensors on-device for the caller.
             if not return_tf:
                 soap_np = soap_t.numpy()
                 grad_np = grad_t.numpy() if calc_gradients else None
@@ -2266,8 +2013,7 @@ class DescriptorBuilderGPUTF:
                     pair_off += P
                 return out
 
-            # return_tf=True: per-frame slices stay on-device. Eager slices
-            # allocate fresh tensors, so soap_t / grad_t free after the loop.
+            # Eager slices allocate fresh tensors, so soap_t / grad_t free after the loop.
             n_compressed = soap_t.shape[1]
             zero_grad = tf.zeros((0, 3, n_compressed), dtype=tf.float32)
             zero_int = tf.zeros((0,), dtype=tf.int32)
@@ -2280,8 +2026,6 @@ class DescriptorBuilderGPUTF:
                 soap_frame = soap_t[atom_off:atom_off + N]
                 if calc_gradients:
                     grad_frame = grad_t[pair_off:pair_off + P]
-                    # all_pa/all_pg hold chunk-global indices; subtract atom_off
-                    # for frame-local, then push to device.
                     pa_frame = tf.constant(all_pa[k] - atom_off, dtype=tf.int32)
                     pg_frame = tf.constant(all_pg[k] - atom_off, dtype=tf.int32)
                     out.append((soap_frame, grad_frame, pa_frame, pg_frame))
@@ -2302,15 +2046,10 @@ class DescriptorBuilderGPUTF:
         calc_gradients: bool = True,
         batch_frames=_UNSET,
         progress_desc: str = "Building descriptors",
+        use_tf_nl: bool | None = None,
     ):
-        """Bucketised-by-atom format used by the training pipeline.
-
-        calc_gradients=False yields empty per-atom gradient/index lists (PES
-        and the neighbor dipole readout; only
-        target_mode=0/PES is meaningful then).
-        Returns (dataset_descriptors, dataset_gradients, dataset_grad_index).
-        """
-        # Resolve effective chunk size for the user-facing print.
+        """Per-atom bucketised (dataset_descriptors, dataset_gradients, dataset_grad_index)
+        for the training pipeline; calc_gradients=False gives empty per-atom lists."""
         eff_batch_frames = (batch_frames if batch_frames is not self._UNSET
                             else getattr(self.cfg, "descriptor_batch_frames", 1))
         n = len(dataset)
@@ -2319,19 +2058,15 @@ class DescriptorBuilderGPUTF:
               f"batch_frames: {eff_batch_frames}, "
               f"pair_tile_size: {self._pair_tile_size}, "
               f"calc_gradients: {calc_gradients})")
-        # pin_data_to_cpu=True stores per-frame tensors on host RAM so the many
-        # small per-atom gradient tensors don't pile up in VRAM (OOM at large S).
+        # pin_data_to_cpu keeps the many small per-atom tensors in host RAM (VRAM OOM at large S).
         pin = bool(getattr(self.cfg, "pin_data_to_cpu", True))
         target_device = "/CPU:0" if pin else "/GPU:0"
         flat = self.build_descriptors_flat(
             dataset, calc_gradients=calc_gradients, batch_frames=batch_frames,
-            progress=True, progress_desc=progress_desc,
-        )
+            progress=True, progress_desc=progress_desc, use_tf_nl=use_tf_nl)
         dataset_descriptors = []
         dataset_gradients = []
         dataset_grad_index = []
-        # Convert per-frame under one device-scope so tensors land on the right
-        # device.
         with tf.device(target_device):
             for atoms, item in zip(dataset, flat):
                 soap, grad, pa, pg = item
@@ -2346,8 +2081,7 @@ class DescriptorBuilderGPUTF:
                         i = int(pa[p])
                         grads_per_atom[i].append(grad[p])
                         idx_per_atom[i].append(int(pg[p]))
-                    # Empty per-atom lists keep the [0,3,Q] shape (bare
-                    # np.asarray([]) is (0,) and breaks downstream concat).
+                    # Empty atoms keep [0,3,Q]: np.asarray([]) is (0,) and breaks the concat.
                     grads_tf = []
                     for g in grads_per_atom:
                         if len(g) > 0:
@@ -2359,24 +2093,20 @@ class DescriptorBuilderGPUTF:
                     dataset_gradients.append(grads_tf)
                     dataset_grad_index.append(idx_per_atom)
                 else:
-                    # Empty per-atom lists: training pipeline will pad to zero pairs
                     dataset_gradients.append([
                         tf.zeros((0, 3, soap.shape[1]), dtype=tf.float32)
                         for _ in range(N)
                     ])
                     dataset_grad_index.append([[] for _ in range(N)])
-        # Drop source arrays so they GC before pad_and_stack (avoid double copy).
+        # GC before pad_and_stack, avoiding a double copy.
         del flat
         return dataset_descriptors, dataset_gradients, dataset_grad_index
 
     def build_descriptors_self_only(self, dataset: list, batch_size=None,
                                     **build_kwargs):
-        """Same triple as `build_descriptors`, reduced to what mode-1 self-only
-        callers read: nothing when no SOAP gradients are read (neighbor
-        readout; tnep under nep_descriptor="replace"), the self-pair row
-        ∂q_i/∂r_i otherwise.
-        `batch_size` is accepted for API parity with the quippy builder (this
-        backend already batches by cfg.descriptor_batch_frames)."""
+        """build_descriptors reduced to what mode-1 self-only callers read: no gradients
+        when none are needed, else only the self-pair row ∂q_i/∂r_i.
+        batch_size is API parity with the quippy builder (this one batches by cfg)."""
         from data import soap_gradients_needed
         if not soap_gradients_needed(self.cfg):
             return self.build_descriptors(dataset, calc_gradients=False,
@@ -2387,59 +2117,3 @@ class DescriptorBuilderGPUTF:
         return _filter_to_self_pairs(
             *self.build_descriptors(dataset, **build_kwargs))
 
-
-# =========================================================================
-# Phase 11 validation: TF outputs match NumPy reference
-# =========================================================================
-
-
-def run_phase11_validation() -> None:
-    """For all 7 fixtures, the TF backend must agree with the NumPy reference."""
-    print("=== Phase 11 validation (TF GPU port vs NumPy reference) ===\n")
-    fixtures = ["water_monomer", "water_dimer", "h2_close", "h2_far",
-                "single_h", "si_bulk", "si_dimer"]
-    max_soap = 0.0
-    max_grad = 0.0
-    for name in fixtures:
-        f = load_fixture(name)
-        positions = np.asarray(f["positions"], dtype=np.float64)
-        cell = np.asarray(f["cell"], dtype=np.float64)
-        pbc = np.asarray(f["pbc"], dtype=bool)
-        numbers = np.asarray(f["numbers"], dtype=np.int32)
-        species_Z = sorted(set(int(z) for z in numbers))
-        soap_params = f["soap_params"]
-
-        # NumPy reference
-        soap_np, grad_np, pa_np, pg_np = compute_soap_with_grad_from_positions_numpy(
-            positions, cell, pbc, numbers, species_Z, soap_params,
-        )
-        # TF backend
-        soap_tf, grad_tf, pa_tf, pg_tf = compute_soap_with_grad_from_positions_tf(
-            positions, cell, pbc, numbers, species_Z, soap_params,
-        )
-        soap_tf_np = soap_tf.numpy().astype(np.float64)
-        grad_tf_np = grad_tf.numpy().astype(np.float64)
-
-        # Pair lists match (same NL builder)
-        if not np.array_equal(pa_np, pa_tf):
-            raise AssertionError(f"{name}: pair_atom differs between NumPy and TF backends")
-
-        s_err = float(np.abs(soap_np.astype(np.float32) - soap_tf_np.astype(np.float32)).max())
-        g_err = float(np.abs(grad_np.astype(np.float32) - grad_tf_np.astype(np.float32)).max())
-        max_soap = max(max_soap, s_err)
-        max_grad = max(max_grad, g_err)
-        if s_err > 1e-5 or g_err > 1e-4:
-            raise AssertionError(
-                f"{name}: TF vs NumPy mismatch. soap={s_err:.3e}, grad={g_err:.3e}"
-            )
-        print(f"   {name:<14} N={int(f['n_atoms']):>2}  P={len(pa_np):>4}  "
-              f"|Δsoap|={s_err:.2e}  |Δgrad|={g_err:.2e}  PASS")
-    print(f"\n   Overall max |Δsoap|={max_soap:.2e}, max |Δgrad|={max_grad:.2e}")
-    print("\nAll Phase 11 (TF GPU) checks passed.")
-
-
-if __name__ == "__main__":
-    print(f"TF version: {tf.__version__}")
-    gpus = tf.config.list_physical_devices("GPU")
-    print(f"GPUs: {gpus if gpus else 'NONE — running on CPU'}\n")
-    run_phase11_validation()

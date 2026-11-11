@@ -41,11 +41,10 @@ def _nep_radial_xla(alpha, slot, fnp, rhat, K):
 
 @tf.function(jit_compile=True)
 def _nep_angular_xla(Gs, c_a_flat, i_lin, slot, fn, fnp, rhat, Pc, dPc, n_a, K):
-    """F^a [Cc, P_a, 3] = Σ_n [ gnp_n (Σ_c Gs[i,n,c] P_c) r̂ + g_n Σ_c Gs[i,n,c] ∇P_c ]
-    with g_n = Σ_k c_a[t_i,t_j,n,k] fn_k, gnp_n likewise with fnp_k (plan §B.2).
-    Gs [Cc, N, n_a, 24] gathered by i_lin; c_a_flat [Cc, T·T, n_a, K] by slot =
-    t_i·T + t_j; Pc [P_a, 24]; dPc [P_a, 3, 24] Cartesian ∇P_c. n-loop (and
-    Cartesian loop) so the largest live tensor is [Cc, P_a, 24] (K ≤ 24)."""
+    """F^a [Cc, P_a, 3] = Σ_n [ gnp_n (Σ_c Gs[i,n,c] P_c) r̂ + g_n Σ_c Gs[i,n,c] ∇P_c ],
+    g_n = Σ_k c_a[t_i,t_j,n,k] fn_k (gnp_n with fnp_k). Gs [Cc, N, n_a, 24] gathered
+    by i_lin; c_a_flat [Cc, T·T, n_a, K] by slot = t_i·T + t_j; Pc [P_a, 24];
+    dPc [P_a, 3, 24]. n-loop keeps the largest live tensor at [Cc, P_a, 24]."""
     F = tf.zeros([1, 1, 3], Gs.dtype)
     for n in range(n_a):                                                 # static n_a
         Gs_n = tf.gather(Gs[:, :, n, :], i_lin, axis=1)                  # [Cc, P_a, 24]
@@ -66,7 +65,8 @@ class TNEP(layers.Layer):
         W0 [num_types, dim_q, num_neurons]  in→hidden
         b0 [num_types, num_neurons]         hidden bias
         W1 [num_types, num_neurons]         hidden→scalar
-        b1 ()                               global scalar bias
+        b1 ()                               global scalar bias (PES / tnep readout)
+        b1 [T, S]                           neighbor readout: per-type site bias
 
     Modes (cfg.target_mode):
         0 PES     : E = -Σ_i U_i                                   → [1]
@@ -74,14 +74,13 @@ class TNEP(layers.Layer):
                     neighbor μ = Σ_i Σ_n s_i^n · c · V_i[:, n, :]  → [3]
         2 Polar.  : neighbor, rank 2 — two even bond kernels          → [6]
 
-    Mode 2 is ALWAYS the neighbour readout (bond_rank 2) on two kernel
-    groups, each with its own site head (channels group-major, Ck = 2C):
+    Mode 2 is always the neighbour readout (bond_rank 2) on two kernel groups
+    with separate site heads (channels group-major, Ck = 2C):
         α = Σ_{i<j} R_n(r_ij)·[ c⁰ (s_i^n + s_j^n) |d|²·I
                                + c¹ (u_i^n + u_j^n) (d⊗d − |d|²I/3) ]
-    — a learned bond polarisability with independent α⊥ and α∥−α⊥ (the
-    isotropic and anisotropic parts differ by ~100× in scale and must not
-    share a coefficient; this mirrors GPUMD's scalar + anisotropic pair).
-    Output order: [xx, yy, zz, xy, yz, zx].
+    Isotropic and anisotropic parts differ ~100× in scale, so they must not share
+    a coefficient (GPUMD's scalar + anisotropic pair). Output order
+    [xx, yy, zz, xy, yz, zx].
     """
 
     def __init__(self,
@@ -90,15 +89,12 @@ class TNEP(layers.Layer):
         super().__init__(**kwargs)
         self.cfg = cfg
 
-        # GPUMD NEP descriptor block (multi_descriptor_plan.md §0.3): raw
-        # per-atom basis from data, contracted in-model by c_r/c_a (below).
-        # validate_nep_cfg owns every NEP cfg guard.
+        # NEP block: raw basis from data, contracted in-model by c_r/c_a.
         self._nep_mode = validate_nep_cfg(cfg)
 
-        # cfg.dim_q is the descriptor width the ANN is built for; nothing
-        # overrides it any more, so a saved config whose dim_q disagrees with
-        # this build's descriptor predates a descriptor change.
-        from DescriptorBuilderGPU import compute_dim_q, soap_dim
+        # A saved dim_q that disagrees with this build's descriptor predates a
+        # descriptor change; the model must be retrained.
+        from descriptor_layout import compute_dim_q, soap_dim
         _dim_q_now = int(compute_dim_q(cfg))
         if int(cfg.dim_q) != _dim_q_now:
             raise ValueError(
@@ -107,25 +103,26 @@ class TNEP(layers.Layer):
                 f"(removed learned-basis NEP extras / preprocess contraction); "
                 f"the model must be retrained.")
         self.dim_q = cfg.dim_q
-        # SOAP-only width (the builder's output after soap_from_raw); under
-        # nep_descriptor="concat" dim_q is wider by the NEP block.
+        # SOAP-only width; under "concat" dim_q is wider by the NEP block.
         self._soap_dim = int(soap_dim(cfg))
         self.num_types = cfg.num_types
-        self.num_neurons = cfg.num_neurons
-        self._H_final = cfg.num_neurons
-        # Any tf.keras.activations.get name is accepted here; _activation_grad
-        # raises NotImplementedError at first dipole/pol pass if not plumbed.
+        # Rank-2 readout: G hidden blocks of num_neurons, W1 block-diagonal
+        # (_head_mask) so the isotropic and traceless sites share no hidden unit.
+        self._head_groups = bond_rank(cfg) if neighbor_readout_on(cfg) else 1
+        self.num_neurons = cfg.num_neurons * self._head_groups
+        self._H_final = self.num_neurons
+        # Any Keras activation name is accepted; _activation_grad raises at the
+        # first dipole/pol pass if its derivative is not plumbed.
         self._activation_name = str(cfg.activation).lower().strip()
         self._glorot_gain = 1.0
         self.activation = tf.keras.activations.get(cfg.activation)
 
-        # Learned radial basis (cfg.radial_basis_size = K): the builder emits
-        # raw centre coefficients [.., A, S·K·k_max·2] in the descriptors slot
-        # and soap_from_raw finishes the SOAP-turbo descriptor with M_radial.
+        # Learned radial basis (K = cfg.radial_basis_size): the builder emits raw
+        # centre coefficients [.., A, S·K·k_max·2]; soap_from_raw finishes them.
         _K = getattr(cfg, "radial_basis_size", None)
         self._learn_radial = _K is not None
         if self._learn_radial:
-            from DescriptorBuilderGPU import (radial_basis_init,
+            from descriptor_layout import (radial_basis_init,
                                               radial_basis_channel_map)
             K = int(_K)
             alpha = int(cfg.alpha_max)
@@ -153,8 +150,7 @@ class TNEP(layers.Layer):
                 raise ValueError(
                     f"cfg.radial_basis_norm={cfg.radial_basis_norm!r}; expected "
                     f"'l2', 'none' or 'sqrt'.")
-            # Fixed O(1) scale for the raw coefficients: undo SOAP-turbo's 4π
-            # and angular amplitude (rcut/σ_t)² they carry.
+            # O(1) scale for the raw coefficients: undo SOAP-turbo's 4π·(rcut/σ_t)².
             self._rb_coef_scale = float(
                 1.0 / (4.0 * np.pi * (float(cfg.rcut_hard) / float(cfg.atom_sigma_t)) ** 2))
             cm = radial_basis_channel_map(alpha, int(cfg.l_max), cfg.num_types,
@@ -200,31 +196,20 @@ class TNEP(layers.Layer):
                     "cfg.radial_basis_norm='none' requires descriptor_mode=1 "
                     "(the quippy builder always L2-normalises).")
             self.M_radial = None
-        # NEP contraction tensors c[t_centre, t_neighbour, n, k]: uniform(−1, 1)
-        # like GPUMD's snes.cu init; non-trainable like M_radial (SNES assigns,
-        # Adam tape-watches). "off": None, and dim_q is the SOAP width.
+        # NEP contraction c[t_centre, t_neighbour, n, k]: uniform(−1, 1) like
+        # GPUMD's snes.cu; non-trainable like M_radial (SNES assigns, Adam
+        # tape-watches). "off": None.
         self.c_r = self.c_a = None
         self._nep_dim = 0
         self._nep_gram = False
-        # "sum" / "gap_sum": ANN_2b + ANN_3b experts added to the SOAP ANN;
-        # their inputs are the NEP contraction or the GAP q2 ‖ q3 raw slot.
-        self._experts_on = self._nep_mode in ("sum", "gap_sum")
-        # The models that make up the prediction, in order; the first is the
-        # main ANN, the rest are extra ANNs. Each has its OWN species-pair
-        # readout table: μ = Σ_k Σ_i s_k,i·Ω_k(r_ij)·d_ij (neighbor readout).
-        # "gap_sum" takes the selection from cfg.gap_models.
-        if self._nep_mode == "gap_sum":
-            from gap_descriptor import gap_models
-            self._models = gap_models(cfg)
-        else:
-            self._models = ("soap", "2b", "3b") if self._experts_on else ("soap",)
-        self._main_in = None      # slice of the raw expert input feeding the main ANN (None = SOAP)
+        # "sum": ANN_2b + ANN_3b experts on the NEP contraction, added to the SOAP ANN.
+        self._experts_on = self._nep_mode == "sum"
+        # Models in order (main ANN first); each has its OWN species-pair table.
+        self._models = ("soap", "2b", "3b") if self._experts_on else ("soap",)
         self._expert_suf = ()     # weight-name suffix per extra model
-        # Per-expert amplitudes δ = (δ_soap, δ_2b, δ_3b) on the summed head.
-        # Exactly redundant with rescaling each expert's W1 — meaningful only
-        # because δ is excluded from the L1/L2 penalty on W1 (cfg.sum_delta).
-        # Non-trainable tf.Variable like M_radial / c_r: SNES assigns it,
-        # Adam tape-watches it. None (and a no-op everywhere) when experts off.
+        # Per-expert amplitudes δ = (δ_soap, δ_2b, δ_3b): redundant with W1
+        # rescaling but excluded from the L1/L2 penalty. Non-trainable like
+        # M_radial; None (no-op) when experts off.
         self.sum_delta = None
         if self._experts_on:
             _d = np.asarray(getattr(cfg, "sum_delta", [1.0, 1.0, 1.0]),
@@ -234,19 +219,15 @@ class TNEP(layers.Layer):
                     f"cfg.sum_delta has {_d.size} entries, expected 3 "
                     f"(δ_soap, δ_2b, δ_3b).")
             self.sum_delta = tf.Variable(_d, trainable=False, name="sum_delta")
-        # Phase B: dipole via per-candidate NEP pair forces (plan §B.2).
+        # tnep dipole under NEP: per-candidate NEP pair forces (_dipole_nep_pairs).
         self._nep_pair_forces_on = (self._nep_mode in ("concat", "replace")
                                     and cfg.target_mode == 1
                                     and str(cfg.dipole_readout) == "tnep")
-        if self._nep_mode == "gap_sum":
-            from gap_descriptor import gap_dim
-            self._nep_dim = self._nep_raw_width = int(gap_dim(cfg))
-        elif self._nep_mode != "off":
+        if self._nep_mode != "off":
             self._nep_dim = int(nep_dim(cfg))
             self._nep_raw_width = int(nep_raw_width(cfg))
-            # Data-static 3-body Gram block at the tail of nep_raw: it makes
-            # the per-candidate angular contraction one GEMM per centre type
-            # instead of a [C, N, n+1, 24] s tensor (nep_gram_on).
+            # Data-static 3-body Gram at the tail of nep_raw: one GEMM per centre
+            # type instead of a [C, N, n+1, 24] s tensor (nep_gram_on).
             self._nep_gram = bool(nep_gram_on(cfg))
             if self._nep_gram:
                 _p, _q, _ = gram_pairs(cfg)
@@ -261,21 +242,14 @@ class TNEP(layers.Layer):
             self.c_a = tf.Variable(rng.uniform(-1.0, 1.0, (
                 T, T, cfg.nep_n_max_angular + 1, cfg.nep_basis_size_angular + 1)
             ).astype(np.float32), trainable=False, name="nep_c_a")
-        # descriptor_scale sees the main ANN's input (dim_q) and, under
-        # "sum" / "gap_sum", the expert input after it ([q_soap ‖ q_nep], see
-        # gen0_ann_inputs): one slice of cfg.q_scale per typed ANN.
+        # q_scale covers the main input (dim_q) then, under "sum", the expert
+        # input ([q_soap ‖ q_nep], gen0_ann_inputs): one slice per typed ANN.
         self._sl_main = slice(0, int(self.dim_q))
         self._scale_width = int(self.dim_q)
         self._expert_in = ()      # (input slice of q_nep, slice of q_scale) per expert
         if self._experts_on:
-            if self._nep_mode == "gap_sum":
-                from gap_descriptor import gap_slices
-                nsl, key = gap_slices(cfg), {"2b": "two_body", "3b": "three_body"}
-            else:
-                nsl, key = nep_slices(cfg), {"2b": "radial", "3b": "angular"}
+            nsl, key = nep_slices(cfg), {"2b": "radial", "3b": "angular"}
             ds = self._scale_width
-            if self._models[0] != "soap":
-                self._main_in = nsl[key[self._models[0]]]
             extra = self._models[1:]
             self._expert_suf = tuple({"2b": "_r", "3b": "_a"}[m] for m in extra)
             self._expert_in = tuple(
@@ -283,11 +257,9 @@ class TNEP(layers.Layer):
             self._scale_width += self._nep_dim
         # δ slot (δ_soap, δ_2b, δ_3b) of each model, main first.
         self._delta_idx = tuple(("soap", "2b", "3b").index(m) for m in self._models)
-        # Descriptor scale: m folded into W0 (see _W0_eff). The stored weights
-        # keep their plain Glorot / zero init and act on the SCALED, centred
-        # input m∘(q − μ) — GPUMD's convention (O(1) weights on O(1) inputs).
-        # Do NOT divide the init by m to reproduce the unscaled model: that
-        # starts the tanh layer saturated and inflates L1/L2 by 1/m.
+        # descriptor_scale: m folded into W0 (_scale_fold); stored weights keep
+        # their plain init and act on m∘(q − μ), GPUMD's convention. Do NOT
+        # divide the init by m: that saturates tanh and inflates L1/L2 by 1/m.
         self._q_scale = None
         if str(getattr(cfg, "descriptor_scale", "off")) != "off":
             if str(cfg.descriptor_scale) not in ("block", "channel", "minmax"):
@@ -318,7 +290,7 @@ class TNEP(layers.Layer):
         # W0 : [num_types, dim_q, num_neurons] — input-to-hidden weights per type
         self.W0 = self.add_weight(
             name="W0",
-            shape=(cfg.num_types, cfg.dim_q, cfg.num_neurons),
+            shape=(cfg.num_types, cfg.dim_q, self.num_neurons),
             initializer="glorot_uniform",
             trainable=True,
         )
@@ -326,13 +298,12 @@ class TNEP(layers.Layer):
         # b0 : [num_types, num_neurons] — hidden bias per type
         self.b0 = self.add_weight(
             name="b0",
-            shape=(cfg.num_types, cfg.num_neurons),
+            shape=(cfg.num_types, self.num_neurons),
             initializer="zeros",
             trainable=True,
         )
 
-        # Neighbor-basis dipole readout: decided before W1 so the site head
-        # can carry its channel axis.
+        # Neighbor readout is decided before W1 so the head can carry its channel axis.
         _readout = str(cfg.dipole_readout)
         if cfg.target_mode == 2 and _readout != "neighbor":
             raise ValueError(
@@ -340,37 +311,31 @@ class TNEP(layers.Layer):
                 f"descriptor-gradient (dual ANN) polarisability form was "
                 f"removed. Set dipole_readout='neighbor' (got {_readout!r}).")
         self._neighbor_readout = neighbor_readout_on(cfg)
-        # Bond tensor rank = number of kernel groups: 1 → d [3]; 2 → Voigt [6]
-        # with an isotropic and a traceless group (_bond_geometry).
+        # Kernel groups: 1 → d [3]; 2 → Voigt [6], isotropic + traceless (_bond_geometry).
         self._bond_rank = bond_rank(cfg)
         self._dipole_channels = int(cfg.dipole_channels)      # radial channels C
-        # Long-range field channel (mode 1): one extra staged channel after
-        # the radial groups; its own head slot under the scalar head.
+        # Long-range field channel (mode 1): one extra staged channel after the
+        # radial groups, with its own slot under the scalar head.
         self._field_channel = (bool(getattr(cfg, "dipole_field", False))
                                and cfg.target_mode == 1 and self._neighbor_readout)
-        # Channel axis of V / c_pair / the vector head: C per group, group-major,
-        # then the field channel.
+        # Channel axis of V / c_pair / vector head: C per group, group-major, then field.
         self._kernel_channels = kernel_channels(cfg)
         self._dipole_radial = str(cfg.dipole_radial)
         self._dipole_zeta = float(cfg.dipole_zeta)
         self._dipole_cutoff = resolved_dipole_cutoff(cfg)
-        # Legacy bool → 3-value field: False→"off", True→"symmetric".
         _sp = cfg.dipole_species_pairs
         cfg.dipole_species_pairs = {False: "off", True: "symmetric"}.get(_sp, _sp)
         self._species_pairs = str(cfg.dipole_species_pairs)
         # THE learnability flag: every save/load/SNES-tail site keys on this.
         self._c_learnable = self._species_pairs != "off"
-        # dipole_head: "vector" = one head slot per radial channel, "scalar" =
-        # one slot broadcast over the channels (_split_head does the tiling).
+        # dipole_head: "vector" one slot per channel; "scalar" one per group (_split_head).
         self._dipole_head = str(getattr(cfg, "dipole_head", "vector"))
         if self._dipole_head not in ("vector", "scalar"):
             raise ValueError(
                 f"cfg.dipole_head must be 'vector' or 'scalar', "
                 f"got {cfg.dipole_head!r}.")
-        # THE single source for W1's last axis; SNES/model_io read it back.
-        # Ck = C·groups slots under the vector head; one slot PER KERNEL GROUP
-        # under "scalar" (broadcast over that group's C channels in
-        # _split_head); 1 for every non-neighbour readout.
+        # THE source for W1's last axis (SNES/model_io read it back): Ck under
+        # the vector head, one slot per kernel group under "scalar", else 1.
         if not self._neighbor_readout:
             self._head_slots = 1
         elif self._dipole_head == "vector":
@@ -395,16 +360,12 @@ class TNEP(layers.Layer):
                     f"cfg.dipole_radial must be 'chebyshev', "
                     f"'chebyshev_warped', 'gaussian', 'bessel' or 'screened', "
                     f"got {self._dipole_radial!r}.")
-            if self._dipole_cutoff not in ("cosine2", "cosine", "cubic",
-                                           "tanh3"):
+            if self._dipole_cutoff not in ("cosine2", "cosine"):
                 raise ValueError(
-                    f"cfg.dipole_cutoff must be 'cosine2', 'cosine', 'cubic', "
-                    f"'tanh3' or None (None = the radial family's traditional "
-                    f"form), got {cfg.dipole_cutoff!r}.")
+                    f"cfg.dipole_cutoff must be 'cosine2', 'cosine' or None "
+                    f"(None = 'cosine2'), got {cfg.dipole_cutoff!r}.")
             if self._dipole_radial == "screened" and self._dipole_channels != 1:
-                # RAISE, don't force: data assembly reads cfg.dipole_channels
-                # before the model exists (data.py V build), so silently
-                # forcing C=1 here would ship a shape-mismatched V.
+                # Raise, don't force C=1: data.py builds V from cfg before the model exists.
                 raise ValueError(
                     f"cfg.dipole_radial='screened' is single-channel — set "
                     f"dipole_channels=1 (got {self._dipole_channels}).")
@@ -413,8 +374,7 @@ class TNEP(layers.Layer):
                     f"cfg.dipole_species_pairs must be 'off', 'symmetric' or "
                     f"'ordered' (legacy bool accepted), got {_sp!r}.")
 
-        # W1 : hidden-to-scalar weights per type — [T, H_final], with an extra
-        # radial-channel axis [T, H_final, C] under the neighbor readout.
+        # W1 : [T, H_final] hidden→scalar; [T, H_final, S] under the neighbor readout.
         self.W1 = self.add_weight(
             name="W1",
             shape=((cfg.num_types, self._H_final, self._head_slots)
@@ -424,25 +384,33 @@ class TNEP(layers.Layer):
             trainable=True,
         )
 
-        # b1 : () — global scalar bias shared across all types
+        # Block-diagonal W1 mask [H_final, S]: slot k reads hidden block k // (S/G).
+        # ponytail: masked genes stay in the SNES genome (T·H·G·(G−1)); store
+        # W1 per block if that ever matters.
+        self._head_mask = None
+        if self._head_groups > 1:
+            G, S, Hb = self._head_groups, self._head_slots, cfg.num_neurons
+            grp_h = np.arange(self._H_final) // Hb
+            grp_s = np.arange(S) // (S // G)
+            self._head_mask = tf.constant((grp_h[:, None] == grp_s[None, :]).astype(np.float32))
+
+        # b1 : () global scalar bias; neighbor readout: [T, S] per-type site bias
+        # (a global one cancels in s_i − s_j; per-type is the fixed-charge part).
         self.b1 = self.add_weight(
             name="b1",
-            shape=(),
+            shape=((cfg.num_types, self._head_slots)
+                   if self._neighbor_readout else ()),
             initializer="zeros",
             trainable=True,
         )
 
-        # c_pair : packed per-(channel, species pair) coefficients of the
-        # neighbor readout — [C, T(T+1)/2] unordered ("off"/"symmetric") or
-        # [C, T²] ordered. Learnable (init 1.0, in the SNES tail) when
-        # _c_learnable; frozen c ≡ 1 for "off" — the forward always contracts
-        # through it either way. _pair_idx maps (t_center, t_neighbor) to the
-        # packed slot; _c_full gathers it back to [C, T, T].
+        # c_pair : packed per-(channel, species pair) coefficients, [C, T(T+1)/2]
+        # unordered or [C, T²] ordered; learnable (init 1) when _c_learnable,
+        # else frozen c ≡ 1. _pair_idx maps (t, t') → slot; _c_full unpacks.
         if self._neighbor_readout:
             T_ = cfg.num_types
             if self._species_pairs == "ordered":
-                # Ordered index t·T + t' — an asymmetric Ω breaks the
-                # (s_i − s_j) difference-form antisymmetry across species.
+                # t·T + t': an asymmetric Ω breaks the (s_i − s_j) antisymmetry.
                 pair_idx = np.arange(T_ * T_, dtype=np.int32).reshape(T_, T_)
             else:
                 pair_idx = np.zeros((T_, T_), dtype=np.int32)
@@ -452,8 +420,8 @@ class TNEP(layers.Layer):
                         pair_idx[t, t2] = pair_idx[t2, t] = p
                         p += 1
             self._pair_idx = tf.constant(pair_idx)
-            # One table per model, side by side on the pair axis: model k
-            # owns columns [k·n_pairs, (k+1)·n_pairs) (see _c_full).
+            # One table per model on the pair axis: model k owns columns
+            # [k·n_pairs, (k+1)·n_pairs) (_c_full).
             self._n_pairs = int(pair_idx.max()) + 1
             c_shape = (self._kernel_channels, self._n_pairs * len(self._models))
             if self._c_learnable:
@@ -463,7 +431,6 @@ class TNEP(layers.Layer):
             else:
                 self.c_pair = tf.ones(c_shape, dtype=tf.float32)
 
-        # Validate dipole contraction power (mode 1 only) at construction time.
         if cfg.target_mode == 1 or self._neighbor_readout:
             _N = int(cfg.dipole_rij_power)
             if _N < 0:
@@ -479,37 +446,24 @@ class TNEP(layers.Layer):
                     f"cfg.dipole_readout must be 'tnep' or 'neighbor', "
                     f"got {_readout!r}.")
             if self._neighbor_readout:
-                # Any positive radius is allowed. The staged V is built from
-                # an image-exact neighbour list, so it is correct past L/2 and
-                # past rcut_hard; the box-size consequences are WARNED about at
-                # data assembly (_neighbor_dipole_guards), and the one path that
-                # genuinely cannot serve rc > rcut_hard — the in-graph V built
-                # from the SOAP pair stream — refuses in _neighbor_V_coo.
-                cfg.dipole_rc = resolved_dipole_rc(cfg)
-                _rc = float(cfg.dipole_rc)
-                if _rc <= 0.0:
-                    raise ValueError(f"cfg.dipole_rc={_rc} must be > 0.")
+                self._rc = resolved_dipole_rc(cfg)      # readout cutoff (staged V is image-exact)
                 if self._dipole_radial == "gaussian":
-                    # Gaussian window constants, fixed at init: μ_n = the C
-                    # interior points of linspace(0, r_c, C+2); σ = σ-scale ×
-                    # spacing r_c/(C+1) (C=1 ⇒ σ-scale·r_c/2, same formula).
+                    # μ_n = C interior points of linspace(0, r_c, C+2); σ = scale·r_c/(C+1).
                     _C = self._dipole_channels
-                    self._gauss_mu = np.linspace(0.0, _rc, _C + 2)[1:-1]
+                    self._gauss_mu = np.linspace(0.0, self._rc, _C + 2)[1:-1]
                     self._gauss_sigma = (float(cfg.dipole_gauss_sigma_scale)
-                                         * _rc / (_C + 1))
+                                         * self._rc / (_C + 1))
                 if float(getattr(cfg, "charge_aux_weight", 0) or 0) > 0:
                     raise ValueError(
                         "charge_aux_weight > 0 is incompatible with "
                         "dipole_readout='neighbor': the site scalar s is an "
                         "electronegativity-like potential, not a charge.")
 
-        # Typed single-hidden-layer ANN blocks in SNES order — (suffix, input
-        # width, hidden width, q_scale slice): the SOAP ANN, then under
-        # nep_descriptor="sum" the 2-body expert on the radial NEP block and
-        # the 3-body expert on the angular block, whose head outputs add to
-        # the SOAP ANN's before _split_head. W1_r / W1_a start at zero so a
-        # fresh model equals the SOAP-only one; b1 stays the one global bias.
-        self._ann_blocks = [AnnBlock("", int(cfg.dim_q), int(cfg.num_neurons), self._sl_main)]
+        # Typed ANN blocks in SNES order: SOAP ANN, then under "sum" the 2-body
+        # (radial block) and 3-body (angular block) experts whose heads add to
+        # the SOAP head. Expert W1 starts at zero so a fresh model equals the
+        # SOAP-only one; b1 stays the one global bias.
+        self._ann_blocks = [AnnBlock("", int(cfg.dim_q), int(self.num_neurons), self._sl_main)]
         for suf, (sl_in, sl_m) in zip(self._expert_suf, self._expert_in):
             d_in, He = sl_in.stop - sl_in.start, int(cfg.nep_num_neurons)
             self._ann_blocks.append(AnnBlock(suf, d_in, He, sl_m))
@@ -519,24 +473,19 @@ class TNEP(layers.Layer):
                 setattr(self, name + suf, self.add_weight(
                     name=name + suf, shape=shape, initializer=init, trainable=True))
 
-        # Optional descriptor-mixing layer (GPUMD c_nk analog). One padded
-        # square block per unordered neighbour-species pair (padded to
-        # max_block_size, active size tracked per pair). Per-pair placement
-        # matrices P_p ∈ R^{bs×Q} map active features to their non-contiguous
-        # q-indices so U_full = Σ_p P_pᵀ · U_pair[...,p,:bs,:bs] · P_p is one
-        # einsum broadcasting over any leading batch dims.
+        # Optional descriptor mixing (GPUMD c_nk analog): one padded square block
+        # per (unordered species pair, l); placement matrices P ∈ R^{α×Q} map
+        # active features to their non-contiguous q-indices (_U_full).
         self.descriptor_mixing = bool(getattr(cfg, "descriptor_mixing", False))
         self.descriptor_mixing_per_type = bool(
             getattr(cfg, "descriptor_mixing_per_type", False))
         if self.descriptor_mixing:
-            from DescriptorBuilderGPU import descriptor_block_layout
+            from descriptor_layout import descriptor_block_layout
             self._mix_layout = descriptor_block_layout(cfg)
             self._mix_pair_keys = self._mix_layout["pair_keys"]
             self._mix_num_pairs = len(self._mix_pair_keys)
             self._mix_Q = int(self._mix_layout["dim_q"])
             T = cfg.num_types
-            # Per-(pair, l) residual blocks: only radial channels at the same l
-            # mix, cross-l is forbidden. alpha_eff_per_pair = radial dim; L=l_max+1.
             self._mix_alpha_per_pair = [
                 int(self._mix_layout["alpha_eff_per_pair"][k])
                 for k in self._mix_pair_keys]
@@ -554,9 +503,8 @@ class TNEP(layers.Layer):
                     per_pair.append(tf.constant(P))
                 mix_P_ln.append(per_pair)
             self._mix_P_ln = mix_P_ln
-            # Stacked projector [num_pairs*L, α, Q] for the batched _U_full fast
-            # path when α is uniform (common case): one batched einsum instead
-            # of num_pairs×L launches.
+            # Stacked projector [num_pairs·L, α, Q] for the uniform-α fast path
+            # of _U_full (one einsum instead of num_pairs×L launches).
             if len(set(self._mix_alpha_per_pair)) == 1:
                 alpha = self._mix_alpha_per_pair[0]
                 PL = self._mix_num_pairs * self._mix_L
@@ -572,9 +520,7 @@ class TNEP(layers.Layer):
             else:
                 self._mix_P_ln_stack = None
                 self._mix_P_ln_uniform_alpha = None
-            # U_pair shape (padded to max_α, padding stays zero):
-            #   shared   [num_pairs, L, max_α, max_α]
-            #   per-type [T, num_pairs, L, max_α, max_α]
+            # U_pair [(T,) num_pairs, L, max_α, max_α], padding stays zero.
             if self.descriptor_mixing_per_type:
                 shape = (T, self._mix_num_pairs, self._mix_L,
                          self._mix_max_alpha, self._mix_max_alpha)
@@ -592,34 +538,26 @@ class TNEP(layers.Layer):
 
         self.optimizer = SNES(self)
 
-    # ---- descriptor mixing helpers ----------------------------------------
+    # ── descriptor mixing ──
 
     def _U_full(self, U_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Assemble the full block-diagonal mixing matrix.
-
-        l-aware: (l_max+1) [α_p × α_p] sub-blocks per pair, cross-l forbidden.
-            U_full = I_Q + Σ_p Σ_l P_{p,l}ᵀ · V_{p,l} · P_{p,l}
-        tf.eye(Q) broadcasts over leading batch dims (single/per-candidate ×
-        shared/per-type). V init = 0 ⇒ U_full == I_Q at gen 0.
+        """U_full = I_Q + Σ_p Σ_l P_{p,l}ᵀ · V_{p,l} · P_{p,l} — block-diagonal
+        mixing matrix [..., Q, Q] from V [..., (T,) num_pairs, L, max_α, max_α];
+        leading dims (candidate / per-type) broadcast. V = 0 ⇒ identity.
         """
         V = self.U_pair if U_pair is None else U_pair
-        # V: [..., (T?), num_pairs, L, max_α, max_α].
-        # Fast path: uniform α. Flatten (num_pairs, L)→PL, one batched einsum
-        # over stacked projector P:[PL, α, Q], V:[..., PL, α, α].
+        # Fast path, uniform α: flatten (num_pairs, L) → PL, one batched einsum.
         if self._mix_P_ln_stack is not None:
             alpha = self._mix_P_ln_uniform_alpha
             PL = self._mix_num_pairs * self._mix_L
             V_active = V[..., :alpha, :alpha]                # drop padding rows/cols
-            # Reshape (num_pairs, L)→PL, preserving leading batch dims (C and/or T).
             new_shape = tf.concat(
                 [tf.shape(V_active)[:-4], [PL, alpha, alpha]], axis=0)
             V_flat = tf.reshape(V_active, new_shape)
-            # p=PL (pair,l), j/k=α projections, i/m=output q-axes.
             V_full = tf.einsum(
                 'pji,...pjk,pkm->...im',
                 self._mix_P_ln_stack, V_flat, self._mix_P_ln_stack)
             return tf.eye(self._mix_Q, dtype=V_full.dtype) + V_full
-        # Fallback: non-uniform α.
         parts = []
         for p_idx, alpha_p in enumerate(self._mix_alpha_per_pair):
             for l in range(self._mix_L):
@@ -632,20 +570,10 @@ class TNEP(layers.Layer):
 
     def _W0_eff(self, W0: tf.Tensor,
                 U_pair: tf.Tensor | None = None) -> tf.Tensor:
-        """Pre-multiply W0 by U_fullᵀ along Q — equivalent to mixing the
-        descriptor (desc' = U_full · desc) but absorbed into the weights, so the
-        forward/backprop/dipole sum use raw descriptors and grad_values unchanged.
-
-        Shapes:
-            shared   U_pair [(C,) num_pairs, bs, bs]    + W0 [(C,) T, Q, H] → W0_eff [(C,) T, Q, H]
-            per-type U_pair [(C,) T, num_pairs, bs, bs] + W0 [(C,) T, Q, H] → W0_eff [(C,) T, Q, H]
-
-        V init = 0 ⇒ U_full = I ⇒ W0_eff == W0 at gen 0.
-        With cfg.descriptor_scale the per-channel m is folded here too, on
-        W0's own input (the mixed descriptor): W0_eff = U_fullᵀ·diag(m)·W0,
-        so a scaled model is exactly an unscaled one with W0' = m∘W0 for
-        any U. This is the ONLY fold site — every entry point must go
-        through _W0_eff unconditionally.
+        """W0_eff = U_fullᵀ·diag(m)·W0 [(C,) T, Q, H]: descriptor mixing and the
+        descriptor_scale m absorbed into the weights, so forward/backward/dipole
+        use raw descriptors and grad_values unchanged. U_pair [(C,) (T,)
+        num_pairs, L, α, α]. Every entry point must go through this fold.
         """
         W0, _ = self._scale_fold(W0, None)                       # [..., Q, H]
         if self.descriptor_mixing:
@@ -657,19 +585,15 @@ class TNEP(layers.Layer):
         return W0
 
     def _b0_eff(self, b0: tf.Tensor, W0_stored: tf.Tensor) -> tf.Tensor:
-        """Centring fold of descriptor_scale: the ANN sees m∘(q − μ), so
-        b0_eff = b0 − (m∘μ)·W0_stored (W0 BEFORE _W0_eff; any leading
-        candidate dim broadcasts). Identity when scaling is off. Call it
-        wherever _W0_eff is called."""
+        """b0_eff = b0 − (m∘μ)·W0_stored (W0 BEFORE _W0_eff). Identity when
+        scaling is off; call it wherever _W0_eff is called."""
         return self._scale_fold(W0_stored, b0)[1]
 
     def _scale_fold(self, W0: tf.Tensor, b0: tf.Tensor | None,
                     sl: slice | None = None) -> tuple:
-        """descriptor_scale fold of one typed ANN whose input is channel
-        slice `sl` of the scaler vector (None → the main ANN's): the ANN sees
-        m∘(q − μ), so W0_eff = m∘W0 and b0_eff = b0 − (m∘μ)·W0_stored (any
-        leading candidate axis broadcasts). Identity when scaling is off.
-        The ONE fold site — the SOAP ANN and both "sum" experts use it."""
+        """descriptor_scale fold for the ANN reading scaler slice `sl` (None →
+        main): W0_eff = m∘W0, b0_eff = b0 − (m∘μ)·W0_stored. Identity when off.
+        The ONE fold site, shared by the SOAP ANN and both experts."""
         if self._q_scale is None:
             return W0, b0
         sl = self._sl_main if sl is None else sl
@@ -678,35 +602,26 @@ class TNEP(layers.Layer):
                   else b0 - tf.einsum('tq,...tqh->...th', self._q_shift_m[:, sl], W0))
         return W0_eff, b0_eff
 
-    # ---- learned radial basis ---------------------------------------------
+    # ── learned radial basis ──
 
     @property
     def descriptor_input_width(self) -> int:
-        """Width of the per-atom vector in the `descriptors` slot (see
-        DescriptorBuilderGPU.descriptor_input_width). Distinct from
-        cfg.dim_q, the width of the W0 matmul."""
-        from DescriptorBuilderGPU import descriptor_input_width
+        """Width of the `descriptors` slot (descriptor_layout); not cfg.dim_q."""
+        from descriptor_layout import descriptor_input_width
         return descriptor_input_width(self.cfg)
 
     def soap_from_raw(self, raw: tf.Tensor, Z: tf.Tensor,
                       M: tf.Tensor | None = None) -> tf.Tensor:
         """SOAP-turbo descriptor from raw centre coefficients with the learned
-        radial basis (cfg.radial_basis_size):
+        radial basis:
             c[a, (s,n), k] = Σ_κ M[t_a, s, n, κ] · c_raw[a, s, κ, k]
             q[a, (n,n',l)] = Σ_m mult · Re(c_{n l m} conj c_{n' l m})   (trivial
-            compression: n or n' a species pivot), then L2-normalised per atom
-            with SOAP-turbo's ‖q‖ < 1e-5 guard (padded atoms stay 0).
-        cfg.radial_basis_species_sum sums the species axis into α shared
-        channels, c[a, n, k] = Σ_s Σ_κ M[t_a, s, n, κ] · c_raw[a, s, κ, k],
-        and keeps every (n ≤ n', l) channel (dim_q = α(α+1)/2·L).
-        cfg.radial_basis_per_l gives each l block its own M[..., l].
-        cfg.radial_basis_norm: "l2" per-atom projection; "none" raw × scale²;
-        "sqrt" sign·√|q| × scale (degree 1). Pair the latter two with descriptor_scale.
-        Args:
-            raw : [..., A, S·K·k_max·2]  builder output (species, κ, k, re/im)
-            Z   : [..., A]               type indices
-            M   : [T, S, α, K(, L)] (None → self.M_radial) or per-candidate
-                  [C, T, S, α, K(, L)]
+            compression), then per-atom norm per cfg.radial_basis_norm ("l2" with
+            SOAP-turbo's ‖q‖ < 1e-5 guard; "none" × scale²; "sqrt" sign·√|q| × scale).
+        species_sum sums s into α shared channels (dim_q = α(α+1)/2·L); per_l
+        gives each l block its own M[..., l].
+            raw : [..., A, S·K·k_max·2]  (species, κ, k, re/im)
+            M   : [T, S, α, K(, L)] (None → self.M_radial) or per-candidate [C, ...]
         Returns [..., A, Q], or [C, ..., A, Q] for per-candidate M.
         """
         M = self.M_radial if M is None else M
@@ -717,10 +632,8 @@ class TNEP(layers.Layer):
         N = tf.reduce_prod(lead)
         r = tf.reshape(raw, [N, S, K, kmax * 2])                 # [N, S, K, 2k]
         Zf = tf.reshape(Z, [N])
-        # Partition atoms by centre type once and contract each type's atoms
-        # with its own M[t] (a small GEMM). Never gather M per atom: that
-        # [N, S, α, K(, L)] copy is hundreds of MB per candidate at 6 species
-        # and its backward makes one copy per l block.
+        # Partition atoms by centre type and contract each with its own M[t].
+        # Never gather M per atom: that [N, S, α, K(, L)] copy is hundreds of MB.
         T = self.num_types
         order = tf.argsort(Zf)
         inv = tf.math.invert_permutation(order)
@@ -729,14 +642,13 @@ class TNEP(layers.Layer):
         atom_axis = 1 if per_cand else 0
 
         def _contract(M_of_t, k_slice):
-            """c[(C,) N, n_max, k_len, 2] = Σ_κ M[t_a, s, n, κ] · r[a, s, κ, k_slice]
-            (Σ_s too under species_sum), atoms back in input order."""
+            """c[(C,) N, n_max, k_len, 2] = Σ_κ M[t_a, s, n, κ] · r[a, s, κ, k_slice],
+            atoms back in input order."""
             outs = []
             for t in range(T):
                 M_t = M_of_t(t)                                   # [(C,) S, α, K]
                 r_t = parts[t][..., k_slice]                      # [N_t, S, K, kk]
                 if self._rb_species_sum:
-                    # NEP-style: sum over neighbour species into α shared channels.
                     outs.append(tf.einsum('csak,nskj->cnaj', M_t, r_t) if per_cand
                                 else tf.einsum('sak,nskj->naj', M_t, r_t))
                 else:
@@ -753,7 +665,6 @@ class TNEP(layers.Layer):
         for l in range(L):
             k0 = l * (l + 1) // 2
             if self._rb_per_l:
-                # This l block's own radial functions M[..., l] on its k slice.
                 c_l = _contract(lambda t, l=l: (M[:, t, ..., l] if per_cand
                                                 else M[t, ..., l]),
                                 slice(2 * k0, 2 * (k0 + l + 1)))
@@ -770,12 +681,8 @@ class TNEP(layers.Layer):
             norm = tf.norm(q, axis=-1, keepdims=True)
             q = q / tf.where(norm < 1e-5, tf.ones_like(norm), norm)
         elif self._rb_norm == "none":
-            # NEP-like: no per-atom projection; the spectrum is quadratic in
-            # the coefficients, so scale² puts it on an O(1) footing.
-            q = q * (sc * sc)
+            q = q * (sc * sc)          # spectrum is quadratic in the coefficients
         else:
-            # "sqrt": degree 1 in the coefficients (like NEP's radial block):
-            # halves every log-spread of "none", keeps magnitude.
             q = tf.math.sign(q) * tf.sqrt(tf.abs(q) + 1e-12) * sc
         out_shape = tf.concat([lead, [self._soap_dim]], axis=0)
         if per_cand:
@@ -790,13 +697,10 @@ class TNEP(layers.Layer):
             q_r[a, n]  = Σ_{t',k} c_r[t_a, t', n, k] · raw_r[a, t', k]
             s[a, n, p] = Σ_{t',k} c_a[t_a, t', n, k] · raw_a[a, t', k, p]
             q_a = find_q(s)  → [q_r ‖ angular l-major (ln = l·(n_max_a+1)+n) ‖ 4b ‖ 5b]
-        Args:
             raw : [..., A, W_raw]  flatten([raw_r [T, K_r+1] ‖ raw_a [T, K_a+1, 24]])
-            Z   : [..., A]         type indices
-            c_r, c_a : [T, T, n+1, K+1] (None → self.c_r / self.c_a) or
-                       per-candidate [C, T, T, n+1, K+1]
-        Returns [..., A, dim_nep], or [C, ..., A, dim_nep] for per-candidate c;
-        with return_s also s [(C,) ..., A, n_a+1, 24] (the tnep pair forces).
+            c_r, c_a : [T, T, n+1, K+1] (None → self.c_r / self.c_a) or per-candidate [C, ...]
+        Returns [..., A, dim_nep] (leading C for per-candidate c); with return_s
+        also s [(C,) ..., A, n_a+1, 24] (for the tnep pair forces).
         """
         c_r = self.c_r if c_r is None else c_r
         c_a = self.c_a if c_a is None else c_a
@@ -816,8 +720,7 @@ class TNEP(layers.Layer):
         else:
             q_r = tf.einsum("atk,atnk->an", raw_r, c_r_g)
         if self._nep_gram:
-            # The angular block of nep_raw IS the 3-body Gram (nep_gram_on):
-            # one GEMM per centre type, no [C, N, n+1, 24] s tensor at all.
+            # Angular block of nep_raw IS the 3-body Gram: one GEMM per centre type.
             if return_s:
                 raise ValueError(
                     "return_s with the NEP Gram layout: s is not recoverable "
@@ -848,32 +751,25 @@ class TNEP(layers.Layer):
     def _ann_inputs(self, descriptors: tf.Tensor, nep_raw: tf.Tensor | None,
                     Z: tf.Tensor, c_r: tf.Tensor | None = None,
                     c_a: tf.Tensor | None = None):
-        """(inputs, s): the [..., A, dim_q] vector the ANN consumes — the one
-        place that knows cfg.nep_descriptor: "off" → descriptors (same
-        object); "concat" → [descriptors ‖ nep_from_raw]; "replace" →
-        nep_from_raw — and s from nep_from_raw (the tnep pair forces; None
-        when no NEP block is formed). `descriptors` is the builder output
-        after soap_from_raw."""
+        """(inputs [..., A, dim_q], s): the one place that knows cfg.nep_descriptor —
+        "off" → descriptors; "concat" → [descriptors ‖ nep]; "replace" → nep.
+        s (tnep pair forces) is None unless the NEP block is formed for them."""
         if self._nep_mode == "off":
             return descriptors, None
         if nep_raw is None:
             raise ValueError(
                 f"nep_raw missing: cfg.nep_descriptor={self._nep_mode!r} needs "
-                f"the raw expert input [.., W_raw] (the NEP basis, or GAP q2‖q3 "
-                f"under gap_sum) at every forward site.")
+                f"the raw expert input [.., W_raw] (the NEP basis) at every forward site.")
         if self._experts_on:              # experts read nep_raw in _expert_outputs
-            return (descriptors if self._main_in is None
-                    else nep_raw[..., self._main_in.start:self._main_in.stop]), None
-        # s is consumed ONLY by the tnep pair-force contraction; asking for it
-        # elsewhere would force the slow path and build a [C, N, n, 24] tensor.
+            return descriptors, None
+        # s only for the tnep pair forces: elsewhere it forces the [C, N, n, 24] slow path.
         if self._nep_pair_forces_on:
             q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a, return_s=True)
         else:
             q_nep, s = self.nep_from_raw(nep_raw, Z, c_r, c_a), None
         if self._nep_mode == "replace":
             return q_nep, s
-        # One side may carry a candidate axis (learned SOAP basis with shared
-        # c, or per-candidate c with fixed SOAP): broadcast the other to it.
+        # Either side may carry a candidate axis: broadcast the other to it.
         if len(q_nep.shape) > len(descriptors.shape):
             descriptors = tf.broadcast_to(
                 descriptors[tf.newaxis],
@@ -899,13 +795,9 @@ class TNEP(layers.Layer):
                     W0: tf.Tensor, b0: tf.Tensor, W1: tf.Tensor,
                     sl_in: slice, sl_m: slice) -> tf.Tensor:
         """One summed expert: activation(q[.., sl_in]·W0[t] + b0[t])·W1[t] →
-        [(C,) ..., A, head_slots]. q [(C,) ..., A, dim_nep]; Z / atom_mask
-        [..., A]; STORED weights [(C,) T, ...] — the descriptor_scale fold on
-        slice sl_m happens here (no mixing reaches the experts,
-        so no caller pre-folds). Type-mask sum, no [.., A, d, H] gather.
-        Per-candidate q (c_r / c_a with a candidate axis) requires
-        per-candidate experts with the same C: the einsum names both axes
-        'c' (no broadcast); shared q with per-candidate experts is fine."""
+        [(C,) ..., A, head_slots]. STORED weights [(C,) T, ...]: the scale fold
+        on slice sl_m happens here (no mixing reaches the experts). Per-candidate
+        q needs per-candidate experts with the same C (einsum, no broadcast)."""
         W0, b0 = self._scale_fold(W0, b0, sl_m)
         x = q[..., sl_in]
         cand = len(W0.shape) == 4
@@ -937,13 +829,10 @@ class TNEP(layers.Layer):
                         c_r: tf.Tensor | None = None, c_a: tf.Tensor | None = None,
                         experts: tuple | None = None,
                         sum_delta: tf.Tensor | None = None) -> list:
-        """The extra models' head outputs δ_k·ANN_k(q_k), one
-        [(C,) ..., A, head_slots] tensor per extra model, under
-        nep_descriptor="sum" / "gap_sum". experts: the STORED tensors in
-        expert_keys order (optional leading candidate axis); None → the
-        model's variables. sum_delta: [3] or per-candidate [C, 3]; None →
-        self.sum_delta."""
-        q = nep_raw if self._nep_mode == "gap_sum" else self.nep_from_raw(nep_raw, Z, c_r, c_a)
+        """Extra models' heads δ_k·ANN_k(q_k), one [(C,) ..., A, head_slots] each.
+        experts: STORED tensors in expert_keys order (optional leading C);
+        sum_delta [3] or [C, 3]; None → the model's variables."""
+        q = self.nep_from_raw(nep_raw, Z, c_r, c_a)
         w = self.expert_weights if experts is None else tuple(experts)
         d = self.sum_delta if sum_delta is None else sum_delta
         return [self._delta_scale(d, self._delta_idx[i + 1],
@@ -954,19 +843,23 @@ class TNEP(layers.Layer):
                     atom_mask: tf.Tensor, c_r: tf.Tensor | None = None,
                     c_a: tf.Tensor | None = None, experts: tuple | None = None,
                     sum_delta: tf.Tensor | None = None) -> list:
-        """Per-model head outputs [main, *extras] for _site_coeff. `out` is
-        the main ANN's head output. Called at every neighbor-readout site."""
+        """Per-model head outputs [main, *extras] for _site_coeff."""
         if not self._experts_on:
             return [out]
         d = self.sum_delta if sum_delta is None else sum_delta
         return ([self._delta_scale(d, self._delta_idx[0], out)]
                 + self._expert_outputs(nep_raw, Z, atom_mask, c_r, c_a, experts, d))
 
+    def _site_bias(self, out: tf.Tensor, b1: tf.Tensor, Z: tf.Tensor,
+                   atom_mask: tf.Tensor) -> tf.Tensor:
+        """out[.., a, :] += b1[t_a] (b1 [(C,) T, S]; padded atoms stay 0)."""
+        b = (tf.gather(b1, Z, axis=1) if len(b1.shape) == 3   # [C, B, A, S]
+             else tf.gather(b1, Z))                            # [..., A, S]
+        return out + b * atom_mask[..., tf.newaxis]
+
     def _site_coeff(self, outs: list, c_pair: tf.Tensor, Z: tf.Tensor) -> tf.Tensor:
-        """G[.., a, n, t'] = Σ_k s_k[.., a, n]·c_k[n, t_a, t'] — every model's
-        site values through its OWN pair table; μ = Σ_{a,n,t'} G·V. outs:
-        _model_outs; c_pair packed [(C,) Ch, M·n_pairs]; Z [..., A]. THE one
-        place the per-model readout is assembled."""
+        """G[.., a, n, t'] = Σ_k s_k[.., a, n]·c_k[n, t_a, t'] (each model through
+        its OWN pair table); μ = Σ_{a,n,t'} G·V. c_pair packed [(C,) Ch, M·n_pairs]."""
         G = None
         for k, out in enumerate(outs):
             s = self._split_head(out)                                   # [(C,) ..., A, Ch]
@@ -986,29 +879,12 @@ class TNEP(layers.Layer):
                 nep_raw: tf.Tensor | None = None,
                 c_r: tf.Tensor | None = None,
                 c_a: tf.Tensor | None = None) -> tf.Tensor:
-        """Run the forward pass for a single structure using padded tensors.
-
-        Not available for the NEP tnep readout (cfg.nep_descriptor != "off"
-        with dipole_readout="tnep"): the padded [A, M] table is the
-        rcut_hard-limited MIC SOAP list and cannot serve the 8 Å image-exact
-        NEP pair stream — use predict_batch (score / validate / fit do).
-
-        Args:
-            descriptors    : [A, dim_q]     padded per-atom SOAP descriptors
-                             ([A, W_in] raw centre coefficients under
-                             cfg.radial_basis_size; see soap_from_raw)
-            gradients      : [A, M, 3, dim_q]  padded descriptor gradients
-            grad_index     : [A, M]         padded neighbor indices
-            positions      : [A, 3]         padded atom positions
-            Z              : [A]            padded integer type indices
-            box            : [3, 3]         lattice vectors
-            atom_mask      : [A]            1.0 for real atoms, 0.0 for padding
-            neighbor_mask  : [A, M]         1.0 for real neighbors, 0.0 for padding
-
-        Returns:
-            target_mode 0: [1]  total energy
-            target_mode 1: [3]  dipole vector
-            target_mode 2: [6]  polarizability tensor [xx, yy, zz, xy, yz, zx]
+        """Single-structure forward on padded tensors → [1] energy, [3] dipole
+        or [6] polarisability. Not for the NEP tnep readout: the padded [A, M]
+        table is the rcut_hard MIC SOAP list, not the image-exact NEP stream.
+            descriptors [A, dim_q] (raw [A, W_in] under radial_basis_size)
+            gradients [A, M, 3, dim_q]; grad_index [A, M]; positions [A, 3]
+            Z [A]; box [3, 3]; atom_mask [A]; neighbor_mask [A, M]
         """
         if self._nep_pair_forces_on:
             raise NotImplementedError(
@@ -1017,25 +893,19 @@ class TNEP(layers.Layer):
         if self._learn_radial:
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)
         descriptors = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)[0]
-        # Absorb U_pairᵀ into W0 once so forward and calc_forces share the
-        # folded weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
         b0_eff = self._b0_eff(self.b0, self.W0)
 
-        # Gather per-type weights for each atom
         W0_t = tf.gather(W0_eff, Z)    # [A, dim_q, H]
         b0_t = tf.gather(b0_eff, Z)    # [A, H]
-        W1_t = tf.gather(self.W1, Z)   # [A, H]
+        W1_t = tf.gather(self._masked_W1(self.W1), Z)   # [A, H]
 
-        # Hidden layer: h = activation(z), z = q @ W0[t] + b0[t]. Keep z for the
-        # swish backward chain (tanh needs only 1 − h²).
+        # z kept for the swish backward chain.
         z = tf.einsum('nd,ndh->nh', descriptors, W0_t) + b0_t   # [A, H]
         h = self.activation(z)                                   # [A, H]
-        # Mask out padded atoms
         h = h * atom_mask[:, tf.newaxis]                   # [A, H]
 
         if self.cfg.target_mode == 0:
-            # PES: E = -sum_i (h_i . W1[t_i] + b1)
             E_per_atom = tf.reduce_sum(h * W1_t, axis=1) + self.b1  # [A]
             E_per_atom = E_per_atom * atom_mask                       # zero padding
             E = tf.reduce_sum(E_per_atom)
@@ -1043,17 +913,12 @@ class TNEP(layers.Layer):
             return out
 
         if self._neighbor_readout:
-            # Neighbor-basis readout, C Chebyshev channels + species-pair c:
-            #   μ = Σ_i Σ_n s_i^n Σ_t' c[t_i,t',n]·V_i[:,n,t'],
-            #   V_i[:,k,t'] = Σ_{j∈t'} R_n(|d|)·g_group(d),  d = r_i − r_j (MIC),
-            #   k = group·C + n; g = d (dipole) or the isotropic / traceless
-            #   Voigt tensors (polarisability) — _bond_geometry.
-            # No de_dq backward chain here — the readout reads no descriptor
-            # gradients; don't re-add it. b1 stays excluded from s: with c
-            # symmetric a per-channel uniform shift of s^n is exact gauge;
-            # under dipole_species_pairs="ordered" that identity breaks and
-            # the exclusion is a modeling choice — keep it, don't "fix" it.
-            out = tf.einsum('ah,ahk->ak', h, W1_t)                    # [A, S]
+            # μ = Σ_i Σ_n s_i^n Σ_t' c[t_i,t',n]·V_i[:,n,t'],
+            # V_i[:,k,t'] = Σ_{j∈t'} R_n(|d|)·g_group(d), d = r_i − r_j (MIC),
+            # k = group·C + n (_bond_geometry). No de_dq chain: the readout reads
+            # no descriptor gradients.
+            out = self._site_bias(tf.einsum('ah,ahk->ak', h, W1_t),
+                                  self.b1, Z, atom_mask)              # [A, S]
             G = self._site_coeff(
                 self._model_outs(out, nep_raw, Z, atom_mask, c_r, c_a),
                 self.c_pair, Z)                                       # [A, C, T]
@@ -1062,7 +927,7 @@ class TNEP(layers.Layer):
                                  "(Ewald field channel); use predict_batch with W_atom.")
             dr, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)          # dr = neighbor − center
-            rc = float(self.cfg.dipole_rc)
+            rc = self._rc
             center = tf.range(tf.shape(grad_index)[0],
                               dtype=grad_index.dtype)[:, tf.newaxis]
             keep = tf.logical_and(rij < rc, tf.not_equal(grad_index, center))
@@ -1078,14 +943,11 @@ class TNEP(layers.Layer):
             mu = tf.einsum('ant,adnt->d', G, tf.cast(V, G.dtype))     # [D]
             return mu
 
-        # The tnep dipole readout needs the descriptor-gradient forces.
         forces = self.calc_forces(h, gradients, W1_t, W0_t, neighbor_mask,
                                   z=z)  # [A, M, 3]
 
         if self.cfg.target_mode == 1:
-            # Dipole. cfg.dipole_rij_power selects the per-pair weight:
-            #   N >= 1 : μ = -Σ_pair |r_ij|^N · F_ij
-            #   N == 0 : μ = -Σ_i de_dq[i] · grad_values[i, i]  (self-only)
+            # μ = -Σ_pair |r_ij|^N·F_ij (N ≥ 1) or -Σ_i F_ii (N == 0, self-only).
             _, rij = self._neighbor_displacements_single(
                 positions, box, grad_index)
             rij_n = (self._dipole_pair_weight_padded(tf.square(rij), grad_index)
@@ -1095,17 +957,10 @@ class TNEP(layers.Layer):
             return dipole
 
     def _activation_grad(self, h: tf.Tensor, z: tf.Tensor) -> tf.Tensor:
-        """dh/dz for the activation, applied as a Hadamard factor in the dipole/pol
-        backward chain.
+        """dh/dz for the backward chain, shaped like h.
             tanh : 1 − h²                        (needs only h)
-            swish: σ(z) · (1 + z · (1 − σ(z)))   (needs z; this form avoids the
-                   z≫0 cancellation of the equivalent σ(z) + h·(1−σ(z)))
-
-        Args:
-            h: activation output, broadcastable to z.
-            z: pre-activation (W0·q + b0). Required for swish; None only for tanh.
-        Returns:
-            tensor shaped like h.
+            swish: σ(z) · (1 + z · (1 − σ(z)))   (needs z; avoids the z≫0
+                   cancellation of the equivalent σ(z) + h·(1−σ(z)))
         """
         if self._activation_name == "tanh":
             return 1.0 - tf.square(h)
@@ -1126,48 +981,26 @@ class TNEP(layers.Layer):
     def calc_forces(self, h: tf.Tensor, gradients: tf.Tensor, W1_t: tf.Tensor,
                     W0_t: tf.Tensor, neighbor_mask: tf.Tensor,
                     z: tf.Tensor | None = None) -> tf.Tensor:
-        """Compute dU_i/dR_j for every atom i and neighbour j via chain rule (padded).
-
-        Args:
-            h              : [N, H]              hidden activations f(z)
-            gradients      : [N, M, 3, dim_q]   padded descriptor gradients
-            W1_t           : [N, H]              per-atom output weights
-            W0_t           : [N, dim_q, H]       per-atom input weights
-            neighbor_mask  : [N, M]              1.0 for real neighbors, 0.0 for padding
-            z              : [N, H]              pre-activation; required for swish.
-
-        Returns:
-            forces : [N, M, 3]  dU_i/dR_j per atom per neighbor
-        """
-        # dU/dh * dh/da = W1 * f'(z)
+        """dU_i/dR_j [N, M, 3] by chain rule (padded). h [N, H], gradients
+        [N, M, 3, dim_q], W1_t [N, H], W0_t [N, dim_q, H], neighbor_mask [N, M],
+        z [N, H] pre-activation (required for swish)."""
         dact = self._activation_grad(h, z)                       # [N, H]
         de_da = dact * W1_t                                       # [N, H]
-        # dU/dq = dU/da @ W0^T  ->  [N, dim_q]
         de_dq = tf.einsum('nh,nqh->nq', de_da, W0_t)             # [N, dim_q]
-        # Contract dU/dq with dq/dR_j: sum over dim_q
         forces = tf.einsum('nq,nmcq->nmc', de_dq, gradients)     # [N, M, 3]
-        # Zero out padded neighbors
         forces = forces * neighbor_mask[:, :, tf.newaxis]
         return forces
 
     def fit(self, train_data: dict[str, tf.Tensor], val_data: dict[str, tf.Tensor],
             plot_callback: Callable | None = None,
             resume_state: dict | None = None) -> dict:
-        """Train the model using the SNES evolutionary optimizer.
+        """Train with SNES (or Adam per cfg.optimizer).
 
-        Args:
-            train_data    : dict with keys descriptors, gradients, grad_index,
-                            positions, Z_int, targets, boxes (lists over structures)
-            val_data      : same structure, used for validation each generation
-            plot_callback : optional callable(history, gen) for periodic plotting
-            resume_state  : optional dict from `model_io.load_checkpoint`
-                            (SNES distribution + best-val + history + RNG). When
-                            given, training continues from last_gen + 1.
+        resume_state: dict from model_io.load_checkpoint; training continues
+        from last_gen + 1.
 
         Returns:
-            history        : dict of generation, train_loss, val_loss (lists)
-            final_model    : model at the last generation
-            best_val_model : model at the best-validation generation
+            history (dict of lists), final_model, best_val_model
         """
         if str(self.cfg.optimizer) == "adam":
             if resume_state is not None:
@@ -1185,27 +1018,18 @@ class TNEP(layers.Layer):
         return history, final_model, best_val_model
 
     def score(self, test_data: dict[str, tf.Tensor]) -> tuple[dict[str, tf.Tensor], tf.Tensor]:
-        """Evaluate RMSE, R², per-component R², and cosine similarity.
-
-        Args:
-            test_data : dict with COO tensors from pad_and_stack()
+        """Evaluate on a pad_and_stack() dict, chunked so peak memory is one
+        chunk's grads.
 
         Returns:
-            metrics : dict with keys:
-                rmse          : scalar float — overall RMSE
-                r2            : scalar float — overall R²
-                r2_components : [T] tensor — per-component R²
-                cos_sim_mean  : scalar float — mean cosine similarity (modes 1,2 only)
-                cos_sim_all   : [S] tensor — per-structure cosine similarity (modes 1,2)
-            preds : [S, T] tensor of predictions
+            metrics : rmse, r2, r2_components [T], cos_sim_mean / cos_sim_all [S]
+                      (modes 1,2), and total_* twins when scale_targets is on
+            preds : [S, T]
         """
-        # Streaming chunked scoring; peak memory bounded to one chunk's grads.
         from data import prefetched_chunks
         S_test = test_data["num_atoms"].shape[0]
         chunk_sz = (self.cfg.batch_chunk_size
                     if self.cfg.batch_chunk_size is not None else S_test)
-        # Pre-fold U_pairᵀ into W0 once so every chunk shares the absorbed
-        # weights (no-op when mixing is off).
         W0_eff = self._W0_eff(self.W0)
         b0_eff = self._b0_eff(self.b0, self.W0)
         ranges = [(s, min(s + chunk_sz, S_test)) for s in range(0, S_test, chunk_sz)]
@@ -1227,7 +1051,6 @@ class TNEP(layers.Layer):
         del pred_parts
         targets = test_data["targets"]
 
-        # Normalize predictions to per-atom space when target scaling is active
         if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
             num_atoms = tf.cast(test_data["num_atoms"], tf.float32)  # [S]
             num_atoms_col = tf.maximum(num_atoms, 1.0)[:, tf.newaxis]  # [S, 1]
@@ -1239,12 +1062,10 @@ class TNEP(layers.Layer):
         mse = tf.reduce_mean(tf.square(diff))
         rmse = tf.sqrt(tf.maximum(mse, 0.0))
 
-        # Overall R² = 1 - SS_res / SS_tot
         ss_res = tf.reduce_sum(tf.square(diff))
         ss_tot = tf.reduce_sum(tf.square(targets - tf.reduce_mean(targets, axis=0)))
         r2 = 1.0 - ss_res / tf.maximum(ss_tot, 1e-12)   # guard degenerate (e.g. 1-structure) sets
 
-        # Per-component R²
         ss_res_comp = tf.reduce_sum(tf.square(diff), axis=0)       # [T]
         ss_tot_comp = tf.reduce_sum(
             tf.square(targets - tf.reduce_mean(targets, axis=0)), axis=0)  # [T]
@@ -1256,7 +1077,7 @@ class TNEP(layers.Layer):
             "r2_components": r2_components,
         }
 
-        # Total (un-scaled) metrics when target scaling is active.
+        # Total (un-scaled) twins when target scaling is active.
         if self.cfg.scale_targets and self.cfg.target_mode == 1 and "num_atoms" in test_data:
             total_targets = targets * num_atoms_col
             total_preds = raw_preds
@@ -1274,7 +1095,6 @@ class TNEP(layers.Layer):
             metrics["total_r2"] = total_r2
             metrics["total_r2_components"] = total_r2_comp
 
-        # Cosine similarity for vector targets (modes 1 and 2)
         if self.cfg.target_mode >= 1:
             dot = tf.reduce_sum(preds * targets, axis=1)          # [S]
             norm_p = tf.linalg.norm(preds, axis=1)                # [S]
@@ -1296,29 +1116,17 @@ class TNEP(layers.Layer):
                          suffix: str | None = None,
                          presentation: bool = False,
                          shared_axis_scale: bool = False) -> tuple[dict, tf.Tensor]:
-        """Score directly on an XYZ file or directory, via the standard pipeline
-        (collect → descriptors → assemble → pad_and_stack) then :py:meth:`score`.
+        """Score an .xyz file or directory (all .xyz concatenated, sorted) via
+        collect → descriptors → assemble → pad_and_stack → score.
 
-        Training-time cfg.num_types/types/dim_q are preserved so the descriptor
-        layout matches; test types are re-indexed into the training species
-        ordering (unseen species raise KeyError).
-
-        Args:
-            path: single ``.xyz`` or a directory (all ``.xyz`` concatenated, sorted).
-            allowed_species: override cfg.allowed_species; None keeps the filter.
-            max_structures: cap on structures; None = no cap.
-            filter_mode: override cfg.filter_mode ("subset"/"exact"); None keeps it.
-            pin_to_cpu: forwarded to pad_and_stack; True keeps test data on host RAM.
-            plot: generate parity + error-vs-magnitude figures after scoring.
-            save_plots: dir to write figures (auto-created); None skips saving.
-            show_plots: show via matplotlib backend; False for headless.
-            suffix: string appended to figure filenames.
-            presentation: poster-style flag, currently a no-op (plumbed via cfg).
-            shared_axis_scale: True → all parity panels share one x/y range from
-                the joint min/max (useful when one component dominates).
+        Training-time num_types/types/dim_q are kept so the layout matches; test
+        types are re-indexed into the training ordering (unseen species raise).
+        allowed_species / filter_mode / max_structures override cfg for the load
+        only. plot writes parity + error figures (save_plots dir, suffix);
+        presentation is a no-op; shared_axis_scale shares one range across panels.
 
         Returns:
-            (metrics, preds) as :py:meth:`score` — preds is [S, T_dim].
+            (metrics, preds) as score().
         """
         import os
         import copy
@@ -1328,15 +1136,13 @@ class TNEP(layers.Layer):
 
         cfg = self.cfg
 
-        # Snapshot training-time species + dim so the layout stays as expected.
         TRAIN_NUM_TYPES = int(cfg.num_types)
         TRAIN_TYPES     = list(cfg.types)
         TRAIN_DIM_Q     = int(cfg.dim_q)
 
-        # Resolve the path. Directory → concatenate all *.xyz children
-        # via a tempfile so the existing `collect` reader sees one set.
+        # Directory → concat all *.xyz into a tempfile so collect sees one set.
         cfg_for_load = copy.copy(cfg)
-        _tmp_xyz = None     # only set when we materialise a concat tempfile
+        _tmp_xyz = None
         if os.path.isdir(path):
             files = sorted(f for f in os.listdir(path)
                             if f.lower().endswith(".xyz"))
@@ -1366,8 +1172,6 @@ class TNEP(layers.Layer):
             raise FileNotFoundError(
                 f"score_from_file: path does not exist: {path}")
 
-        # Apply optional overrides on the temp cfg only — the model's
-        # own cfg.attributes are restored before exit.
         if allowed_species is not None:
             cfg_for_load.allowed_species = list(allowed_species)
         if filter_mode is not None:
@@ -1375,21 +1179,17 @@ class TNEP(layers.Layer):
         if max_structures is not None:
             cfg_for_load.total_N = int(max_structures)
 
-        # collect overrides num_types from the data; restore below so the builder
-        # produces the trained dim_q, not the data-implied one.
         print(f"score_from_file: loading {path} ...")
         dataset, ti_loaded = collect(cfg_for_load)
         if max_structures is not None and len(dataset) > max_structures:
             dataset = dataset[:max_structures]
 
-        # Restore training-time species so the descriptor builder produces
-        # the model's expected layout.
+        # collect overrode num_types from the data; restore the trained layout.
         cfg_for_load.num_types = TRAIN_NUM_TYPES
         cfg_for_load.types     = TRAIN_TYPES
         cfg_for_load.dim_q     = TRAIN_DIM_Q
 
-        # Re-index per-atom type arrays using the training-time species
-        # ordering so per-type ANN routing puts each atom on the correct head.
+        # Re-index types into the training ordering so per-type routing is right.
         Z_to_train_idx = {int(z): i for i, z in enumerate(TRAIN_TYPES)}
         ti = []
         for s in dataset:
@@ -1404,17 +1204,13 @@ class TNEP(layers.Layer):
                     f"{TRAIN_TYPES}. Use a model trained on the broader "
                     f"species set, or filter the test set.") from exc
 
-        # Build descriptors using the model's training-time SOAP layout.
         print(f"  building descriptors for {len(dataset)} structures ...")
-        # Same gradient gating as data.materialize_test_data (score() is the
-        # same consumer): no SOAP gradients for the neighbour readout
-        # or tnep under nep_descriptor="replace".
+        # Same gradient gating as data.materialize_test_data.
         from data import soap_gradients_needed, dipole_self_pairs_only
         builder = make_descriptor_builder(cfg_for_load)
         descs, grads, gidx = builder.build_descriptors(
             dataset, calc_gradients=soap_gradients_needed(cfg_for_load))
 
-        # Assemble + pad. Descriptors are now [N_i, TRAIN_DIM_Q] per structure.
         data_dict = assemble_data_dict(
             dataset, ti, descs, grads, gidx, cfg_for_load)
         test_data = pad_and_stack(
@@ -1425,15 +1221,13 @@ class TNEP(layers.Layer):
         try:
             metrics, preds = self.score(test_data)
             if plot:
-                # Lazy import: keeps matplotlib out of module import.
                 from plotting import (plot_correlation, plot_error_vs_magnitude,
                                       plot_error_decomposition)
                 if save_plots is not None:
                     os.makedirs(save_plots, exist_ok=True)
                 targets_np = test_data["targets"].numpy()
                 preds_np   = preds.numpy()
-                # plot_correlation needs an RRMSE entry score() doesn't produce;
-                # inject RMSE / target-std on the reported (per-atom) space.
+                # plot_correlation needs an RRMSE entry score() doesn't produce.
                 diff = targets_np - preds_np
                 std_overall = max(float(targets_np.std()), 1e-12)
                 std_comp = np.maximum(targets_np.std(axis=0), 1e-12)
@@ -1441,8 +1235,7 @@ class TNEP(layers.Layer):
                 metrics_plot = dict(metrics)
                 metrics_plot["rrmse"] = float(metrics["rmse"]) / std_overall
                 metrics_plot["rrmse_components"] = rmse_comp / std_comp
-                # cfg carries plot_units; stash presentation on cfg as
-                # _presentation_mode for future plot paths (no-op today).
+                # presentation is stashed on cfg (no-op today).
                 _prev_pres = getattr(self.cfg, "_presentation_mode", None)
                 self.cfg._presentation_mode = bool(presentation)
                 print(f"  plotting (save_plots={save_plots}, "
@@ -1464,7 +1257,6 @@ class TNEP(layers.Layer):
                                              show_plots=show_plots,
                                              suffix=suffix)
                 finally:
-                    # Restore/remove the presentation flag.
                     if _prev_pres is None:
                         try:
                             delattr(self.cfg, "_presentation_mode")
@@ -1474,7 +1266,6 @@ class TNEP(layers.Layer):
                         self.cfg._presentation_mode = _prev_pres
             return metrics, preds
         finally:
-            # Clean up the concat tempfile if we made one.
             if _tmp_xyz is not None:
                 try:
                     os.unlink(_tmp_xyz)
@@ -1482,24 +1273,19 @@ class TNEP(layers.Layer):
                     pass
 
     def score_summary(self, test_data: dict[str, tf.Tensor]) -> dict:
-        """Print and return a comparison-ready scoring summary.
-
-        Reports metrics in BOTH per-atom space (GPUMD loss.out rmse_virial) and
-        total-dipole space (NEP-paper headline RMSE/R²). RRMSE = √(1 − R²) is the
-        centered definition, differing from the un-centered SNES training RRMSE
-        (Σy² denominator) — nearly equal only when target means are small.
+        """Print per-atom (GPUMD loss.out) and total-dipole (NEP-paper) metrics.
+        RRMSE = √(1 − R²) is centred, unlike the SNES training RRMSE (Σy²
+        denominator); they agree only when target means are small.
         """
         metrics, preds = self.score(test_data)
         m = {k: (float(v.numpy()) if hasattr(v, "numpy") else float(v))
              for k, v in metrics.items()
              if v is not None and getattr(v, "shape", ())  == ()}
-        # Per-atom (always populated):
         rrmse_pa = (1.0 - m["r2"]) ** 0.5
         print(f"  PER-ATOM space (matches GPUMD loss.out 'rmse_virial'):")
         print(f"    RMSE  = {m['rmse']:.6f}  e·bohr / atom / component")
         print(f"    R²    = {m['r2']:.6f}")
         print(f"    RRMSE = √(1−R²) = {rrmse_pa:.4%}")
-        # Total (only when scale_targets active):
         if "total_rmse" in m and "total_r2" in m:
             rrmse_tot = (1.0 - m["total_r2"]) ** 0.5
             print(f"  TOTAL-DIPOLE space (matches NEP paper headline RMSE / R²):")
@@ -1530,64 +1316,35 @@ class TNEP(layers.Layer):
                       nep_pair_struct: tf.Tensor | None = None,
                       nep_pair_D: tf.Tensor | None = None,
                       nep_pair_ang: tf.Tensor | None = None) -> tf.Tensor:
-        """Batched forward pass for B structures using COO gradient storage.
-
-        Weights are passed explicitly (not read from self) so this method can
-        be used for SNES population evaluation with different candidate weights.
-
-        Args:
-            descriptors : [B, A, Q]    padded descriptors
-            grad_values : [P, 3, Q]    COO gradient blocks (P = total pairs in batch)
-            pair_atom   : [P]          center atom index for each pair
-            pair_gidx   : [P]         neighbor atom index for each pair
-            pair_struct : [P]          batch-relative structure index for each pair
-            positions   : [B, A, 3]   padded positions
-            Z           : [B, A]      padded type indices
-            boxes       : [B, 3, 3]   lattice vectors
-            atom_mask   : [B, A]      atom mask (1.0 real, 0.0 padding)
-            W0          : [T, Q, H]   input weights
-            b0          : [T, H]      hidden bias
-            W1          : [T, H]      output weights ([T, H, C] neighbor readout)
-            b1          : ()          scalar bias
+        """Batched forward for B structures with COO gradients → [B, T_dim].
+        Weights are explicit (already U-folded by the caller; no mixing here).
+            descriptors [B, A, Q] (raw [B, A, W_in] under radial_basis_size)
+            grad_values [P, 3, Q]; pair_atom / pair_gidx / pair_struct [P]
+            positions [B, A, 3]; Z [B, A]; boxes [B, 3, 3]; atom_mask [B, A]
+            W0 [T, Q, H]; b0 [T, H]; W1 [T, H] ([T, H, S] neighbor); b1 ()
             W_atom      : dipole kernel [B, A, 3, Q]; neighbor readout: V
-                          [B, A, D, C, T] instead (D = 3 dipole, 6 polaris-
-                          ability; built in-graph when None)
-            c_pair      : [C, T(T+1)/2] species-pair coefficients (neighbor
-                          readout; None → self.c_pair)
-            M_radial    : [T, S, α, K] learned radial basis (None → self.M_radial)
-            nep_raw     : [B, A, W_raw] raw expert input (cfg.nep_descriptor
-                          != "off"): the NEP basis, or GAP q2‖q3 under gap_sum
-            c_r, c_a    : NEP contraction tensors (None → self.c_r / self.c_a)
-            experts     : "sum" mode: the six STORED expert tensors
-                          (EXPERT_WEIGHTS order; None → model variables)
-            sum_delta   : [3] per-expert amplitudes (δ_soap, δ_2b, δ_3b);
-                          None → self.sum_delta
-            nep_pair_*  : image-exact NEP pair stream (data.py nep_pairs; the
-                          tnep readout under NEP): atom/gidx/struct [P],
-                          D [P, 3] = r_j − r_i incl. image, ang [P] bool
-
-        Returns:
-            predictions : [B, T_dim]  T_dim = 1 (PES), 3 (dipole), 6 (pol)
+                          [B, A, D, Ck, T] (built in-graph when None)
+            c_pair, M_radial, c_r, c_a, experts (STORED, EXPERT_WEIGHTS order),
+                          sum_delta [3]: None → the model's variables
+            nep_pair_*  : image-exact NEP pair stream (data.py nep_pairs):
+                          atom/gidx/struct [P], D [P, 3] = r_j − r_i, ang [P] bool
         """
         if self._learn_radial:
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)
         descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
         box_inv = tf.linalg.inv(boxes)  # [B, 3, 3]
 
-        # Pure forward primitive: caller decides whether W0 is raw or already
-        # U-absorbed, so no double-mixing here.
         W0_use = W0
 
         b0_t = tf.gather(b0, Z)   # [B, A, H]
-        W1_t = tf.gather(W1, Z)   # [B, A, H_final]
+        W1_t = tf.gather(self._masked_W1(W1), Z)   # [B, A, H_final]
 
-        # Per-type loop for W0 avoids materialising [B, A, Q, H] (memory-dominant);
-        # b0/W1 are only [B, A, H] so their gathers are fine.
+        # Per-type loop avoids materialising a [B, A, Q, H] W0 gather.
         type_masks = [
             tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
             for t in range(self.num_types)
         ]
-        # z1 preserved for the swish backward chain.
+        # z1 kept for the swish backward chain.
         z1 = tf.add_n([
             tf.einsum('baq,qh->bah', descriptors, W0_use[t]) * type_masks[t]
             for t in range(self.num_types)
@@ -1602,22 +1359,17 @@ class TNEP(layers.Layer):
             return -E
 
         if self._neighbor_readout:
-            # Neighbor-basis readout (C channels + species-pair c):
-            #   μ[b] = Σ_{a,n,t'} s[b,a,n]·c[t_a,t',n]·V[b,a,:,n,t'].
-            # The de_dq backward chain is skipped entirely — the readout
-            # reads no descriptor gradients; don't re-add it. b1 stays
-            # excluded from s: exact gauge with c symmetric; a modeling
-            # choice (kept deliberately) under "ordered" Ω.
+            # μ[b] = Σ_{a,n,t'} s[b,a,n]·c[t_a,t',n]·V[b,a,:,n,t']; no de_dq chain.
             if c_pair is None:
-                c_pair = self.c_pair  # model-weight callers (score, spectro)
-            out = tf.einsum('bah,bahk->bak', h1, W1_t)               # [B, A, S]
+                c_pair = self.c_pair
+            out = self._site_bias(tf.einsum('bah,bahk->bak', h1, W1_t),
+                                  b1, Z, atom_mask)                   # [B, A, S]
             G = self._site_coeff(
                 self._model_outs(out, nep_raw, Z, atom_mask, c_r, c_a,
                                  experts, sum_delta), c_pair, Z)     # [B, A, C, T]
             V = W_atom  # [B, A, D, C, T] geometry kernel via the W_atom slot
             if V is None:
-                # Full-pair callers (spectroscopy fused / legacy pack):
-                # build V in-graph from the r_d pair stream (r_c ≤ rcut_hard).
+                # Full-pair callers (spectroscopy): in-graph V, r_c ≤ rcut_hard.
                 V = self._neighbor_V_coo(
                     positions, boxes, box_inv, pair_struct, pair_atom,
                     pair_gidx, Z, tf.shape(descriptors)[0],
@@ -1625,8 +1377,7 @@ class TNEP(layers.Layer):
             mu = tf.einsum('bant,badnt->bd', G, V)                # [B, D]
             return mu
 
-        # Single-hidden backward chain (∂U/∂q):
-        #   ∂U/∂h1 = W1, ∂U/∂a1 = activation'(h1, z1)·W1, ∂U/∂q = ∂U/∂a1·W0^T
+        # Backward chain: ∂U/∂a1 = activation'(h1, z1)·W1, ∂U/∂q = ∂U/∂a1·W0ᵀ.
         de_da = self._activation_grad(h1, z1) * W1_t
         de_dq = tf.add_n([
             tf.einsum('bah,qh->baq', de_da, W0_use[t]) * type_masks[t]
@@ -1636,8 +1387,7 @@ class TNEP(layers.Layer):
         B = tf.shape(descriptors)[0]
 
         if self._nep_pair_forces_on:
-            # NEP columns → per-pair forces on the image-exact stream; SOAP
-            # columns (concat) → the unchanged W_atom / COO path below.
+            # NEP columns → image-exact pair forces; SOAP columns → W_atom / COO path.
             off = self._soap_dim if self._nep_mode == "concat" else 0
             mu = self._dipole_nep_pairs(
                 de_dq[tf.newaxis, :, :, off:], s_nep[tf.newaxis], c_r, c_a, Z, B,
@@ -1652,12 +1402,9 @@ class TNEP(layers.Layer):
                 pair_struct, pair_atom, pair_gidx, positions, boxes, box_inv, B)
 
         if self.cfg.target_mode == 1 and W_atom is not None:
-            # Precomputed-kernel path (avoids [C, P, Q]):
-            # dipole[b,s] = -Σ_{a,q} de_dq[b,a,q]·W_atom[b,a,s,q], identical to
-            # the COO forces path by W_atom's definition.
+            # Precomputed kernel: dipole[b,s] = -Σ_{a,q} de_dq·W_atom (no [C, P, Q]).
             return -tf.einsum('baq,basq->bs', de_dq, W_atom)  # [B, 3]
 
-        # Standard COO path (W_atom not precomputed: score(), predict()).
         forces_per_pair = self._calc_forces_coo(de_dq, grad_values, pair_struct, pair_atom)
 
         if self.cfg.target_mode == 1:
@@ -1687,45 +1434,14 @@ class TNEP(layers.Layer):
                                   nep_pair_struct: tf.Tensor | None = None,
                                   nep_pair_D: tf.Tensor | None = None,
                                   nep_pair_ang: tf.Tensor | None = None) -> tf.Tensor:
-        """Forward pass for C candidates × B structures using explicit batched GEMMs.
-
-        Replaces vectorized_map for every mode (PES, dipole, polarisability).
-        Both the input→hidden and hidden→descriptor matmuls are executed as
-        single large GEMMs over all C candidates simultaneously:
-
-            Forward:  [B*A, Q] @ [Q, C*H]    → [B*A, C*H] → [C, B, A, H]
-            Backward: [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]  (batched GEMM)
-
-        Descriptors are assumed pre-scaled by the caller.
-
-        Args:
-            descriptors : [B, A, Q]
-            W_atom      : [B, A, 3, Q]  precomputed dipole kernel (mode 1 only);
-                          neighbor readout: V [B, A, 3, Ch, T] geometry kernel
-            Z           : [B, A]        type indices
-            atom_mask   : [B, A]        1.0 real, 0.0 pad
-            W0          : [C, T, Q, H]
-            b0          : [C, T, H]
-            W1          : [C, T, H]     ([C, T, H, Ch] neighbor readout)
-            b1          : [C]
-            c_pair      : [C, Ch, T(T+1)/2] per-candidate species-pair
-                          coefficients (neighbor readout only)
-            M_radial    : [C, T, S, α, K] per-candidate learned radial basis
-                          (required under cfg.radial_basis_size; descriptors
-                          are then raw centre coefficients [B, A, W_in])
-            nep_raw     : [B, A, W_raw] raw expert input (cfg.nep_descriptor
-                          != "off"): the NEP basis, or GAP q2‖q3 under gap_sum
-            c_r, c_a    : per-candidate [C, T, T, n+1, K+1] NEP contraction
-                          tensors (None → the model's shared c_r / c_a)
-            experts     : "sum" mode: per-candidate [C, ...] STORED expert
-                          tensors (EXPERT_WEIGHTS order; None → the model's)
-            sum_delta   : per-candidate [C, 3] amplitudes (δ_soap, δ_2b, δ_3b)
-                          or shared [3]; None → the model's self.sum_delta
-            nep_pair_*  : image-exact NEP pair stream (see predict_batch); the
-                          tnep readout under NEP contracts it per candidate
-
-        Returns:
-            predictions : [C, B, T_dim]  T_dim = 1 (PES) or 3 (dipole)
+        """Forward for C candidates × B structures → [C, B, T_dim], as batched GEMMs:
+            forward  [B*A, Q] @ [Q, C*H]     → [C, B, A, H]
+            backward [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]
+        Per-candidate twin of predict_batch; STORED weights (U/scale folded here):
+            W0 [C, T, Q, H]; b0 [C, T, H]; W1 [C, T, H] ([C, T, H, S] neighbor); b1 [C]
+            W_atom [B, A, 3, Q] (neighbor: V [B, A, D, Ck, T]); U_pair / c_pair /
+            M_radial / c_r, c_a / experts / sum_delta with a leading C (shared
+            [3] sum_delta allowed; None → the model's)
         """
         Q = self.dim_q
         H = self.num_neurons
@@ -1736,18 +1452,15 @@ class TNEP(layers.Layer):
         A = tf.shape(descriptors)[1]
         C = tf.shape(W0)[0]
 
-        # Type masks [B, A, 1] — C-independent, reused for both matmul directions.
         type_masks = [
             tf.cast(tf.equal(Z, t), tf.float32)[:, :, tf.newaxis]
             for t in range(T)
         ]
 
-        # Per-candidate mixing: absorb U_pairᵀ into W0 so forward/backward stay
-        # in raw-desc space (de_dq combines with raw grad_values). See _W0_eff.
         b0 = self._b0_eff(b0, W0)          # centring fold needs the STORED W0
         W0 = self._W0_eff(W0, U_pair)
 
-        # ── Forward: input→hidden ─────────────────────────────────────────────
+        # ── forward: input→hidden ──
         pre_h_terms = []
         if self._learn_radial:
             if M_radial is None:
@@ -1757,15 +1470,13 @@ class TNEP(layers.Layer):
             descriptors = self.soap_from_raw(descriptors, Z, M_radial)         # [C, B, A, Q]
         descriptors, s_nep = self._ann_inputs(descriptors, nep_raw, Z, c_r, c_a)
         if len(descriptors.shape) == 4:
-            # Per-candidate descriptors [C, B, A, Q] (learned radial basis or
-            # per-candidate c): the input→hidden product is a batched GEMM
-            # over C per type.
+            # Per-candidate descriptors [C, B, A, Q]: batched GEMM over C per type.
             desc_c = tf.reshape(descriptors, [C, B * A, Q])                    # [C, B*A, Q]
             for t in range(T):
                 ph = tf.reshape(tf.matmul(desc_c, W0[:, t, :, :]), [C, B, A, H])  # [C,B,A,H]
                 pre_h_terms.append(ph * type_masks[t][tf.newaxis])
         else:
-            # Per type: [B*A, Q] @ [Q, C*H] → [C, B, A, H]. One GEMM/type, not C.
+            # One GEMM per type: [B*A, Q] @ [Q, C*H] → [C, B, A, H].
             desc_flat = tf.reshape(descriptors, [B * A, Q])
             for t in range(T):
                 W0_t     = W0[:, t, :, :]                                              # [C, Q, H]
@@ -1775,35 +1486,30 @@ class TNEP(layers.Layer):
                 pre_h_terms.append(ph * type_masks[t][tf.newaxis])
         pre_h = tf.add_n(pre_h_terms)  # [C, B, A, H]
 
-        # ── Bias / output-weight gathers ──────────────────────────────────────
-        # tf.gather along T axis: b0[C,T,H] gathered by Z_flat[B*A] → [C,B*A,H]
+        # ── bias / output-weight gathers ──
         Z_flat   = tf.reshape(Z, [B * A])
         b0_t_all = tf.reshape(tf.gather(b0, Z_flat, axis=1), [C, B, A, H])
         _w1_shape = ([C, B, A, H_final, self._head_slots]
                      if self._neighbor_readout else [C, B, A, H_final])
-        W1_t_all = tf.reshape(tf.gather(W1, Z_flat, axis=1), _w1_shape)
+        W1_t_all = tf.reshape(tf.gather(self._masked_W1(W1), Z_flat, axis=1), _w1_shape)
 
-        # ── Activation (single hidden layer) ──────────────────────────────────
-        # z1 preserved for the swish backward chain below.
+        # z1 kept for the swish backward chain.
         z1 = pre_h + b0_t_all
         h1 = self.activation(z1)
         h1 = h1 * atom_mask[tf.newaxis, :, :, tf.newaxis]
 
-        # ── PES ───────────────────────────────────────────────────────────────
+        # ── PES ──
         if self.cfg.target_mode == 0:
             E = tf.reduce_sum(h1 * W1_t_all, axis=3) + b1[:, tf.newaxis, tf.newaxis]
             E = E * atom_mask[tf.newaxis]
             return -tf.reduce_sum(E, axis=2, keepdims=True)  # [C, B, 1]
 
-        # ── Dipole, neighbor-basis readout ────────────────────────────────────
+        # ── neighbor readout ──
         if self._neighbor_readout:
-            # W_atom slot carries V [B, A, D, Ch, T] (SNES threads it); no
-            # backward matmul — the readout reads no descriptor gradients.
-            # b1 stays excluded: exact gauge with c symmetric; a modeling
-            # choice (kept deliberately) under "ordered" Ω.
-            out = tf.einsum('cbah,cbahk->cbak', h1, W1_t_all)      # [C, B, A, S]
-            # c_pair None = candidate-independent table (frozen c ≡ 1, or the
-            # model's weights): it broadcasts against the candidate axis of s.
+            # W_atom slot carries V [B, A, D, Ck, T]; no backward matmul.
+            out = self._site_bias(tf.einsum('cbah,cbahk->cbak', h1, W1_t_all),
+                                  b1, Z, atom_mask)                 # [C, B, A, S]
+            # c_pair None: candidate-independent table, broadcasts over C.
             G = self._site_coeff(
                 self._model_outs(out, nep_raw, Z, atom_mask, c_r, c_a,
                                  experts, sum_delta),
@@ -1811,12 +1517,10 @@ class TNEP(layers.Layer):
             mu = tf.einsum('cbant,badnt->cbd', G, W_atom)          # [C, B, D]
             return mu
 
-        # ── Dipole: backward matmul ───────────────────────────────────────────
-        # ∂U/∂a1 = activation'(h1, z1)·W1.
+        # ── dipole: backward matmul ──
         de_da    = self._activation_grad(h1, z1) * W1_t_all   # [C, B, A, H]
         de_da_flat = tf.reshape(de_da, [C, B * A, H])         # [C, B*A, H]
 
-        # Per type: [C, B*A, H] @ [C, H, Q] → [C, B*A, Q]  (batched GEMM over C)
         de_dq_terms = []
         for t in range(T):
             W0_t_T  = tf.transpose(W0[:, t, :, :], [0, 2, 1])    # [C, H, Q]
@@ -1834,7 +1538,6 @@ class TNEP(layers.Layer):
                 return mu
             return mu - tf.einsum('cbaq,basq->cbs', de_dq[:, :, :, :off], W_atom)
 
-        # W_atom [B, A, 3, Q]: dipole[c,b,s] = -Σ_{a,q} de_dq[c,b,a,q]*W_atom[b,a,s,q]
         return -tf.einsum('cbaq,basq->cbs', de_dq, W_atom)  # [C, B, 3]
 
     def _dipole_nep_pairs(self, de_dq_nep: tf.Tensor, s: tf.Tensor,
@@ -1842,9 +1545,8 @@ class TNEP(layers.Layer):
                           Z: tf.Tensor, B: tf.Tensor,
                           nep_pair_atom, nep_pair_gidx, nep_pair_struct,
                           nep_pair_D, nep_pair_ang) -> tf.Tensor:
-        """μ [Cc, B, 3] = −Σ_p |D_p|^N F_p from the NEP pair forces, N =
-        cfg.dipole_rij_power ≥ 1, |D| from the stored image-exact D (never MIC:
-        rc_r = 8 Å exceeds L/2 for the water box — plan §B.2)."""
+        """μ [Cc, B, 3] = −Σ_p |D_p|^N F_p from the NEP pair forces (N ≥ 1).
+        |D| from the stored image-exact D, never MIC: rc_r = 8 Å exceeds L/2."""
         if nep_pair_D is None:
             raise ValueError(
                 "nep_pair_* stream missing: the tnep readout under "
@@ -1861,22 +1563,14 @@ class TNEP(layers.Layer):
                          c_r: tf.Tensor | None, c_a: tf.Tensor | None, Z: tf.Tensor,
                          nep_pair_atom, nep_pair_gidx, nep_pair_struct,
                          nep_pair_D, nep_pair_ang) -> tf.Tensor:
-        """Per-pair NEP forces F_p = ∂U_{i_p}/∂D_p [Cc, P, 3] (D = r_j − r_i, the
-        neighbour-side derivative as GPUMD's x12 = x[j] − x[i]; the centre side is
-        −F_p), for U_i = Σ_d Fp[i,d] q_d with Fp = de_dq over the NEP block.
-        Plan §B.2 factorisation:
+        """Per-pair NEP forces F_p = ∂U_{i_p}/∂D_p [Cc, P, 3], D = r_j − r_i (the
+        neighbour side, GPUMD's x12; centre side is −F_p), U_i = Σ_d Fp[i,d] q_d:
             radial   F^r_p = (Σ_k α[i,t_j,k] fnp_k(r)) r̂,  α[i,t',k] = Σ_n Fp[i,n] c_r[t_i,t',n,k]
-            angular  Gs[i,n,c] = ∂(Σ_d Fp[i,d] q_d(s_i))/∂s[i,n,c]   (GradientTape over
-                     find_q_tf — covers L=1..4, 4-body, 5-body)
+            angular  Gs[i,n,c] = ∂(Σ_d Fp[i,d] q_d(s_i))/∂s[i,n,c]  (tape over find_q_tf)
                      F^a_p = Σ_n [ gnp_n (Σ_c Gs P_c) r̂ + g_n Σ_c Gs ∇P_c ]  (XLA n-loop)
-        Args:
-            de_dq_nep : [Cc, B, A, dim_nep]     (Cc = 1 for predict_batch)
-            s         : [(Cc,) B, A, n_a+1, 24] from nep_from_raw(return_s=True)
-            c_r, c_a  : [(Cc,) T, T, n+1, K+1] (None → self.c_r / self.c_a); shared
-                        c is broadcast over the candidate axis
-            Z         : [B, A]
-            nep_pair_atom/gidx/struct [P], nep_pair_D [P, 3], nep_pair_ang [P] bool —
-            ang is the authoritative rc_a mask (never re-derived from float32 D).
+        de_dq_nep [Cc, B, A, dim_nep] (Cc = 1 for predict_batch); s [(Cc,) B, A,
+        n_a+1, 24]; c_r, c_a [(Cc,) T, T, n+1, K+1]; nep_pair_D [P, 3]; nep_pair_ang
+        [P] bool is the authoritative rc_a mask (never re-derived from float32 D).
         """
         cfg = self.cfg
         c_r = self.c_r if c_r is None else c_r
@@ -1901,12 +1595,11 @@ class TNEP(layers.Layer):
         t_i, t_j = tf.gather(Zf, i_lin), tf.gather(Zf, j_lin)
         slot = t_i * T + t_j                                                 # (t_i, t_j) → T·T
 
-        # Candidate-independent per-pair basis (in-graph from D).
         r = tf.norm(nep_pair_D, axis=1)                                      # [P]
         rhat = nep_pair_D / r[:, tf.newaxis]
         _, fnp_r = fn_and_fnp_tf(r, cfg.nep_rc_radial, K_r - 1)              # [P, K_r]
 
-        # Radial: α [Cc, N, T, K_r] → gathered per pair at (i, t_j).
+        # Radial: α [Cc, N, T, K_r], gathered per pair at (i, t_j).
         c_r_i = tf.gather(c_r, Zf, axis=1)                                   # [Cc, N, T, n_r, K_r]
         alpha = tf.einsum('cin,citnk->citk', Fp[:, :, :n_r], c_r_i)
         F = _nep_radial_xla(tf.reshape(alpha, [Cc, N * T, K_r]),
@@ -1933,10 +1626,8 @@ class TNEP(layers.Layer):
         return F + tf.transpose(F_a, [1, 0, 2])
 
     def _scalar_rij_pow(self, rij2: tf.Tensor) -> tf.Tensor:
-        """|r_ij|^N per-pair weight from the rij² primitive (N ≥ 1; avoids sqrt
-        for even N). N=0 (self-pairs only) is handled by _dipole_pair_weight_*.
-            N=1 → √rij²;  N=2 → rij²;  even≥4 → rij²^(N/2);  odd≥3 → rij²^((N-1)/2)·√rij²
-        """
+        """|r_ij|^N from rij² (N ≥ 1; no sqrt for even N). N=0 is handled by
+        _dipole_pair_weight_*."""
         N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if N == 1:
             return tf.sqrt(rij2)
@@ -1944,18 +1635,14 @@ class TNEP(layers.Layer):
             return rij2
         if N % 2 == 0:
             return tf.pow(rij2, N // 2)
-        # Odd N ≥ 3
         return tf.pow(rij2, (N - 1) // 2) * tf.sqrt(rij2)
 
     def _dipole_pair_weight_coo(self, rij2: tf.Tensor,
                                  pair_atom: tf.Tensor,
                                  pair_gidx: tf.Tensor) -> tf.Tensor:
-        """Per-pair dipole weight, COO-pair interface.
-            N == 0 : 1 where pair_atom==pair_gidx AND rij²<1e-20 (true self pair),
-                     else 0. The rij² guard rejects periodic self-images (same
-                     atom index, nonzero displacement) that would double-count.
-            N >= 1 : |r_ij|^N (self pairs → 0, images weighted correctly).
-        """
+        """Per-pair dipole weight (COO). N == 0: 1 on true self pairs
+        (pair_atom==pair_gidx AND rij² < 1e-20 — the guard rejects periodic
+        self-images); N ≥ 1: |r_ij|^N."""
         N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if N == 0:
             is_self = tf.logical_and(tf.equal(pair_atom, pair_gidx),
@@ -1965,12 +1652,8 @@ class TNEP(layers.Layer):
 
     def _dipole_pair_weight_padded(self, rij2: tf.Tensor,
                                     grad_index: tf.Tensor) -> tf.Tensor:
-        """Per-pair dipole weight, padded [A, M] interface (same dispatch as COO).
-        Centre of row i is i, so self pairs are grad_index[i,m]==i AND rij²<1e-20.
-
-        Caller MUST multiply by neighbor_mask afterwards: padding rows can look
-        like self pairs (grad_index==0, rij2==0). predict()'s dipole branch does.
-        """
+        """Padded [A, M] twin of _dipole_pair_weight_coo. Caller MUST multiply
+        by neighbor_mask: padding rows look like self pairs (grad_index==0, rij²==0)."""
         N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if N == 0:
             A = tf.shape(grad_index)[0]
@@ -1982,17 +1665,7 @@ class TNEP(layers.Layer):
 
     def _calc_forces_coo(self, de_dq: tf.Tensor, grad_values: tf.Tensor,
                          pair_struct: tf.Tensor, pair_atom: tf.Tensor) -> tf.Tensor:
-        """Compute per-pair forces via COO gather + einsum.
-
-        Args:
-            de_dq       : [B, A, Q]   energy derivative w.r.t. descriptor
-            grad_values : [P, 3, Q]   COO gradient blocks
-            pair_struct : [P]         batch-relative structure index
-            pair_atom   : [P]         center atom index
-
-        Returns:
-            forces_per_pair : [P, 3]
-        """
+        """Per-pair forces [P, 3] = de_dq[B, A, Q] gathered per pair · grad_values [P, 3, Q]."""
         ba = tf.stack([pair_struct, pair_atom], axis=1)          # [P, 2]
         de_dq_per_pair = tf.gather_nd(de_dq, ba)                 # [P, Q]
         return tf.einsum('kq,kcq->kc', de_dq_per_pair, grad_values)  # [P, 3]
@@ -2000,25 +1673,11 @@ class TNEP(layers.Layer):
     def _neighbor_displacements_single(self, positions: tf.Tensor,
                                        box: tf.Tensor,
                                        grad_index: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute neighbor displacements for a single structure (padded interface).
-
-        Used by the single-structure predict() path (e.g. spectroscopy).
-
-        Args:
-            positions  : [A, 3]
-            box        : [3, 3]
-            grad_index : [A, M]
-
-        Returns:
-            dr  : [A, M, 3]  displacement vectors to neighbors
-            rij : [A, M]     scalar distances to neighbors
-        """
+        """MIC displacements for one padded structure: positions [A, 3], box [3, 3],
+        grad_index [A, M] → dr [A, M, 3] (neighbor − center), rij [A, M]."""
         box_inv = tf.linalg.inv(box)
-        # ASE row-vector cell convention: fractional s = r @ inv(cell), i.e.
-        # contract the FIRST index of box_inv (='ji'), so the minimum-image
-        # round() below happens in the true fractional basis. Using 'ij' here
-        # transposes the basis and gives wrong MIC wrapping for non-orthogonal
-        # (triclinic/sheared) cells (no-op for orthorhombic/diagonal boxes).
+        # ASE row-vector cells: s = r @ inv(cell), so contract the FIRST index of
+        # box_inv ('ji'); 'ij' gives wrong MIC wrapping for triclinic cells.
         s = tf.einsum('ji,nj->ni', box_inv, positions)       # [A, 3]
         s_j = tf.gather(s, grad_index)                        # [A, M, 3]
         s_i = s[:, tf.newaxis, :]                             # [A, 1, 3]
@@ -2033,30 +1692,13 @@ class TNEP(layers.Layer):
                                   pair_gidx: tf.Tensor, positions: tf.Tensor,
                                   boxes: tf.Tensor, B: tf.Tensor,
                                   A: tf.Tensor) -> tf.Tensor:
-        """Aggregate rij²-weighted gradients per (structure, atom); candidate-independent.
-            W_atom[b,a,s,q] = Σ_{p: struct=b, atom=a} rij²[p]·grad_values[p,s,q]
-        Dipole is then -einsum('baq,basq->bs', de_dq, W_atom), no P axis inside
-        the candidate loop (eliminates the [C, P, Q] intermediate).
-
-        Args:
-            grad_values : [P, 3, Q]  (already scaled if descriptor scaling is active)
-            pair_struct : [P]
-            pair_atom   : [P]
-            pair_gidx   : [P]
-            positions   : [B, A, 3]
-            boxes       : [B, 3, 3]
-            B           : number of structures
-            A           : max atoms (padded)
-
-        Returns:
-            W_atom : [B, A, 3, Q]
-        """
+        """Candidate-independent dipole kernel W_atom [B, A, 3, Q] =
+        Σ_{p: struct=b, atom=a} |r|^N[p]·grad_values[p, :, :], so the dipole is
+        -einsum('baq,basq->bs', de_dq, W_atom) with no [C, P, Q] intermediate.
+        grad_values [P, 3, Q] (already scaled); positions [B, A, 3]; boxes [B, 3, 3]."""
         P = tf.shape(grad_values)[0]
         Q = tf.shape(grad_values)[2]
-        # N == 0 : weight = 1 everywhere — the COO list is already filtered to
-        #          self-pairs (data.py self_pairs_only), so skip displacements
-        #          + tf.linalg.inv(boxes) entirely.
-        # N >= 1 : per-pair |r|^N weight; needs displacements.
+        # N == 0: the COO list is already self-pairs only (data.py), weight 1.
         _N = int(getattr(self.cfg, "dipole_rij_power", 2))
         if _N == 0:
             weight = tf.ones([P], dtype=grad_values.dtype)
@@ -2077,29 +1719,15 @@ class TNEP(layers.Layer):
                                     box_inv: tf.Tensor, pair_struct: tf.Tensor,
                                     pair_atom: tf.Tensor,
                                     pair_gidx: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute per-pair displacements in COO format with MIC wrapping.
-
-        Args:
-            positions  : [B, A, 3]
-            boxes      : [B, 3, 3]
-            box_inv    : [B, 3, 3]
-            pair_struct: [P]  batch-relative structure index
-            pair_atom  : [P]  center atom index
-            pair_gidx  : [P]  neighbor atom index
-
-        Returns:
-            dr   : [P, 3]  displacement vectors (neighbor - center)
-            rij2 : [P]     squared distances
-        """
+        """COO twin of _neighbor_displacements_single: positions [B, A, 3], boxes /
+        box_inv [B, 3, 3], pair_* [P] → dr [P, 3] (neighbor − center), rij2 [P]."""
         ba_c = tf.stack([pair_struct, pair_atom], axis=1)   # [P, 2]
         ba_n = tf.stack([pair_struct, pair_gidx], axis=1)   # [P, 2]
         pos_c   = tf.gather_nd(positions, ba_c)              # [P, 3]
         pos_n   = tf.gather_nd(positions, ba_n)              # [P, 3]
         box_k   = tf.gather(boxes,   pair_struct)            # [P, 3, 3]
         binv_k  = tf.gather(box_inv, pair_struct)            # [P, 3, 3]
-        # ASE row-vector convention: s = r @ inv(cell) → contract the first
-        # (row) index of box_inv (='kji'), matching _neighbor_displacements_single.
-        # 'kij' transposes the fractional basis → wrong MIC for triclinic cells.
+        # 'kji' contracts the first index of box_inv (ASE row-vector cells), see _single.
         s_c = tf.einsum('kji,kj->ki', binv_k, pos_c)        # [P, 3] fractional
         s_n = tf.einsum('kji,kj->ki', binv_k, pos_n)
         ds  = s_n - s_c
@@ -2109,48 +1737,34 @@ class TNEP(layers.Layer):
         return dr, rij2
 
     def _fc(self, r: tf.Tensor) -> tf.Tensor:
-        """Dipole cutoff f_c(r) per the resolved cfg.dipole_cutoff:
-        "cosine2" ((1+cos(πr/r_c))/2)² — C³ contact at r_c; "cosine"
-        (1+cos(πr/r_c))/2 — C¹; "cubic" 1 − 3x² + 2x³, x = r/r_c — C¹;
-        "tanh3" tanh³(1 − r/r_c)/tanh³(1) — C² (normalized so f(0) = 1).
-        All finite on raw r (tanh3 goes NEGATIVE beyond r_c before
-        masking); callers mask r ≥ dipole_rc to zero."""
-        rc = float(self.cfg.dipole_rc)
+        """f_c(r): "cosine2" ((1+cos(πr/r_c))/2)², C³ at r_c; "cosine" (1+cos(πr/r_c))/2,
+        C¹. Callers mask r ≥ r_c."""
+        rc = self._rc
         fc = self._dipole_cutoff
         if fc == "cosine2":
             return tf.square(0.5 * (1.0 + tf.cos(np.pi / rc * r)))
         if fc == "cosine":
             return 0.5 * (1.0 + tf.cos(np.pi / rc * r))
-        if fc == "cubic":
-            x = r / rc
-            return 1.0 - 3.0 * x * x + 2.0 * x * x * x
-        if fc == "tanh3":
-            return tf.tanh(1.0 - r / rc) ** 3 / np.tanh(1.0) ** 3
         raise ValueError(f"unknown dipole_cutoff {fc!r}")
 
     def _cheb_R(self, r: tf.Tensor) -> tf.Tensor:
-        """Chebyshev radial channels R_n(r) = T_n(x)·f_c(r), n = 0..C−1,
-        stacked on a trailing channel axis → [..., C]; f_c per
-        cfg.dipole_cutoff (_fc). x = 2r/r_c − 1 ("chebyshev") or the NEP
-        warp x_w = 2(r/r_c − 1)² − 1 ("chebyshev_warped"). Recurrence
-        (not cos∘arccos) so out-of-cutoff r stays finite until the caller
-        masks it."""
+        """R_n(r) = T_n(x)·f_c(r), n = 0..C−1 → [..., C]; x = 2r/r_c − 1, or the
+        NEP warp 2(r/r_c − 1)² − 1 for "chebyshev_warped". Recurrence, not
+        cos∘arccos, so out-of-cutoff r stays finite until masked."""
         C = self._dipole_channels
         if self._dipole_radial == "chebyshev_warped":
-            x = 2.0 * tf.square(r / float(self.cfg.dipole_rc) - 1.0) - 1.0
+            x = 2.0 * tf.square(r / self._rc - 1.0) - 1.0
         else:
-            x = 2.0 * r / float(self.cfg.dipole_rc) - 1.0
+            x = 2.0 * r / self._rc - 1.0
         Ts = [tf.ones_like(x), x]
         for _ in range(2, C):
             Ts.append(2.0 * x * Ts[-1] - Ts[-2])
         return tf.stack(Ts[:C], axis=-1) * self._fc(r)[..., tf.newaxis]
 
     def _radial(self, r: tf.Tensor) -> tf.Tensor:
-        """Radial channel matrix [..., C] per cfg.dipole_radial. Screened:
-        R(r) = r^(ζ−1)·f_c(r), single channel; f_c per cfg.dipole_cutoff
-        (_fc). Both TF call sites mask AFTER the radial and real r=0
-        self-image entries exist in the pair streams, so guard the power's
-        INPUT (at ζ < 1, 0**(ζ−1) = inf and inf·0 = nan downstream)."""
+        """Radial channels [..., C] per cfg.dipole_radial; "screened" is
+        r^(ζ−1)·f_c(r), one channel. Callers mask AFTER the radial and r=0
+        self-images exist, so guard the power's INPUT (0**(ζ−1) = inf → nan)."""
         rad = self._dipole_radial
         if rad == "screened":
             r_safe = tf.where(r > 0, r, tf.ones_like(r))
@@ -2164,9 +1778,8 @@ class TNEP(layers.Layer):
                        / (2.0 * self._gauss_sigma ** 2))
             return g * self._fc(r)[..., tf.newaxis]
         if rad == "bessel":
-            # spherical Bessel j₀ family sin((n+1)πr/rc)/(r/rc); r=0 self-image
-            # entries are masked by the callers, so guard the division only.
-            rc = float(self.cfg.dipole_rc)
+            # j₀ family sin(nπr/rc)/(r/rc); guard the r=0 division only.
+            rc = self._rc
             n1 = tf.constant(np.arange(1, self._dipole_channels + 1), dtype=r.dtype)
             x = tf.where(r > 0, r, tf.ones_like(r)) / rc
             return (tf.sin(np.pi * n1 * x[..., tf.newaxis]) / x[..., tf.newaxis]
@@ -2174,11 +1787,9 @@ class TNEP(layers.Layer):
         raise ValueError(f"unknown dipole_radial {rad!r}")
 
     def _bond_geometry(self, d: tf.Tensor) -> tf.Tensor:
-        """Bond tensors [..., 3] → [..., D, G] per self._bond_rank. 1: d itself
-        (dipole, D = 3, G = 1). 2 (polarisability, D = 6 Voigt, G = 2): group
-        0 the isotropic |d|²·I, group 1 the traceless d⊗d − |d|²I/3 — both
-        even under d → −d, so the per-site sum equals the symmetric pair
-        form. TF twin of data.bond_geometry."""
+        """Bond tensors [..., 3] → [..., D, G]: rank 1 d itself (D=3, G=1); rank 2
+        Voigt (D=6, G=2) isotropic |d|²·I and traceless d⊗d − |d|²I/3, both even
+        in d so the per-site sum equals the pair form. TF twin of data.bond_geometry."""
         if self._bond_rank == 1:
             return d[..., tf.newaxis]
         x, y, z = tf.unstack(d, axis=-1)
@@ -2188,10 +1799,13 @@ class TNEP(layers.Layer):
         tr = tf.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=-1) - iso / 3.0
         return tf.stack([iso, tr], axis=-1)
 
+    def _masked_W1(self, W1: tf.Tensor) -> tf.Tensor:
+        """W1 [.., T, H, S] → block-diagonal over the kernel groups (_head_mask)."""
+        return W1 if self._head_mask is None else W1 * tf.cast(self._head_mask, W1.dtype)
+
     def _split_head(self, out: tf.Tensor):
-        """Head output [.., S] → site values s [.., Ck], S = _head_slots (Ck
-        for dipole_head="vector"; one slot per kernel group for "scalar",
-        repeated over that group's C channels — group-major like V)."""
+        """Head [.., S] → site values [.., Ck]: "scalar" repeats each group's
+        slot over its C channels (group-major like V)."""
         if self._head_slots == self._kernel_channels:
             return out
         if self._field_channel:                      # groups repeated, field slot as is
@@ -2200,33 +1814,24 @@ class TNEP(layers.Layer):
         return tf.repeat(out, self._dipole_channels, axis=-1)
 
     def _c_full(self, c_pair: tf.Tensor, k: int = 0) -> tf.Tensor:
-        """Model k's table from the packed c_pair [..., C, M·n_pairs] →
-        [..., C, T, T] via _pair_idx (symmetric table for "off"/"symmetric",
-        ordered for "ordered")."""
+        """Model k's table from packed c_pair [..., C, M·n_pairs] → [..., C, T, T]."""
         return tf.gather(c_pair, self._pair_idx + k * self._n_pairs, axis=-1)
 
     def _neighbor_V_coo(self, positions: tf.Tensor, boxes: tf.Tensor,
                         box_inv: tf.Tensor, pair_struct: tf.Tensor,
                         pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
                         Z: tf.Tensor, B: tf.Tensor, A: tf.Tensor) -> tf.Tensor:
-        """Geometry kernel of the neighbor-basis readout:
-            V[b,a,:,n,t'] = Σ_{pairs (a,j), |d|<r_c, t_j=t'} R_n(|d|)·g(d),
-            d = r_a − r_j (MIC), g = _bond_geometry (d or Voigt(d⊗d)),
-            R_n per cfg.dipole_radial (_radial).
-        Pairs come from the r_d descriptor list (r_c ≤ rcut_hard guarantees
-        coverage); j==a self-image entries are excluded. Accumulated in
-        float64, cast back to the pipeline dtype.
-
-        Returns:
-            V : [B, A, D, C, T]
-        """
+        """In-graph geometry kernel V [B, A, D, Ck, T]:
+            V[b,a,:,k,t'] = Σ_{pairs (a,j), |d|<r_c, t_j=t'} R_n(|d|)·g(d), d = r_a − r_j (MIC)
+        from the SOAP pair list (needs r_c ≤ rcut_hard); self-images excluded;
+        float64 accumulation. Twin of the staged V from data.py."""
         if self._field_channel:
             raise ValueError(
                 "in-graph V: cfg.dipole_field needs the staged V (Ewald field "
                 "channel built at data assembly); this path cannot build it.")
-        if float(self.cfg.dipole_rc) > float(self.cfg.rcut_hard):
+        if self._rc > float(self.cfg.rcut_hard):
             raise ValueError(
-                f"in-graph V: dipole_rc={self.cfg.dipole_rc} > "
+                f"in-graph V: readout r_c={self._rc} > "
                 f"rcut_hard={self.cfg.rcut_hard}, but this path builds V from "
                 f"the SOAP descriptor pair stream, which only reaches "
                 f"rcut_hard — it would silently truncate the readout. Pass the "
@@ -2234,13 +1839,13 @@ class TNEP(layers.Layer):
                 f"score already do.")
         dr, rij2 = self._neighbor_displacements_coo(
             positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
-        rc = float(self.cfg.dipole_rc)
+        rc = self._rc
         C = self._dipole_channels
         T = self.num_types
         r = tf.sqrt(rij2)
         keep = tf.logical_and(r < rc, tf.not_equal(pair_atom, pair_gidx))
         Rw = self._radial(r) * tf.cast(keep, r.dtype)[:, tf.newaxis]  # [P, C]
-        # contrib[p, d, k] = R_n·g_group(d), k = group·C + n, d = −(neighbor − center).
+        # contrib[p, d, k] = R_n·g_group(d), k = group·C + n.
         g = self._bond_geometry(-dr)                                # [P, D, G]
         D, Ck = int(g.shape[1]), self._kernel_channels
         contrib = tf.reshape(
@@ -2257,22 +1862,7 @@ class TNEP(layers.Layer):
                     pair_atom: tf.Tensor, pair_gidx: tf.Tensor,
                     positions: tf.Tensor, boxes: tf.Tensor,
                     box_inv: tf.Tensor, B: tf.Tensor) -> tf.Tensor:
-        """Batched dipole prediction using COO forces.
-
-        Args:
-            forces_per_pair : [P, 3]
-            pair_struct     : [P]
-            pair_atom       : [P]
-            pair_gidx       : [P]
-            positions       : [B, A, 3]
-            boxes           : [B, 3, 3]
-            box_inv         : [B, 3, 3]
-            B               : int scalar — number of structures
-
-        Returns:
-            dipole : [B, 3]
-        """
-        # μ: N>=1 → -Σ_pair |r_ij|^N·F_ij; N==0 → -Σ_i F_ii (self-only).
+        """μ [B, 3] = -Σ_pair |r_ij|^N·F_ij (N==0: -Σ_i F_ii) from COO forces [P, 3]."""
         _, rij2 = self._neighbor_displacements_coo(
             positions, boxes, box_inv, pair_struct, pair_atom, pair_gidx)
         weight = self._dipole_pair_weight_coo(rij2, pair_atom, pair_gidx)  # [P]
@@ -2283,13 +1873,10 @@ class TNEP(layers.Layer):
 
 
 def gen0_ann_inputs(cfg, data) -> np.ndarray:
-    """[S, A, dim_q] generation-0 ANN input of a padded data dict — what
-    compute_q_scale must see. The builder's `descriptors` slot is returned as
-    is unless it needs finishing: a throwaway model (scaling off) applies
-    soap_from_raw (learned basis) and _ann_inputs (NEP concat/replace) chunk by
-    chunk; under "sum" / "gap_sum" the expert input follows the SOAP block
-    ([q_soap ‖ q_nep] or [q_soap ‖ q2‖q3]). "minmax" assembles the NEP block with c ≡ 1 like GPUMD's q_scaler
-    (fitness.cu:165-175, initial_para = 1); block/channel use the real gen-0 c."""
+    """[S, A, dim_q] gen-0 ANN input of a padded data dict (what compute_q_scale
+    sees): a throwaway unscaled model finishes the `descriptors` slot chunk by
+    chunk; under "sum" the expert input follows ([q_soap ‖ q_nep]). "minmax"
+    uses c ≡ 1 like GPUMD's q_scaler (fitness.cu:165-175); block/channel the real c."""
     q0, Z = data["descriptors"], data["Z_int"]
     if cfg.radial_basis_size is None and str(getattr(cfg, "nep_descriptor", "off")) == "off":
         return q0.numpy() if hasattr(q0, "numpy") else np.asarray(q0)
@@ -2309,9 +1896,7 @@ def gen0_ann_inputs(cfg, data) -> np.ndarray:
             d = m0.soap_from_raw(d, z)
         raw = None if nep_raw is None else nep_raw[s:s + step]
         x = m0._ann_inputs(d, raw, z, **c)[0]
-        if m0._nep_mode == "gap_sum":
-            x = tf.concat([x, raw], axis=-1)
-        elif m0._nep_mode == "sum":
+        if m0._nep_mode == "sum":
             x = tf.concat([x, m0.nep_from_raw(raw, z, **c)], axis=-1)
         out.append(x)
     return tf.concat(out, axis=0).numpy()

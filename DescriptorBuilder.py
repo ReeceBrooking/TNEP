@@ -12,19 +12,14 @@ from quippy.descriptors import Descriptor
 from ase import Atoms
 
 
-# Per-thread cache of quippy Descriptor objects, keyed by SOAP-string tuple.
-# Building Descriptors is expensive and quippy .calc() is not thread-safe on a
-# shared object, so cache per thread to avoid rebuilds while staying isolated.
+# Per-thread quippy Descriptor cache: .calc() is not thread-safe on a shared object.
 _thread_local = threading.local()
 
 
 def _allocated_cpus() -> int:
-    """CPU cores actually granted to this process (mirrors
-    MasterTNEP._allocated_cpu_count). os.cpu_count() reports the whole physical
-    node and ignores the Slurm cgroup/cpuset, so using it inside a partial-node
-    allocation over-subscribes the worker pool. Prefer the Slurm allocation, then
-    the cpuset affinity mask, and only fall back to cpu_count()//2 off Slurm.
-    """
+    """CPUs granted to this process (twin of MasterTNEP._allocated_cpu_count):
+    Slurm vars, then the cpuset mask, else cpu_count()//2 — os.cpu_count()
+    ignores the cgroup and over-subscribes partial-node allocations."""
     for _var in ('SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE'):
         _val = os.environ.get(_var)
         if _val:
@@ -56,17 +51,8 @@ def _get_thread_builders(soap_strings: list[str]) -> list:
 def _describe_structure_worker(
     args: tuple,
 ) -> tuple[np.ndarray, list[np.ndarray], list[list[int]]]:
-    """Compute SOAP descriptors for one structure in a worker thread.
-
-    Reuses thread-local Descriptor objects across calls.
-
-    Args:
-        args: (structure, soap_strings) or (structure, soap_strings, do_grad);
-              do_grad defaults to True.
-    Returns:
-        (descriptors [N, dim_q], per-atom gradients [M_i, 3, dim_q],
-         per-atom neighbour-index lists).
-    """
+    """One structure in a worker thread, args = (structure, soap_strings[, do_grad=True])
+    → (descriptors [N, Q], per-atom gradients [M_i, 3, Q], per-atom neighbour lists)."""
     if len(args) == 2:
         structure, soap_strings = args
         do_grad = True
@@ -110,8 +96,7 @@ def _describe_structure_worker(
     descriptors_np = np.array(descriptors, dtype=np.float32).squeeze(axis=1)
     Q = descriptors_np.shape[-1]
     if do_grad:
-        # Empty per-atom gradient lists must keep [0, 3, Q]; bare np.array([])
-        # gives shape (0,) and breaks downstream concat/stack.
+        # Empty lists must stay [0, 3, Q]; np.array([]) is (0,) and breaks concat.
         gradients_np = [
             (np.array(g, dtype=np.float32) if len(g) > 0
              else np.zeros((0, 3, Q), dtype=np.float32))
@@ -128,17 +113,8 @@ def _describe_structure_worker_flat(
     dim_q: int,
     do_grad: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute SOAP descriptors and return flat COO arrays directly.
-
-    Skips per-atom bucketisation (the consumer wants flat COO), avoiding many
-    Python-level appends per batch.
-
-    Returns:
-        descriptors : [N, dim_q]      float32
-        grad_values : [P, 3, dim_q]   float32 — one entry per (centre, neighbour) pair
-        pair_atom   : [P]             int32   — centre atom index (0-based)
-        pair_gidx   : [P]             int32   — neighbour atom index (0-based)
-    """
+    """One structure → flat COO (no per-atom bucketing): descriptors [N, Q],
+    grad_values [P, 3, Q], pair_atom [P], pair_gidx [P] (0-based)."""
     cell = structure.cell.array
     if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
         cell = 1000.0 * np.eye(3, dtype=np.float32)
@@ -165,8 +141,7 @@ def _describe_structure_worker_flat(
         data = out.get("data")
         if data is None or data.size == 0 or data.shape[1] == 0:
             continue
-        # ci is 1-based; vectorised assign by centre atom.
-        ci = np.asarray(out["ci"], dtype=np.int32) - 1
+        ci = np.asarray(out["ci"], dtype=np.int32) - 1  # ci is 1-based
         descriptors[ci] = np.asarray(data, dtype=np.float32)
 
         grad_idx = out.get("grad_index_0based")
@@ -193,19 +168,8 @@ def _filter_to_self_pairs(
     gradients_per_struct: list,
     grad_index_per_struct: list,
 ) -> tuple[list, list, list]:
-    """Reduce a full neighbour-gradient bundle to the self-pair (∂q_i/∂r_i) per atom.
-
-    Keeps only the gradient row whose neighbour index equals the centre index;
-    atoms with no self entry get a [1, 3, dim_q] zero row.
-
-    Args:
-        descriptors_per_struct: list of [N_i, dim_q] tensors (passed through).
-        gradients_per_struct: list of (list of [M_ij, 3, dim_q] tensors).
-        grad_index_per_struct: list of (list of [M_ij] neighbour indices).
-    Returns:
-        Same triple, but each per-atom gradient reduced to [1, 3, dim_q] and
-        each grad_index to a single-element [centre_idx] list.
-    """
+    """Reduce each atom's gradients to the self row ∂q_i/∂r_i: [1, 3, Q] and
+    grad_index [i] (a zero row when no self entry). Descriptors pass through."""
     new_grads = []
     new_gidx  = []
     for s, (grads, gidx) in enumerate(
@@ -213,25 +177,19 @@ def _filter_to_self_pairs(
         atom_grads_kept: list = []
         atom_gidx_kept:  list = []
         for i, (g_i, idx_i) in enumerate(zip(grads, gidx)):
-            # `idx_i` is a list of neighbour indices for centre atom i.
-            # `g_i` is the matching [len(idx_i), 3, dim_q] tensor.
-            # We want the row where idx_i[k] == i.
             try:
                 k_self = idx_i.index(i) if isinstance(idx_i, list) \
                     else int(np.where(np.asarray(idx_i) == i)[0][0])
             except (ValueError, IndexError):
-                # No self entry — zero row keeps downstream COO shape consistent.
                 dim_q = (g_i.shape[-1] if hasattr(g_i, "shape")
                          else descriptors_per_struct[s].shape[-1])
                 atom_grads_kept.append(tf.zeros((1, 3, dim_q),
                                                  dtype=tf.float32))
                 atom_gidx_kept.append([i])
                 continue
-            # Extract the single self row, materialise as [1, 3, dim_q].
             if hasattr(g_i, "shape") and len(g_i.shape) == 3:
                 row = g_i[k_self:k_self + 1]
             else:
-                # Numpy fallback (some worker paths return arrays).
                 row = tf.convert_to_tensor(
                     np.asarray(g_i)[k_self:k_self + 1], dtype=tf.float32)
             atom_grads_kept.append(row)
@@ -242,12 +200,7 @@ def _filter_to_self_pairs(
 
 
 class DescriptorBuilder(layers.Layer):
-    """Builds SOAP-turbo descriptors and their gradients using quippy.
-
-    Constructs one quippy Descriptor per atom type (central_index), then
-    aggregates per-atom descriptors, gradients, and neighbour indices per
-    structure.
-    """
+    """SOAP-turbo descriptors + gradients via quippy, one Descriptor per centre type."""
 
     def __init__(self,
                  cfg: TNEPconfig,
@@ -264,11 +217,8 @@ class DescriptorBuilder(layers.Layer):
             f"basis={cfg.basis} scaling_mode={cfg.scaling_mode} "
             f"add_species=F "
             f"radial_enhancement={cfg.radial_enhancement} "
-            # compress_mode="none" is TurboGAP's "compression off": the
-            # keyword is OMITTED, not passed through — soap_turbo's
-            # get_compress_indices rejects the literal "none"
-            # (soap_turbo_compress.f90:292), which is why TurboGAP gates it
-            # behind its own compress_soap flag (read_files.f90:2607/2646).
+            # "none" = keyword omitted: soap_turbo rejects the literal
+            # (soap_turbo_compress.f90:292).
             + (f"compress_mode={cfg.compress_mode} "
                if str(cfg.compress_mode) != "none" else "")
         )
@@ -321,28 +271,14 @@ class DescriptorBuilder(layers.Layer):
         calc_gradients: bool = True,
         batch_frames: int | None = 1,
     ) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
-        """Compute SOAP descriptors and (optionally) their gradients.
-
-        Args:
-            dataset        : list of ase.Atoms structures
-            calc_gradients : if False, gradients/grad_index are empty per-atom
-                             lists (skips the quippy gradient calc, the dominant
-                             cost).
-
-        Returns:
-            dataset_descriptors : list of tensors, one per structure [N, dim_q]
-            dataset_gradients   : per-structure list of N tensors
-                                  ([M_i, 3, dim_q] when calc_gradients=True,
-                                  [0, 3, dim_q] when False)
-            dataset_grad_index  : per-structure list of N lists of int neighbour
-                                  indices (empty when calc_gradients=False)
-        """
+        """Per structure: descriptors [N, Q], N gradient tensors [M_i, 3, Q]
+        ([0, 3, Q] when calc_gradients=False, which skips the dominant cost),
+        N neighbour-index lists."""
         dataset_descriptors = []
         dataset_gradients   = []
         dataset_grad_index  = []
 
         if self._num_workers <= 1:
-            # Serial path
             for structure in dataset:
                 cell = structure.cell.array
                 if np.allclose(cell, 0) or abs(np.linalg.det(cell)) < 1e-6:
@@ -381,8 +317,7 @@ class DescriptorBuilder(layers.Layer):
                 descriptors = tf.squeeze(descriptors, axis=1)
                 dim_q = int(descriptors.shape[-1])
                 if calc_gradients:
-                    # Empty gradient lists must become [0,3,Q] (bare
-                    # convert_to_tensor on `[]` gives (0,) and breaks concat).
+                    # Empty lists must become [0, 3, Q], not (0,).
                     for i in range(len(gradients)):
                         if len(gradients[i]) > 0:
                             gradients[i] = tf.convert_to_tensor(
@@ -400,16 +335,14 @@ class DescriptorBuilder(layers.Layer):
             _total_cpus = _allocated_cpus()
             omp_per_worker = max(1, _total_cpus // self._num_workers)
 
-            # quippy's Descriptor.calc() is a C extension that releases the GIL,
-            # so ThreadPoolExecutor gives true parallelism with no pickling.
+            # quippy .calc() releases the GIL: threads give true parallelism, no pickling.
             soap_strings = self._soap_strings
 
             def _thread_worker(structure):
                 return _describe_structure_worker(
                     (structure, soap_strings, calc_gradients))
 
-            # Set OMP_NUM_THREADS before the pool starts so each worker nests
-            # omp_per_worker OMP threads under its quippy call.
+            # OMP_NUM_THREADS set before the pool so each worker nests omp_per_worker threads.
             old_omp = os.environ.get('OMP_NUM_THREADS')
             os.environ['OMP_NUM_THREADS'] = str(omp_per_worker)
             try:
@@ -437,28 +370,14 @@ class DescriptorBuilder(layers.Layer):
         batch_size: int | None = 100,
         **build_kwargs,
     ) -> tuple[list[tf.Tensor], list[list[tf.Tensor]], list[list[list[int]]]]:
-        """Batched build retaining only the self-pair gradient (∂q_i/∂r_i) per atom.
-
-        Builds in chunks and filters each to the self-pair immediately, so the
-        full neighbour-gradient tensors never outlive one chunk (bounds peak
-        memory). Output matches `build_descriptors` but each gradient is
-        [1, 3, dim_q] and grad_index[i] == [i].
-
-        Args:
-            dataset: list of ase.Atoms.
-            batch_size: structures per chunk. `None` builds unbatched (still
-                filters; peak memory unchanged).
-            **build_kwargs: forwarded to `build_descriptors`.
-        Returns:
-            Same triple as `build_descriptors`, one self-pair entry per atom.
-        """
+        """build_descriptors in chunks of batch_size, each filtered to the self
+        gradient ([1, 3, Q], grad_index[i] == [i]) before the next chunk
+        allocates, bounding peak memory. batch_size=None: single shot."""
         from data import soap_gradients_needed
         if not soap_gradients_needed(self.cfg):
-            # Neighbor readout / nep "replace": no SOAP gradient is read.
             return self.build_descriptors(dataset, calc_gradients=False,
                                           **build_kwargs)
         if batch_size is None or batch_size >= len(dataset):
-            # Single-shot path — still filters, just doesn't chunk.
             descs, grads, gidx = self.build_descriptors(dataset, **build_kwargs)
             return _filter_to_self_pairs(descs, grads, gidx)
 
@@ -476,8 +395,6 @@ class DescriptorBuilder(layers.Layer):
             out_descs.extend(filtered_descs)
             out_grads.extend(filtered_grads)
             out_gidx.extend(filtered_gidx)
-            # Drop chunk refs so the neighbour-gradient tensors can be GC'd
-            # before the next chunk allocates.
             del chunk_descs, chunk_grads, chunk_gidx
             del filtered_descs, filtered_grads, filtered_gidx
         return out_descs, out_grads, out_gidx
@@ -489,23 +406,9 @@ class DescriptorBuilder(layers.Layer):
         batch_frames: int | None = 1,
         memory_budget_bytes: int | None = None,
     ) -> list[tuple]:
-        """Compute SOAP descriptors and return flat per-frame COO arrays.
-
-        Args:
-            dataset             : list of ase.Atoms
-            calc_gradients      : when False, gradient outputs are zero-length
-                                  arrays (skips the dominant gradient cost).
-            batch_frames        : ignored; accepted for parity with the GPU backend.
-            memory_budget_bytes : ignored; accepted for parity with the GPU backend.
-
-        Returns:
-            list of (descriptors, grad_values, pair_atom, pair_gidx) tuples
-            per structure. All arrays are numpy:
-                descriptors : [N, dim_q]   float32
-                grad_values : [P, 3, dim_q] (or [0,3,dim_q]) float32
-                pair_atom   : [P] (or [0]) int32
-                pair_gidx   : [P] (or [0]) int32
-        """
+        """Per structure a numpy (descriptors [N, Q], grad_values [P, 3, Q],
+        pair_atom [P], pair_gidx [P]) tuple (P = 0 when calc_gradients=False).
+        batch_frames / memory_budget_bytes are ignored (GPU-backend parity)."""
         soap_strings = self._soap_strings
         dim_q = self.cfg.dim_q
 
@@ -537,18 +440,12 @@ class DescriptorBuilder(layers.Layer):
 
 
 
-# =========================================================================
-# Backend dispatcher
-# =========================================================================
-
+# ── backend dispatcher ──
 
 class _SoapFreeBuilder:
-    """Emits a ZERO-WIDTH `descriptors` slot instead of the SOAP power
-    spectrum, for nep_descriptor="replace" where nothing reads it
-    (DescriptorBuilderGPU.soap_descriptors_needed).
-
-    Everything else delegates to the real builder, so a path that genuinely
-    needs SOAP fails loudly on the shape rather than quietly reading zeros."""
+    """Zero-width `descriptors` slot for nep_descriptor="replace", where nothing
+    reads SOAP; everything else delegates, so a path that needs SOAP fails on
+    the shape rather than reading zeros."""
 
     def __init__(self, inner):
         self._inner = inner
@@ -558,9 +455,7 @@ class _SoapFreeBuilder:
 
     @staticmethod
     def _empty(dataset):
-        """The calc_gradients=False shape contract at dim_q = 0: descriptors
-        [N, 0], one zero-ROW gradient tensor per atom (a bare [] converts to
-        shape (0,) and breaks the downstream concat), empty index lists."""
+        """calc_gradients=False contract at Q = 0: [N, 0] descriptors, [0, 3, 0] per atom, empty lists."""
         import tensorflow as _tf
         descs, grads, gidx = [], [], []
         for st in dataset:
@@ -578,23 +473,15 @@ class _SoapFreeBuilder:
 
 
 def make_descriptor_builder(cfg: TNEPconfig, mode: int | None = None):
-    """Return the descriptor builder selected by `cfg.descriptor_mode` or `mode`.
-
-    Args:
-        cfg  : TNEPconfig instance (default mode + hyperparameters)
-        mode : optional override (None → use cfg.descriptor_mode)
-    Returns:
-        mode 0 → DescriptorBuilder (quippy/Fortran, CPU);
-        mode 1 → DescriptorBuilderGPUTF (TF/GPU). GPU backend imported lazily.
-    """
+    """Builder for `mode` (default cfg.descriptor_mode): 0 → quippy DescriptorBuilder,
+    1 → DescriptorBuilderGPUTF; wrapped in _SoapFreeBuilder when SOAP is unused."""
     selected = cfg.descriptor_mode if mode is None else int(mode)
-    from DescriptorBuilderGPU import soap_descriptors_needed
+    from descriptor_layout import soap_descriptors_needed
     wrap = (lambda b: b) if soap_descriptors_needed(cfg) else _SoapFreeBuilder
     if selected == 0:
         return wrap(DescriptorBuilder(cfg))
     if selected == 1:
-        # Local import to avoid circular dependency at module load time
-        from DescriptorBuilderGPU_tf import DescriptorBuilderGPUTF
+        from DescriptorBuilderGPU_tf import DescriptorBuilderGPUTF  # circular at load
         return wrap(DescriptorBuilderGPUTF(cfg))
     raise ValueError(
         f"Unknown descriptor_mode={selected}. Use 0 (quippy) or 1 (GPU TF)."

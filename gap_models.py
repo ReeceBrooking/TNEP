@@ -1,16 +1,11 @@
 """Body-order site-model descriptors and angular geometric kernels for the GAP
-dipole/polarisability fit (gap_site_models). Numpy only.
+fit (gap_site_models). Numpy only. R_n = the readout's radial family on its cutoff.
 
-Descriptors (invariant, row-normalised; the GAP kernel is (q̂_i·q̂_m)^ξ on
-descriptors of the SAME body order only):
+Descriptors (invariant, unit rows; the kernel (q̂_i·q̂_m)^ξ never mixes body orders):
     2b  q_n^{t'}(i)        = Σ_{j∈t'} R_n(r_ij)
     3b  q_{nn'l}^{t't''}(i) = Σ_{j∈t'} Σ_{k∈t'', k≠j} R_n(r_ij) R_n'(r_ik) P_l(cos θ_jik)
-with R_n the readout's radial family on gap_site_rcut (default dipole_rc;
-data._radial_weights).
-
-Angular geometric kernels for the 3b model (equivariance by construction: the
-angle enters as an invariant weight, the tensor character comes from the
-uncontracted bond vectors):
+Angular kernels of the 3b model (angle = invariant weight, tensor character from
+the uncontracted bond vectors):
     α : W_i^{(ab,l)} = Σ_{j,k≠j} R_a(r_ij) R_b(r_ik) P_l(cos θ) [sym(d_ij d_ikᵀ)]_traceless
     μ : w_i^{(ab,l)} = Σ_{j,k≠j} R_a(r_ij) R_b(r_ik) P_l(cos θ) d_ij           (odd)
 """
@@ -20,14 +15,25 @@ import numpy as np
 from ase import Atoms
 
 import data as tnep_data
-from gap_descriptor import pair_index
-from TNEPconfig import GAPconfig, resolved_dipole_cutoff
+from gap_config import GAPconfig
+from TNEPconfig import resolved_dipole_cutoff, resolved_dipole_rc
+
+
+def pair_index(T: int) -> np.ndarray:
+    """[T, T] symmetric packing t ≤ t′ → slot: (0,0)=0, (0,1)=1, … (same
+    convention as TNEP._pair_idx "symmetric")."""
+    idx = np.zeros((T, T), dtype=np.int64)
+    p = 0
+    for t in range(T):
+        for t2 in range(t, T):
+            idx[t, t2] = idx[t2, t] = p
+            p += 1
+    return idx
 
 
 def pair_columns(cfg: GAPconfig) -> bool:
-    """True when the neighbor-type axis becomes design columns (any
-    dipole_species_pairs but "off"/legacy False) — THE one definition of T′,
-    shared by the descriptors, the angular kernels and gap_dipole's bond basis."""
+    """True when the neighbor-type axis becomes design columns (dipole_species_pairs
+    not "off"/False) — THE one definition of T′ for descriptors, kernels and bond basis."""
     sp = cfg.dipole_species_pairs
     return not (sp == "off" or sp is False)
 
@@ -41,10 +47,9 @@ def legendre(cos: np.ndarray, lmax: int) -> np.ndarray:
 
 
 def _site_pairs(atoms: Atoms, cfg: GAPconfig, C: int):
-    """(i, j, d [P,3], R [P,C]) over image pairs within gap_site_rcut (default
-    dipole_rc) with the readout's radial family evaluated for C channels
-    (data._radial_weights)."""
-    rc = float(cfg.gap_site_rcut or cfg.dipole_rc or cfg.rcut_hard)
+    """(i, j, d [P,3], R [P,C]) over image pairs within the readout cutoff, R = the readout's
+    radial family for C channels (data._radial_weights)."""
+    rc = resolved_dipole_rc(cfg)
     i, j, D = tnep_data._neighbor_pairs(atoms, rc)
     keep = i != j
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
@@ -70,9 +75,8 @@ def two_body_descriptor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndar
 
 
 def _triplets(i):
-    """All ordered neighbour pairs (p, k) of the same centre, p ≠ k, as index
-    arrays into the pair list sorted by centre: (order, P, K) with P grouped
-    by centre (i[order][P] is non-decreasing)."""
+    """Ordered neighbour pairs (p, k), p ≠ k, of each centre: (order, P, K) indexing
+    the pair list sorted by centre (i[order][P] non-decreasing)."""
     order = np.argsort(i, kind="stable"); i = i[order]
     starts = np.flatnonzero(np.r_[True, i[1:] != i[:-1]]); ends = np.r_[starts[1:], len(i)]
     P, K = [np.zeros(0, dtype=np.int64)], [np.zeros(0, dtype=np.int64)]   # keeps concatenate happy when there are no pairs
@@ -83,12 +87,10 @@ def _triplets(i):
 
 
 def _angular_triplets(atoms: Atoms, cfg: GAPconfig, C: int, L: int):
-    """Shared preamble of the angular descriptors/kernels: site pairs →
-    triplets → reorder → clipped Legendre of the bond angle. Returns
-    (i, j, d, R, P, K, Pl, starts, ends): the pair list sorted by centre,
-    triplet indices P/K into it, Pl = P_0..P_L(cos θ_pik) [Q, L+1], and the
-    centre segments [starts[c], ends[c]) of P/K (centre i[P[starts[c]]];
-    centres with < 2 neighbours have no segment)."""
+    """Site pairs → triplets → Legendre of the bond angle. Returns (i, j, d, R, P, K,
+    Pl, starts, ends): pair list sorted by centre, triplet indices P/K into it,
+    Pl = P_0..P_L(cos θ) [Q, L+1], centre segments [starts[c], ends[c]) of P/K
+    (centres with < 2 neighbours have no segment)."""
     i, j, d, R = _site_pairs(atoms, cfg, C)
     order, P, K = _triplets(i)
     i, j, d, R = i[order], j[order], d[order], R[order]
@@ -126,8 +128,7 @@ def three_body_descriptor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nd
     for s, e in zip(starts, ends):                                        # per-centre segmented reduction
         q[i[P[s]]] = RR[s:e].T @ Pls[s:e]
     q = q.reshape(N, C, C, S, L + 1).transpose(0, 3, 1, 2, 4)             # [N, S, C, C, L+1]
-    # The C×C block is symmetric in (n, n') under the ordered p≠k sum: redundant
-    # but harmless columns of an INVARIANT descriptor (kept for a simple layout).
+    # C×C block symmetric in (n, n'): redundant but harmless invariant columns
     return _normalise(q.reshape(N, -1))
 
 
@@ -140,6 +141,7 @@ def angular_cross_tensor(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.nda
     Rp = _species_resolved(R, np.asarray(ti)[j], T, pair)                 # [P, K1]
     au, bu = np.triu_indices(Rp.shape[1])
     Q, dP, dK = len(P), d[P], d[K]
+    # Full d_ij d_ikᵀ on purpose (the û variant scored worse on the χ suite): keeps the r-weighting.
     S = 0.5 * (dP[:, :, None] * dK[:, None, :] + dK[:, :, None] * dP[:, None, :])          # [Q, 3, 3]
     tr = np.trace(S, axis1=1, axis2=2) / 3.0
     S[:, 0, 0] -= tr; S[:, 1, 1] -= tr; S[:, 2, 2] -= tr

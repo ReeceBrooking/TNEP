@@ -8,15 +8,10 @@ def squared_error_per_structure(
     diff: tf.Tensor,
     component_weights: tf.Tensor | None = None,
 ) -> tf.Tensor:
-    """Per-structure squared error Σ_k r_k² (training loss and RMSE/RRMSE metric).
+    """Per-structure squared error Σ_k r_k² → shape diff.shape[:-1].
 
-    Args:
-        diff: prediction − target, shape ``[..., T_dim]``.
-        component_weights: optional ``[..., T_dim]`` per-component weights,
-            applied before the reduction; broadcasts over leading dims.
-
-    Returns:
-        per-structure squared error with shape ``diff.shape[:-1]``.
+    diff = prediction − target [..., T_dim]; optional component_weights
+    [..., T_dim] are applied before the sum (training loss and RMSE/RRMSE metric).
     """
     sq = tf.square(diff)
     if component_weights is not None:

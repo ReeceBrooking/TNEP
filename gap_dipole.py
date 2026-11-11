@@ -1,51 +1,25 @@
-"""GAP-mode dipole fit for the neighbor readout.
+"""GAP-mode dipole / polarisability fit for the neighbor readout.
 
-Sparse Gaussian-process alternative to the SNES-trained ANN, exploiting the
-readout's linearity in the site scalars (neighbor_dipole_gap_plan.md). The fit
-is gap_fit's estimator (libAtoms/GAP gp_predict.F90 gpSparse_fit): observation
-error gap_sigma·√N_atoms, penalty αᵀ·K_MM·α per GAP term, δ² on every kernel:
+Sparse-GP alternative to the SNES-trained ANN, exploiting the readout's
+linearity in the site scalars. Estimator = gap_fit's (libAtoms/GAP
+gp_predict.F90 gpSparse_fit): observation error gap_sigma·√N_atoms, penalty
+αᵀ·K_MM·α per term, δ² on every kernel:
 
     μ = Σ_i Σ_k s_i^k v_i[:, k],  s_i^k = Σ_m α_m^k (D̂_i · D̂_m)^ξ
 
-with v_i from data._neighbor_dipole_V [N, D, C, T] — any radial
-(chebyshev/warped/gaussian/screened; screened requires C = 1, matching the
-readout contract) and any cutoff. The k axis of v — and hence the design
-columns per sparse point m — depends on dipole_species_pairs:
+v_i from data._neighbor_dipole_V [N, D, C, T] (any radial/cutoff; screened
+needs C = 1). Polarisability (target_mode=2) is the same fit with D = 6 Voigt
+rows and 2·C kernel channels (isotropic |d|²I, traceless d⊗d − |d|²I/3).
 
-    "off":         k = channel n only, V summed over neighbor type t′ (K = C);
-    anything else: k = (n, t′) kept (K = C·T) — per-(sparse-point, channel,
-        neighbor-species) weights absorbed into the linear fit. This STRICTLY
-        SUBSUMES both the readout's symmetric c and ordered Ω tables; the
-        symmetric/ordered distinction does not exist in the absorbed form
-        (any non-"off" value enables the same general columns).
+Design columns per sparse point: dipole_species_pairs="off" → k = n (V summed
+over t′, K = C); anything else → k = (n, t′), K = C·T, which subsumes both the
+symmetric c and ordered Ω readout tables. Extensions: gap_extra_rcut (second
+SOAP scale for the KERNEL only, own FPS sets, scales never cross, v unchanged),
+gap_cross_channels (two-neighbour cross group, _finish_v), gap_site_models
+(2b/3b body-order kernels, gap_models.py, each with its own FPS set and prior).
 
-Two multiplicative column extensions (both optional, both compose with
-pairs/channels — columns multiply as n_scales × len(ξ) × M_tot·K):
-  • sum-of-kernels: gap_kernel_power may be a LIST of ξ — one column block
-    per ξ per sparse point (base Gram computed once, raised elementwise);
-    the ridge learns the implicit kernel mixture (Deringer Chem. Rev. 2021).
-  • multi-scale: gap_extra_rcut adds a second SOAP length scale for the
-    KERNEL only (second builder + second FPS sparse sets; scales never
-    cross). The geometry vectors v are UNCHANGED (Willatt/Musil/Ceriotti).
-
-Summed site models (gap_site_models, gap_models.py): besides SOAP, a 2b
-and/or 3b body-order kernel, each with its own FPS sparse set, prior and
-relative amplitude (gap_model_delta); soap/2b read out through the bond
-basis, 3b through its own angular geometric kernel (gap_cross_lmax).
-
-Additive (not multiplicative) column blocks: gap_2b / gap_3b append TurboGAP's
-2b/3b distance descriptors (gap_descriptor.py, fixed centres auto-selected at
-fit) as per-species linear features — plan §0.3.
-
-Columns = M_tot·K can exceed the 3·F equations (underdetermined); the prior
-handles it — train RMSE approaches 0 there and test RMSE is the metric.
-Takes its own GAPconfig (declared in TNEPconfig.py), never TNEPconfig: the ANN modes
-are frozen constants there, so no ANN experiment can reach the fit.
-Polarisability (target_mode=2) fits the same way with the rank-2 kernel
-(D = 6 Voigt rows per frame instead of 3, and 2·C kernel channels — the
-isotropic |d|²I and traceless d⊗d − |d|²I/3 groups; data.bond_geometry):
-α = Σ_i Σ_k s_i^k W_i[:, k] — linear in the site scalars exactly as μ is.
-Still fixed: dipole_readout="neighbor", scale_targets=False.
+Columns may exceed the D·F equations; the prior handles it (train RMSE → 0,
+test RMSE is the metric). Takes GAPconfig only (ANN modes are frozen there).
 NO model persistence — fit writes a config+metrics run record JSON to GAP/."""
 from __future__ import annotations
 
@@ -63,43 +37,28 @@ from ase.io import read
 import data as tnep_data
 import gap_models as gm
 from DescriptorBuilder import make_descriptor_builder
-from gap_descriptor import (_pairs, _triplets, f_cut, gap_raw_numpy, gap_slices, kernel_3b, select_centres,
-                            validate_gap_cfg)
-from TNEPconfig import GAPconfig, resolved_dipole_cutoff, bond_rank, kernel_channels
+from gap_config import GAPconfig
+from TNEPconfig import resolved_dipole_cutoff, resolved_dipole_rc, bond_rank, kernel_channels
 
 
 @dataclass
 class GapDipoleModel:
-    """In-memory GAP dipole model — never persisted (refits in seconds).
+    """In-memory GAP model — never persisted (refits in seconds).
 
-    Column/α block order (one contract, shared by fit + predict via
-    _phi_frame): site model (cfg.gap_site_models order) → species → ξ →
-    (m, k). Per (model, species) the block is [len(xi)·M_t·K_model] flat,
-    ξ-major; K_model is the bond-basis width for soap/2b and the angular
-    kernel width for 3b. site_sparse / site_alpha are keyed by model name;
-    `sparse_desc` / `alpha` are the "soap" entries (read-only views for the
-    callers that only know the SOAP model). The scale-2 fields are None
-    unless cfg.gap_extra_rcut is set (appended after the site models). Then
-    the additive TurboGAP blocks
-    (gap_descriptor_plan.md §0.3): alpha_gap2b / alpha_gap3b per species t,
-    [W2·K] / [W3·K] flat (s-major), None unless cfg.gap_2b / gap_3b.
-
-    The fitted alpha_gap* values are NOT interpretable per-centre weights.
-    The gap block is rank-deficient and badly conditioned (unpopulated
-    species-pair slots give identically-zero columns; cond ~1e18 raw, ~1e6
-    after column normalisation on the test cfg), so predictions are
-    recovered to the ridge floor while α itself wanders along a near-null
-    space — measured |Δα| ~0.8 between fits even at 200 frames."""
+    Column/α block order (shared by fit + predict via _phi_frame): site model
+    (cfg.gap_site_models order) → species → (m, k), each block [M_t·K_model]
+    flat (K_model = bond-basis width for soap/2b, angular-kernel width for 3b);
+    the scale-2 blocks (gap_extra_rcut) come last. `sparse_desc`/`alpha` are
+    the "soap" entries."""
     cfg: GAPconfig
     builder: object                   # descriptor builder from the fitting cfg
     site_sparse: dict                 # model → per type t: [M_t, Q] unit-norm rows
-    site_alpha: dict                  # model → per type t: [len(xi)·M_t·K_model] flat
-    xi: tuple[int, ...]               # kernel powers — one column block each
+    site_alpha: dict                  # model → per type t: [M_t·K_model] flat
+    xi: int                           # kernel power (D̂_i·D̂_m)^ξ
     builder2: object = None           # second-scale builder (gap_extra_rcut)
     sparse_desc2: list[np.ndarray] | None = None
     alpha2: list[np.ndarray] | None = None
-    alpha_gap2b: list[np.ndarray] | None = None
-    alpha_gap3b: list[np.ndarray] | None = None
+    train_pred: np.ndarray | None = None   # Φα on the training frames, [F, D] (fit order)
 
     @property
     def sparse_desc(self) -> list[np.ndarray]:
@@ -110,22 +69,26 @@ class GapDipoleModel:
         return self.site_alpha["soap"]
 
 
-def _xi_tuple(cfg: GAPconfig) -> tuple[int, ...]:
-    """Normalize cfg.gap_kernel_power (int | list[int]) to a tuple.
-    Each entry contributes one column block per sparse point (sum-of-kernels:
-    the ridge learns the implicit mixture of (D̂·D̂_m)^ξ kernels)."""
-    xi = cfg.gap_kernel_power
-    xis = (xi,) if not hasattr(xi, "__iter__") else tuple(xi)
-    if not xis or any(isinstance(x, bool) or x != int(x) or int(x) < 1
-                      for x in xis):
-        raise ValueError(
-            f"gap_kernel_power entries must be ints >= 1, got {xi!r}")
-    return tuple(int(x) for x in xis)
+def _sparse_per_model(cfg: GAPconfig) -> dict:
+    """model → FPS sparse points per species: an int for every site model, or a
+    dict keyed by site model (missing models take the "soap" entry)."""
+    M = cfg.gap_sparse_per_species
+    if isinstance(M, dict):
+        return {m: int(M.get(m, M.get("soap"))) for m in cfg.gap_site_models}
+    return {m: int(M) for m in cfg.gap_site_models}
 
 
 def _validate(cfg: GAPconfig) -> None:
     """Raise unless cfg is a GAP-fittable configuration. Runs FIRST in fit."""
-    _xi_tuple(cfg)
+    xi = cfg.gap_kernel_power
+    if isinstance(xi, bool) or not isinstance(xi, int) or xi < 1:
+        raise ValueError(f"gap_kernel_power must be an int >= 1, got {xi!r}")
+    M = cfg.gap_sparse_per_species
+    ok = (isinstance(M, dict) and ("soap" in M or set(cfg.gap_site_models) <= set(M))
+          and all(int(v) >= 1 for v in M.values())) or (not isinstance(M, dict) and int(M) >= 1)
+    if not ok:
+        raise ValueError(f"gap_sparse_per_species must be an int >= 1 or a dict keyed by site model "
+                         f"(covering gap_site_models or carrying 'soap'), got {M!r}")
     extra = cfg.gap_extra_rcut
     if extra is not None:
         if not extra > 0.0:
@@ -148,20 +111,12 @@ def _validate(cfg: GAPconfig) -> None:
          f"{cfg.dipole_channels}"),
         (not cfg.scale_targets, "scale_targets must be False"),
         (int(cfg.gap_cross_channels) >= 0, "gap_cross_channels must be >= 0"),
-        (len(cfg.gap_group_delta) == 3 and all(float(x) > 0 for x in cfg.gap_group_delta),
-         "gap_group_delta needs 3 positive entries (isotropic, traceless, cross)"),
         (float(cfg.gap_lambda_shear) > 0, "gap_lambda_shear must be > 0"),
-        # nep_descriptor is a frozen constant on GAPconfig, so this cannot
-        # fire from a class default — it catches INSTANCE mutation
-        # (cfg.nep_descriptor = "concat"), which would otherwise reach
-        # data.assemble_data_dict and build NEP inputs the fit never reads.
+        # frozen on GAPconfig, so this catches INSTANCE mutation that would make
+        # assemble_data_dict build NEP inputs the fit never reads.
         (str(cfg.nep_descriptor) == "off",
          "GAP mode needs nep_descriptor='off' (NEP inputs are not part of "
          "the kernel fit)"),
-        # Any positive radius, as at model init (47ae1cc): the staged V comes
-        # from an image-exact neighbour list, so r_c > rcut_hard is legal.
-        (0.0 < float(cfg.dipole_rc or cfg.rcut_hard),
-         f"dipole_rc must be > 0, got {cfg.dipole_rc}"),
         (bool(cfg.gap_site_models) and set(cfg.gap_site_models) <= {"soap", "2b", "3b"}
          and len(set(cfg.gap_site_models)) == len(cfg.gap_site_models),
          f"gap_site_models must be a non-empty subset of soap/2b/3b without repeats, "
@@ -172,46 +127,27 @@ def _validate(cfg: GAPconfig) -> None:
         (int(cfg.gap_site_channels) >= 1 and int(cfg.gap_site_lmax) >= 0,
          "gap_site_channels >= 1 and gap_site_lmax >= 0 required"),
         (int(cfg.gap_cross_lmax) >= 0, "gap_cross_lmax must be >= 0"),
-        (cfg.gap_site_rcut is None or float(cfg.gap_site_rcut) > 0,
-         f"gap_site_rcut must be > 0, got {cfg.gap_site_rcut}"),
-        (cfg.gap_site_rcut is None or {"2b", "3b"} & set(cfg.gap_site_models),
-         "gap_site_rcut only applies to the 2b/3b site models"),
         ("3b" not in cfg.gap_site_models or int(cfg.gap_cross_channels) >= 1,
          "the 3b site model reads out through the angular kernel: gap_cross_channels >= 1 required"),
         ("3b" not in cfg.gap_site_models or int(cfg.target_mode) == 2 or int(cfg.gap_cross_lmax) >= 1,
          "3b dipole kernel needs gap_cross_lmax >= 1 (l = 0 collapses to the one-hop basis)"),
         (set(cfg.gap_site_models) <= {"soap"} or cfg.dipole_radial != "screened",
          "2b/3b site models need a multi-channel radial (screened is single-channel)"),
-        (not (cfg.gap_2b or cfg.gap_3b) or list(cfg.gap_site_models)[:1] == ["soap"],
-         "the TurboGAP 2b/3b tails read out through the bond basis of the first (soap) site model"),
-        (not cfg.gap_angular_cross or int(cfg.target_mode) == 2,
-         "gap_angular_cross is a polarisability (target_mode=2) group"),
-        (not cfg.gap_angular_cross or (int(cfg.gap_cross_channels) >= 1 and int(cfg.gap_cross_lmax) >= 1),
-         "gap_angular_cross needs gap_cross_channels >= 1 and gap_cross_lmax >= 1"),
-        (not cfg.gap_triplet_tensor or int(cfg.target_mode) == 2,
-         "gap_triplet_tensor is a polarisability (target_mode=2) group"),
-        (not cfg.pol_field_groups or int(cfg.target_mode) == 2,
-         "pol_field_groups are polarisability (target_mode=2) columns"),
-        (set(cfg.pol_field_groups) <= set(tnep_data.POL_FIELD_GROUPS)
-         and len(set(cfg.pol_field_groups)) == len(cfg.pol_field_groups),
-         f"pol_field_groups must be a subset of {list(tnep_data.POL_FIELD_GROUPS)} without repeats, "
-         f"got {cfg.pol_field_groups!r}"),
-        ("cross" not in cfg.pol_field_groups or int(cfg.gap_cross_channels) >= 1,
-         "pol_field_groups 'cross' contracts the cross group's vectors: gap_cross_channels >= 1 required"),
-        (not cfg.pol_field_groups or bool(cfg.dipole_field_charges),
-         "pol_field_groups need dipole_field_charges ({Z: charge in e} per species)"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     if bad:
         raise ValueError("fit_gap_dipole config violation: " + "; ".join(bad))
-    if cfg.gap_2b or cfg.gap_3b or cfg.gap_triplet_tensor:
-        validate_gap_cfg(cfg)          # centres may still be None: fit selects them
 
 
 def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
     """SOAP descriptors, no gradients, float64. Asserts ‖D‖ ≈ 1 (both
     builders already unit-normalize; we must NOT renormalize)."""
-    desc, _, _ = builder.build_descriptors(frames, calc_gradients=False)
+    if type(builder).__name__ == "DescriptorBuilderGPUTF":
+        # flat output with the TF NL: build_descriptors' per-atom packing and
+        # brute-force NumPy NL cost ~300 ms/frame for data we never read.
+        desc = [f[0] for f in builder.build_descriptors_flat(frames, calc_gradients=False, use_tf_nl=True)]
+    else:
+        desc, _, _ = builder.build_descriptors(frames, calc_gradients=False)
     out = []
     for D in desc:
         D = np.asarray(D, dtype=np.float64)
@@ -224,10 +160,9 @@ def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
 
 
 def _collapse_V(V: np.ndarray, pair_columns: bool) -> np.ndarray:
-    """[N, D, C, T] → v_i [N, D, K] — the ONE place the column contract is
-    encoded (float64, shared by fit + predict). K = C·T with pair columns
-    (k = (n, t′), C-major, matching reshape order) else K = C (t′ summed).
-    D = 3 (dipole) or 6 (polarisability, Voigt)."""
+    """[N, D, C, T] → v_i [N, D, K] — THE one place the column contract is encoded.
+    K = C·T with pair columns (k = (n, t′), C-major reshape order) else K = C
+    (t′ summed). D = 3 (dipole) or 6 (polarisability, Voigt)."""
     V = np.asarray(V, dtype=np.float64)
     if pair_columns:
         return V.reshape(V.shape[0], V.shape[1], -1)
@@ -238,23 +173,19 @@ def _cross_vectors(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
     """Dipole kernel vectors of the cross group v_i^a = Σ_j R_a(r_ij) d_ij over
     the first C_x radial channels, [N, 3, K₁] (K₁ = C_x·T′ under pair columns)."""
     V1 = tnep_data._neighbor_dipole_V(
-        atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard),
+        atoms, ti, resolved_dipole_rc(cfg),
         int(cfg.gap_cross_channels), int(cfg.num_types),
         str(cfg.dipole_radial), float(cfg.dipole_zeta),
         resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale),
-        rank=1)                                                 # [N, 3, C_x, T]
+        rank=1, unit=bool(getattr(cfg, "dipole_unit_vector", False)))   # [N, 3, C_x, T]
     return _collapse_V(V1, gm.pair_columns(cfg))
 
 
 def _cross_group(v: np.ndarray) -> np.ndarray:
-    """Third polarisability kernel group [N, 6, K_x] (gap_cross_channels C_x):
-    the dipole kernel v_i^a = Σ_j R_a(r_ij) d_ij over its first C_x radial
-    channels (species-resolved under pair columns, K₁ = C_x·T′ vectors),
-    combined as traceless symmetric products sym(v^a ⊗ v^b) − tr/3 for a ≤ b,
-    K_x = K₁(K₁+1)/2. Expanding v⊗v = Σ_j Σ_k R_a R_b d_j⊗d_k shows it carries
-    the two-neighbour cross tensors the bond-axis groups lack. Even under
-    inversion, covariant, image-exact, linear in the site coefficient.
-    Takes v = _cross_vectors(...) [N, 3, K₁] (shared with pol_field_groups)."""
+    """Third polarisability kernel group [N, 6, K_x]: traceless sym(v^a ⊗ v^b),
+    a ≤ b, over v = _cross_vectors(...) [N, 3, K₁]; K_x = K₁(K₁+1)/2. Carries the
+    two-neighbour d_j⊗d_k tensors the bond-axis groups lack; even under
+    inversion, linear in the site coefficient."""
     a_idx, b_idx = np.triu_indices(v.shape[2])
     a, b = v[:, :, a_idx], v[:, :, b_idx]                       # [N, 3, K_x]
     sym = 0.5 * (a[:, :, None, :] * b[:, None, :, :]
@@ -264,60 +195,12 @@ def _cross_group(v: np.ndarray) -> np.ndarray:
                      sym[:, 0, 1], sym[:, 1, 2], sym[:, 2, 0]], axis=1)
 
 
-def _angular_cross_group(w: np.ndarray, v: np.ndarray, cfg: GAPconfig) -> np.ndarray:
-    """Angular-cross polarisability group [N, 6, 2·C_x²·L] (gap_angular_cross):
-    sym(w_p ⊗ v_c) of the 3b angular kernel vector w = gm.angular_cross_vector
-    [N, 3, K₁²·L] (columns (a, b, l), a, b over K₁ = C_x·T′) and the dipole
-    kernel vector v = _cross_vectors [N, 3, K₁], both species-summed to C_x
-    channels as pol_field_groups "cross" does (C-major; no-op without pair
-    columns). All isotropic columns (w_p·v_c)·I (p-major, c-minor), then the
-    traceless remainders, Voigt order. Even under inversion, covariant."""
-    N, Cx, L = len(v), int(cfg.gap_cross_channels), int(cfg.gap_cross_lmax)
-    T_ = v.shape[2] // Cx
-    w = w.reshape(N, 3, Cx, T_, Cx, T_, L).sum((3, 5)).reshape(N, 3, -1)   # [N, 3, C_x²·L]
-    v = v.reshape(N, 3, Cx, T_).sum(3)                                       # [N, 3, C_x]
-    S = 0.5 * (w[:, :, None, :, None] * v[:, None, :, None, :]
-               + v[:, :, None, None, :] * w[:, None, :, :, None])          # [N, 3, 3, P, C_x]
-    S = S.reshape(N, 3, 3, -1)                                               # g = p·C_x + c
-    return _split_iso(np.stack([S[:, 0, 0], S[:, 1, 1], S[:, 2, 2], S[:, 0, 1], S[:, 1, 2], S[:, 2, 0]], axis=1))
-
-
-def _split_iso(sym: np.ndarray) -> np.ndarray:
-    """Voigt [N, 6, G] → [N, 6, 2G]: all isotropic columns (tr/3)·I, then the
-    traceless remainders."""
-    tr3 = (sym[:, 0] + sym[:, 1] + sym[:, 2]) / 3.0
-    iso = np.stack([tr3, tr3, tr3] + [np.zeros_like(tr3)] * 3, axis=1)
-    return np.concatenate([iso, sym - iso], axis=2)
-
-
-def _triplet_tensor_group(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
-    """Triplet-tensor polarisability group [N, 6, 2·M3] (gap_triplet_tensor):
-    W_i^s = Σ_{j<k} k_s(q_ijk) f(r_ij) f(r_ik) sym(d_ij ⊗ d_ik) — the TurboGAP
-    3b block's triplets, kernel (gap3b_centres/sigma/kernel) and cutoff factors
-    verbatim (gap_descriptor._triplets, kernel_3b), species-summed, with the
-    tensor character from the bond vectors (sym(d_ij⊗d_ik) = sym(D_a⊗D_b) is
-    even in the bond sign). Isotropic columns (s-major) then traceless, Voigt."""
-    N = len(atoms)
-    ci, _, _, q, w, Da, Db = _triplets(N, _pairs(atoms, cfg.gap3b_rcut), cfg.gap3b_rcut, cfg.gap_buffer)
-    k3 = kernel_3b(q, w, cfg)                                                # [P, M3]
-    o = lambda a, b: 0.5 * (Da[:, a] * Db[:, b] + Da[:, b] * Db[:, a])       # [P]
-    sym = [o(0, 0), o(1, 1), o(2, 2), o(0, 1), o(1, 2), o(2, 0)]
-    W = np.zeros((N, 6, k3.shape[1]))
-    for c in range(6):                                 # per component: peak one [P, M3]
-        np.add.at(W[:, c], ci, sym[c][:, None] * k3)
-    return _split_iso(W)
-
-
 def _cross_group_dipole(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
-    """Dipole cross group [N, 3, K_x] (gap_cross_channels C_x): the bond-axis
-    tensor T_i^a = Σ_j R_a(r_ij) d_ij d_ijᵀ contracted with the dipole kernel
-    vector v_i^b = Σ_j R_b(r_ij) d_ij — w_i^{ab} = T^a·v^b, both species-
-    resolved under pair columns (K₁ = C_x·T′ each, K_x = K₁²). Expanded it is
-    Σ_j Σ_k R_a R_b (d_ij·d_ik) d_ij: the bond-angle charge flux the one-hop
-    difference form (s_i − s_j) d_ij cannot carry (the cocycle restriction of
-    neighbor_dipole_formulation.md). Odd under inversion, covariant,
-    image-exact, linear in the site coefficient."""
-    args = (atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard), int(cfg.gap_cross_channels),
+    """Dipole cross group [N, 3, K_x]: w^{ab} = T^a·v^b with T^a = Σ_j R_a d_ij d_ijᵀ,
+    v^b = Σ_j R_b d_ij (K₁ = C_x·T′ each, K_x = K₁²), i.e. Σ_jk R_a R_b (d_ij·d_ik) d_ij —
+    the bond-angle charge flux the one-hop difference form cannot carry. Odd
+    under inversion, linear in the site coefficient."""
+    args = (atoms, ti, resolved_dipole_rc(cfg), int(cfg.gap_cross_channels),
             int(cfg.num_types), str(cfg.dipole_radial), float(cfg.dipole_zeta),
             resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale))
     pair = gm.pair_columns(cfg)
@@ -338,94 +221,37 @@ def _cross_group_dipole(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndar
 
 
 def _finish_v(V: np.ndarray, atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
-    """Staged kernel [N, D, Ck, T] → design geometry v_i [N, D, K]: collapse
-    to pair columns, then scale each polarisability kernel group by its
-    gap_group_delta (target_mode=2) and append the cross group (dipole:
-    T·v vectors; polarisability: sym(v⊗v) tensors), scaled by
-    gap_group_delta[2], the angular-cross group (gap_angular_cross) and the
-    triplet-tensor group (gap_triplet_tensor), both at the same amplitude;
-    then the long-range pol_field_groups (target_mode=2),
-    each group × its pol_field_scale (unscaled while None — the fit pins it,
-    _pin_pol_field_scale). THE one place fit and predict both go through, so
-    the column contract cannot drift."""
+    """Staged kernel [N, D, Ck, T] → design geometry v_i [N, D, K]: pair columns +
+    cross group. THE one path fit and predict share, so the contract cannot drift."""
     v = _collapse_V(V, gm.pair_columns(cfg))
-    d_iso, d_tr, d_x = (float(x) for x in cfg.gap_group_delta)
-    pol = int(cfg.target_mode) == 2
-    if pol:
-        per_group = v.shape[2] // 2                              # C·T′ channels per group
-        v = v.copy()
-        v[:, :, :per_group] *= d_iso
-        v[:, :, per_group:] *= d_tr
-    v1 = _cross_vectors(atoms, ti, cfg) if pol and int(cfg.gap_cross_channels) > 0 else None
     if int(cfg.gap_cross_channels) > 0:
-        cross = _cross_group(v1) if pol else _cross_group_dipole(atoms, ti, cfg)
-        v = np.concatenate([v, d_x * cross], axis=2)
-    if pol and cfg.gap_angular_cross:
-        w = gm.angular_cross_vector(atoms, ti, cfg)
-        v = np.concatenate([v, d_x * _angular_cross_group(w, v1, cfg)], axis=2)
-    if pol and cfg.gap_triplet_tensor:
-        v = np.concatenate([v, d_x * _triplet_tensor_group(atoms, ti, cfg)], axis=2)
-    if pol and cfg.pol_field_groups:
-        scale = cfg.pol_field_scale or {}
-        X = tnep_data.pol_field_groups(atoms, ti, cfg, v1)
-        k0 = 0
-        for g in cfg.pol_field_groups:
-            w = tnep_data.pol_group_width(cfg, [g])
-            X[:, :, k0:k0 + w] *= float(scale.get(g, 1.0))
-            k0 += w
-        v = np.concatenate([v, X], axis=2)
+        pol = int(cfg.target_mode) == 2
+        cross = _cross_group(_cross_vectors(atoms, ti, cfg)) if pol else _cross_group_dipole(atoms, ti, cfg)
+        v = np.concatenate([v, cross], axis=2)
     return v
 
 
-def _pin_pol_field_scale(cfg: GAPconfig, vs: list) -> None:
-    """Pin cfg.pol_field_scale on the training geometry (groups appended
-    UNscaled by _finish_v while it is None): per group RMS(bond basis)/RMS(group),
-    as dipole_field_scale for μ; rescales the group columns of vs in place."""
-    rms = lambda cols: float(np.sqrt(np.mean([np.mean(v[:, :, cols] ** 2) for v in vs])))
-    k0 = _n_vcols(cfg) - tnep_data.pol_group_width(cfg)
-    bond = rms(slice(0, k0))
-    cfg.pol_field_scale = {}
-    for g in cfg.pol_field_groups:
-        w = tnep_data.pol_group_width(cfg, [g])
-        cfg.pol_field_scale[g] = bond / rms(slice(k0, k0 + w))
-        for v in vs:
-            v[:, :, k0:k0 + w] *= cfg.pol_field_scale[g]
-        k0 += w
-    print(f"  pol_field_groups: pol_field_scale = "
-          f"{ {g: round(x, 4) for g, x in cfg.pol_field_scale.items()} } (pinned on cfg)")
-
-
 def _n_vcols(cfg: GAPconfig) -> int:
-    """K: design geometry columns per sparse point (kernel channels × pair
-    columns, + the cross group: K₁(K₁+1)/2 symmetric tensor products under
-    target_mode=2, K₁² T·v vectors under target_mode=1; K₁ = C_x·T′; + the angular-cross
-    group 2·C_x³·L, the triplet-tensor group 2·M3 and the pol_field_groups
-    block, target_mode=2)."""
+    """K: design columns per sparse point = kernel channels × pair columns + cross
+    group (K₁(K₁+1)/2 under target_mode=2, K₁² under target_mode=1; K₁ = C_x·T′)."""
     T_ = cfg.num_types if gm.pair_columns(cfg) else 1
     k = kernel_channels(cfg) * T_
     cx = int(cfg.gap_cross_channels)
     if cx > 0:
         k1 = cx * T_
         k += k1 * (k1 + 1) // 2 if int(cfg.target_mode) == 2 else k1 * k1
-    if int(cfg.target_mode) == 2:
-        if cfg.gap_angular_cross:
-            k += 2 * cx ** 3 * int(cfg.gap_cross_lmax)
-        if cfg.gap_triplet_tensor:
-            k += 2 * int(cfg.gap3b_n_centres)
-        k += tnep_data.pol_group_width(cfg)
     return k
 
 
 def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
-    """Per-atom geometry vectors v_i [N, D, K] per the cfg's radial/cutoff/
-    channels, pair-column mode, bond rank (target_mode) and polarisability
-    kernel-group settings."""
+    """Per-atom geometry vectors v_i [N, D, K] from cfg (radial, cutoff, channels,
+    pair columns, bond rank, field channel)."""
     V = tnep_data._neighbor_dipole_V(
-        atoms, ti, float(cfg.dipole_rc or cfg.rcut_hard),
+        atoms, ti, resolved_dipole_rc(cfg),
         int(cfg.dipole_channels), int(cfg.num_types),
         str(cfg.dipole_radial), float(cfg.dipole_zeta),
         resolved_dipole_cutoff(cfg), float(cfg.dipole_gauss_sigma_scale),
-        rank=bond_rank(cfg))
+        rank=bond_rank(cfg), unit=bool(getattr(cfg, "dipole_unit_vector", False)))
     if bool(getattr(cfg, "dipole_field", False)) and int(cfg.target_mode) == 1:
         # same staged channel as assemble_data_dict (scale pinned there at fit)
         V = tnep_data._append_field_channel(V, tnep_data.field_channel(atoms, cfg),
@@ -456,7 +282,7 @@ def _site_terms(cfg: GAPconfig, builder, frames: list[Atoms], tis: list, vs: lis
     """model → (per-frame descriptors, per-frame geometry [N, D, K_model], δ)
     in cfg.gap_site_models order — THE per-model inputs shared by fit and
     predict. `descs` reuses already-built SOAP descriptors."""
-    d_soap = _deltas(cfg)[0]
+    d_soap = float(cfg.gap_delta_soap)
     return {m: (descs if m == "soap" and descs is not None
                 else _site_descriptor(m, builder, frames, tis, cfg),
                 _site_geometry(m, frames, tis, cfg, vs),
@@ -485,153 +311,38 @@ def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
     return idx
 
 
-def _phi_frame(scales: list, ti: np.ndarray, xis: tuple[int, ...],
-               gap_q: tuple[np.ndarray | None, np.ndarray | None] | None = None,
-               tail_deltas: tuple[float, float] = (1.0, 1.0),
-               v: np.ndarray | None = None) -> np.ndarray:
-    """[D, n_columns] design block for one frame (D = 3 dipole components or
-    6 Voigt polarisability components) — THE column contract for fit AND
-    predict. scales = [(D, sparse_desc, v, delta)] per site model: each
-    model's kernel couples ITS descriptors to ITS sparse points only (models
-    never cross, like species), reads out through ITS geometry v [N, D, K]
-    and carries δ² on its columns and prior. Block order: model → species → ξ
-    → (m, k); the base Gram is computed once per (model, species) and raised
-    elementwise to each ξ (sum-of-kernels column blocks).
-
-    gap_q = (q2 [N, W2] | None, q3 [N, W3] | None) appends the additive
-    TurboGAP blocks AFTER all model columns: gap2b (species → (s, k)) then
-    gap3b (species → (s, k)) — Σ_{i∈t} q[i, s]·v[i, x, k] — i.e. the 2b/3b
-    site energies with a linear readout, μ-weighted by the bond basis `v`.
-
-    tail_deltas = (δ_2b, δ_3b) of those tails (_deltas(cfg)[1:]); a site
-    model's δ comes ONLY from its scales entry. The 2b/3b kernels carry δ²,
-    as in gap.f90 (`delta**2 * alphas * kernel`) and gap_fit's covariance —
-    so the columns here are δ²·k and the coefficients α are in gap_fit's
-    convention. The same δ² sits on the sparse-sparse kernel K_MM that
-    regularises the fit (_prior_factors), which is what makes δ² the prior
-    variance of that term's site function."""
-    d_2b, d_3b = (float(d) for d in tail_deltas)
+def _phi_frame(scales: list, ti: np.ndarray, xi: int) -> np.ndarray:
+    """[D, n_columns] design block for one frame — THE column contract for fit AND
+    predict. scales = [(D, sparse_desc, v, delta)] per site model (then the extra
+    SOAP scale); each model's kernel couples its own descriptors to its own sparse
+    points, reads out through its v [N, D, K] and carries δ² on its columns
+    (gap.f90 `delta**2 * alphas * kernel`). Block order: model → species → (m, k)."""
     cols = []
     for D, sparse_desc, vm, dm in scales:
         n_rows = vm.shape[1]             # 3 (dipole) or 6 (polarisability)
         for t, Dm in enumerate(sparse_desc):
             sel = ti == t
-            G = D[sel] @ Dm.T                           # [n_t, M_t] base Gram
+            G = D[sel] @ Dm.T                           # [n_t, M_t] Gram
             vt = vm[sel]
-            for xi in xis:
-                cols.append(dm ** 2 * np.einsum("nm,nxk->xmk", G ** xi, vt)
-                            .reshape(n_rows, -1))       # [D, M_t·K]
-    assert v is not None or not any(q is not None for q in (gap_q or ())), \
-        "_phi_frame: the TurboGAP tails need v (the bond basis)"
-    for q, d_q in zip(gap_q or (), (d_2b, d_3b)):
-        if q is not None:
-            # scales[0][1] is the first model's sparse list: exactly one entry
-            # per species (_fps_per_species loops range(cfg.num_types)).
-            for t in range(len(scales[0][1])):
-                sel = ti == t
-                cols.append(d_q ** 2 * np.einsum("ns,nxk->xsk", q[sel], v[sel])
-                            .reshape(v.shape[1], -1))   # [D, W·K]
+            vflat = vt.reshape(len(vt), -1)             # [n_t, D·K]
+            # Σ_n G^ξ[n,m]·v[n,x,k] as ONE GEMM: [M_t, D·K] → [D, M_t·K]
+            cols.append(dm ** 2 * ((G ** xi).T @ vflat).reshape(-1, n_rows, vt.shape[2])
+                        .transpose(1, 0, 2).reshape(n_rows, -1))           # [D, M_t·K]
     return np.concatenate(cols, axis=1)
 
 
-def _deltas(cfg: GAPconfig) -> tuple[float, float, float]:
-    """(δ_soap, δ_2b, δ_3b) — the ONE place the amplitudes are read, so fit
-    and predict cannot disagree about the column scaling."""
-    return (float(cfg.gap_delta_soap), float(cfg.gap_delta_2b),
-            float(cfg.gap_delta_3b))
-
-
-def _gap_centres(cfg: GAPconfig):
-    """The 2b / 3b sparse points as gap_fit sees them: (Q2 [M2], w2 [M2],
-    Q3 [M3, 3], w3 [M3]). w is the sparse point's own cutoff weight — gap.f90's
-    `cutoff(s)` factor (lines 278, 563): f(Q) for a 2b distance, f(r12)·f(r13)
-    for a 3b triangle, with r12, r13 recovered from its (sum, squared
-    difference) coordinates."""
-    Q2 = np.asarray(cfg.gap2b_centres, dtype=np.float64)
-    Q3 = np.asarray(cfg.gap3b_centres, dtype=np.float64)
-    root = np.sqrt(np.maximum(Q3[:, 1], 0.0))
-    w3 = (f_cut(0.5 * (Q3[:, 0] + root), cfg.gap3b_rcut, cfg.gap_buffer)
-          * f_cut(0.5 * (Q3[:, 0] - root), cfg.gap3b_rcut, cfg.gap_buffer))
-    return Q2, f_cut(Q2, cfg.gap2b_rcut, cfg.gap_buffer), Q3, w3
-
-
-def _gap_q(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig):
-    """Per-frame (q2 | None, q3 | None) float64 for _phi_frame per the
-    cfg flags; None when both are off (shared by fit + predict). Each centre's
-    column carries its cutoff weight (_gap_centres), as in gap.f90."""
-    if not (cfg.gap_2b or cfg.gap_3b):
-        return None
-    raw = gap_raw_numpy(atoms, ti, cfg).astype(np.float64)
-    sl = gap_slices(cfg)
-    _, w2, _, w3 = _gap_centres(cfg)
-    q2 = raw[:, sl["two_body"]]; q3 = raw[:, sl["three_body"]]
-    return ((q2.reshape(len(raw), -1, len(w2)) * w2).reshape(q2.shape) if cfg.gap_2b else None,
-            (q3.reshape(len(raw), -1, len(w3)) * w3).reshape(q3.shape) if cfg.gap_3b else None)
-
-
-def _prior_factors(cfg: GAPconfig, scale_sparse: list, xis: tuple,
-                   tail_vcols: int | None = None) -> list:
-    """gap_fit's regulariser, one entry per column block in _phi_frame order:
-    (n_columns, L) with K_MM + jitter·I = L·Lᵀ the sparse-sparse covariance of
-    that GAP term (gp_predict.F90 gpSparse_fit penalises αᵀ·K_MM·α). A block
-    is M sparse points × K readout columns, m-major, and the prior is
-    independent across the K columns, so its penalty is kron(K_MM, I_K).
-
-    scale_sparse = [(sparse_desc, delta, n_vcols)] per site model, matching
-    _phi_frame's scales: one term per (model, species, ξ), K_MM =
-    δ²·(D_m·D_m′)^ξ, n_vcols the model's readout width K. The TurboGAP tails
-    (cfg.gap_2b / gap_3b) read out through the bond basis of width tail_vcols
-    (required only then): one term per (species, neighbour species) for 2b
-    and per (species, neighbour pair) for 3b, K_MM = δ²·w_s·w_s′·k(Q_s, Q_s′)
-    with the descriptor's own kernel."""
-    _, d_2b, d_3b = _deltas(cfg)
-    T = cfg.num_types
-
-    def chol(K):
-        # gap_fit adds sparse_jitter and factorises (in quad precision). In
-        # double a near-singular K_MM can still fail: raise the jitter tenfold
-        # until it factorises and say so.
-        jit = float(cfg.gap_sparse_jitter)
-        while True:
-            try:
-                L = np.linalg.cholesky(K + jit * np.eye(len(K)))
-                if jit > float(cfg.gap_sparse_jitter):
-                    warnings.warn(f"K_MM not positive definite at gap_sparse_jitter="
-                                  f"{cfg.gap_sparse_jitter:g}; factorised with {jit:g}")
-                return L
-            except np.linalg.LinAlgError:
-                jit *= 10.0
-
-    out = []
-    for sparse_desc, dm, k in scale_sparse:
-        for Dm in sparse_desc:
-            base = Dm @ Dm.T
-            for xi in xis:
-                out.append((len(Dm) * k, chol(dm ** 2 * base ** xi)))
-    if cfg.gap_2b or cfg.gap_3b:
-        assert tail_vcols is not None, "tail_vcols required with gap_2b/gap_3b"
-        n_vcols = tail_vcols
-        Q2, w2, Q3, w3 = _gap_centres(cfg)
-        if cfg.gap_2b:
-            K2 = d_2b ** 2 * np.outer(w2, w2) * np.exp(
-                -0.5 * ((Q2[:, None] - Q2[None]) / cfg.gap2b_sigma) ** 2)
-            L2 = chol(K2)
-            out += [(len(Q2) * n_vcols, L2)] * (T * T)            # species × neighbour species
-        if cfg.gap_3b:
-            r = np.sqrt(sum(((Q3[:, None, d] - Q3[None, :, d]) / cfg.gap3b_sigma[d]) ** 2
-                            for d in range(3)))
-            k3 = (np.where(r < 1.0, (1.0 - r) ** 4 * (4.0 * r + 1.0), 0.0)
-                  if str(getattr(cfg, "gap3b_kernel", "exp")) == "pol" else np.exp(-0.5 * r ** 2))
-            L3 = chol(d_3b ** 2 * np.outer(w3, w3) * k3)
-            out += [(len(Q3) * n_vcols, L3)] * (T * (T * (T + 1) // 2))   # species × neighbour pair
-    return out
+def _prior_factors(cfg: GAPconfig, scale_sparse: list, xi: int) -> list:
+    """gap_fit's regulariser per column block, in _phi_frame order: (n_columns, L)
+    with L·Lᵀ = K_MM + jitter·I, K_MM = δ²·(D_m·D_m′)^ξ per (model, species). The
+    prior is independent across the K readout columns, so the penalty is kron(K_MM, I_K)."""
+    jit = float(cfg.gap_sparse_jitter)
+    return [(len(Dm) * k, np.linalg.cholesky(dm ** 2 * (Dm @ Dm.T) ** xi + jit * np.eye(len(Dm))))
+            for sparse_desc, dm, k in scale_sparse for Dm in sparse_desc]
 
 
 def _whiten(X: np.ndarray, factors: list, solve_with_transpose: bool) -> np.ndarray:
-    """Apply each block's prior factor along its sparse-point axis.
-    X [R, n_columns]. solve_with_transpose=False: Φ → Φ·(L⁻ᵀ ⊗ I) (design in
-    whitened coefficients β = (Lᵀ ⊗ I)·α). True: β → α = (L⁻ᵀ ⊗ I)·β.
-    Each block's readout width is n_columns / M, so blocks may differ."""
+    """Apply each block's prior factor along its sparse-point axis (X [R, n_columns]).
+    False: Φ → Φ·(L⁻ᵀ ⊗ I) (whitened coefficients β = (Lᵀ ⊗ I)·α); True: β → α."""
     out, off = np.empty_like(X), 0
     for n, L in factors:
         M = len(L)
@@ -649,11 +360,8 @@ def _whiten(X: np.ndarray, factors: list, solve_with_transpose: bool) -> np.ndar
 
 
 def _targets(frames: list[Atoms], cfg: GAPconfig) -> np.ndarray:
-    """Targets [F, D] (dipole [F, 3] unit-converted per cfg, matching
-    assemble; polarisability [F, 6] Voigt as stored).
-
-    NOTE: unlike the training path (assemble_data_dict), this applies NO
-    box/label guards — a pathological test file scores silently."""
+    """Targets [F, D] (dipole unit-converted per cfg; polarisability Voigt as stored).
+    Unlike assemble_data_dict this applies NO box/label guards."""
     key = tnep_data._resolve_target_key(cfg)
     mu = np.stack([np.asarray(tnep_data._extract_target(s, key))
                    for s in frames]).astype(np.float64)
@@ -672,26 +380,20 @@ def _rmse_r2(pred: np.ndarray, mu: np.ndarray) -> tuple[float, float]:
     return rmse, r2
 
 
-def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
-    """Fit the sparse-kernel dipole model on cfg.data_path; evaluate
-    cfg.test_data_path when set; write a run record JSON to GAP/.
-
-    MUTATES cfg in place: `seed` (when None) and `gap2b_centres`/
-    `gap3b_centres` (when auto-selected) are filled in, because they must
-    travel with the model for `predict` and into the run record.
-
-    Solver memory: the dual ridge solves the [DF, DF] Gram, so Φ itself
-    dominates (~1.7 GB at F=1500, 48k columns) and memory is linear in
-    columns. Multi-scale (gap_extra_rcut) ≈ 2× descriptor build time, fit
-    and predict."""
-    _validate(cfg)
-    t0 = time.time()
-
-    # As MasterTNEP (~418): resolve the seed BEFORE any RNG is constructed —
-    # the subsample draw, FPS and centre selection all consume it, so a seed
-    # generated after cfg.randomise would not replay the recorded config.
+def _resolve_seed(cfg: GAPconfig) -> None:
+    # Resolve the seed BEFORE any RNG exists (subsample, FPS and centre selection
+    # all consume it) so the run record replays the fit.
     if cfg.seed is None:
         cfg.seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
+
+
+def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
+    """Fit on cfg.data_path, evaluate cfg.test_data_path, write a run record JSON
+    to GAP/. MUTATES cfg: fills `seed` when None. Memory is linear in columns
+    (Φ ~1.7 GB at F=1500, 48k columns); gap_extra_rcut ≈ 2× build/fit/predict."""
+    _validate(cfg)
+    t0 = time.time()
+    _resolve_seed(cfg)
 
     dataset, types_int = tnep_data.collect(cfg)
     if cfg.total_N is not None:
@@ -699,38 +401,25 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
         dataset = [dataset[k] for k in cfg.indices]
         types_int = [types_int[k] for k in cfg.indices]
     tis = [np.asarray(t) for t in types_int]
-    # Mutating cfg (here and the seed above) is deliberate: the centres are
-    # part of the descriptor definition, so they must travel with the model
-    # (model.cfg → predict) and into the run record's "config" block.
-    gap_centres = cfg.gap_2b or cfg.gap_3b or cfg.gap_triplet_tensor
-    if gap_centres and (cfg.gap2b_centres is None or cfg.gap3b_centres is None):
-        c2, c3 = select_centres(dataset, cfg)
-        cfg.gap2b_centres, cfg.gap3b_centres = c2.tolist(), c3.tolist()
-
     builder = make_descriptor_builder(cfg)
     descs = _descriptors(builder, dataset)
-    # assemble_data_dict: unit-converted targets, box/label guards, V_atom —
-    # all built purely from cfg pre-model. Gradients not needed (empty).
+    # unit-converted targets, box/label guards, V_atom — all from cfg pre-model; no gradients
     d = tnep_data.assemble_data_dict(
         dataset, types_int, descs, [[]] * len(dataset), [[]] * len(dataset),
         cfg)
     mu = np.stack([np.asarray(t, dtype=np.float64) for t in d["targets"]])
     pair = gm.pair_columns(cfg)
     vs = [_finish_v(V, a, t, cfg) for V, a, t in zip(d["V_atom"], dataset, tis)]
-    if cfg.pol_field_groups and cfg.pol_field_scale is None:
-        _pin_pol_field_scale(cfg, vs)
     # Kernel channels (2·C under target_mode=2: isotropic + traceless groups).
     n_vcols = _n_vcols(cfg)
 
-    # Per-species FPS sparse points, per site model in cfg order, then the
-    # extra SOAP scale (selected on ITS OWN descriptors — the wider builder)
-    # — all from one rng stream, so gap_site_models=["soap"] without
-    # gap_extra_rcut is bit-identical to the pre-feature code.
+    # FPS per species, per site model in cfg order, then the extra scale (on ITS
+    # OWN descriptors) — one rng stream.
     rng = np.random.default_rng(cfg.seed)
-    M_req = int(cfg.gap_sparse_per_species)
-    xis = _xi_tuple(cfg)
+    M_req = _sparse_per_model(cfg)
+    xi = int(cfg.gap_kernel_power)
 
-    def _fps_per_species(scale_descs):
+    def _fps_per_species(scale_descs, M):
         out = []
         for t in range(cfg.num_types):
             Dt = np.concatenate([D[ti == t]
@@ -739,39 +428,31 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
                 raise ValueError(
                     f"no atoms of type Z={cfg.types[t]} in the training "
                     f"data — cannot place sparse points for that species")
-            out.append(Dt[_fps(Dt, M_req, rng)].copy())
+            out.append(Dt[_fps(Dt, M, rng)].copy())
         return out
 
     models = list(cfg.gap_site_models)
     site = _site_terms(cfg, builder, dataset, tis, vs, descs)
-    site_sparse = {m: _fps_per_species(d) for m, (d, _, _) in site.items()}
+    site_sparse = {m: _fps_per_species(d, M_req[m]) for m, (d, _, _) in site.items()}
     builder2 = descs2 = sparse_desc2 = None
     if cfg.gap_extra_rcut is not None:
-        # Second SOAP length scale for the KERNEL only (v is untouched):
-        # rcut_hard = gap_extra_rcut, same buffer width rcut_hard − rcut_soft.
+        # second SOAP scale for the KERNEL only (v untouched), same soft/hard buffer
         cfg2 = copy.copy(cfg)
         cfg2.rcut_hard = float(cfg.gap_extra_rcut)
         cfg2.rcut_soft = cfg2.rcut_hard - (cfg.rcut_hard - cfg.rcut_soft)
         builder2 = make_descriptor_builder(cfg2)
         descs2 = _descriptors(builder2, dataset)
-        sparse_desc2 = _fps_per_species(descs2)
+        sparse_desc2 = _fps_per_species(descs2, M_req["soap"])
 
-    deltas = _deltas(cfg)
-    d_soap = deltas[0]
+    d_soap = float(cfg.gap_delta_soap)
     # (sparse set, δ, readout width K_model) per site model, then the extra scale
     scale_sparse = [(site_sparse[m], dm, g[0].shape[2]) for m, (_, g, dm) in site.items()]
     if descs2 is not None:
         scale_sparse.append((sparse_desc2, d_soap, n_vcols))
     sizes = [[len(s) for s in group] for group, _, _ in scale_sparse]
-    # α block per (model/scale, species): M × len(ξ list) × K columns; then the
-    # additive GAP blocks, one per species: W2·K (gap_2b) and W3·K (gap_3b).
-    sl = gap_slices(cfg)
+    # α block per (model/scale, species): M × K columns.
     T = cfg.num_types
-    w_gap = {k: (sl[k].stop - sl[k].start) * n_vcols if on else 0
-             for k, on in (("two_body", cfg.gap_2b),
-                           ("three_body", cfg.gap_3b))}
-    blocks = ([len(Dm) * len(xis) * k for group, _, k in scale_sparse for Dm in group]
-              + [w for w in w_gap.values() if w for _ in range(T)])
+    blocks = [len(Dm) * k for group, _, k in scale_sparse for Dm in group]
     n_columns = sum(blocks)
 
     # Φ frame-by-frame — the full N_envs × M kernel never exists.
@@ -780,41 +461,24 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     Phi = np.empty((F, D, n_columns))
     for f in range(F):
         scales = _frame_scales(site, site_sparse, f, descs2, sparse_desc2, vs[f], d_soap)
-        Phi[f] = _phi_frame(scales, tis[f], xis,
-                            _gap_q(dataset[f], tis[f], cfg), deltas[1:], v=vs[f])
+        Phi[f] = _phi_frame(scales, tis[f], xi)
     Phi_flat = Phi.reshape(D * F, n_columns)
 
-    # An unpopulated species-pair slot (or a centre no triplet reaches) gives
-    # identically-zero gap columns: those coefficients are unidentifiable.
-    n_gap = sum(w * T for w in w_gap.values())
-    if n_gap:
-        dead = int(np.count_nonzero(~Phi_flat[:, -n_gap:].any(axis=0)))
-        if dead:
-            warnings.warn(
-                f"{dead}/{n_gap} GAP 2b/3b columns are identically zero "
-                f"(unpopulated species-pair slots or unreached centres): "
-                f"those coefficients are unidentifiable — the ridge leaves "
-                f"them at ~0 and predictions are unaffected")
-
-    # gap_fit's estimator (gp_predict.F90 gpSparse_fit): sparse GP regression,
-    #   minimise  Σ_obs ((Φα − μ)/σ_obs)²  +  αᵀ·K_MM·α,
-    # σ_obs the absolute error on a total dipole component. gap_fit's default
-    # is per-atom regularisation, σ_obs = σ·√N_atoms (gap_fit_module.F90:1149).
-    # gap_fit solves the augmented system [Λ^-½·K_NM; chol(K_MM)] by QR. The
-    # readout multiplies the columns by K per sparse point, so here the SAME
-    # minimiser is taken in whitened coefficients β = (Lᵀ ⊗ I)·α, where the
-    # penalty is ‖β‖², and solved in the dual: the Gram is [DF, DF]
-    # regardless of n_columns.
+    # gap_fit's estimator: minimise Σ_obs ((Φα − μ)/σ_obs)² + αᵀ·K_MM·α, σ_obs =
+    # σ·√N_atoms (gap_fit_module.F90:1149). gap_fit QR-solves the augmented system;
+    # here the same minimiser is taken in whitened β = (Lᵀ ⊗ I)·α (penalty ‖β‖²)
+    # and solved in the dual: the Gram is [DF, DF] regardless of n_columns.
     sigma = float(cfg.gap_sigma)
     row_w = np.repeat(1.0 / (sigma * np.sqrt([len(a) for a in dataset])), D)
     if D == 6 and float(cfg.gap_lambda_shear) != 1.0:
         # GPUMD lambda_shear: off-diagonal rows fitted with σ/λ_shear.
         row_w = row_w * np.tile([1.0] * 3 + [float(cfg.gap_lambda_shear)] * 3, F)
-    factors = _prior_factors(cfg, scale_sparse, xis, n_vcols)
+    factors = _prior_factors(cfg, scale_sparse, xi)
     Phi_w = _whiten(Phi_flat, factors, False) * row_w[:, None]
+    mu_w = mu.reshape(-1) * row_w
     G = Phi_w @ Phi_w.T                                  # [DF, DF]
     G[np.diag_indices_from(G)] += 1.0
-    beta = Phi_w.T @ np.linalg.solve(G, mu.reshape(-1) * row_w)
+    beta = Phi_w.T @ np.linalg.solve(G, mu_w)
     alpha_flat = _whiten(beta[None], factors, True)[0]
     parts = np.split(alpha_flat, np.cumsum(blocks)[:-1])
     # every α group is one block per species
@@ -822,20 +486,17 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     site_alpha = dict(zip(models, groups[:len(models)]))
     del groups[:len(models)]
     alpha2 = groups.pop(0) if descs2 is not None else None
-    alpha_gap2b = groups.pop(0) if cfg.gap_2b else None
-    alpha_gap3b = groups.pop(0) if cfg.gap_3b else None
     assert not groups
 
     model = GapDipoleModel(cfg=cfg, builder=builder, site_sparse=site_sparse,
-                           site_alpha=site_alpha, xi=xis, builder2=builder2,
+                           site_alpha=site_alpha, xi=xi, builder2=builder2,
                            sparse_desc2=sparse_desc2, alpha2=alpha2,
-                           alpha_gap2b=alpha_gap2b, alpha_gap3b=alpha_gap3b)
+                           train_pred=(Phi_flat @ alpha_flat).reshape(F, D))
 
-    train_rmse, train_r2 = _rmse_r2(
-        (Phi_flat @ alpha_flat).reshape(F, D), mu)
+    train_rmse, train_r2 = _rmse_r2(model.train_pred, mu)
     metrics = {"train_rmse": train_rmse, "train_r2": train_r2,
                "n_train_frames": F, "fit_seconds": time.time() - t0}
-    print(f"[gap_dipole] fit models={models} M={sizes} xi={list(xis)} sigma={sigma:g} "
+    print(f"[gap_dipole] fit models={models} M={sizes} xi={xi} sigma={sigma:g} "
           f"n_columns={n_columns}: "
           f"train RMSE {train_rmse:.4f}, R² {train_r2:.4f} "
           f"({metrics['fit_seconds']:.1f} s)")
@@ -851,62 +512,39 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     from model_io import _serialize_config
     record = {
         "config": _serialize_config(cfg),
-        "gap": {"sparse_per_species": M_req, "kernel_power": list(xis),
+        "gap": {"sparse_per_species": M_req if isinstance(cfg.gap_sparse_per_species, dict) else M_req[models[0]],
+                "kernel_power": xi,
                 "sigma": sigma, "sparse_jitter": float(cfg.gap_sparse_jitter),
-                # summed site models (gap_models.py): kernel per body order,
-                # each with its own FPS set, prior and relative amplitude
                 "site_models": models,
                 "model_delta": {m: float(cfg.gap_model_delta[m]) for m in models},
                 "site_channels": int(cfg.gap_site_channels),
                 "site_lmax": int(cfg.gap_site_lmax),
-                "site_rcut": cfg.gap_site_rcut,
                 "cross_lmax": int(cfg.gap_cross_lmax),
                 "delta_soap": float(cfg.gap_delta_soap),
-                "delta_2b": float(cfg.gap_delta_2b),
-                "delta_3b": float(cfg.gap_delta_3b),
-                # zeta only where it is live — config.dipole_zeta is present
-                # in every record but decorative for non-screened radials.
+                # zeta only where live (screened radial)
                 **({"zeta": float(cfg.dipole_zeta)}
                    if cfg.dipole_radial == "screened" else {}),
                 "radial": cfg.dipole_radial,
                 "cutoff": resolved_dipole_cutoff(cfg),
                 "channels": int(cfg.dipole_channels),
                 "kernel_channels": kernel_channels(cfg),
-                # True ⇒ per-(sparse-point, channel, neighbor-species)
-                # columns; subsumes symmetric c AND ordered Ω (no distinction
-                # in the absorbed linear form).
+                # per-(sparse-point, channel, neighbor-species) columns
                 "pair_columns": pair,
                 "cross_channels": int(cfg.gap_cross_channels),
-                **({"group_delta": [float(x) for x in cfg.gap_group_delta],
-                    "lambda_shear": float(cfg.gap_lambda_shear),
-                    "angular_cross": bool(cfg.gap_angular_cross),
-                    "triplet_tensor": bool(cfg.gap_triplet_tensor),
-                    "pol_field_groups": list(cfg.pol_field_groups),
-                    "pol_field_scale": cfg.pol_field_scale}
-                   if int(cfg.target_mode) == 2 else {}),
+                **({"lambda_shear": float(cfg.gap_lambda_shear)} if int(cfg.target_mode) == 2 else {}),
                 "extra_rcut": cfg.gap_extra_rcut,
                 "n_columns": n_columns,
-                # additive TurboGAP 2b/3b blocks (gap_descriptor.py)
-                "gap_2b": bool(cfg.gap_2b), "gap_3b": bool(cfg.gap_3b),
-                "n_gap_columns": {k: w * T for k, w in w_gap.items()},
-                **({k: getattr(cfg, k) for k in (
-                    "gap2b_centres", "gap3b_centres", "gap2b_sigma",
-                    "gap3b_sigma", "gap2b_rcut", "gap3b_rcut", "gap_buffer")}
-                   if gap_centres else {}),
-                # sparse-set sizes per site model
                 "M_per_species": {m: {str(z): n for z, n in zip(cfg.types, sz)}
                                   for m, sz in zip(models, sizes)},
-                # scale-2 sparse-set sizes, only when gap_extra_rcut is set
                 **({"M_per_species_2": {str(z): n
                                         for z, n in zip(cfg.types, sizes[-1])}}
                    if descs2 is not None else {})},
         "metrics": metrics,
     }
     os.makedirs("GAP", exist_ok=True)
-    xtag = "-".join(map(str, xis))
-    # Uniquify: same-second fits (λ/ξ scan loops) must not clobber records.
+    # Uniquify: same-second fits (scan loops) must not clobber records.
     stem = os.path.join(
-        "GAP", f"gap_M{M_req}_x{xtag}_{time.strftime('%Y%m%d_%H%M%S')}")
+        "GAP", f"gap_M{M_req[models[0]]}_x{xi}_{time.strftime('%Y%m%d_%H%M%S')}")
     path, k = stem + ".json", 1
     while os.path.exists(path):
         path, k = f"{stem}_{k}.json", k + 1
@@ -917,11 +555,17 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
 
 
 def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
-    """μ [F, 3] (or α [F, 6], target_mode=2) for a list of frames via the
-    model's held cfg/builder.
+    """μ [F, 3] (or α [F, 6]) for frames. soap-only polarisability on orthorhombic
+    periodic cells → batched GPU forward (gap_gpu.predict_gpu, matches
+    _predict_numpy to 1e-3 Å³); everything else → float64 NumPy."""
+    import gap_gpu
+    if frames and gap_gpu.gpu_applicable(model) and gap_gpu._cell_ok(frames, resolved_dipole_rc(model.cfg)):
+        return gap_gpu.predict_gpu(model, frames)
+    return _predict_numpy(model, frames)
 
-    Routes through _phi_frame — the SAME design-matrix contraction the fit
-    uses (μ = Φα) — so fit and predict cannot drift."""
+
+def _predict_numpy(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
+    """Through _phi_frame — the fit's own contraction (μ = Φα) — so fit and predict cannot drift."""
     cfg = model.cfg
     models = list(cfg.gap_site_models)
     tis = [np.asarray(t) for t in tnep_data.assign_type_indices(frames, cfg.types)]
@@ -929,16 +573,12 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
     site = _site_terms(cfg, model.builder, frames, tis, vs)
     descs2 = (_descriptors(model.builder2, frames)
               if model.builder2 is not None else None)
-    alpha_flat = np.concatenate(
-        [a for m in models for a in model.site_alpha[m]] + list(model.alpha2 or [])
-        + list(model.alpha_gap2b or []) + list(model.alpha_gap3b or []))
-    deltas = _deltas(cfg)
-    d_soap = deltas[0]
+    alpha_flat = np.concatenate([a for m in models for a in model.site_alpha[m]] + list(model.alpha2 or []))
+    d_soap = float(cfg.gap_delta_soap)
     out = None
     for f, (atoms, ti, v) in enumerate(zip(frames, tis, vs)):
         scales = _frame_scales(site, model.site_sparse, f, descs2, model.sparse_desc2, v, d_soap)
-        row = _phi_frame(scales, ti, model.xi,
-                         _gap_q(atoms, ti, cfg), deltas[1:], v=v) @ alpha_flat
+        row = _phi_frame(scales, ti, model.xi) @ alpha_flat
         if out is None:
             out = np.empty((len(frames), len(row)))     # D = 3 or 6
         out[f] = row
@@ -953,10 +593,8 @@ def predict_timed(model: GapDipoleModel, frames: list[Atoms]) -> tuple[np.ndarra
 
 
 if __name__ == "__main__":
-    # IDE / CLI entry: fit on cfg.data_path, evaluate cfg.test_data_path,
-    # print metrics, write the GAP/ run record. The GAP-relevant readout
-    # fields are pinned HERE rather than read from GAPconfig class defaults,
-    # so a working-tree default edit cannot leak into the fit.
+    # CLI entry: fit, evaluate, write the run record. Knobs are pinned here so a
+    # working-tree default edit cannot leak into the fit.
     os.chdir(os.path.dirname(os.path.abspath(__file__)))  # datasets/, GAP/
 
     cfg = GAPconfig()

@@ -1,8 +1,6 @@
-"""Tests for the neighbor-basis dipole readout (plan Phase 4, tests 10-18t).
-
-Gradient tests (12, 13, 13b, 17t) are deferred until dipole_gradient exists
-(plan Phase 3).
-"""
+"""Neighbour-basis readout geometry (data.py): the staged V the GAP fit reads,
+its radial/cutoff smoothness, the pair search and the data-assembly guards.
+Checked through the ANN forward because that is the cheapest linear consumer of V."""
 import os
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
@@ -19,12 +17,10 @@ from ase import Atoms
 from ase.io import read
 from ase.neighborlist import neighbor_list
 
-from TNEPconfig import TNEPconfig, resolved_dipole_cutoff
+from TNEPconfig import TNEPconfig
 from TNEP import TNEP
-from DescriptorBuilder import make_descriptor_builder
-from DescriptorBuilderGPU import compute_dim_q
-from data import (prepare_eval_data, assign_type_indices, assemble_data_dict,
-                  pad_and_stack, _neighbor_dipole_guards, _neighbor_dipole_V)
+from descriptor_layout import compute_dim_q
+from data import prepare_eval_data, _neighbor_dipole_guards, _neighbor_pairs
 
 WATER_XYZ = os.path.join(ROOT, "datasets", "train_waterbulk.xyz")
 
@@ -33,45 +29,19 @@ def _cfg(**kw):
     cfg = TNEPconfig()
     cfg.target_mode = 1
     cfg.dipole_readout = "neighbor"
-    cfg.rcut_hard = 3.5
-    cfg.rcut_soft = 3.0
-    cfg.dipole_rc = 3.0
-    cfg.num_neurons = 8
-    cfg.activation = "tanh"
+    cfg.rcut_hard, cfg.rcut_soft = 3.5, 3.0
+    cfg.num_neurons, cfg.activation, cfg.seed = 8, "tanh", 7
     cfg.descriptor_mixing = False
-    cfg.seed = 7
-    cfg.types = [8, 1]
-    cfg.num_types = 2
-    cfg.type_map = {8: 0, 1: 1}
-    # Pin readout fields so working-tree experiment defaults in TNEPconfig
-    # never leak into the suite (kwargs still override).
-    cfg.dipole_channels = 4
-    cfg.dipole_species_pairs = "off"
-    cfg.dipole_radial = "chebyshev"
-    cfg.dipole_zeta = -2.0
-    cfg.dipole_cutoff = None
+    cfg.types, cfg.num_types, cfg.type_map = [8, 1], 2, {8: 0, 1: 1}
+    # Pin every readout/ANN-input field so working-tree experiment defaults never leak in.
+    cfg.dipole_channels, cfg.dipole_species_pairs = 4, "off"
+    cfg.dipole_radial, cfg.dipole_zeta, cfg.dipole_cutoff = "chebyshev", -2.0, None
     cfg.dipole_gauss_sigma_scale = 1.0
-    cfg.l_max = 4
-    cfg.alpha_max = 4
-    cfg.radial_basis_size = None
-    cfg.radial_basis_species_sum = False
-    cfg.radial_basis_per_l = False
-    cfg.radial_basis_norm = "l2"
-    cfg.q_shift = None
-    cfg.descriptor_scale = "off"
-    cfg.q_scale = None
-    cfg.optimizer = "snes"
-    cfg.dipole_head = "vector"
-    # The ANN-input mode and the GAP feature flags are experiment knobs the
-    # user tunes in the working tree; pin them so a live TNEPconfig default
-    # cannot change dim_q underneath every suite that imports this helper.
-    cfg.nep_descriptor = "off"
-    cfg.sum_delta = [1.0, 1.0, 1.0]
-    cfg.sum_delta_learn = False
-    cfg.gap_2b = False
-    cfg.gap_3b = False
-    # Regularisation strengths are per-model lists in the working tree;
-    # the suites build one-model configs, so pin a scalar.
+    cfg.l_max = cfg.alpha_max = 4
+    cfg.radial_basis_size, cfg.radial_basis_species_sum, cfg.radial_basis_per_l = None, False, False
+    cfg.radial_basis_norm, cfg.q_shift, cfg.descriptor_scale, cfg.q_scale = "l2", None, "off", None
+    cfg.optimizer, cfg.dipole_head, cfg.nep_descriptor = "snes", "vector", "off"
+    cfg.sum_delta, cfg.sum_delta_learn = [1.0, 1.0, 1.0], False
     cfg.lambda_1 = cfg.lambda_2 = 0.0005
     for k, v in kw.items():
         setattr(cfg, k, v)
@@ -91,7 +61,7 @@ def _bulk_frame():
 
 
 def _mu(model, atoms, cfg):
-    """μ through the production eval path (predict_batch, V via W_atom slot)."""
+    """μ (or Voigt α) through predict_batch with the staged V in the W_atom slot."""
     data = prepare_eval_data([atoms], cfg)
     return model.predict_batch(
         data["descriptors"], data["grad_values"],
@@ -101,53 +71,29 @@ def _mu(model, atoms, cfg):
         W_atom=data.get("V_atom"))[0].numpy()
 
 
-# Readout variants shared across the parametrized suites. "screened" is the
-# user-mandated BASIC form: single channel, c ≡ 1 frozen, ζ = −2.
-_MODE_KW = {
-    "chebyshev": {},
-    "screened": dict(dipole_radial="screened", dipole_channels=1,
-                     dipole_zeta=-2.0),
-    "ordered": dict(dipole_species_pairs="ordered"),
-    "chebyshev_warped": dict(dipole_radial="chebyshev_warped"),
-    "gaussian": dict(dipole_radial="gaussian"),
-    "bessel": dict(dipole_radial="bessel"),
-    "cheb_tanh3": dict(dipole_cutoff="tanh3"),
-}
-
-
-@functools.lru_cache(maxsize=8)
-def _bulk_setup(mode="chebyshev", head="vector"):
-    """(cfg, model, atoms, padded-data) for the 96-atom water frame — shared.
-    "ordered" gets a randomized ASYMMETRIC Ω (symmetric Ω would telescope
-    back to the difference form and hide ordered-path bugs)."""
-    cfg = _cfg(dipole_head=head, **_MODE_KW[mode])
+@functools.lru_cache(maxsize=2)
+def _bulk_setup(target_mode=1):
+    cfg = _cfg(target_mode=target_mode, dipole_species_pairs="symmetric")
     model = _model(cfg)
-    if mode == "ordered":
-        rng = np.random.default_rng(11)
-        model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape)
-                            .astype(np.float32))
+    rng = np.random.default_rng(3)
+    model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape).astype(np.float32))
     atoms = _bulk_frame()
-    data = prepare_eval_data([atoms], cfg)
-    return cfg, model, atoms, data
+    return cfg, model, atoms, prepare_eval_data([atoms], cfg)
 
 
 def _site_scalars_np(model, data):
-    """s_i^n replicated in numpy float64 (tanh ANN, b1 excluded by design)."""
-    desc = data["descriptors"][0].numpy().astype(np.float64)   # [A, Q]
-    Z = data["Z_int"][0].numpy()                                # [A]
+    """s_i^n in numpy float64 (tanh ANN, b1 excluded by design)."""
+    desc = data["descriptors"][0].numpy().astype(np.float64)
+    Z = data["Z_int"][0].numpy()
     W0 = model.W0.numpy().astype(np.float64)
     b0 = model.b0.numpy().astype(np.float64)
-    W1 = model.W1.numpy().astype(np.float64)                    # [T, H, C]
+    W1 = model._masked_W1(model.W1).numpy().astype(np.float64)
     h = np.tanh(np.einsum('aq,aqh->ah', desc, W0[Z]) + b0[Z])
-    return np.einsum('ah,ahn->an', h, W1[Z])                    # [A, C]
-
-
-def _fc(r, rc):
-    return ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
+    return np.einsum('ah,ahn->an', h, W1[Z])
 
 
 def _R_np(r, rc, C):
-    """R_n(r) = T_n(2r/rc − 1)·f_c(r), Chebyshev recurrence → [P, C]."""
+    """R_n(r) = T_n(2r/rc − 1)·cosine²(r) by the Chebyshev recurrence → [P, C]."""
     x = 2.0 * r / rc - 1.0
     Tn = np.empty((len(r), C))
     Tn[:, 0] = 1.0
@@ -155,7 +101,7 @@ def _R_np(r, rc, C):
         Tn[:, 1] = x
     for n in range(2, C):
         Tn[:, n] = 2.0 * x * Tn[:, n - 1] - Tn[:, n - 2]
-    return Tn * _fc(r, rc)[:, None]
+    return Tn * (((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2)[:, None]
 
 
 def _pair_index(T):
@@ -169,138 +115,62 @@ def _pair_index(T):
     return M
 
 
-# ── 10: pair-difference double sum == model's per-atom collapsed form ───────
-
-def test_pair_difference_sum_matches_model():
-    # Learned c exercised: dipole_species_pairs=True + randomized table.
-    cfg = _cfg(dipole_species_pairs=True)
-    model = _model(cfg)
-    rng = np.random.default_rng(3)
-    model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape)
-                        .astype(np.float32))
-    atoms = _bulk_frame()
-    data = prepare_eval_data([atoms], cfg)
-    s = _site_scalars_np(model, data)                          # [A, C]
-    mu_model = _mu(model, atoms, cfg)
-
-    Zt = data["Z_int"][0].numpy()
-    c = model.c_pair.numpy().astype(np.float64)                # [C, P]
-    pidx = _pair_index(cfg.num_types)
-    i, j, D = neighbor_list("ijD", atoms, float(cfg.dipole_rc))
-    keep = i != j
-    i, j, D = i[keep], j[keep], D[keep].astype(np.float64)
-    d = -D                                       # d = r_i − r_j (+ image)
-    r = np.linalg.norm(d, axis=1)
-    R = _R_np(r, float(cfg.dipole_rc), int(cfg.dipole_channels))  # [P, C]
-    cn = c[:, pidx[Zt[i], Zt[j]]].T                               # [P, C]
-    # b_ij = Σ_n c_n[p(t_i,t_j)]·R_n(r_ij)·(s_i^n − s_j^n); ordered pairs
-    # count each unordered pair twice with identical term.
-    b = np.sum(cn * R * (s[i] - s[j]), axis=1)                    # [P]
-    mu_pair = 0.5 * np.sum(b[:, None] * d, axis=0)
-
-    scale = max(np.linalg.norm(mu_model), 1e-6)
-    assert np.allclose(mu_model, mu_pair, atol=1e-4 * max(scale, 1.0), rtol=1e-4)
-
-
-# ── 11: invariance suite ────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered",
-                                  "gaussian"])
-def test_rigid_translation_invariance(mode):
-    cfg, model, atoms, _ = _bulk_setup(mode)
-    mu0 = _mu(model, atoms, cfg)
-    at2 = atoms.copy()
-    at2.positions = at2.positions + np.array([1.234, -2.517, 0.771])
-    mu1 = _mu(model, at2, cfg)
-    assert np.allclose(mu0, mu1, atol=2e-3)
-
-
-@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered",
-                                  "gaussian"])
-def test_rotation_covariance(mode):
-    cfg, model, atoms, _ = _bulk_setup(mode)
-    mu0 = _mu(model, atoms, cfg)
+def _rotation():
     a, b, c = 0.7, -0.4, 1.1
     Rz = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
     Ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
     Rx = np.array([[1, 0, 0], [0, np.cos(c), -np.sin(c)], [0, np.sin(c), np.cos(c)]])
-    R = Rz @ Ry @ Rx
-    at2 = atoms.copy()
-    at2.set_cell(atoms.cell[:] @ R.T, scale_atoms=False)
-    at2.positions = atoms.positions @ R.T
-    mu_rot = _mu(model, at2, cfg)
-    assert np.allclose(mu_rot, R @ mu0, atol=2e-3)
+    return Rz @ Ry @ Rx
 
 
-@pytest.mark.parametrize("mode", ["chebyshev", "screened", "ordered",
-                                  "gaussian"])
-def test_single_atom_lattice_translation_invariance(mode):
-    cfg, model, atoms, _ = _bulk_setup(mode)
-    mu0 = _mu(model, atoms, cfg)
-    at2 = atoms.copy()
-    at2.positions[5] += atoms.cell[:][0]         # +one cell vector, atom 5
-    mu1 = _mu(model, at2, cfg)
-    assert np.allclose(mu0, mu1, atol=2e-3)
+# ── rank 1: the staged V equals the pair-difference double sum ─────────────
+
+def test_pair_difference_sum_matches_model():
+    cfg, model, atoms, data = _bulk_setup()
+    s = _site_scalars_np(model, data)
+    Zt = data["Z_int"][0].numpy()
+    c = model.c_pair.numpy().astype(np.float64)
+    pidx = _pair_index(cfg.num_types)
+    i, j, D = neighbor_list("ijD", atoms, float(cfg.rcut_hard))
+    keep = i != j
+    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)        # d = r_i − r_j
+    R = _R_np(np.linalg.norm(d, axis=1), float(cfg.rcut_hard), int(cfg.dipole_channels))
+    cn = c[:, pidx[Zt[i], Zt[j]]].T
+    b = np.sum(cn * R * (s[i] - s[j]), axis=1)
+    mu_pair = 0.5 * np.sum(b[:, None] * d, axis=0)
+    mu_model = _mu(model, atoms, cfg)
+    assert np.allclose(mu_model, mu_pair, atol=1e-4 * max(np.linalg.norm(mu_model), 1.0), rtol=1e-4)
 
 
-# ── 13c: four-path forward consistency (the drift alarm) ────────────────────
-
-@pytest.mark.parametrize("mode", ["chebyshev", "screened", "chebyshev_warped",
-                                  "gaussian", "bessel", "cheb_tanh3"])
-@pytest.mark.parametrize("head", ["vector", "scalar"])
-def test_four_path_consistency(mode, head):
-    # The only test cross-checking all three radial dispatch sites (numpy
-    # twin, predict inline, _neighbor_V_coo) against each other — catches a
-    # ζ/radial mismatch between them. The in-graph/predict legs are the ONLY
-    # automated execution of the TF _radial/_fc branches (every μ-comparing
-    # test consumes the numpy-built V via W_atom), so the new radials and
-    # the tanh3 cross MUST be parametrized here.
-    cfg, model, atoms, _ = _bulk_setup(mode, head)
-    # Full pair stream (self_pairs_only=False) so the in-graph V path has
-    # the r_d COO list to build V from.
-    types_int = assign_type_indices([atoms], cfg.types)
-    builder = make_descriptor_builder(cfg)
-    desc, grads, gidx = builder.build_descriptors([atoms])
-    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
-    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=False)
-
-    args = (full["descriptors"], full["grad_values"],
-            full["pair_atom"], full["pair_gidx"], full["pair_struct"],
-            full["positions"], full["Z_int"], full["boxes"], full["atom_mask"],
-            model.W0, model.b0, model.W1, model.b1)
-    mu_slot = model.predict_batch(*args, W_atom=full["V_atom"])[0].numpy()
-    mu_ingraph = model.predict_batch(*args, W_atom=None)[0].numpy()   # COO legs
-
-    mu_cand = model.predict_batch_candidates(
-        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
-        model.W0[tf.newaxis], model.b0[tf.newaxis],
-        model.W1[tf.newaxis], model.b1[tf.newaxis])[0, 0].numpy()
-
-    # Single-structure predict(): dense [A, M] neighbor table from the builder.
-    gi = gidx[0]
-    A = len(atoms)
-    M = max(len(lst) for lst in gi)
-    grad_index = np.zeros((A, M), dtype=np.int32)
-    nmask = np.zeros((A, M), dtype=np.float32)
-    for a, lst in enumerate(gi):
-        grad_index[a, :len(lst)] = lst
-        nmask[a, :len(lst)] = 1.0
-    mu_single = model.predict(
-        full["descriptors"][0],
-        tf.zeros([A, M, 3, cfg.dim_q]),          # unused by neighbor readout
-        tf.constant(grad_index), full["positions"][0], full["Z_int"][0],
-        full["boxes"][0], full["atom_mask"][0], tf.constant(nmask)).numpy()
-
-    atol = 1e-4 * max(np.linalg.norm(mu_slot), 1.0)
-    assert np.allclose(mu_slot, mu_ingraph, atol=atol)
-    assert np.allclose(mu_slot, mu_cand, atol=atol)
-    assert np.allclose(mu_slot, mu_single, atol=atol)
+def test_gauge_shift_cancels():
+    """s → s + g moves μ by g·Σ V ≡ 0 with symmetric c: Σ_{a,t'} V[a,:,n,t'] vanishes."""
+    _, _, _, data = _bulk_setup()
+    V = data["V_atom"][0].numpy()                        # [A, 3, C, T]
+    assert np.all(np.abs(V.sum(axis=(0, 3))) < 1e-4 * np.abs(V).sum(axis=(0, 3)))
 
 
-# ── 13d: branch-consistency label guard ─────────────────────────────────────
+# ── smoothness at r_c, keyed on the cutoff ─────────────────────────────────
+
+@pytest.mark.parametrize("cutoff", ["cosine2", "cosine"])
+def test_radial_weights_smooth_at_rc(cutoff):
+    """R_n·f_c (the weights the GAP fit and the staged V use): cosine² is a C³
+    contact (value, R′, R″ vanish), cosine is C¹ (value and R′ only)."""
+    from data import _radial_weights
+    rc, h = 3.0, 0.01
+    r = np.arange(rc - 0.3, rc + 1e-9, h)
+    R = _radial_weights(r, rc, 10, "chebyshev_warped", -2.0, cutoff, 1.0)      # [P, C]
+    assert np.allclose(R[-1], 0.0, atol=1e-12)
+    d1 = np.abs(np.diff(R, axis=0)).max(1) / h                                  # slope per step
+    assert d1[-1] < 0.15 * d1.max()
+    if cutoff == "cosine2":
+        d2 = np.abs(np.diff(R, 2, axis=0)).max(1) / h ** 2
+        assert d2[-1] < 0.15 * d2.max()
+
+
+# ── data-assembly guards and the pair search ───────────────────────────────
 
 def test_branch_inconsistency_warning(capsys):
-    cfg = _cfg(convert_dipole_to_eangstrom=True)  # quantum = L_min directly
+    cfg = _cfg(convert_dipole_to_eangstrom=True)
     frame = _bulk_frame()
     dataset = [frame] * 5
     L = float(frame.cell[0, 0])
@@ -308,588 +178,30 @@ def test_branch_inconsistency_warning(capsys):
     _neighbor_dipole_guards(dataset, tame, cfg)
     assert "branch-inconsistent" not in capsys.readouterr().out
     offset = list(tame)
-    offset[2] = offset[2] + np.array([L, 0.0, 0.0])  # one frame off by ~e·L
+    offset[2] = offset[2] + np.array([L, 0.0, 0.0])
     _neighbor_dipole_guards(dataset, offset, cfg)
     assert "branch-inconsistent" in capsys.readouterr().out
 
 
-# ── 14: smoothness at r_c ───────────────────────────────────────────────────
-
-_SCAN_H = 0.03
-
-
-def _rc_scan(cfg):
-    """μ(r) for an OH dimer scanned through cfg.dipole_rc → (rs, mus [K, 3])."""
-    model = _model(cfg)
-    rc = float(cfg.dipole_rc)
-    rs = np.arange(rc - 0.3, rc + 0.3 + 1e-9, _SCAN_H)
-    mus = []
-    for r in rs:
-        at = Atoms("OH", positions=[[10.0, 10.0, 10.0], [10.0 + r, 10.0, 10.0]],
-                   cell=20.0 * np.eye(3), pbc=True)
-        at.info["dipole"] = np.zeros(3)
-        mus.append(_mu(model, at, cfg))
-    return rs, np.array(mus)
-
-
-def _assert_smooth_at_rc(cfg, cutoff):
-    """Continuity of μ at r_c, keyed on the CUTOFF (radial-agnostic):
-    "cosine2" is a C³ contact — value, μ′ AND μ″ vanish into the
-    identically-zero region; "tanh3" is C² — value, μ′, μ″ vanish with
-    pinned looser gates; "cubic"/"cosine" are C¹ only — value + μ′ vanish,
-    the μ″ jump at r_c is EXPECTED, so d2 is deliberately unasserted."""
-    rc, h = float(cfg.dipole_rc), _SCAN_H
-    rs, mus = _rc_scan(cfg)
-    # Beyond r_c: exactly zero (V has no pairs).
-    assert np.allclose(mus[rs >= rc], 0.0, atol=1e-12)
-    d1 = (mus[2:] - mus[:-2]) / (2 * h)
-    n_mu = np.linalg.norm(mus, axis=1)
-    n_d1 = np.linalg.norm(d1, axis=1)
-    r_mid = rs[1:-1]
-    k_last = np.max(np.where(rs < rc))                    # last point inside
-    near = np.abs(r_mid - rc) < 1.5 * h                   # FD points straddling rc
-    if cutoff == "cosine2":
-        # μ ∝ (rc − r)^4 near rc: value, μ', μ'' all continuous — no jump.
-        d2 = (mus[2:] - 2 * mus[1:-1] + mus[:-2]) / h ** 2
-        n_d2 = np.linalg.norm(d2, axis=1)
-        assert n_mu[k_last] < 1e-3 * n_mu.max()
-        assert n_d1[near].max() < 0.05 * n_d1.max()
-        assert n_d2[near].max() < 0.10 * n_d2.max()
-    elif cutoff == "tanh3":
-        # C² contact: μ ~ A(r_c − r)³ near r_c, so the last inside point
-        # (s = h = 0.03 into a 0.3 window) has value ratio (h/0.3)³ = 1e-3
-        # and d2 ratio h/0.3 = 0.10 — exactly on the cosine2 gates. The
-        # pinned looser gates below pass cleanly while a C¹ bug fails by
-        # ~4×; float32 FD noise sits ~10³ below signal.
-        d2 = (mus[2:] - 2 * mus[1:-1] + mus[:-2]) / h ** 2
-        n_d2 = np.linalg.norm(d2, axis=1)
-        assert n_mu[k_last] < 5e-3 * n_mu.max()
-        assert n_d1[near].max() < 0.05 * n_d1.max()
-        assert n_d2[near].max() < 0.25 * n_d2.max()
-    else:
-        # μ ∝ (rc − r)² near rc: value ~h² and slope ~h at the last inside
-        # points relative to their scan maxima.
-        assert n_mu[k_last] < 0.02 * n_mu.max()
-        assert n_d1[near].max() < 0.15 * n_d1.max()
-
-
-def test_smoothness_at_rc():
-    # dipole_rc strictly inside rcut so the descriptor is smooth at r_c.
-    # Default (None) cutoff for chebyshev resolves to "cosine2".
-    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0)
-    _assert_smooth_at_rc(cfg, "cosine2")
-
-
-@pytest.mark.parametrize("radial,cutoff", [("chebyshev", "cubic"),
-                                           ("screened", "cosine2")])
-def test_cross_combo_smoothness_at_rc(radial, cutoff):
-    # The two NEW radial×cutoff crosses: smoothness class follows the CUTOFF.
-    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0,
-               dipole_cutoff=cutoff, **_MODE_KW[radial])
-    _assert_smooth_at_rc(cfg, cutoff)
-
-
-@pytest.mark.parametrize("cutoff", ["cosine", "tanh3"])
-def test_new_cutoff_smoothness_at_rc(cutoff):
-    # "cosine" C¹ (value + d1 only); "tanh3" C² (value + d1 + d2, pinned).
-    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0,
-               dipole_cutoff=cutoff)
-    _assert_smooth_at_rc(cfg, cutoff)
-
-
-# ── 15: single H₂O sanity — μ nonzero, along the molecular bisector ─────────
-
-def test_water_monomer_bisector():
-    cfg = _cfg()
-    model = _model(cfg)
-    at = Atoms("OHH",
-               positions=[[10.0, 10.0, 10.0],
-                          [10.7568, 10.5859, 10.0],
-                          [9.2432, 10.5859, 10.0]],     # bisector = +y
-               cell=20.0 * np.eye(3), pbc=True)
-    at.info["dipole"] = np.zeros(3)
-    mu = _mu(model, at, cfg)
-    assert np.linalg.norm(mu) > 1e-6
-    # Symmetry forces μ ∥ bisector (up to sign) for any weights.
-    assert abs(mu[0]) < 1e-3 * abs(mu[1])
-    assert abs(mu[2]) < 1e-3 * abs(mu[1])
-
-
-# ── 16t: gauge — s → s + c shifts μ by c·Σ_i v_i ≡ 0 ────────────────────────
-
-@pytest.mark.parametrize("mode", ["chebyshev", "screened"])
-def test_gauge_shift_cancels(mode):
-    # "off"/"symmetric" only: with an asymmetric ordered Ω the s → s + g
-    # residual Σ g·R·d·(Ω[t,t'] − Ω[t',t]) is nonzero BY DESIGN (gauge
-    # invariance is deliberately traded away), so no "ordered" case here.
-    cfg, model, atoms, data = _bulk_setup(mode)
-    V = data["V_atom"][0].numpy()               # [A, 3, C, T], model's own V
-    # Per channel n: shifting s^n uniformly across ALL atoms moves μ by
-    # g_n·Σ_{a,t'} V[a,:,n,t'] ≡ 0 (ordered-pair cancellation, c symmetric).
-    residual = np.abs(V.sum(axis=(0, 3)))                # [3, C]
-    total = np.abs(V).sum(axis=(0, 3))                   # [3, C]
-    assert np.all(residual < 1e-4 * total)
-
-
-# ── 17: species-pair coefficient table ──────────────────────────────────────
-
-def test_same_species_coefficient_zeroes_contribution():
-    # Frame of only O atoms → every pair is the OO pair. c[:, OO]=0 must
-    # zero μ identically; c=1 must leave it nonzero (random W1 environments).
-    cfg = _cfg(dipole_species_pairs=True)
-    model = _model(cfg)
-    at = Atoms("O4", positions=[[8.0, 8.0, 8.0], [9.1, 8.4, 8.2],
-                                [8.3, 9.2, 8.9], [10.0, 9.5, 8.1]],
-               cell=20.0 * np.eye(3), pbc=True)
-    at.info["dipole"] = np.zeros(3)
-    oo = _pair_index(cfg.num_types)[0, 0]         # types [8, 1] → O is type 0
-    c = np.ones(model.c_pair.shape, dtype=np.float32)
-    model.c_pair.assign(c)
-    mu_on = _mu(model, at, cfg)
-    c[:, oo] = 0.0
-    model.c_pair.assign(c)
-    mu_off = _mu(model, at, cfg)
-    assert np.linalg.norm(mu_on) > 1e-6
-    assert np.allclose(mu_off, 0.0, atol=1e-10)
-
-
-def test_species_pairs_off_is_frozen_ones():
-    # "off": no c parameters in the SNES tail, and the forward equals the
-    # learnable model at its c=1 init. Legacy bools (old configs/saves)
-    # normalize at model init: False→"off", True→"symmetric".
-    from SNES import SNES
-    cfg_off = _cfg(dipole_species_pairs=False)             # legacy bool
-    model_off = _model(cfg_off)
-    assert cfg_off.dipole_species_pairs == "off"           # normalized
-    assert not isinstance(model_off.c_pair, tf.Variable)
-    cfg_on = _cfg(dipole_species_pairs=True)               # legacy bool
-    model_on = _model(cfg_on)                              # same seed → same W
-    assert cfg_on.dipole_species_pairs == "symmetric"      # normalized
-    atoms = _bulk_frame()
-    assert np.allclose(_mu(model_off, atoms, cfg_off),
-                       _mu(model_on, atoms, cfg_on), atol=1e-6)
-    n_pairs = cfg_on.num_types * (cfg_on.num_types + 1) // 2
-    opt_off, opt_on = SNES(model_off), SNES(model_on)
-    assert opt_off.n_c == 0
-    assert opt_on.n_c == int(cfg_on.dipole_channels) * n_pairs
-    assert opt_on.dim == opt_off.dim + opt_on.n_c
-
-
-# ── 18t: config gates ───────────────────────────────────────────────────────
-
-def test_dipole_channels_lt_1_raises_at_init():
-    cfg = _cfg(dipole_channels=0)
-    with pytest.raises(ValueError, match="dipole_channels"):
-        _model(cfg)
-
-
-def test_dipole_rc_above_rcut_is_allowed_but_the_in_graph_v_refuses():
-    """Any positive dipole_rc is accepted: the STAGED V is built from an
-    image-exact neighbour list and is correct past rcut_hard. Only the in-graph
-    V fallback is limited, because it reads the SOAP pair stream, so that path
-    refuses rather than silently truncating the readout."""
-    cfg = _cfg(dipole_rc=5.0)                            # > rcut_hard = 3.5
-    m = _model(cfg)                                      # no longer raises
-    assert cfg.dipole_rc == 5.0
-    atoms = _bulk_frame()
-    data = prepare_eval_data([atoms], cfg)
-    assert data.get("V_atom") is not None
-    _mu(m, atoms, cfg)                                   # staged V: fine
-    with pytest.raises(ValueError, match="in-graph V"):   # no V_atom → fallback
-        m.predict_batch(
-            data["descriptors"], data["grad_values"],
-            data["pair_atom"], data["pair_gidx"], data["pair_struct"],
-            data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
-            m.W0, m.b0, m.W1, m.b1, W_atom=None)
-    with pytest.raises(ValueError, match="must be > 0"):
-        _model(_cfg(dipole_rc=0.0))
-
-
-@pytest.mark.parametrize("mode,expect", [("off", "rcut_hard"), ("replace", "nep")])
-def test_dipole_rc_inherits_the_descriptor_that_feeds_the_model(mode, expect):
-    """dipole_rc=None follows whichever descriptor the ANN actually reads:
-    nep_rc_radial under "replace", where the SOAP block is dropped and
-    rcut_hard means nothing to the model, else rcut_hard."""
-    kw = dict(dipole_rc=None, nep_descriptor=mode)
-    if mode == "replace":
-        kw.update(nep_rc_radial=6.0, nep_rc_angular=4.0, descriptor_mixing=False)
-    cfg = _cfg(**kw)
-    _model(cfg)
-    assert cfg.dipole_rc == (float(cfg.rcut_hard) if expect == "rcut_hard"
-                             else float(cfg.nep_rc_radial))
-
-
-def test_charge_aux_weight_raises_at_init():
-    cfg = _cfg()
-    setattr(cfg, "charge_aux_weight", 0.5)
-    with pytest.raises(ValueError, match="charge_aux_weight"):
-        _model(cfg)
-
-
 @pytest.mark.parametrize("L,needle", [
-    (6.0, "half the smallest box height"),   # rc = 3.5 ≥ L/2 = 3.0: MIC paths
-    (3.0, "own periodic image"),             # rc = 3.5 ≥ L: self-images dropped
-    (100.0, None),                           # roomy: silent
+    (6.0, "half the smallest box height"),   # rc = 3.5 ≥ L/2: MIC paths
+    (3.0, "the smallest box height"),        # rc = 3.5 ≥ L: lattice sum
+    (100.0, None),
 ])
 def test_small_box_warns_at_data_assembly(capsys, L, needle):
-    """A small box is a WARNING now, not an error: the staged V is image-exact
-    (_neighbor_pairs falls back to ASE below 2·rc), so the result is computed
-    correctly — the warning says what it stops meaning."""
-    cfg = _cfg()                                         # dipole_rc → rcut_hard = 3.5
-    at = Atoms("OHH",
-               positions=[[1.0, 1.0, 1.0], [1.96, 1.0, 1.0], [0.76, 1.59, 1.0]],
+    cfg = _cfg()
+    at = Atoms("OHH", positions=[[1.0, 1.0, 1.0], [1.96, 1.0, 1.0], [0.76, 1.59, 1.0]],
                cell=L * np.eye(3), pbc=True)
-    _neighbor_dipole_guards([at], [np.zeros(3)], cfg)    # never raises
+    _neighbor_dipole_guards([at], [np.zeros(3)], cfg)
     out = capsys.readouterr().out
-    if needle is None:
-        assert "WARNING: dipole_rc" not in out
-    else:
-        assert needle in out
-
-
-# ── screened power-law radial ───────────────────────────────────────────────
-
-def _fcub(r, rc):
-    x = r / rc
-    return 1.0 - 3.0 * x ** 2 + 2.0 * x ** 3
-
-
-def test_screened_identity_user_formula():
-    # Independent reference implements the USER'S ORIGINAL formula
-    # s·r̂·|r|^ζ·f_cub (unit vector times power) — NOT the code's
-    # r^(ζ−1)·d rearrangement — so a rearrangement bug cannot self-verify.
-    # Basic form: C = 1, c ≡ 1 frozen, ζ = −2.
-    cfg, model, atoms, data = _bulk_setup("screened")
-    s = _site_scalars_np(model, data)[:, 0]                    # [A]
-    mu_model = _mu(model, atoms, cfg)
-    rc, zeta = float(cfg.dipole_rc), float(cfg.dipole_zeta)
-    i, j, D = neighbor_list("ijD", atoms, rc)
-    keep = i != j
-    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # d = r_i − r_j
-    r = np.linalg.norm(d, axis=1)
-    rhat = d / r[:, None]
-    mu_ref = np.sum(s[i, None] * rhat
-                    * (r ** zeta * _fcub(r, rc))[:, None], axis=0)
-    assert np.allclose(mu_model, mu_ref,
-                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
-
-
-def test_screened_smoothness_at_rc():
-    # Screened cubic f_cub = (1−x)²(1+2x): f(r_c) = f′(r_c) = 0 but
-    # f″(r_c) = 6/r_c² ≠ 0 — C¹ contact only. Default (None) cutoff for
-    # screened resolves to "cubic".
-    cfg = _cfg(rcut_hard=4.5, rcut_soft=4.0, dipole_rc=3.0,
-               dipole_radial="screened", dipole_channels=1, dipole_zeta=-2.0)
-    _assert_smooth_at_rc(cfg, "cubic")
-
-
-def test_screened_no_nan_padded_batch():
-    # Padded batch at ζ = −2: the self-pairs-only pair stream feeds the
-    # in-graph V builder real r = 0 entries, and padding adds more — the
-    # input guard in _radial must keep μ finite (0**(ζ−1) = inf without it).
-    cfg, model, _, _ = _bulk_setup("screened")
-    small = Atoms("OHH",
-                  positions=[[10.0, 10.0, 10.0], [10.96, 10.0, 10.0],
-                             [9.76, 10.59, 10.0]],
-                  cell=20.0 * np.eye(3), pbc=True)
-    small.info["dipole"] = np.zeros(3)
-    data = prepare_eval_data([_bulk_frame(), small], cfg)   # padded to 96
-    args = (data["descriptors"], data["grad_values"],
-            data["pair_atom"], data["pair_gidx"], data["pair_struct"],
-            data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
-            model.W0, model.b0, model.W1, model.b1)
-    assert np.all(np.isfinite(
-        model.predict_batch(*args, W_atom=data["V_atom"]).numpy()))
-    assert np.all(np.isfinite(
-        model.predict_batch(*args, W_atom=None).numpy()))
-
-
-# ── ordered species-weight table Ω ──────────────────────────────────────────
-
-def test_ordered_identity_asymmetric_omega():
-    # Independent numpy ordered-pair sum: μ = Σ_(i,j) s_i·Ω[t_i,t_j]·R·d —
-    # only the CENTER's scalar and the ORDERED index, no (s_i − s_j) form.
-    cfg, model, atoms, data = _bulk_setup("ordered")
-    T = cfg.num_types
-    Om = model.c_pair.numpy().astype(np.float64)               # [C, T²]
-    Om_sq = Om.reshape(-1, T, T)
-    assert not np.allclose(Om_sq, np.swapaxes(Om_sq, 1, 2))    # asymmetric
-    s = _site_scalars_np(model, data)                          # [A, C]
-    mu_model = _mu(model, atoms, cfg)
-    Zt = data["Z_int"][0].numpy()
-    i, j, D = neighbor_list("ijD", atoms, float(cfg.dipole_rc))
-    keep = i != j
-    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
-    r = np.linalg.norm(d, axis=1)
-    R = _R_np(r, float(cfg.dipole_rc), int(cfg.dipole_channels))  # [P, C]
-    cn = Om[:, Zt[i] * T + Zt[j]].T                               # [P, C]
-    b = np.sum(cn * R * s[i], axis=1)
-    mu_ref = np.sum(b[:, None] * d, axis=0)
-    assert np.allclose(mu_model, mu_ref,
-                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
-
-
-def test_ordered_omega_one_collapses_to_off():
-    # Ω ≡ 1 gathers to the same all-ones [C, T, T] table as "off" — the two
-    # forwards are the SAME graph, so the collapse is bit-tight.
-    cfg_off = _cfg()
-    cfg_ord = _cfg(dipole_species_pairs="ordered")
-    model_off = _model(cfg_off)
-    model_ord = _model(cfg_ord)                     # same seed → same W; Ω = 1
-    atoms = _bulk_frame()
-    np.testing.assert_array_equal(_mu(model_off, atoms, cfg_off),
-                                  _mu(model_ord, atoms, cfg_ord))
-
-
-def test_ordered_snes_tail_size():
-    from SNES import SNES
-    cfg = _cfg(dipole_species_pairs="ordered")
-    opt = SNES(_model(cfg))
-    assert opt.n_c == int(cfg.dipole_channels) * cfg.num_types ** 2
-
-
-def test_save_load_roundtrip_ordered_omega(tmp_path):
-    # The silent-failure path from the gate inventory: a miskeyed save or
-    # load-assign would drop the asymmetric Ω and μ would change silently.
-    import model_io
-    cfg = _cfg(dipole_species_pairs="ordered")
-    model = _model(cfg)
-    rng = np.random.default_rng(5)
-    model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape)
-                        .astype(np.float32))
-    atoms = _bulk_frame()
-    mu0 = _mu(model, atoms, cfg)
-    p = str(tmp_path / "ordered.h5")
-    model_io.save_model(model, cfg, path=p)
-    loaded = model_io.load_model(p)
-    assert loaded.cfg.dipole_species_pairs == "ordered"
-    np.testing.assert_array_equal(loaded.c_pair.numpy(), model.c_pair.numpy())
-    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
-
-
-def test_save_load_roundtrip_screened_basic(tmp_path):
-    # Basic screened form (C=1, "off"): saves/loads with no Ω machinery,
-    # and dipole_radial/dipole_zeta persist through the config JSON.
-    import model_io
-    cfg, model, atoms, _ = _bulk_setup("screened")
-    mu0 = _mu(model, atoms, cfg)
-    p = str(tmp_path / "screened.h5")
-    model_io.save_model(model, cfg, path=p)
-    loaded = model_io.load_model(p)
-    assert loaded.cfg.dipole_radial == "screened"
-    assert float(loaded.cfg.dipole_zeta) == -2.0
-    assert not isinstance(loaded.c_pair, tf.Variable)
-    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
-
-
-# ── config gates (screened / 3-value field) ─────────────────────────────────
-
-def test_screened_multichannel_raises_at_init():
-    # RAISE, not force: data assembly reads cfg.dipole_channels before the
-    # model exists, so forcing C=1 here would desync the precomputed V.
-    cfg = _cfg(dipole_radial="screened", dipole_channels=4)
-    with pytest.raises(ValueError, match="single-channel"):
-        _model(cfg)
-
-
-def test_unknown_radial_raises_at_init():
-    cfg = _cfg(dipole_radial="banana")
-    with pytest.raises(ValueError, match="dipole_radial"):
-        _model(cfg)
-
-
-def test_numpy_twin_unknown_names_raise():
-    # _neighbor_dipole_V runs at data assembly, BEFORE model-init validation
-    # — an else-fallthrough there would silently compute the wrong radial.
-    at = _bulk_frame()
-    t = np.zeros(len(at), dtype=int)
-    with pytest.raises(ValueError, match="dipole_radial"):
-        _neighbor_dipole_V(at, t, 3.0, 4, 2, radial="banana")
-    with pytest.raises(ValueError, match="dipole_cutoff"):
-        _neighbor_dipole_V(at, t, 3.0, 4, 2, cutoff="banana")
-
-
-def test_unknown_species_pairs_raises_at_init():
-    cfg = _cfg(dipole_species_pairs="banana")
-    with pytest.raises(ValueError, match="dipole_species_pairs"):
-        _model(cfg)
-
-
-def test_legacy_bool_normalizes_at_config_load():
-    # model_io leg of the normalization: an old saved JSON carrying a bool
-    # must come out of the load path as the 3-value string.
-    from model_io import _apply_legacy_field_defaults
-    cfg_t = _cfg(dipole_species_pairs=True)
-    _apply_legacy_field_defaults(cfg_t, ["dipole_species_pairs"])
-    assert cfg_t.dipole_species_pairs == "symmetric"
-    cfg_f = _cfg(dipole_species_pairs=False)
-    _apply_legacy_field_defaults(cfg_f, ["dipole_species_pairs"])
-    assert cfg_f.dipole_species_pairs == "off"
-
-
-# ── crossable cutoff function (dipole_cutoff) ───────────────────────────────
-
-def test_cheb_cubic_identity():
-    # NEW cross combo chebyshev+cubic: independent numpy ordered-pair sum
-    # μ = Σ_(i,j) s_i^n·T_n(2r/rc − 1)·f_cub(r)·d with chebvander (not the
-    # model's TF recurrence); c ≡ 1 ("off"), C = 4.
-    cfg = _cfg(dipole_cutoff="cubic")                       # chebyshev C=4
-    model = _model(cfg)
-    atoms = _bulk_frame()
-    data = prepare_eval_data([atoms], cfg)
-    s = _site_scalars_np(model, data)                       # [A, C]
-    mu_model = _mu(model, atoms, cfg)
-    rc = float(cfg.dipole_rc)
-    i, j, D = neighbor_list("ijD", atoms, rc)
-    keep = i != j
-    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
-    r = np.linalg.norm(d, axis=1)
-    Tn = np.polynomial.chebyshev.chebvander(
-        2.0 * r / rc - 1.0, int(cfg.dipole_channels) - 1)   # [P, C]
-    R = Tn * _fcub(r, rc)[:, None]
-    b = np.sum(R * s[i], axis=1)                            # [P]
-    mu_ref = np.sum(b[:, None] * d, axis=0)
-    assert np.allclose(mu_model, mu_ref,
-                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
-
-
-def test_warped_identity():
-    # chebyshev_warped, default (None→cosine2) cutoff: independent numpy
-    # ordered-pair sum with chebvander at an INDEPENDENTLY-computed
-    # x_w = 2(r/rc − 1)² − 1 (not the model's TF recurrence); c ≡ 1, C = 4.
-    cfg = _cfg(dipole_radial="chebyshev_warped")
-    model = _model(cfg)
-    atoms = _bulk_frame()
-    data = prepare_eval_data([atoms], cfg)
-    s = _site_scalars_np(model, data)                       # [A, C]
-    mu_model = _mu(model, atoms, cfg)
-    rc = float(cfg.dipole_rc)
-    i, j, D = neighbor_list("ijD", atoms, rc)
-    keep = i != j
-    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
-    r = np.linalg.norm(d, axis=1)
-    xw = 2.0 * (r / rc - 1.0) ** 2 - 1.0
-    Tn = np.polynomial.chebyshev.chebvander(
-        xw, int(cfg.dipole_channels) - 1)                   # [P, C]
-    R = Tn * _fc(r, rc)[:, None]
-    b = np.sum(R * s[i], axis=1)                            # [P]
-    mu_ref = np.sum(b[:, None] * d, axis=0)
-    assert np.allclose(mu_model, mu_ref,
-                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
-
-
-def test_gaussian_identity():
-    # gaussian radial at σ-scale 0.5, default (None→cosine2) cutoff:
-    # explicit exp formula with μ_n/σ RE-DERIVED here (μ_n = rc·(n+1)/(C+1),
-    # σ = scale·rc/(C+1)) — NOT read from the model; c ≡ 1, C = 4.
-    cfg = _cfg(dipole_radial="gaussian", dipole_gauss_sigma_scale=0.5)
-    model = _model(cfg)
-    atoms = _bulk_frame()
-    data = prepare_eval_data([atoms], cfg)
-    s = _site_scalars_np(model, data)                       # [A, C]
-    mu_model = _mu(model, atoms, cfg)
-    rc, C = float(cfg.dipole_rc), int(cfg.dipole_channels)
-    mu_n = rc * (np.arange(C) + 1.0) / (C + 1)              # interior points
-    sigma = 0.5 * rc / (C + 1)                              # scale × spacing
-    i, j, D = neighbor_list("ijD", atoms, rc)
-    keep = i != j
-    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
-    r = np.linalg.norm(d, axis=1)
-    R = (np.exp(-(r[:, None] - mu_n) ** 2 / (2.0 * sigma ** 2))
-         * _fc(r, rc)[:, None])                             # [P, C]
-    b = np.sum(R * s[i], axis=1)                            # [P]
-    mu_ref = np.sum(b[:, None] * d, axis=0)
-    assert np.allclose(mu_model, mu_ref,
-                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
-
-
-def test_screened_cosine2_identity():
-    # NEW cross combo screened+cosine2: reference is the user's ORIGINAL
-    # s·r̂·|r|^ζ·f form (unit vector times power) with f = cosine².
-    cfg = _cfg(dipole_cutoff="cosine2", **_MODE_KW["screened"])
-    model = _model(cfg)
-    atoms = _bulk_frame()
-    data = prepare_eval_data([atoms], cfg)
-    s = _site_scalars_np(model, data)[:, 0]                 # [A]
-    mu_model = _mu(model, atoms, cfg)
-    rc, zeta = float(cfg.dipole_rc), float(cfg.dipole_zeta)
-    i, j, D = neighbor_list("ijD", atoms, rc)
-    keep = i != j
-    i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
-    r = np.linalg.norm(d, axis=1)
-    rhat = d / r[:, None]
-    mu_ref = np.sum(s[i, None] * rhat
-                    * (r ** zeta * _fc(r, rc))[:, None], axis=0)
-    assert np.allclose(mu_model, mu_ref,
-                       atol=1e-4 * max(np.linalg.norm(mu_model), 1.0))
-
-
-def test_dipole_cutoff_none_resolution():
-    # None resolves at model init to the radial family's traditional form —
-    # existing configs/saves keep identical behavior.
-    from TNEPconfig import resolved_dipole_cutoff
-    cfg_c = _cfg()                                          # chebyshev
-    assert _model(cfg_c)._dipole_cutoff == "cosine2"
-    assert resolved_dipole_cutoff(cfg_c) == "cosine2"
-    cfg_s = _cfg(**_MODE_KW["screened"])
-    assert _model(cfg_s)._dipole_cutoff == "cubic"
-    assert resolved_dipole_cutoff(cfg_s) == "cubic"
-    for rad in ("chebyshev_warped", "gaussian"):        # new radials: cosine2
-        cfg_n = _cfg(dipole_radial=rad)
-        assert _model(cfg_n)._dipole_cutoff == "cosine2"
-        assert resolved_dipole_cutoff(cfg_n) == "cosine2"
-
-
-def test_unknown_dipole_cutoff_raises_at_init():
-    cfg = _cfg(dipole_cutoff="gaussian")
-    with pytest.raises(ValueError, match="dipole_cutoff"):
-        _model(cfg)
-
-
-def test_save_load_roundtrip_explicit_cutoff(tmp_path):
-    # An explicit non-default cutoff must persist through the config JSON
-    # and leave μ unchanged after load.
-    import model_io
-    cfg = _cfg(dipole_cutoff="cubic")                       # chebyshev+cubic
-    model = _model(cfg)
-    atoms = _bulk_frame()
-    mu0 = _mu(model, atoms, cfg)
-    p = str(tmp_path / "cutoff.h5")
-    model_io.save_model(model, cfg, path=p)
-    loaded = model_io.load_model(p)
-    assert loaded.cfg.dipole_cutoff == "cubic"
-    assert loaded._dipole_cutoff == "cubic"
-    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
-
-
-def test_save_load_roundtrip_gaussian_tanh3(tmp_path):
-    # New cross combo gaussian+tanh3 with a non-default σ-scale: all three
-    # fields must persist through the config JSON and leave μ unchanged.
-    import model_io
-    cfg = _cfg(dipole_radial="gaussian", dipole_cutoff="tanh3",
-               dipole_gauss_sigma_scale=0.5)
-    model = _model(cfg)
-    atoms = _bulk_frame()
-    mu0 = _mu(model, atoms, cfg)
-    p = str(tmp_path / "gauss_tanh3.h5")
-    model_io.save_model(model, cfg, path=p)
-    loaded = model_io.load_model(p)
-    assert loaded.cfg.dipole_radial == "gaussian"
-    assert loaded.cfg.dipole_cutoff == "tanh3"
-    assert float(loaded.cfg.dipole_gauss_sigma_scale) == 0.5
-    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
-
+    assert ("WARNING: readout r_c" not in out) if needle is None else (needle in out)
 
 
 def test_neighbor_pairs_fast_path_matches_ase():
-    """Direct MIC search == ASE neighbor_list on the bulk water frame (periodic,
-    L > 2rc) and on a vacuum-boxed CHO molecule (100 Å, pbc True)."""
-    from data import _neighbor_pairs
-    from ase.io import read as _read
+    """Direct MIC search == ASE neighbor_list: periodic water (L > 2rc) and a vacuum-boxed CHO molecule."""
     frames = [_bulk_frame()]
-    cho = [a for a in _read(os.path.join(ROOT, "datasets", "train.xyz"), index=":10")
-           if set(a.numbers) <= {1, 6, 8}][0]
-    frames.append(cho)
+    frames.append([a for a in read(os.path.join(ROOT, "datasets", "train.xyz"), index=":10")
+                   if set(a.numbers) <= {1, 6, 8}][0])
     for at in frames:
         rc = 3.0
         i, j, D = _neighbor_pairs(at, rc)
@@ -897,162 +209,14 @@ def test_neighbor_pairs_fast_path_matches_ase():
         assert len(i) == len(i2) > 0
         key = lambda i_, j_, D_: sorted(zip(i_.tolist(), j_.tolist(), np.round(D_, 6).tolist()))
         assert key(i, j, D) == key(i2, j2, D2)
-        # the fast path really was taken
-        L = np.diag(at.cell.array)
-        assert np.all(L[at.pbc] >= 2 * rc)
+        assert np.all(np.diag(at.cell.array)[at.pbc] >= 2 * rc)       # the fast path really was taken
 
 
-# ── Site head width (dipole_head) ──────────────────────────────────
-
-def test_head_slots_width():
-    # "vector": one head slot per radial channel; _split_head is the identity.
-    cfg = _cfg(dipole_channels=4)
-    m = _model(cfg)
-    assert m._head_slots == 4 and tuple(m.W1.shape) == (2, 8, 4)
-    out = tf.reshape(tf.range(4, dtype=tf.float32), [1, 4])
-    np.testing.assert_array_equal(m._split_head(out).numpy()[0], [0, 1, 2, 3])
-    # "scalar": one slot, broadcast over the C channels by _split_head.
-    m = _model(_cfg(dipole_channels=4, dipole_head="scalar",
-                    dipole_species_pairs="symmetric"))
-    assert m._head_slots == 1 and tuple(m.W1.shape) == (2, 8, 1)
-    s_ = m._split_head(tf.constant([[2.5]]))
-    assert tuple(s_.shape) == (1, 4)
-    np.testing.assert_array_equal(s_.numpy()[0], [2.5] * 4)
-
-
-def test_unknown_readout_raises_at_init():
-    with pytest.raises(ValueError, match="dipole_readout"):
-        _model(_cfg(dipole_readout="bogus"))
-
-
-def test_head_snes_tail_and_gen0_identity():
-    """W1 block = T·H·C; c_pair block C·pairs; reconstruct → assign →
-    predict_batch agrees with predict_batch_candidates on the same μ."""
-    from SNES import SNES, _set_model_params
-    cfg = _cfg(dipole_channels=4, dipole_species_pairs="symmetric")
-    model = _model(cfg); opt = SNES(model)
-    T, H, C = 2, 8, 4
-    assert opt._n_W1 == T * H * C
-    assert opt.n_c == C * (T * (T + 1) // 2)
-    named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
-    W1 = named["W1"].numpy()
-    assert tuple(W1.shape) == (T, H, C)
-    assert np.any(W1 != 0.0)                              # Glorot, not zeros
-    atoms = _bulk_frame()
-    types_int = assign_type_indices([atoms], cfg.types)
-    builder = make_descriptor_builder(cfg)
-    desc, grads, gidx = builder.build_descriptors([atoms])
-    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
-    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
-    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
-    params = opt.reconstruct_params_tf(mu_vec)
-    _set_model_params(model, *params)
-    mu_model = model.predict_batch(
-        full["descriptors"], full["grad_values"], full["pair_atom"], full["pair_gidx"],
-        full["pair_struct"], full["positions"], full["Z_int"], full["boxes"],
-        full["atom_mask"], model.W0, model.b0, model.W1, model.b1,
-        W_atom=full["V_atom"])[0].numpy()
-    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
-    mu_cand = model.predict_batch_candidates(
-        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
-        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"])[0, 0].numpy()
-    np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
-    assert np.any(mu_cand != 0.0)
-
-
-# ── Scalar head (dipole_head="scalar") ───────────────────────────
-
-def test_scalar_head_equals_tiled_vector_head():
-    kw = dict(dipole_channels=4, dipole_species_pairs="symmetric")
-    cs = _cfg(dipole_head="scalar", **kw); ms = _model(cs)
-    cv = _cfg(dipole_head="vector", **kw); mv = _model(cv)
-    assert tuple(ms.W1.shape) == (2, 8, 1)
-    assert tuple(mv.W1.shape) == (2, 8, 4)
-    ms.W1.assign(tf.random.stateless_normal(ms.W1.shape, [7, 8]))
-    for src, dst in ((ms.W0, mv.W0), (ms.b0, mv.b0), (ms.c_pair, mv.c_pair)):
-        dst.assign(src)
-    # The scalar head's single slot repeated over the C channels.
-    mv.W1.assign(np.tile(ms.W1.numpy(), (1, 1, 4)))
-    atoms = _bulk_frame()
-    mu_s = _mu(ms, atoms, cs); mu_v = _mu(mv, atoms, cv)
-    assert np.linalg.norm(mu_s) > 1e-3
-    np.testing.assert_allclose(mu_s, mu_v, rtol=1e-5, atol=1e-6)
-
-
-def test_scalar_head_snes_layout_and_gen0():
-    from SNES import SNES, _set_model_params
-    cfg = _cfg(dipole_channels=4, dipole_head="scalar",
-               dipole_species_pairs="symmetric")
-    model = _model(cfg); opt = SNES(model)
-    T, H, C = 2, 8, 4
-    assert opt._n_W1 == T * H
-    assert opt.n_c == C * (T * (T + 1) // 2)            # channels still in c_pair
-    named = opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu))
-    W1 = named["W1"].numpy()
-    assert tuple(W1.shape) == (T, H, 1)
-    assert np.any(W1 != 0.0)
-    atoms = _bulk_frame()
-    d = prepare_eval_data([atoms], cfg)
-    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
-    _set_model_params(model, *opt.reconstruct_params_tf(mu_vec))
-    mu_model = _mu(model, atoms, cfg)
-    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
-    mu_cand = model.predict_batch_candidates(
-        d["descriptors"], d["V_atom"], d["Z_int"], d["atom_mask"],
-        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"])[0, 0].numpy()
-    np.testing.assert_allclose(mu_cand, mu_model, rtol=1e-5, atol=1e-6)
-
-
-def test_scalar_head_save_load_roundtrip(tmp_path):
-    import model_io
-    cfg = _cfg(dipole_channels=4, dipole_head="scalar",
-               dipole_species_pairs="symmetric")
-    model = _model(cfg)
-    model.W1.assign(tf.random.stateless_normal(model.W1.shape, [5, 6]))
-    atoms = _bulk_frame()
-    mu0 = _mu(model, atoms, cfg)
-    p = str(tmp_path / "scalar.h5")
-    model_io.save_model(model, cfg, path=p)
-    loaded = model_io.load_model(p)
-    assert loaded.cfg.dipole_head == "scalar" and tuple(loaded.W1.shape) == (2, 8, 1)
-    assert np.allclose(mu0, _mu(loaded, atoms, loaded.cfg), atol=1e-6)
-
-
-def test_scalar_head_validation_and_warning():
-    with pytest.raises(ValueError, match="dipole_head"):
-        _model(_cfg(dipole_head="bogus"))
-    import warnings
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        _model(_cfg(dipole_head="scalar", dipole_species_pairs="off"))
-    assert any("dipole_head" in str(x.message) for x in w)
-
-
-# ── Polarisability: target_mode=2 is the rank-2 neighbour readout ───────────
-# α = Σ_i Σ_n s_i^n c[n, p(t_i, t')] W_i[:, n, t'],  W_i = Σ_j R_n(|d|) Voigt(d⊗d)
-#   ≡ Σ_{i<j} R_n c (s_i^n + s_j^n) d⊗d   (d⊗d even under i↔j).
-
-def _pol_frame():
-    at = read(WATER_XYZ, index="0")       # carries a 9-component pol label
-    return at
-
-
-def _alpha(model, atoms, cfg):
-    """α [6] through the production eval path (predict_batch, V via W_atom)."""
-    return _mu(model, atoms, cfg)
-
+# ── rank 2: α = Σ_{i<j} R_n [c⁰ (s_i+s_j) |d|²I + c¹ (u_i+u_j)(d⊗d − |d|²I/3)] ──
 
 def _voigt(d):
     x, y, z = d.T
     return np.stack([x * x, y * y, z * z, x * y, y * z, z * x], axis=1)
-
-
-def _iso_tr(d):
-    """The two even bond kernels: isotropic |d|²·I and traceless d⊗d − |d|²I/3
-    (Voigt), matching data.bond_geometry group order."""
-    r2 = (d ** 2).sum(1)
-    iso = np.stack([r2, r2, r2, 0 * r2, 0 * r2, 0 * r2], 1)
-    return iso, _voigt(d) - iso / 3.0
 
 
 def _voigt_to_mat(v):
@@ -1060,313 +224,66 @@ def _voigt_to_mat(v):
     return np.array([[xx, xy, zx], [xy, yy, yz], [zx, yz, zz]])
 
 
-@functools.lru_cache(maxsize=2)
-def _pol_setup():
-    cfg = _cfg(target_mode=2, dipole_species_pairs="symmetric")
-    model = _model(cfg)
-    rng = np.random.default_rng(3)
-    model.c_pair.assign(rng.uniform(0.3, 1.7, size=model.c_pair.shape)
-                        .astype(np.float32))
-    atoms = _pol_frame()
-    data = prepare_eval_data([atoms], cfg)
-    return cfg, model, atoms, data
-
-
 def test_pol_symmetric_pair_sum_matches_model():
-    """α = Σ_{i<j} R_n [c⁰ (s_i+s_j) |d|²I + c¹ (u_i+u_j)(d⊗d − |d|²I/3)]:
-    two kernel groups, each with its own site head and pair table slice."""
-    cfg, model, atoms, data = _pol_setup()
-    assert model._neighbor_readout and model._bond_rank == 2
-    C, rc = cfg.dipole_channels, cfg.dipole_rc
-    assert model._kernel_channels == 2 * C and model._head_slots == 2 * C
+    cfg, model, atoms, data = _bulk_setup(target_mode=2)
+    C, rc = cfg.dipole_channels, cfg.rcut_hard
+    assert model._bond_rank == 2 and model._kernel_channels == 2 * C
     assert tuple(data["V_atom"].shape) == (1, len(atoms), 6, 2 * C, 2)
-    assert tuple(data["targets"].shape) == (1, 6)
     s_all = _site_scalars_np(model, data)                       # [A, 2C]: iso | traceless
     Z = data["Z_int"][0].numpy()
     c = model.c_pair.numpy().astype(np.float64)[:, _pair_index(2)]  # [2C, T, T]
     i, j, D = neighbor_list("ijD", atoms, rc)
     keep = i < j
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)
-    R = _R_np(np.linalg.norm(d, axis=1), rc, C)                 # [P, C]
-    iso, tr = _iso_tr(d)
+    R = _R_np(np.linalg.norm(d, axis=1), rc, C)
+    r2 = (d ** 2).sum(1)
+    iso = np.stack([r2, r2, r2, 0 * r2, 0 * r2, 0 * r2], 1)
     a_ref = np.zeros(6)
-    for g, geom in enumerate((iso, tr)):
+    for g, geom in enumerate((iso, _voigt(d) - iso / 3.0)):
         s, cg = s_all[:, g * C:(g + 1) * C], c[g * C:(g + 1) * C]
         w = np.einsum("pn,pn->p", R, cg[:, Z[i], Z[j]].T * (s[i] + s[j]))
         a_ref += (w[:, None] * geom).sum(0)
-    a_model = _alpha(model, atoms, cfg)
-    assert np.allclose(a_model, a_ref, rtol=1e-5,
-                       atol=1e-5 * np.abs(a_ref).max())
+    a_model = _mu(model, atoms, cfg)
     assert np.any(a_ref != 0.0)
-
-
-def test_pol_four_path_consistency():
-    cfg, model, atoms, _ = _pol_setup()
-    types_int = assign_type_indices([atoms], cfg.types)
-    builder = make_descriptor_builder(cfg)
-    desc, grads, gidx = builder.build_descriptors([atoms])
-    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
-    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=False)
-    args = (full["descriptors"], full["grad_values"],
-            full["pair_atom"], full["pair_gidx"], full["pair_struct"],
-            full["positions"], full["Z_int"], full["boxes"], full["atom_mask"],
-            model.W0, model.b0, model.W1, model.b1)
-    a_slot = model.predict_batch(*args, W_atom=full["V_atom"])[0].numpy()
-    a_ingraph = model.predict_batch(*args, W_atom=None)[0].numpy()
-    a_cand = model.predict_batch_candidates(
-        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
-        model.W0[tf.newaxis], model.b0[tf.newaxis],
-        model.W1[tf.newaxis], model.b1[tf.newaxis])[0, 0].numpy()
-    gi = gidx[0]
-    A = len(atoms)
-    M = max(len(lst) for lst in gi)
-    grad_index = np.zeros((A, M), dtype=np.int32)
-    nmask = np.zeros((A, M), dtype=np.float32)
-    for a, lst in enumerate(gi):
-        grad_index[a, :len(lst)] = lst
-        nmask[a, :len(lst)] = 1.0
-    a_single = model.predict(
-        full["descriptors"][0], tf.zeros([A, M, 3, cfg.dim_q]),
-        tf.constant(grad_index), full["positions"][0], full["Z_int"][0],
-        full["boxes"][0], full["atom_mask"][0], tf.constant(nmask)).numpy()
-    atol = 1e-4 * max(np.abs(a_slot).max(), 1.0)
-    assert a_slot.shape == (6,)
-    assert np.allclose(a_slot, a_ingraph, atol=atol)
-    assert np.allclose(a_slot, a_cand, atol=atol)
-    assert np.allclose(a_slot, a_single, atol=atol)
+    assert np.allclose(a_model, a_ref, rtol=1e-5, atol=1e-5 * np.abs(a_ref).max())
 
 
 def test_pol_rotation_covariance_and_translation_invariance():
-    cfg, model, atoms, _ = _pol_setup()
-    a0 = _voigt_to_mat(_alpha(model, atoms, cfg))
-    a, b, c = 0.7, -0.4, 1.1
-    Rz = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
-    Ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
-    Rx = np.array([[1, 0, 0], [0, np.cos(c), -np.sin(c)], [0, np.sin(c), np.cos(c)]])
-    R = Rz @ Ry @ Rx
+    cfg, model, atoms, _ = _bulk_setup(target_mode=2)
+    a0 = _voigt_to_mat(_mu(model, atoms, cfg))
+    R = _rotation()
     at2 = atoms.copy()
     at2.set_cell(atoms.cell[:] @ R.T, scale_atoms=False)
     at2.positions = atoms.positions @ R.T
-    a_rot = _voigt_to_mat(_alpha(model, at2, cfg))
-    assert np.allclose(a_rot, R @ a0 @ R.T, atol=2e-3 * np.abs(a0).max())
+    assert np.allclose(_voigt_to_mat(_mu(model, at2, cfg)), R @ a0 @ R.T, atol=2e-3 * np.abs(a0).max())
     at3 = atoms.copy()
     at3.positions = atoms.positions + np.array([1.3, -0.7, 2.1])
-    assert np.allclose(_alpha(model, at3, cfg), _alpha(model, atoms, cfg),
-                       atol=1e-4 * np.abs(a0).max())
+    assert np.allclose(_mu(model, at3, cfg), _mu(model, atoms, cfg), atol=1e-4 * np.abs(a0).max())
 
 
-def test_pol_snes_tail_has_no_second_ann_and_gen0_identity():
-    from SNES import _set_model_params
-    cfg, model, atoms, _ = _pol_setup()
-    opt = model.optimizer
-    T, H, C = 2, 8, 4
-    # One ANN only: typed slab + b1 + c_pair; the dual-ANN doubling is gone.
-    assert int(opt.dim) == opt.n_typed + 1 + opt.n_c
-    assert opt.n_anns_total == opt.n_primary and opt._n_per_type == opt.n_typed // T
-    # Two kernel groups: the head and the pair table carry 2C channels.
-    assert opt._n_W1 == T * H * 2 * C and opt.n_c == 2 * C * (T * (T + 1) // 2)
-    assert np.allclose(opt._pol_weights.numpy(), np.ones(6))
-    assert not any(k.endswith("_pol") for k in
-                   opt._split_reconstructed(opt.reconstruct_params_tf(opt.mu)))
-    types_int = assign_type_indices([atoms], cfg.types)
-    builder = make_descriptor_builder(cfg)
-    desc, grads, gidx = builder.build_descriptors([atoms])
-    d = assemble_data_dict([atoms], types_int, desc, grads, gidx, cfg)
-    full = pad_and_stack(d, num_types=cfg.num_types, self_pairs_only=True)
-    mu_vec = opt.mu + 0.05 * tf.random.stateless_normal(opt.mu.shape, [3, 4])
-    _set_model_params(model, *opt.reconstruct_params_tf(mu_vec))
-    a_model = model.predict_batch(
-        full["descriptors"], full["grad_values"], full["pair_atom"], full["pair_gidx"],
-        full["pair_struct"], full["positions"], full["Z_int"], full["boxes"],
-        full["atom_mask"], model.W0, model.b0, model.W1, model.b1,
-        W_atom=full["V_atom"])[0].numpy()
-    n = opt._split_reconstructed(opt.reconstruct_params_tf(mu_vec[tf.newaxis]))
-    a_cand = model.predict_batch_candidates(
-        full["descriptors"], full["V_atom"], full["Z_int"], full["atom_mask"],
-        n["W0"], n["b0"], n["W1"], n["b1"], c_pair=n["c_pair"])[0, 0].numpy()
-    np.testing.assert_allclose(a_cand, a_model, rtol=1e-5, atol=1e-6)
-    _pol_setup.cache_clear()          # model weights were perturbed
+# ── Ewald field channel (experimental option): the GAP geometry helper builds the same staged V ──
 
-
-def test_pol_lambda_shear_weights_fitness_only():
-    from SNES import _set_model_params
-    cfg = _cfg(target_mode=2, lambda_shear=0.5)
-    model = _model(cfg)
-    opt = model.optimizer
-    assert np.allclose(opt._pol_weights.numpy(), [1, 1, 1, .25, .25, .25])
-    atoms = _pol_frame()
-    data = prepare_eval_data([atoms], cfg)
-    data["_W_atom"] = data["V_atom"]
-    fit, sq = opt._evaluate_chunk_impl(opt.mu[tf.newaxis], data)
-    _set_model_params(model, *opt.reconstruct_params_tf(opt.mu))   # μ ≠ Keras init
-    preds = model.predict_batch_candidates(
-        data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
-        *(t[tf.newaxis] for t in (model.W0, model.b0, model.W1, model.b1)))[0, 0].numpy()
-    diff = preds - data["targets"][0].numpy()
-    np.testing.assert_allclose(sq[0, 0], (diff ** 2).sum(), rtol=1e-4)
-    np.testing.assert_allclose(fit[0, 0], (diff ** 2 * opt._pol_weights.numpy()).sum(), rtol=1e-4)
-
-
-def test_pol_save_load_roundtrip_and_old_dual_ann_refused(tmp_path):
-    import h5py
-    import model_io
-    cfg, model, atoms, _ = _pol_setup()
-    a0 = _alpha(model, atoms, cfg)
-    p = str(tmp_path / "pol.h5")
-    model_io.save_model(model, cfg, path=p)
-    with h5py.File(p, "r") as f:
-        assert "W0_pol" not in f["weights"] and f.attrs["target_mode"] == 2
-    loaded = model_io.load_model(p)
-    assert loaded.cfg.target_mode == 2 and loaded._bond_rank == 2
-    assert np.allclose(a0, _alpha(loaded, atoms, loaded.cfg), atol=1e-6 * np.abs(a0).max())
-    with h5py.File(p, "a") as f:
-        f["weights"].create_dataset("W0_pol", data=np.zeros((2, cfg.dim_q, 8)))
-    with pytest.raises(ValueError, match="W0_pol"):
-        model_io.load_model(p)
-
-
-def test_pol_scalar_head_is_one_slot_per_kernel_group():
-    """dipole_head="scalar" under mode 2 keeps the isotropic and traceless
-    groups independent: W1 [T, H, 2], each slot repeated over its group's C
-    channels — identical to a vector head tiled group-wise."""
-    cfg_s = _cfg(target_mode=2, dipole_head="scalar", dipole_species_pairs="symmetric")
-    cfg_v = _cfg(target_mode=2, dipole_head="vector", dipole_species_pairs="symmetric")
-    m_s, m_v = _model(cfg_s), _model(cfg_v)
-    C = cfg_s.dipole_channels
-    assert tuple(m_s.W1.shape) == (2, 8, 2) and tuple(m_v.W1.shape) == (2, 8, 2 * C)
-    assert m_s.optimizer._n_W1 == 2 * 8 * 2 and m_s.optimizer.n_c == m_v.optimizer.n_c
-    W1s = tf.random.stateless_normal(m_s.W1.shape, [7, 8])
-    m_s.W1.assign(W1s)
-    m_v.W0.assign(m_s.W0); m_v.b0.assign(m_s.b0)
-    m_v.W1.assign(tf.repeat(W1s, C, axis=-1))                 # group-major tiling
-    rng = np.random.default_rng(5)
-    cp = rng.uniform(0.3, 1.7, size=m_s.c_pair.shape).astype(np.float32)
-    m_s.c_pair.assign(cp); m_v.c_pair.assign(cp)
-    atoms = _pol_frame()
-    a_s, a_v = _alpha(m_s, atoms, cfg_s), _alpha(m_v, atoms, cfg_v)
-    np.testing.assert_allclose(a_s, a_v, rtol=1e-5, atol=1e-5 * np.abs(a_v).max())
-    assert np.any(a_s != 0.0)
-
-
-def test_pol_rejects_tnep_readout_and_needs_no_gradients():
-    from data import descriptor_gradients_needed, dipole_self_pairs_only
-    with pytest.raises(ValueError, match="rank-2 neighbour readout"):
-        _model(_cfg(target_mode=2, dipole_readout="tnep"))
-    cfg = _cfg(target_mode=2)
-    assert not descriptor_gradients_needed(cfg) and dipole_self_pairs_only(cfg)
-
-
-@pytest.mark.parametrize("optimizer", ["adam", "snes"])
-def test_pol_fit_smoke(optimizer):
-    """Both trainers run end to end in mode 2: the V kernel rides the W_atom
-    slot, lambda_shear weights the ranking, every head weight moves."""
-    cfg = _cfg(target_mode=2, dipole_species_pairs="symmetric", optimizer=optimizer,
-               num_generations=3, val_interval=1, pop_size=6, patience=None,
-               adam_lr=1e-2, batch_chunk_size=4, save_path=None, lambda_shear=0.7)
-    model = _model(cfg)
-    frames = read(WATER_XYZ, index="0:6")
-    tr = prepare_eval_data(frames[:4], cfg)
-    va = prepare_eval_data(frames[4:], cfg)
-    for d in (tr, va):
-        d["types_contained"] = tf.ones((int(d["num_atoms"].shape[0]), 2))
-    before = (model.W1.numpy().copy(), model.c_pair.numpy().copy())
-    history, final_model, best_model = model.fit(tr, va)
-    assert np.all(np.isfinite(history["val_loss"])) and len(history["val_loss"]) >= 2
-    assert not np.allclose(final_model.W1.numpy(), before[0])
-    assert not np.allclose(final_model.c_pair.numpy(), before[1])
-    metrics, preds = final_model.score(va)
-    assert tuple(preds.shape) == (2, 6) and np.isfinite(float(metrics["rmse"]))
-
-
-# ── Long-range field channel (cfg.dipole_field) ─────────────────────────────
-
-SPCE = {8: -0.8476, 1: 0.4238}
-
-
-def _field_cfg(**kw):
-    return _cfg(dipole_field=True, dipole_field_charges=SPCE, dipole_field_scale=None,
-                dipole_species_pairs="symmetric", **kw)
-
-
-@pytest.mark.parametrize("head", ["vector", "scalar"])
-def test_field_channel_shapes_and_forward_identity(head):
-    """V gains one channel (Ck = C+1, scale pinned on cfg), W1/c_pair/SNES follow,
-    and predict_batch == production readout + Σ_i s_i^E c[t_i,0] scale·E_i."""
-    cfg = _field_cfg(dipole_head=head)
-    frames = [read(WATER_XYZ, index="0")]
-    data = prepare_eval_data(frames, cfg)          # pins cfg.dipole_field_scale
-    C, T = cfg.dipole_channels, 2
-    assert cfg.dipole_field_scale is not None and cfg.dipole_field_scale > 0
-    assert tuple(data["V_atom"].shape) == (1, 96, 3, C + 1, T)
-    model = _model(cfg)
-    assert model._kernel_channels == C + 1
-    assert tuple(model.c_pair.shape) == (C + 1, T * (T + 1) // 2)
-    assert tuple(model.W1.shape) == (T, 8, C + 1 if head == "vector" else 2)
-    opt = model.optimizer
-    assert opt._Ch == C + 1 and opt._n_W1 == T * 8 * model._head_slots
-    rng = np.random.default_rng(1)
-    model.c_pair.assign(rng.uniform(0.5, 1.5, size=model.c_pair.shape).astype(np.float32))
-    args = (data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"], data["pair_struct"],
-            data["positions"], data["Z_int"], data["boxes"], data["atom_mask"], model.W0, model.b0, model.W1, model.b1)
-    mu_full = model.predict_batch(*args, W_atom=data["V_atom"])[0].numpy()
-    V = data["V_atom"].numpy()[0].astype(np.float64)
-    V0 = V.copy(); V0[:, :, C, :] = 0.0                   # field channel removed
-    mu_base = model.predict_batch(*args, W_atom=tf.constant(V0[None].astype(np.float32)))[0].numpy()
-    # field term by hand: s^E = head slot of the field channel, c on channel C for pair (t_i, t'=0)
-    desc = data["descriptors"][0].numpy().astype(np.float64); Z = data["Z_int"][0].numpy()
-    h = np.tanh(np.einsum("aq,aqh->ah", desc, model.W0.numpy().astype(np.float64)[Z]) + model.b0.numpy().astype(np.float64)[Z])
-    W1 = model.W1.numpy().astype(np.float64)[Z]            # [A, H, S]
-    sE = np.einsum("ah,ah->a", h, W1[:, :, -1])            # last slot in both heads
-    c = model.c_pair.numpy().astype(np.float64)[C, _pair_index(T)[Z, 0]]
-    E_scaled = V[:, :, C, 0]                                # scale·E_i sits in the t'=0 slot
-    mu_field = np.einsum("a,a,ad->d", sE, c, E_scaled)
-    assert np.allclose(mu_full, mu_base + mu_field, rtol=1e-5, atol=1e-5 * np.abs(mu_full).max())
-    assert np.abs(mu_field).max() > 1e-3 * np.abs(mu_full).max()
-    # candidates path agrees
-    mu_c = model.predict_batch_candidates(data["descriptors"], data["V_atom"], data["Z_int"], data["atom_mask"],
-                                          model.W0[None], model.b0[None], model.W1[None], model.b1[None])[0, 0].numpy()
-    assert np.allclose(mu_c, mu_full, rtol=1e-5, atol=1e-5 * np.abs(mu_full).max())
-
-
-def test_field_channel_in_graph_paths_refuse_and_gap_matches_staged():
+def test_field_channel_gap_matches_staged_and_in_graph_refuses():
     import gap_dipole
-    cfg = _field_cfg()
-    atoms = read(WATER_XYZ, index="2")
-    data = prepare_eval_data([atoms], cfg)
-    model = _model(cfg)
-    args = (data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"], data["pair_struct"],
-            data["positions"], data["Z_int"], data["boxes"], data["atom_mask"], model.W0, model.b0, model.W1, model.b1)
-    with pytest.raises(ValueError, match="dipole_field"):
-        model.predict_batch(*args, W_atom=None)
-    # the GAP geometry helper (GAPconfig) builds the same staged channel
     from test_gap_dipole import _cfg as _gcfg
-    gcfg = _gcfg(dipole_rc=3.0, dipole_channels=cfg.dipole_channels, dipole_radial="chebyshev",
+    spce = {8: -0.8476, 1: 0.4238}
+    cfg = _cfg(dipole_field=True, dipole_field_charges=spce, dipole_field_scale=None,
+               dipole_species_pairs="symmetric")
+    atoms = read(WATER_XYZ, index="2")
+    data = prepare_eval_data([atoms], cfg)                     # pins cfg.dipole_field_scale
+    model = _model(cfg)
+    with pytest.raises(ValueError, match="dipole_field"):
+        model.predict_batch(data["descriptors"], data["grad_values"], data["pair_atom"], data["pair_gidx"],
+                            data["pair_struct"], data["positions"], data["Z_int"], data["boxes"], data["atom_mask"],
+                            model.W0, model.b0, model.W1, model.b1, W_atom=None)
+    gcfg = _gcfg(dipole_channels=cfg.dipole_channels, dipole_radial="chebyshev",
                  dipole_cutoff=None, dipole_species_pairs="symmetric", dipole_field=True,
-                 dipole_field_charges=SPCE, dipole_field_scale=cfg.dipole_field_scale)
+                 dipole_field_charges=spce, dipole_field_scale=cfg.dipole_field_scale)
     gcfg.types, gcfg.num_types = [8, 1], 2
     ti = np.array([0 if z == 8 else 1 for z in atoms.numbers])
-    v = gap_dipole._v_atoms(atoms, ti, gcfg)                # [N, 3, (C+1)·T]
+    v = gap_dipole._v_atoms(atoms, ti, gcfg)                   # [N, 3, (C+1)·T]
     V = data["V_atom"].numpy()[0]
     assert v.shape[2] == (cfg.dipole_channels + 1) * 2
     assert np.allclose(v, V.reshape(96, 3, -1), rtol=1e-5, atol=1e-5 * np.abs(V).max())
-    # str-keyed charges (JSON round trip) are accepted
-    gcfg.dipole_field_charges = {"8": -0.8476, "1": 0.4238}
+    gcfg.dipole_field_charges = {"8": -0.8476, "1": 0.4238}    # str keys (JSON round trip)
     assert np.allclose(gap_dipole._v_atoms(atoms, ti, gcfg), v)
-
-
-def test_field_channel_save_load_and_fit_smoke(tmp_path):
-    import model_io
-    cfg = _field_cfg(optimizer="snes", num_generations=2, val_interval=1, pop_size=6, patience=None,
-                     save_path=None, batch_chunk_size=4)
-    frames = read(WATER_XYZ, index="0:5")
-    tr, va = prepare_eval_data(frames[:3], cfg), prepare_eval_data(frames[3:], cfg)
-    for d in (tr, va):
-        d["types_contained"] = tf.ones((int(d["num_atoms"].shape[0]), 2))
-    model = _model(cfg)
-    history, final_model, _ = model.fit(tr, va)
-    assert np.all(np.isfinite(history["val_loss"]))
-    mu0 = _mu(final_model, frames[4], cfg)
-    p = str(tmp_path / "field.h5"); model_io.save_model(final_model, cfg, path=p)
-    loaded = model_io.load_model(p)
-    assert loaded.cfg.dipole_field and loaded.cfg.dipole_field_scale == cfg.dipole_field_scale
-    assert np.allclose(mu0, _mu(loaded, frames[4], loaded.cfg), atol=1e-5 * max(np.abs(mu0).max(), 1.0))

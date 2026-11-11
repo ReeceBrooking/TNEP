@@ -31,11 +31,7 @@ def cell_to_box(atoms) -> np.ndarray:
 
 
 def _dipole_conversion_factor(dipole_units: str) -> float:
-    """Multiplicative factor converting dipole_units → e·Å (1.0 if already e·Å).
-
-    Args:
-        dipole_units : "e*angstrom", "e*bohr", or "debye"
-    """
+    """Factor converting dipole_units ("e*angstrom" | "e*bohr" | "debye") → e·Å."""
     if dipole_units == "e*angstrom":
         return 1.0
     elif dipole_units == "e*bohr":
@@ -48,13 +44,10 @@ def _dipole_conversion_factor(dipole_units: str) -> float:
 
 
 def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
-    """Load structures from cfg.data_path, discover species, filter, drop bad data.
+    """Load cfg.data_path, discover species, filter, drop bad data.
 
     Side effect: populates cfg.num_types and cfg.types.
-
-    Returns:
-        dataset           : list of ase.Atoms
-        dataset_types_int : list of ndarray [N_i] — integer type index per atom
+    Returns (dataset, dataset_types_int) — Atoms list and parallel [N_i] int type indices.
     """
     dataset = read(cfg.data_path, index=":")
     dataset_types_int = []
@@ -110,14 +103,7 @@ def collect(cfg: TNEPconfig) -> tuple[list[Atoms], list[np.ndarray]]:
 
 
 def assign_type_indices(dataset: list[Atoms], types: list[int]) -> list[np.ndarray]:
-    """Map atoms to type indices using a known type list (no discovery).
-
-    Args:
-        dataset : list of ase.Atoms
-        types   : list of atomic numbers defining the type ordering
-    Returns:
-        list of ndarray [N_i] — integer type index per atom
-    """
+    """Map atoms to indices into a known `types` list (no discovery) → list of [N_i] int arrays."""
     dataset_types_int = []
     for struct in dataset:
         structure_types_int = np.zeros_like(struct.numbers)
@@ -152,16 +138,7 @@ def _extract_target(structure: Atoms, target_key: str) -> tf.Tensor:
 
 
 def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]:
-    """Find structures with NaN or missing targets.
-
-    Args:
-        dataset    : list of ase.Atoms
-        target_key : key for the target property (e.g. 'dipole', 'pol')
-
-    Returns:
-        dict with keys 'nan_positions', 'nan_targets', 'missing_targets',
-        each mapping to a list of structure indices.
-    """
+    """Structure indices with NaN positions / NaN targets / missing target key, by category."""
     nan_positions = []
     nan_targets = []
     missing_targets = []
@@ -173,9 +150,7 @@ def find_bad_data(dataset: list[Atoms], target_key: str) -> dict[str, list[int]]
         except KeyError:
             missing_targets.append(i)
             continue
-        # size==0 catches an all-NaN target that _extract_target's trailing-NaN
-        # strip reduced to empty — otherwise it evades the isnan check and later
-        # crashes pad_and_stack instead of being dropped here.
+        # size==0: an all-NaN target that the trailing-NaN strip emptied.
         if target.size == 0 or np.any(np.isnan(target)):
             nan_targets.append(i)
     return {'nan_positions': nan_positions,
@@ -188,11 +163,7 @@ def filter_bad_data(
     dataset_types_int: list[np.ndarray],
     cfg: TNEPconfig,
 ) -> tuple[list[Atoms], list[np.ndarray]]:
-    """Drop untrainable structures (NaN positions/targets, missing target key).
-
-    Returns:
-        filtered_dataset, filtered_types_int : filtered parallel lists
-    """
+    """Drop untrainable structures (NaN positions/targets, missing target key)."""
     target_key = _resolve_target_key(cfg)
     bad = find_bad_data(dataset, target_key)
 
@@ -227,12 +198,7 @@ def _resolve_target_key(cfg: TNEPconfig) -> str:
 
 
 def component_labels(target_mode: int, num_components: int) -> list[str]:
-    """Human-readable label per target component.
-
-    Args:
-        target_mode    : 0 (PES), 1 (dipole), 2 (polarizability)
-        num_components : output count (fallback labels for unknown modes)
-    """
+    """Label per target component for mode 0/1/2 (generic "comp i" otherwise)."""
     if target_mode == 0:
         return ["Energy"]
     elif target_mode == 1:
@@ -243,13 +209,7 @@ def component_labels(target_mode: int, num_components: int) -> list[str]:
 
 
 def print_score_summary(metrics: dict, cfg: TNEPconfig, prefix: str = "") -> None:
-    """Print RMSE, R², per-component R², and cosine similarity from a metrics dict.
-
-    Args:
-        metrics : dict from TNEP.score() with rmse, r2, r2_components, etc.
-        cfg     : TNEPconfig (target_mode, component labels)
-        prefix  : str prepended to the first line
-    """
+    """Print RMSE, R², per-component R² and cosine similarity from a TNEP.score() dict."""
     rmse = float(metrics["rmse"])
     r2 = float(metrics["r2"])
     r2_comp = metrics["r2_components"].numpy()
@@ -321,22 +281,12 @@ def assemble_data_dict(
     grad_index: list[list[list[int]]],
     cfg: TNEPconfig,
 ) -> dict:
-    """Assemble a data dict from structures, type indices, and descriptors.
+    """List-form data dict: positions [N_i,3], Z_int [N_i], targets, boxes [3,3],
+    descriptors [N_i,Q], gradients (N_i × [M,3,Q]), grad_index (N_i × [M] ints);
+    plus forces/virials (PES, auto-detected), V_atom (neighbour readout),
+    nep_raw / nep_pairs / nep_pad_D (nep_descriptor != "off").
 
-    Applies dipole unit conversion (× _dipole_conversion_factor) and, when
-    cfg.scale_targets, per-atom scaling (target / N_atoms) for dipole mode.
-
-    Args:
-        dataset     : list of ase.Atoms
-        types_int   : list of ndarray [N_i] integer type indices
-        descriptors : list of [N_i, dim_q] tensors
-        gradients   : list of (list of N_i tensors each [M, 3, dim_q])
-        grad_index  : list of (list of N_i lists each [M] ints)
-        cfg         : TNEPconfig (uses target_mode)
-
-    Returns:
-        dict: positions, Z_int, targets, boxes, descriptors, gradients, grad_index
-        (+ forces/virials auto-detected in PES mode)
+    Dipoles are converted to e·Å and, when cfg.scale_targets, divided by N_atoms.
     """
     target_key = _resolve_target_key(cfg)
     targets = [_extract_target(s, target_key) for s in dataset]
@@ -344,8 +294,7 @@ def assemble_data_dict(
         factor = _dipole_conversion_factor(cfg.dipole_units)
         if factor != 1.0:
             targets = [t * factor for t in targets]
-    # Guards read TOTAL-cell dipoles (branch-gap quantum e·L), so run them
-    # before any per-atom scaling. Dipole-only: α is single-valued under PBC.
+    # Guards need total-cell dipoles (branch quantum e·L): run before per-atom scaling.
     if cfg.target_mode == 1 and neighbor_readout_on(cfg):
         _neighbor_dipole_guards(dataset, targets, cfg)
     if cfg.scale_targets and cfg.target_mode == 1:
@@ -360,9 +309,7 @@ def assemble_data_dict(
         "grad_index": grad_index,
     }
 
-    # Neighbor-basis readout (dipole, or polarisability = rank 2): precompute
-    # the per-structure geometry kernel V [N, D, C, T] (data-static;
-    # delivered to the forwards via the W_atom slot).
+    # Neighbour readout: data-static geometry kernel V_atom [N, D, C, T].
     if neighbor_readout_on(cfg):
         from tqdm import tqdm
         data["V_atom"] = [
@@ -372,7 +319,8 @@ def assemble_data_dict(
                                float(cfg.dipole_zeta),
                                resolved_dipole_cutoff(cfg),
                                float(cfg.dipole_gauss_sigma_scale),
-                               rank=bond_rank(cfg))
+                               rank=bond_rank(cfg),
+                               unit=bool(getattr(cfg, "dipole_unit_vector", False)))
             for s, t in tqdm(list(zip(dataset, types_int)),
                              desc="Building neighbor-readout V", unit="struct",
                              disable=len(dataset) < 50)]
@@ -388,16 +336,9 @@ def assemble_data_dict(
             data["V_atom"] = [_append_field_channel(V, E, float(cfg.dipole_field_scale))
                               for V, E in zip(data["V_atom"], Es)]
 
-    # Raw expert input data["nep_raw"] [N, W_raw]: the GPUMD NEP per-atom
-    # basis, contracted in-model by c_r/c_a (multi_descriptor_plan.md §0.3),
-    # or the GAP q2‖q3 under nep_descriptor="gap_sum" (fixed centres).
-    # Phase B adds the image-exact pair stream (plan §B.3) when ∂q/∂r is
-    # needed; both consume one ase pair list per frame.
-    if cfg.nep_descriptor == "gap_sum":
-        # GAP 2b/3b distance descriptors (fixed centres) in the raw slot.
-        from gap_descriptor import gap_raw_numpy
-        data["nep_raw"] = [gap_raw_numpy(s, t, cfg) for s, t in zip(dataset, types_int)]
-    elif cfg.nep_descriptor != "off":
+    # nep_raw [N, W_raw]: GPUMD NEP per-atom basis (contracted in-model by c_r/c_a);
+    # nep_pairs: image-exact pair stream when ∂q/∂r is needed. One ase pair list per frame.
+    if cfg.nep_descriptor != "off":
         need_pairs = nep_pairs_needed(cfg)
         data["nep_raw"] = []
         if need_pairs:
@@ -408,8 +349,7 @@ def assemble_data_dict(
             if need_pairs:
                 data["nep_pairs"].append(nep_pairs_numpy(s, cfg, p))
         if need_pairs:
-            # Displacement of the bucket-padding pairs (gather_nep_pairs): beyond
-            # every cutoff, so fc = fn = fnp = 0 and they contribute exactly nothing.
+            # Padding-pair displacement (gather_nep_pairs): beyond every cutoff → fc = 0.
             data["nep_pad_D"] = np.array(
                 [max(float(cfg.nep_rc_radial), float(cfg.nep_rc_angular)) + 1.0, 0.0, 0.0],
                 dtype=np.float32)
@@ -429,45 +369,34 @@ def assemble_data_dict(
 
 
 def dipole_self_pairs_only(cfg: TNEPconfig) -> bool:
-    """True when the batches need only self descriptor gradients: a readout
-    that reads no SOAP descriptor gradients at all (neighbor — modes 1 and 2;
-    tnep under nep_descriptor="replace") or dipole_rij_power=0."""
+    """Batches need only self gradients: no SOAP gradients read, or dipole_rij_power=0."""
     return not soap_gradients_needed(cfg) or (
         cfg.target_mode == 1 and int(cfg.dipole_rij_power) == 0)
 
 
 def descriptor_gradients_needed(cfg: TNEPconfig) -> bool:
-    """False only for the neighbor readout (dipole, and always
-    polarisability), which reads no descriptor gradients — every other mode
-    contracts ∂q/∂r (model-side guards: learned basis, Phase B). NOTE: that
-    readout still needs the PAIR INDEX stream (pair_atom/pair_gidx) on the
-    trajectory path, where V is built in-graph — that path keeps
-    calc_gradients=True and only the gradient VALUES are skipped (zero-width
-    under the learned basis)."""
+    """False only for the neighbour readout, which reads no ∂q/∂r. Gotcha: that
+    readout still needs pair_atom/pair_gidx on the trajectory path (V built
+    in-graph), which keeps calc_gradients=True and skips only the values."""
     return not neighbor_readout_on(cfg)
 
 
 def soap_gradients_needed(cfg: TNEPconfig) -> bool:
-    """Whether the SOAP builder must emit ∂q^SOAP/∂r: descriptor gradients are
-    needed AND the SOAP block reaches the ANN (nep_descriptor="replace" feeds
-    NEP only, so its tnep readout contracts the NEP pair stream alone)."""
+    """SOAP builder must emit ∂q/∂r: gradients needed AND the SOAP block reaches the ANN."""
     return descriptor_gradients_needed(cfg) and cfg.nep_descriptor != "replace"
 
 
 def nep_pairs_needed(cfg: TNEPconfig) -> bool:
-    """Whether the image-exact NEP pair stream (Phase B) is built: the tnep
-    dipole readout with NEP inputs in the ANN ("concat"/"replace")."""
+    """Image-exact NEP pair stream is built: tnep dipole readout with NEP in the ANN."""
     return (cfg.nep_descriptor in ("concat", "replace")
             and cfg.target_mode == 1 and cfg.dipole_readout == "tnep")
 
 
 def _neighbor_pairs(atoms: Atoms, rc: float):
-    """(i, j, D) with D = r_j − r_i for every pair within rc, ASE's
-    neighbor_list("ijD") contract. Fast path for orthorhombic cells whose
-    periodic lengths are all ≥ 2·rc (every molecular vacuum box and the bulk
-    cells the readout guards already require): direct N² minimum-image
-    search — ASE bins the whole cell at rc, ~100 ms per 16-atom molecule in
-    a 100 Å box. Anything else falls back to ASE."""
+    """(i, j, D) with D = r_j − r_i for pairs within rc (ASE neighbor_list("ijD")
+    contract). Orthorhombic cells with periodic L ≥ 2·rc take a direct
+    minimum-image path (ASE bins the whole box: ~100 ms per molecule in a
+    100 Å vacuum cell); anything else falls back to ASE."""
     cell = np.asarray(atoms.cell.array, dtype=np.float64)
     pbc = np.asarray(atoms.pbc, dtype=bool)
     L = np.diag(cell)
@@ -475,6 +404,18 @@ def _neighbor_pairs(atoms: Atoms, rc: float):
     if not (orthorhombic and np.all(L[pbc] >= 2.0 * rc)):
         return neighbor_list("ijD", atoms, rc)
     pos = np.asarray(atoms.positions, dtype=np.float64)
+    if len(pos) > 128:
+        # Periodic k-d tree: O(N) instead of N² (12 → 1 ms at 648 atoms);
+        # non-periodic axes get a huge box so nothing wraps.
+        from scipy.spatial import cKDTree
+        box = np.where(pbc, L, 1e6)
+        wrapped = np.where(pbc, pos % L, pos - pos.min(0) + 1.0)
+        p = cKDTree(wrapped, boxsize=box).query_pairs(rc, output_type="ndarray")
+        i = np.concatenate([p[:, 0], p[:, 1]]); j = np.concatenate([p[:, 1], p[:, 0]])
+        D = pos[j] - pos[i]
+        for a in np.flatnonzero(pbc):
+            D[:, a] -= L[a] * np.round(D[:, a] / L[a])
+        return i, j, D
     D = pos[None, :, :] - pos[:, None, :]                       # [N, N, 3] r_j − r_i
     for a in np.flatnonzero(pbc):
         D[..., a] -= L[a] * np.round(D[..., a] / L[a])          # minimum image
@@ -484,13 +425,13 @@ def _neighbor_pairs(atoms: Atoms, rc: float):
     return i, j, D[i, j]
 
 
-def bond_geometry(d: np.ndarray, rank: int) -> np.ndarray:
-    """Bond tensors of the neighbour readout, [P, 3] → [P, D, G] (G kernel
-    groups). rank 1: d itself (D = 3, G = 1, odd — the dipole). rank 2
-    (D = 6 Voigt [xx, yy, zz, xy, yz, zx], G = 2, even — the polarisability):
-    group 0 the isotropic |d|²·I, group 1 the traceless d⊗d − |d|²I/3, so a
-    bond carries independent α⊥-like and (α∥−α⊥)-like coefficients.
-    Numpy twin of TNEP._bond_geometry."""
+def bond_geometry(d: np.ndarray, rank: int, unit: bool = False) -> np.ndarray:
+    """Bond tensors [P, 3] → [P, D, G]. rank 1: d (D=3, G=1). rank 2: Voigt
+    [xx,yy,zz,xy,yz,zx], group 0 isotropic |d|²·I, group 1 traceless
+    d⊗d − |d|²I/3 (independent α⊥ / α∥−α⊥ coefficients per bond).
+    unit=True uses d/|d|. Numpy twin of TNEP._bond_geometry."""
+    if unit:
+        d = d / np.linalg.norm(d, axis=1, keepdims=True)
     if rank == 1:
         return d[:, :, None]
     if rank == 2:
@@ -509,11 +450,6 @@ def _radial_weights(r: np.ndarray, rc: float, C: int, radial: str, zeta: float,
         fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
     elif cutoff == "cosine":
         fc = (1.0 + np.cos(np.pi * r / rc)) / 2.0
-    elif cutoff == "cubic":
-        x = r / rc
-        fc = 1.0 - 3.0 * x * x + 2.0 * x**3
-    elif cutoff == "tanh3":
-        fc = np.tanh(1.0 - r / rc) ** 3 / np.tanh(1.0) ** 3
     else:
         raise ValueError(f"unknown dipole_cutoff {cutoff!r}")
     if radial == "screened":
@@ -538,34 +474,24 @@ def _radial_weights(r: np.ndarray, rc: float, C: int, radial: str, zeta: float,
 
 def _neighbor_dipole_pairs(atoms: Atoms, rc: float, C: int, radial: str,
                            zeta: float, cutoff: str, gauss_sigma_scale: float,
-                           rank: int = 1):
-    """Ordered neighbor pairs of the neighbor-basis readout: (i, j, G) with
-    G[p] = R_n(|d|)·g(d) [P, D, G·C] (channel = group·C + n, groups and D per
-    bond_geometry(d, rank)), d = r_i − r_j (image pairs, self-images
-    dropped). R per `radial`: "chebyshev" T_n(2r/rc − 1)·f_c,
-    "chebyshev_warped" T_n(2(r/rc − 1)² − 1)·f_c, "gaussian"
-    exp(−(r − μ_n)²/2σ²)·f_c (μ_n interior points of linspace(0, rc, C+2),
-    σ = gauss_sigma_scale·rc/(C+1)), or "screened" r^(ζ−1)·f_c. f_c per
-    `cutoff` — "cosine2" ((1+cos(πr/rc))/2)², "cosine" (1+cos(πr/rc))/2,
-    "cubic" 1 − 3x² + 2x³, x = r/rc, or "tanh3" tanh³(1 − r/rc)/tanh³(1)
-    (numpy twin of TNEP._radial/_fc; pairs are filtered before the power,
-    so no r=0 guard). float64 throughout; callers cast."""
+                           rank: int = 1, unit: bool = False):
+    """Neighbour pairs (i, j, G) with G[p] = R_n(|d|)·g(d) [P, D, G·C], channel
+    = group·C + n (groups/D per bond_geometry), d = r_i − r_j, image pairs
+    with self-images dropped. R_n·f_c per _radial_weights. float64; callers cast."""
     i, j, D = _neighbor_pairs(atoms, rc)
     keep = i != j                                  # drop self-image pairs
     i, j, d = i[keep], j[keep], -D[keep].astype(np.float64)  # ase D = r_j − r_i
     r = np.linalg.norm(d, axis=1)
     Rw = _radial_weights(r, rc, C, radial, zeta, cutoff, gauss_sigma_scale)
-    g = bond_geometry(d, rank)                                # [P, D, G]
+    g = bond_geometry(d, rank, unit)                          # [P, D, G]
     P_, D_, G_ = g.shape
     return i, j, np.einsum("pdg,pn->pdgn", g, Rw).reshape(P_, D_, G_ * Rw.shape[1])
 
 
 def ewald_field(atoms: Atoms, q: np.ndarray, alpha: float = 0.35,
                 r_cut: float = 9.0, k_cut: float = 7.0) -> np.ndarray:
-    """Ewald field E_i [N, 3] (q/Å² units) of point charges q at every atom
-    from all OTHER charges, tin-foil boundary, k = 0 dropped (neutral cells).
-    Real space over the image-exact ASE neighbour list, reciprocal over
-    |k| ≤ k_cut; α-independent to 1e-5 and E = −∇φ verified (gap_ewald tests)."""
+    """Ewald field E_i [N, 3] (q/Å²) at each atom from all OTHER charges q;
+    tin-foil boundary, k = 0 dropped (neutral cells). α-independent to 1e-5."""
     from scipy.special import erfc
     N, r = len(atoms), atoms.positions
     i, j, d, D = neighbor_list("ijdD", atoms, r_cut)          # D = r_j − r_i
@@ -599,196 +525,11 @@ def field_channel(atoms: Atoms, cfg) -> np.ndarray:
 
 
 def _append_field_channel(V: np.ndarray, E: np.ndarray, scale: float) -> np.ndarray:
-    """[N, 3, Ck, T] + E [N, 3] → [N, 3, Ck+1, T]: scale·E in the t′=0 slot of
-    the new last channel (zeros elsewhere), so the species-pair coefficient on
-    it is a per-centre-species scale the site function can already express."""
+    """V [N, 3, Ck, T] + E [N, 3] → [N, 3, Ck+1, T]: scale·E in the t′=0 slot of a
+    new last channel, so its species-pair coefficient acts as a per-centre scale."""
     extra = np.zeros(V.shape[:2] + (1, V.shape[3]), dtype=V.dtype)
     extra[:, :, 0, 0] = scale * E
     return np.concatenate([V, extra], axis=2)
-
-
-# ── long-range polarisability site tensors (GAP pol_field_groups) ─────────
-
-def ewald_dipole_tensor(atoms: Atoms, alpha: float = 0.35, r_cut: float = 9.0, k_cut: float = 4.0,
-                        exclude_pairs=None) -> np.ndarray:
-    """Ewald dipole–dipole tensor T [N, N, 3, 3] such that the field at i from
-    point dipoles p_j is E_i = Σ_j T_ij p_j (own-dipole term excluded, the
-    Gaussian self part included as in the standard dipole Ewald self term).
-    Real space over the image-exact neighbour list with f(r) = erfc(αr)/r:
-    T = ∇∇f = f″ r̂r̂ + (f′/r)(I − r̂r̂); reciprocal: (4π/V) Σ_k w_k k kᵀ
-    cos(k·(r_i − r_j)); self: −(4α³/3√π) I. `exclude_pairs` (i, j) arrays are
-    zeroed (intramolecular exclusion, as in polarisable water models).
-    Validated against finite differences of ewald_field to 1.7e-4 (relative).
-    k_cut 4.0 at α = 0.35 reproduces k_cut 7.0 to 1e-15 (exp(−k²/4α²) ≈ 1e-14); 70 ms/frame at N = 96."""
-    from scipy.special import erfc
-    N, r = len(atoms), atoms.positions
-    i, j, d, D = neighbor_list("ijdD", atoms, r_cut)        # D = r_j − r_i
-    a2d2 = (alpha * d) ** 2
-    ex = np.exp(-a2d2); erfc_ = erfc(alpha * d)
-    fp = -(erfc_ / d ** 2 + 2 * alpha / np.sqrt(np.pi) * ex / d)                 # f′
-    fpp = 2 * erfc_ / d ** 3 + (4 * alpha / np.sqrt(np.pi)) * ex / d ** 2 + (4 * alpha ** 3 / np.sqrt(np.pi)) * ex   # f″
-    rhat = D / d[:, None]
-    rr = rhat[:, :, None] * rhat[:, None, :]
-    Tp = fpp[:, None, None] * rr + (fp / d)[:, None, None] * (np.eye(3)[None] - rr)   # [P, 3, 3]
-    T = np.zeros((N, N, 3, 3)); np.add.at(T, (i, j), Tp)
-    cell = np.asarray(atoms.cell.array); V = abs(np.linalg.det(cell))
-    recip = 2 * np.pi * np.linalg.inv(cell).T
-    nmax = int(np.ceil(k_cut / np.min(np.linalg.norm(recip, axis=1)))) + 1
-    rng_ = np.arange(-nmax, nmax + 1)
-    n = np.array(np.meshgrid(rng_, rng_, rng_, indexing="ij")).reshape(3, -1).T
-    k = n @ recip; k2 = (k ** 2).sum(1); keep = (k2 > 1e-12) & (k2 <= k_cut ** 2); k, k2 = k[keep], k2[keep]
-    w = 4 * np.pi / V * np.exp(-k2 / (4 * alpha ** 2)) / k2
-    phase = r @ k.T; c, s = np.cos(phase), np.sin(phase)
-    kk = w[:, None, None] * k[:, :, None] * k[:, None, :]                        # [K, 3, 3]
-    # φ_dip = −p·∇G ⇒ E = −(4π/V) Σ_k w k kᵀ cos(k·r_ij)·p: the reciprocal tensor is NEGATIVE
-    kk9 = kk.reshape(-1, 9).T                                                    # [9, K]
-    rec = (np.ascontiguousarray((c.T[None] * kk9[:, :, None]).transpose(0, 2, 1)) @ c.T
-           + np.ascontiguousarray((s.T[None] * kk9[:, :, None]).transpose(0, 2, 1)) @ s.T)
-    T -= rec.transpose(1, 2, 0).reshape(N, N, 3, 3)                              # batched matmul, not einsum
-    # The reciprocal sum includes each dipole's own Gaussian cloud, whose field at
-    # its centre is −(4α³/3√π)·p (Hessian of erf(αr)/r at 0): remove it.
-    T[np.arange(N), np.arange(N)] += (4 * alpha ** 3 / (3 * np.sqrt(np.pi))) * np.eye(3)
-    # sign: E = −∇φ, φ_dipole = −p·∇f  ⇒  E_i = Σ_j (∇∇f) p_j with ∇∇f as above
-    if exclude_pairs is not None:
-        T[exclude_pairs[0], exclude_pairs[1]] = 0.0
-    return T
-
-
-def molecules(atoms: Atoms):
-    """(i, j) index arrays of all intramolecular pairs: each H assigned to its
-    nearest O (MIC). Water-specific, used only for the induction exclusion."""
-    from ase.geometry import get_distances
-    Z = atoms.numbers; O = np.where(Z == 8)[0]; H = np.where(Z == 1)[0]
-    _, Dm = get_distances(atoms.positions[H], atoms.positions[O], cell=atoms.cell, pbc=True)
-    owner = O[Dm.argmin(1)]
-    members = {o: [o] for o in O}
-    for h, o in zip(H, owner): members[o].append(h)
-    ii, jj = [], []
-    for m in members.values():
-        for a in m:
-            for b in m:
-                if a != b: ii.append(a); jj.append(b)
-    return np.array(ii), np.array(jj)
-
-
-# one-entry cache of the [3N, 3N] Ewald tensor, keyed by frame CONTENT (not
-# id(): a freed frame's id is reused), so α scans on one frame reuse it.
-_T_CACHE: list = [None, None]
-
-
-def applequist(atoms: Atoms, E0: np.ndarray, alpha_species: dict, exclude_intra: bool = True):
-    """Linear-response induction with fixed scalar polarisabilities α_z (Å³):
-    p = (I − A T)⁻¹ A E0, A = diag(α). Returns (p [N, 3] e·Å, E_eff = E0 + T p,
-    R = (I − A T)⁻¹ A [3N, 3N] for the polarisability columns)."""
-    N = len(atoms)
-    key = (bool(exclude_intra), atoms.numbers.tobytes(), atoms.cell.array.tobytes(), atoms.positions.tobytes())
-    if _T_CACHE[0] != key:
-        T = ewald_dipole_tensor(atoms, exclude_pairs=molecules(atoms) if exclude_intra else None)
-        _T_CACHE[:] = key, T.transpose(0, 2, 1, 3).reshape(3 * N, 3 * N)
-    Tm = _T_CACHE[1]
-    A = np.repeat(np.array([alpha_species.get(int(z), 0.0) for z in atoms.numbers]), 3)
-    R = np.linalg.solve(np.eye(3 * N) - A[:, None] * Tm, np.diag(A))
-    p = (R @ E0.reshape(-1)).reshape(N, 3)
-    return p, E0 + (Tm @ p.reshape(-1)).reshape(N, 3), R
-
-
-def _voigt(W: np.ndarray) -> np.ndarray:
-    """[N, 3, 3] symmetric → Voigt [N, 6] (xx, yy, zz, xy, yz, zx)."""
-    return np.stack([W[:, 0, 0], W[:, 1, 1], W[:, 2, 2], W[:, 0, 1], W[:, 1, 2], W[:, 2, 0]], 1)
-
-
-def _iso_traceless(Wv: np.ndarray) -> np.ndarray:
-    """Voigt [N, 6] → [N, 6, 2]: the isotropic part (tr/3)·I and the traceless
-    remainder — the two kernel-group columns of bond_geometry."""
-    tr3 = Wv[:, :3].mean(1, keepdims=True)
-    iso = np.concatenate([tr3.repeat(3, 1), np.zeros_like(tr3).repeat(3, 1)], 1)
-    return np.stack([iso, Wv - iso], 2)
-
-
-def induced_site_tensors(atoms: Atoms, alpha_species: dict, exclude_intra: bool = True) -> np.ndarray:
-    """Per-site induced-coupling tensor W_i = Σ_j R_ij (Voigt [N, 6]), R the
-    Applequist response: Σ_i W_i is the Applequist cell polarisability, so a
-    site-weighted sum Σ_i s_i W_i is a long-range, screened α kernel group.
-    Only the total is symmetric; each W_i is symmetrised (the Voigt column
-    must be a symmetric tensor to rotate covariantly)."""
-    N = len(atoms)
-    _, _, R = applequist(atoms, np.zeros((N, 3)), alpha_species, exclude_intra)
-    W = R.reshape(N, 3, N, 3).sum(2)
-    return _voigt(0.5 * (W + W.transpose(0, 2, 1)))
-
-
-POL_FIELD_GROUPS = ("induced", "grad", "cross", "quad", "qeq")
-
-
-def pol_group_width(cfg, groups=None) -> int:
-    """Columns of the pol_field_groups block (cfg.pol_field_groups, or `groups`):
-    induced 1, grad 1, cross 2·C_x, quad 2, qeq 2."""
-    w = {"induced": 1, "grad": 1, "cross": 2 * int(cfg.gap_cross_channels), "quad": 2, "qeq": 2}
-    return sum(w[g] for g in (cfg.pol_field_groups if groups is None else groups))
-
-
-def qeq_site_tensors(atoms: Atoms, cutoff: float = 6.0, hardness: float = 10.0) -> np.ndarray:
-    """Charge-flow polarisability site tensors W_i = −½ Σ_j L⁺_ij d_ij⊗d_ij
-    [N, 3, 3]: L = hardness·I + the short-range smeared Coulomb (Gaussian
-    charges of covalent-radius width, cosine cutoff, image pairs within
-    `cutoff`), L⁺ its pseudo-inverse on the charge-conserving subspace. Σ_i W_i
-    is the QEq polarisability of a charge-flow model whose electronegativity
-    responds to the field; Σ_j L⁺_ij = 0 makes W_i translation invariant."""
-    from ase.data import covalent_radii
-    from scipy.special import erf
-    N = len(atoms)
-    i, j, d, D = neighbor_list("ijdD", atoms, cutoff)
-    keep = i != j; i, j, d, D = i[keep], j[keep], d[keep], D[keep]
-    sig = covalent_radii[atoms.numbers]
-    gam = np.sqrt(sig[i] ** 2 + sig[j] ** 2)
-    fc = (1.0 + np.cos(np.pi * d / cutoff)) / 2.0
-    L = np.zeros((N, N)); np.add.at(L, (i, j), 14.399645 * erf(d / (np.sqrt(2.0) * gam)) / d * fc)
-    L[np.diag_indices(N)] += 14.399645 / (sig * np.sqrt(np.pi)) + float(hardness)
-    P = np.eye(N) - 1.0 / N
-    Lp = P @ np.linalg.pinv(P @ L @ P) @ P
-    W = np.zeros((N, 3, 3)); np.add.at(W, i, -0.5 * Lp[i, j][:, None, None] * D[:, :, None] * D[:, None, :])
-    return W
-
-
-def pol_field_groups(atoms: Atoms, ti: np.ndarray, cfg, v_cross: np.ndarray | None) -> np.ndarray:
-    """Long-range polarisability columns [N, 6, G] (Voigt), the groups of
-    cfg.pol_field_groups in order, UNscaled (the caller applies
-    cfg.pol_field_scale). E_i is the Ewald field of dipole_field_charges
-    (field_channel); v_cross [N, 3, K₁] the cross group's dipole kernel vectors
-    v^a_i = Σ_j R_a d_ij (species-resolved under pair columns; summed over
-    neighbour species here, K₁ = C_x·T′, C-major), needed for "cross" only.
-      induced : traceless Applequist tensor (induced_site_tensors, pol_induced_alpha)
-      grad    : traceless field gradient ∇E_i = −Σ_j q_j T_ij (ewald_dipole_tensor)
-      cross   : (E·v^a)·I for a < C_x, then traceless sym(E ⊗ v^a)
-      quad    : |E|²·I and traceless E⊗E
-      qeq     : isotropic and traceless parts of qeq_site_tensors"""
-    groups = list(cfg.pol_field_groups)
-    N = len(atoms)
-    need_E = {"grad", "cross", "quad"} & set(groups)
-    E = field_channel(atoms, cfg) if need_E else None
-    cols = []
-    for g in groups:
-        if g == "induced":
-            alpha = {int(z): float(a) for z, a in cfg.pol_induced_alpha.items()}
-            cols.append(_iso_traceless(induced_site_tensors(atoms, alpha))[:, :, 1:])
-        elif g == "grad":
-            ch = cfg.dipole_field_charges
-            q = np.array([float(ch[int(z)] if int(z) in ch else ch[str(int(z))]) for z in atoms.numbers])
-            gradE = -np.einsum("j,ijab->iab", q, ewald_dipole_tensor(atoms))
-            cols.append(_iso_traceless(_voigt(gradE))[:, :, 1:])
-        elif g == "cross":
-            Cx = int(cfg.gap_cross_channels)
-            v = v_cross.reshape(N, 3, Cx, -1).sum(3)                        # [N, 3, C_x]
-            S = 0.5 * (E[:, :, None, None] * v[:, None, :, :] + v[:, :, None, :] * E[:, None, :, None])
-            parts = np.stack([_iso_traceless(_voigt(S[:, :, :, a])) for a in range(Cx)], 3)   # [N, 6, 2, C_x]
-            cols.append(parts.reshape(N, 6, 2 * Cx))                        # (E·v^a)I for all a, then traceless
-        elif g == "quad":
-            cols.append(_iso_traceless(_voigt(E[:, :, None] * E[:, None, :])))
-        elif g == "qeq":
-            cols.append(_iso_traceless(_voigt(qeq_site_tensors(atoms))))
-        else:
-            raise ValueError(f"unknown pol_field_group {g!r}")
-    return np.concatenate(cols, 2) if cols else np.zeros((N, 6, 0))
 
 
 def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
@@ -796,29 +537,27 @@ def _neighbor_dipole_V(atoms: Atoms, types_int: np.ndarray, rc: float,
                        zeta: float = -2.0,
                        cutoff: str = "cosine2",
                        gauss_sigma_scale: float = 1.0,
-                       rank: int = 1) -> np.ndarray:
-    """Per-atom geometry kernel of the neighbor-basis readout:
-    V_i[:,k,t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·g_group(d), k = group·C + n
-    (rank 1: d, one group; rank 2: isotropic |d|²I and traceless
-    d⊗d − |d|²I/3 groups); pairs and R_n from _neighbor_dipole_pairs.
-    float64 accumulate → float32 [N, D, G·C, T]."""
+                       rank: int = 1, unit: bool = False) -> np.ndarray:
+    """Geometry kernel V_i[:, k, t'] = Σ_{j≠i, |d|<rc, t_j=t'} R_n(|d|)·g_group(d),
+    k = group·C + n; float64 accumulate → float32 [N, D, G·C, T]."""
     i, j, G = _neighbor_dipole_pairs(atoms, rc, C, radial, zeta, cutoff,
-                                     gauss_sigma_scale, rank)
+                                     gauss_sigma_scale, rank, unit)
     D, Ck = G.shape[1], G.shape[2]
-    V = np.zeros((len(atoms), T, D, Ck))
-    np.add.at(V, (i, np.asarray(types_int)[j]), G)
+    # sparse matmul scatter-add (np.add.at ~10× slower on 30k pairs)
+    from scipy.sparse import csr_matrix
+    N, P = len(atoms), len(i)
+    if P == 0:
+        return np.zeros((N, D, Ck, T), dtype=np.float32)
+    S = csr_matrix((np.ones(P), (i * T + np.asarray(types_int)[j], np.arange(P))), shape=(N * T, P))
+    V = np.asarray(S @ G.reshape(P, -1)).reshape(N, T, D, Ck)
     return V.transpose(0, 2, 3, 1).astype(np.float32)      # [N, D, G·C, T]
 
 
 def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
                             cfg: TNEPconfig) -> None:
-    """Box/label guards for the neighbor-basis dipole readout.
-
-    Raises when a box is too small for MIC to be exact (a second image of the
-    same pair would MIC-map onto the same vector and double-count the bond);
-    warns on net-charged frames and on label distributions with ~e·L gaps
-    (branch-inconsistent Berry-phase labels).
-    """
+    """Warnings for the neighbour dipole readout: readout r_c vs box height /
+    rcut_hard, net-charged frames, label gaps ≳ e·L (branch-inconsistent Berry
+    phases). Warnings only: the staged V is image-exact at any radius."""
     rc, rd = resolved_dipole_rc(cfg), float(cfg.rcut_hard)
     L_min = np.inf
     for k, s in enumerate(dataset):
@@ -832,13 +571,9 @@ def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
             print(f"  WARNING: structure {k} has net charge "
                   f"{float(np.sum(q)):+.3g}; the origin-free neighbor "
                   f"readout cannot fit its label convention.")
-    # Box-size consequences of dipole_rc. These are WARNINGS, not errors: the
-    # staged V comes from an image-exact neighbour list (_neighbor_pairs falls
-    # back to ASE whenever L < 2·rc), so a large radius is computed correctly —
-    # it just stops being the thing you may have intended.
     if np.isfinite(L_min):
         if rc >= L_min:
-            print(f"  WARNING: dipole_rc={rc} Å ≥ the smallest box height "
+            print(f"  WARNING: readout r_c={rc} Å ≥ the smallest box height "
                   f"{L_min:.2f} Å, so every neighbour enters through several "
                   f"periodic images and the readout is effectively a lattice "
                   f"sum rather than a local one. Still EXACT: images are "
@@ -849,20 +584,18 @@ def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
                   f"is a scalar sum, where they do not cancel; our NEP basis "
                   f"keeps them too (nep_descriptor.nep_pair_list).")
         elif 2.0 * rc >= L_min:
-            print(f"  WARNING: dipole_rc={rc} Å ≥ half the smallest box height "
+            print(f"  WARNING: readout r_c={rc} Å ≥ half the smallest box height "
                   f"{L_min:.2f} Å. The staged V is image-exact and fine, but "
                   f"the minimum-image paths — the in-graph V fallback and "
                   f"TNEP.predict — double-count bonds whose second image maps "
                   f"onto the same vector. Use the staged V (training and "
                   f"score do); treat predict()/spectroscopy output with care.")
         if rc > rd:
-            print(f"  WARNING: dipole_rc={rc} Å > rcut_hard={rd} Å, so a "
+            print(f"  WARNING: readout r_c={rc} Å > rcut_hard={rd} Å, so a "
                   f"readout neighbour can lie outside its partner's SOAP "
                   f"descriptor. Intended under nep_descriptor='replace', "
                   f"where the SOAP block is dropped; the in-graph V fallback "
                   f"cannot serve this radius and will refuse.")
-    # Branch consistency: per-component gaps ≳ the polarization quantum e·L
-    # suggest branch-inconsistent Berry-phase labels (warning, not rejection).
     if np.isfinite(L_min) and len(targets) > 3:
         conv = getattr(cfg, "convert_dipole_to_eangstrom", True)
         quantum = (L_min if conv
@@ -874,13 +607,7 @@ def _neighbor_dipole_guards(dataset: list[Atoms], targets: list,
 
 
 def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Tensor]:
-    """Chain assign_type_indices → build_descriptors → assemble_data_dict →
-    pad_and_stack into a padded data dict ready for score()/predict_batch().
-
-    Args:
-        dataset : list of ase.Atoms to evaluate
-        cfg     : TNEPconfig from training (types, descriptor params, target_mode)
-    """
+    """assign_type_indices → build_descriptors → assemble_data_dict → pad_and_stack."""
     types_int = assign_type_indices(dataset, cfg.types)
     builder = make_descriptor_builder(cfg)
     descriptors, gradients, grad_index = builder.build_descriptors(
@@ -895,23 +622,9 @@ def prepare_eval_data(dataset: list[Atoms], cfg: TNEPconfig) -> dict[str, tf.Ten
 def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPconfig) -> tuple[dict, dict, dict]:
     """Split into train/test/val (cfg.indices, cfg.test_ratio) and build descriptors.
 
-    Test descriptors are deferred (see test_pending below); an external
-    cfg.test_data_path replaces the internal test split with a train+val split.
-
-    Args:
-        dataset           : list of ase.Atoms
-        dataset_types_int : list of ndarray [N_i] integer type indices
-        cfg               : TNEPconfig
-
-    Returns:
-        train_data, test_data, val_data : dicts each containing:
-            positions   : list of [N_i, 3] tensors
-            Z_int       : list of [N_i] int tensors (type indices)
-            targets     : list of target tensors (scalar for PES, [3] for dipole)
-            boxes       : list of [3, 3] tensors (lattice vectors)
-            descriptors : list of [N_i, dim_q] tensors
-            gradients   : list of (list of N_i tensors each [M, 3, dim_q])
-            grad_index  : list of (list of N_i lists each [M] ints)
+    Returns (train_data, test_pending, val_data): list-form dicts per
+    assemble_data_dict; test descriptors are deferred to materialize_test_data.
+    An external cfg.test_data_path turns the internal split into train+val only.
     """
 
     indices = cfg.indices
@@ -926,8 +639,7 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
             "of data_path and uses the external test set as the report-only "
             "monitor, which is GPUMD's procedure.")
     if cfg.test_data_path is not None:
-        # External test set: split data_path into train + val only. Under the
-        # GPUMD path there is no val split at all — every frame trains.
+        # GPUMD path: no val split, every frame trains.
         n_val = 0 if gpumd_path else int(cfg.test_ratio * n_structures)
         val_idx = indices[:n_val]
         train_idx = indices[n_val:]
@@ -954,8 +666,7 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         test_types_int = assign_type_indices(test_dataset, cfg.types)
         print(f"External test set: {len(test_dataset)} structures from {cfg.test_data_path}")
         if gpumd_path:
-            # The monitor set IS the test set (report only — SNES.fit never
-            # selects on it under this flag).
+            # Monitor set IS the test set (report only; SNES.fit never selects on it).
             val_dataset, val_types_int = test_dataset, test_types_int
     else:
         # Default: three-way split from data_path
@@ -971,11 +682,8 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
         val_types_int = [dataset_types_int[i] for i in val_idx]
         train_types_int = [dataset_types_int[i] for i in train_idx]
 
-    # Build train + val descriptors; test is deferred to materialize_test_data.
-    # dipole_rij_power==0 (and the neighbor readout, which reads no descriptor
-    # gradients at all) → dipole forward needs only self-pair gradients
-    # ∂q_i/∂r_i, so build self-only in batches and drop the ~90%-of-COO
-    # neighbour rows the forward never reads (bounds peak memory to one batch).
+    # Self-only forward (dipole_rij_power=0 / neighbour readout): build in batches
+    # keeping only ∂q_i/∂r_i, dropping the ~90 % of COO rows never read.
     _self_only_batch = (int(cfg.descriptor_self_batch_size)
                         if getattr(cfg, "descriptor_self_batch_size", None)
                         is not None else None)
@@ -999,8 +707,6 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
 
     train_data = assemble_data_dict(train_dataset, train_types_int, train_descriptors, train_gradients, train_grad_index, cfg)
     val_data   = assemble_data_dict(val_dataset,   val_types_int,   val_descriptors,   val_gradients,   val_grad_index,   cfg)
-    # Deferred test set: stash raw atoms + type indices for
-    # materialize_test_data to build descriptors at scoring time.
     test_pending = {
         "_pending_test": True,
         "dataset": test_dataset,
@@ -1025,21 +731,9 @@ def split(dataset: list[Atoms], dataset_types_int: list[np.ndarray], cfg: TNEPco
 def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
                           num_types: int | None = None,
                           pin_to_cpu: bool | None = None) -> dict:
-    """Build test descriptors on demand; return a ready-to-score data dict.
-
-    Idempotent: the built dict is cached under test_pending["_built"] and
-    returned unchanged on repeat calls.
-
-    Args:
-        test_pending : split()'s third return value (_pending_test=True plus
-                       raw dataset/types_int keys).
-        cfg          : TNEPconfig
-        num_types    : for pad_and_stack; defaults to cfg.num_types.
-        pin_to_cpu   : for pad_and_stack; defaults to cfg.pin_data_to_cpu.
-
-    Returns:
-        Padded, stacked test_data dict (same shape as train_data/val_data).
-    """
+    """Build the deferred test set from split() into a padded, scorable dict.
+    Idempotent (cached under test_pending["_built"]); num_types/pin_to_cpu
+    default to cfg."""
     if not test_pending.get("_pending_test", False):
         return test_pending  # already materialised or never deferred
     cached = test_pending.get("_built")
@@ -1065,14 +759,12 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
     test_data = pad_and_stack(
         test_data, num_types=num_types, pin_to_cpu=pin_to_cpu,
         self_pairs_only=dipole_self_pairs_only(cfg))
-    # Pre-stage per-chunk pair indices to GPU (test eval uses predict_batch,
-    # not _evaluate_chunk, so no XLA padding needed).
+    # Pre-stage per-chunk pair indices (predict_batch path: no XLA padding).
     S_test = int(test_data["num_atoms"].shape[0])
     chunk = cfg.batch_chunk_size if cfg.batch_chunk_size is not None else S_test
     test_ranges = [(s, min(s + chunk, S_test)) for s in range(0, S_test, chunk)]
     prestage_chunk_indices(test_data, test_ranges)
     test_pending["_built"] = test_data
-    # Free the raw atom list now that descriptors are baked in.
     test_pending["dataset"] = None
     test_pending["types_int"] = None
     return test_data
@@ -1081,42 +773,20 @@ def materialize_test_data(test_pending: dict, cfg: 'TNEPconfig',
 def pad_and_stack(data: dict, num_types: int | None = None,
                   pin_to_cpu: bool = True,
                   self_pairs_only: bool = False) -> dict[str, tf.Tensor]:
-    """Convert variable-length list data into COO gradients + padded tensors.
+    """List-form dict (assemble_data_dict) → padded tensors + COO gradients.
 
-    Gradients use COO (only real atom-neighbor pairs) to avoid the dense
-    O(S·A_max·M_max·3·Q) allocation. Per-atom fields (descriptors, positions)
-    stay structure-padded [S, A_max, ...]. self_pairs_only keeps only the
-    zero-image self entry per centre (dipole_rij_power=0 path).
+    COO (real pairs only) avoids the dense O(S·A·M·3·Q) gradient allocation.
+    self_pairs_only keeps one zero-image self entry per centre.
 
-    Args:
-        data : dict from split() with keys:
-            descriptors : list of [N_i, dim_q] tensors
-            gradients   : list of (list of N_i tensors each [M_ij, 3, dim_q])
-            grad_index  : list of (list of N_i lists each [M_ij] ints)
-            positions   : list of [N_i, 3] tensors
-            Z_int       : list of [N_i] int tensors
-            targets     : list of scalar/[3]/[6] tensors
-            boxes       : list of [3, 3] tensors
-
-    Returns:
-        padded : dict with keys:
-            descriptors : [S, A, Q]       float32  — padded per-atom descriptors
-            grad_values : [P, 3, Q]       float32  — COO gradient blocks (P = total pairs)
-            pair_struct : [P]             int32    — structure index for each pair
-            pair_atom   : [P]             int32    — center atom index for each pair
-            pair_gidx   : [P]            int32    — neighbor atom index for each pair
-            struct_ptr  : [S+1]          int32    — CSR row pointer: pairs for struct s
-                                                     are grad_values[struct_ptr[s]:struct_ptr[s+1]]
-            nep_pair_atom/gidx/struct [P'] int32, nep_pair_D [P',3] float32,
-            nep_pair_ang [P'] bool, nep_struct_ptr [S+1] — NEP image-exact pair
-                                                     stream, same CSR pattern (only with data["nep_pairs"])
-            positions   : [S, A, 3]      float32
-            Z_int       : [S, A]         int32
-            targets     : [S, T]         float32
-            boxes       : [S, 3, 3]      float32
-            atom_mask   : [S, A]         float32  — 1.0 for real atoms, 0.0 for padding
-            num_atoms   : [S]            int32
-        where S = num_structures, A = max_atoms, Q = dim_q, P = total atom-neighbor pairs
+    Returns, with S structures, A = max atoms, Q = dim_q, P = total pairs:
+        descriptors [S, A, Q]; positions [S, A, 3]; Z_int [S, A]; targets [S, T];
+        boxes [S, 3, 3]; atom_mask [S, A] (1 = real); num_atoms [S];
+        grad_values [P, 3, Q]; pair_struct / pair_atom / pair_gidx [P] int32;
+        struct_ptr [S+1] CSR (struct s owns grad_values[ptr[s]:ptr[s+1]]);
+        types_contained [S, num_types] when num_types given;
+        forces [S, A, 3] / virials [S, 6] / V_atom [S, A, ...] / nep_raw [S, A, W] when present;
+        nep_pair_atom/gidx [P'], nep_pair_D [P', 3], nep_pair_ang [P'] bool,
+        nep_pair_struct [P'], nep_struct_ptr [S+1], nep_pad_D [3] when nep_pairs present.
     """
     S = len(data["descriptors"])
     dim_q = data["descriptors"][0].shape[-1]
@@ -1127,13 +797,11 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     target_dim = 1 if target_sample.shape == () else target_sample.shape[0]
     has_forces = "forces" in data
     has_virials = "virials" in data
-    has_V = "V_atom" in data  # neighbor-basis dipole geometry kernel
+    has_V = "V_atom" in data
 
-    # Count pairs per structure to build CSR struct_ptr and size COO arrays.
+    # Pairs per structure → CSR struct_ptr + COO sizes.
     if self_pairs_only:
-        # Count centres with a self entry (grad_index[s][i] == i). Keep only
-        # the first (zero-image) match; periodic self-images would double-count
-        # the self contribution under dipole_rij_power=0.
+        # One (zero-image) self entry per centre; periodic self-images would double-count.
         pair_counts = [
             int(sum(1 for i in range(atom_counts[s])
                     if bool(np.any(np.asarray(data["grad_index"][s][i]) == i))))
@@ -1149,13 +817,11 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     for s in range(S):
         struct_ptr_np[s + 1] = struct_ptr_np[s] + pair_counts[s]
 
-    # COO arrays: one entry per real atom-neighbor pair.
     grad_values_np = np.zeros((N_pairs_total, 3, dim_q), dtype=np.float32)
     pair_struct_np = np.zeros(N_pairs_total, dtype=np.int32)
     pair_atom_np   = np.zeros(N_pairs_total, dtype=np.int32)
     pair_gidx_np   = np.zeros(N_pairs_total, dtype=np.int32)
 
-    # Structure-padded arrays (no M dimension)
     desc_np      = np.zeros((S, max_atoms, dim_q), dtype=np.float32)
     pos_np       = np.zeros((S, max_atoms, 3), dtype=np.float32)
     z_np         = np.zeros((S, max_atoms), dtype=np.int32)
@@ -1170,10 +836,10 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     if has_V:
         V_np = np.zeros((S, max_atoms) + data["V_atom"][0].shape[1:],
                         dtype=np.float32)
-    has_nep = "nep_raw" in data  # raw expert input [S, A, W_raw]: NEP basis, or GAP q2‖q3 under gap_sum
+    has_nep = "nep_raw" in data
     if has_nep:
         nep_np = np.zeros((S, max_atoms, data["nep_raw"][0].shape[1]), dtype=np.float32)
-    has_nep_pairs = "nep_pairs" in data  # Phase B stream: concatenate, CSR by nep_struct_ptr
+    has_nep_pairs = "nep_pairs" in data  # concatenated, CSR by nep_struct_ptr
     if has_nep_pairs:
         nps = data["nep_pairs"]
         counts = np.array([p["nep_pair_atom"].shape[0] for p in nps], dtype=np.int32)
@@ -1186,8 +852,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
     pair_offset = 0
     for s in range(S):
         N_s = atom_counts[s]
-        # Descriptors: numpy ndarray (streaming path) or TF tensor (legacy).
-        d_s = data["descriptors"][s]
+        d_s = data["descriptors"][s]  # ndarray or TF tensor
         desc_np[s, :N_s, :]  = d_s if isinstance(d_s, np.ndarray) else d_s.numpy()
         pos_np[s, :N_s, :]   = data["positions"][s].numpy()
         z_np[s, :N_s]        = data["Z_int"][s].numpy()
@@ -1218,9 +883,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
             gv_full = data["gradients"][s][i]
             gidx_full = np.asarray(data["grad_index"][s][i])
             if self_pairs_only:
-                # Keep only the first zero-image self row (gidx == i); drop
-                # periodic self-images and all neighbour pairs. grad_values
-                # shrinks O(N·M)→O(N) and dipole becomes Σ_i de_dq[i]·grad[i,i].
+                # First self row only (gidx == i): dipole = Σ_i de_dq[i]·grad[i,i].
                 mask = (gidx_full == i)
                 if not bool(np.any(mask)):
                     continue
@@ -1243,8 +906,7 @@ def pad_and_stack(data: dict, num_types: int | None = None,
                 pair_gidx_np[pair_offset:k_end]   = gidx_full
                 pair_offset += n_nbrs
 
-    # Convert to TF then delete the numpy copy so peak RAM stays ~1x, not ~2x.
-    # pin_to_cpu → CPU; else GPU if present (CPU-only falls back implicitly).
+    # Convert then delete each numpy copy so peak RAM stays ~1x. pin_to_cpu → CPU, else GPU.
     _dev_ctx = (tf.device('/CPU:0') if pin_to_cpu
                 else _gpu_device_ctx())
     with _dev_ctx:
@@ -1283,26 +945,11 @@ def pad_and_stack(data: dict, num_types: int | None = None,
 
 def pack_chunk_from_flat(frame_results: list, dim_q: int,
                           max_atoms: int | None = None) -> dict:
-    """Pack per-frame TF tensors from build_descriptors_flat(return_tf=True)
-    into a chunk dict (COO gradients + padded descriptors) for _evaluate_chunk.
-
-    Each frame_results[s] = (soap_t [N, Q], grad_t [P, 3, Q], pa_t [P], pg_t [P]),
-    concatenated on-device with per-frame structure indices.
-
-    Args:
-        frame_results : list of per-frame (soap, grad, pa, pg) TF tensors.
-        dim_q         : descriptor dimension (Q).
-        max_atoms     : A-axis pad length. None = chunk's own max(atom_counts);
-                        pass a wider dataset-wide A_max to stay shape-consistent
-                        with positions/Z_int.
-
-    Returns a dict with descriptor-shaped fields only:
-        descriptors  [B, A_max, Q]   float32
-        grad_values  [P, 3, Q]       float32
-        pair_atom    [P]             int32   — frame-local center index
-        pair_gidx    [P]             int32   — frame-local neighbour index
-        pair_struct  [P]             int32   — chunk-local structure index
-    """
+    """Per-frame (soap [N, Q], grad [P, 3, Q], pair_atom [P], pair_gidx [P]) TF
+    tensors from build_descriptors_flat → chunk dict {descriptors [B, A, Q],
+    grad_values [P, 3, Q], pair_atom/pair_gidx (frame-local), pair_struct
+    (chunk-local)} for _evaluate_chunk. max_atoms=None pads to the chunk's own
+    max; pass the dataset-wide A_max to match positions/Z_int. Clears frame_results."""
     S = len(frame_results)
     atom_counts = [int(r[0].shape[0]) for r in frame_results]
     chunk_max_atoms = max(atom_counts) if atom_counts else 0
@@ -1350,11 +997,7 @@ def pack_chunk_from_flat(frame_results: list, dim_q: int,
 
 
 def _is_contiguous_range(arr: np.ndarray) -> bool:
-    """True iff `arr` is a strictly +1 monotonic sequence (a true slice).
-
-    Every diff must be 1 — stronger than arr[-1]-arr[0]+1 == arr.size, which
-    would falsely accept permutations bracketing a contiguous range.
-    """
+    """True iff every diff is +1 (a true slice; the size check alone accepts permutations)."""
     if arr.size == 0:
         return False
     if arr.size == 1:
@@ -1371,14 +1014,10 @@ _RESIDENT_SMALL_KEYS = ("positions", "Z_int", "boxes", "num_atoms",
 _NEP_PAIR_KEYS = ("nep_pair_atom", "nep_pair_gidx", "nep_pair_D", "nep_pair_ang")
 
 
-# Significant binary digits kept when bucketing the pair-stream length. The
-# bucket exists ONLY to keep the number of distinct shapes the XLA pair kernels
-# compile for small; it must not cost memory. Powers of two (the old rule) cost
-# up to 2x: a 500-frame water chunk has 4,209,650 radial pairs, just over 2^22,
-# so it padded to 2^23 and every per-pair tensor doubled. Keeping 6 significant
-# digits bounds the waste at 2^-6 of the octave (≤3%) while still collapsing
-# nearby counts onto at most 64 shapes per octave — and a full-batch run, where
-# the pair count never changes, compiles exactly once either way.
+# Significant binary digits kept when bucketing the NEP pair-stream length, so
+# the per-shape XLA pair kernels compile ≤ 64 times per octave. Not a power of
+# two: that padded a 4.2 M-pair chunk to 2^23 and doubled every per-pair tensor;
+# 6 digits bounds the waste at ≤ 3 %.
 _PAIR_BUCKET_BITS = 6
 
 
@@ -1392,20 +1031,13 @@ def _bucket(n: int, bits: int = _PAIR_BUCKET_BITS) -> int:
 
 
 def gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
-    """NEP pair stream for structures idx_tf → chunk: CSR gather by nep_struct_ptr,
-    nep_pair_struct remapped chunk-local (mirrors the grad_values gather). No-op
-    when the stream is absent. Eager only (int(...) on shapes sizes the padding).
-
-    The chunk stream is bucket-padded — both the pair count P and the angular
-    count P_a, see _bucket — so the XLA pair kernels (TNEP._nep_radial_xla /
-    _nep_angular_xla, compiled per shape) compile once per bucket instead of once
-    per mini-batch. The bucket keeps 6 significant digits, NOT a power of two:
-    the pair tensors are the largest in the whole forward, so rounding them up
-    to the next power of two was costing up to 2x in memory. Padding pairs are (atom 0, gidx 0, struct 0, D = nep_pad_D =
-    (rc + 1, 0, 0)): fc = fn = fnp = 0 beyond the cutoff, so their radial and
-    angular forces are exactly 0 and the |D|^N μ weight multiplies zero; the first
-    pow2(P_a) − P_a of them carry nep_pair_ang=True to pad the angular subset.
-    The chunk-local nep_struct_ptr counts real pairs only (re-slicing re-pads)."""
+    """Gather the NEP pair stream for structures idx_tf into chunk (CSR by
+    nep_struct_ptr, nep_pair_struct chunk-local); no-op without the stream.
+    Eager only. P and the angular count P_a are bucket-padded (_bucket) so the
+    per-shape XLA pair kernels compile once per bucket; padding pairs sit at
+    D = nep_pad_D beyond every cutoff (fc = 0, contribute nothing), the first
+    bucket(P_a) − P_a of them flagged nep_pair_ang. The chunk nep_struct_ptr
+    counts real pairs only."""
     ptr = data.get("nep_struct_ptr")
     if ptr is None:
         return
@@ -1430,27 +1062,10 @@ def gather_nep_pairs(data: dict, chunk: dict, idx_tf) -> None:
 
 
 def slice_and_complete_chunk(data: dict, indices) -> dict:
-    """Build a chunk dict by slicing per-structure fields from `data`.
-
-    The returned chunk has the same field contract that `SNES._evaluate_chunk`
-    and `TNEP.predict_batch` consume:
-        descriptors  [B_chunk, A_max, Q]
-        grad_values  [P_chunk, 3, Q]
-        pair_atom    [P_chunk]    int32  — frame-local centre index
-        pair_gidx    [P_chunk]    int32  — frame-local neighbour index
-        pair_struct  [P_chunk]    int32  — chunk-local structure index
-        nep_pair_*   / nep_pair_struct   — NEP pair stream, same contract (when present)
-        positions    [B_chunk, A_max, 3]
-        Z_int        [B_chunk, A_max]
-        boxes        [B_chunk, 3, 3]
-        atom_mask    [B_chunk, A_max]
-        num_atoms    [B_chunk]
-        targets      [B_chunk, T]
-        types_contained [B_chunk, T]   (only present when caller supplied it)
-
-    Gradient pairs are gathered from the in-memory grad_values via struct_ptr;
-    pair_struct is remapped to chunk-local indices.
-    """
+    """Chunk dict for SNES._evaluate_chunk / TNEP.predict_batch: the
+    _RESIDENT_SMALL_KEYS and descriptors gathered on the B axis, grad_values
+    [P_chunk, 3, Q] + pair_atom/pair_gidx (frame-local) gathered via
+    struct_ptr, pair_struct remapped chunk-local, NEP pair stream likewise."""
     if isinstance(indices, tf.Tensor):
         idx_tf = tf.cast(indices, tf.int32)
     else:
@@ -1462,9 +1077,6 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
             chunk[k] = tf.gather(data[k], idx_tf)
 
     chunk["descriptors"] = tf.gather(data["descriptors"], idx_tf)
-    # COO pair gather: pairs for structure idx_tf[i] live in
-    # struct_ptr[idx_tf[i]:idx_tf[i]+1]. Flatten via tf.ragged.range;
-    # pair_struct → chunk-local [0..B_chunk) via value_rowids().
     ptr = data["struct_ptr"]
     pair_starts = tf.gather(ptr, idx_tf)
     pair_ends   = tf.gather(ptr, idx_tf + 1)
@@ -1480,18 +1092,11 @@ def slice_and_complete_chunk(data: dict, indices) -> dict:
     return chunk
 
 
-# ============================================================================
-# Chunk staging + prefetch + chunk-index caching
-# ============================================================================
+# ── chunk staging / prefetch ──
 
 def prestage_chunk_indices(data: dict, ranges: list) -> None:
-    """Pre-build GPU tensors for per-chunk pair indices (pair_atom, pair_gidx,
-    pair_struct) for each (s, e) in `ranges`.
-
-    Full-batch chunks are constant across generations, so staging once at
-    startup saves ~3-5 ms/chunk of per-gen tf.constant + DMA. Stored under
-    data["_pair_idx_gpu_cache"], consumed by the staging paths.
-    """
+    """Pre-build GPU pair_atom/pair_gidx/pair_struct per (s, e) chunk into
+    data["_pair_idx_gpu_cache"]; saves ~3-5 ms/chunk/gen of tf.constant + DMA."""
     cache: dict = data.setdefault("_pair_idx_gpu_cache", {})
     pa_full = data["pair_atom"]
     pg_full = data["pair_gidx"]
@@ -1515,10 +1120,7 @@ def prestage_chunk_indices(data: dict, ranges: list) -> None:
 
 
 class ChunkIndexCache:
-    """Caches per-chunk flat_pair_idx and chunk-local pair_struct, keyed by
-    (id(data), s_start, s_end). Avoids rebuilding them every generation for
-    repeating full-batch chunks; harmless on miss for finite batches.
-    """
+    """Per-chunk flat_pair_idx + chunk-local pair_struct, keyed (id(data), s, e)."""
     def __init__(self):
         self._cache: dict = {}
 
@@ -1533,8 +1135,7 @@ class ChunkIndexCache:
             pair_ranges = tf.ragged.range(pair_starts, pair_ends)
             flat_pair_idx_tf = tf.cast(pair_ranges.flat_values, tf.int32)
             pair_struct_tf   = tf.cast(pair_ranges.value_rowids(), tf.int32)
-            # Numpy copy lets staging fancy-index passthrough pair arrays
-            # without a per-call device sync (small, < ~100 K ints).
+            # numpy copy: staging fancy-indexes without a per-call device sync
             flat_pair_idx_np = flat_pair_idx_tf.numpy()
             item = {
                 "flat_pair_idx_tf": flat_pair_idx_tf,
@@ -1548,7 +1149,6 @@ class ChunkIndexCache:
         self._cache.clear()
 
 
-# Process-wide singleton; created lazily because tf.range needs TF imported.
 _chunk_index_cache: ChunkIndexCache | None = None
 
 
@@ -1560,15 +1160,12 @@ def get_chunk_index_cache() -> ChunkIndexCache:
 
 
 def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
-    """Numpy-only first phase of chunk staging: slice per-structure fields to
-    ndarrays and pass the in-RAM gradient/pair tensors through untouched.
-    _stage_finalize_tf converts the result to TF tensors.
-    """
+    """Staging phase 1 (numpy): slice per-structure fields; pass grad/pair
+    tensors through untouched for _stage_finalize_tf."""
     precomputed = get_chunk_index_cache().get(data, s_start, s_end)
     idx_np = np.arange(int(s_start), int(s_end), dtype=np.int32)
     flat_pair_idx_np = precomputed["flat_pair_idx_np"]
 
-    # Slice every CPU-resident structure-padded field into numpy.
     out: dict = {"_idx_np": idx_np, "_precomputed": precomputed}
     for k in _RESIDENT_SMALL_KEYS:
         if k in data:
@@ -1579,7 +1176,6 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
     desc_np = desc.numpy() if hasattr(desc, "numpy") else np.asarray(desc)
     out["_np_descriptors"] = desc_np[idx_np]
 
-    # In-RAM: hand back the original grad/pair tensors untouched (finalize gathers).
     out["_passthrough_grad_values"] = data["grad_values"]
     out["_passthrough_pair_atom"]   = data["pair_atom"]
     out["_passthrough_pair_gidx"]   = data["pair_gidx"]
@@ -1589,12 +1185,9 @@ def _stage_disk_only(data: dict, s_start: int, s_end: int) -> dict:
 def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
                         s_start: int | None = None,
                         s_end: int | None = None) -> dict:
-    """Second phase of staging: convert _stage_disk_only's numpy output to TF
-    tensors (tf.constant). Reuses pre-staged pair-index tensors from
-    data["_pair_idx_gpu_cache"] for (s_start, s_end) when present."""
+    """Staging phase 2: numpy → tf.constant, reusing data["_pair_idx_gpu_cache"]
+    entries when present. pin_to_cpu ⇒ upload each chunk to GPU."""
     chunk: dict = {}
-    # pin_to_cpu=True ⇒ host RAM, upload each chunk to GPU if present.
-    # False ⇒ already on-device, no device context needed.
     ctx = _gpu_device_ctx() if pin_to_cpu else _NullCtx()
     pair_idx_cache = data.get("_pair_idx_gpu_cache")
     pair_idx_entry = None
@@ -1612,8 +1205,7 @@ def _stage_finalize_tf(data: dict, raw: dict, pin_to_cpu: bool,
             chunk["pair_struct"] = (tf.identity(raw["_precomputed"]["pair_struct_tf"])
                                      if pin_to_cpu else
                                      raw["_precomputed"]["pair_struct_tf"])
-        # Contiguous pair indices (sequential full-batch) → strided slice
-        # (pure GPU, no D2D gather); random sub-sampling → tf.gather.
+        # Contiguous indices (full-batch) → strided slice; sub-sampling → tf.gather.
         flat_pair_idx_np = raw["_precomputed"]["flat_pair_idx_np"]
         is_contig = _is_contiguous_range(flat_pair_idx_np)
         if is_contig:
@@ -1642,9 +1234,8 @@ class _NullCtx:
 
 
 def _gpu_device_ctx():
-    """Return tf.device('/GPU:0') when a GPU is visible, else a no-op context.
-    Lets staging code run unchanged on CPU-only nodes, where a bare
-    '/GPU:0' pin would raise under TF's hard placement."""
+    """tf.device('/GPU:0') if a GPU is visible, else a no-op context (a bare pin
+    raises on CPU-only nodes)."""
     try:
         if tf.config.list_physical_devices('GPU'):
             return tf.device('/GPU:0')
@@ -1655,10 +1246,7 @@ def _gpu_device_ctx():
 
 
 def move_data_to_gpu(data: dict) -> None:
-    """Move every static (non-helper) field in `data` onto /GPU:0 so staging
-    avoids host round-trips. Resident tensors are left alone (identity-on-GPU
-    is a no-op); underscore-prefixed helper keys are skipped.
-    """
+    """Move every static field of `data` onto /GPU:0 (helper `_` keys skipped)."""
     keys = list(_RESIDENT_SMALL_KEYS) + [
         "descriptors", "pair_atom", "pair_gidx", "pair_struct",
         "struct_ptr", "grad_values", "nep_struct_ptr", "nep_pair_struct", "nep_pad_D",
@@ -1669,20 +1257,14 @@ def move_data_to_gpu(data: dict) -> None:
             if v is None:
                 continue
             if hasattr(v, "device"):
-                # tf.Tensor: identity-on-GPU is cheap if already there.
                 data[k] = tf.identity(v)
             else:
-                # numpy → GPU tensor
                 data[k] = tf.constant(np.asarray(v))
 
 
 def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
-    """Pure-GPU chunk staging for `_gv_resident_gpu` data dicts.
-
-    All inputs are GPU tensors; per-chunk work is on-device tf.gather over
-    small [B]-axis fields plus a strided slice on grad_values. No numpy or
-    host↔device traffic. Replaces the two-phase disk_only/finalize path.
-    """
+    """On-device chunk staging for `_gv_resident_gpu` dicts: tf.gather on the
+    B axis + strided grad_values slice, no host↔device traffic."""
     chunk: dict = {}
     s_lo = int(s_start)
     s_hi = int(s_end)
@@ -1698,7 +1280,6 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
             chunk[k] = tf.gather(v, idx_tf)
         chunk["descriptors"] = tf.gather(data["descriptors"], idx_tf)
 
-        # Grad slice + pair indices.
         precomputed = get_chunk_index_cache().get(data, s_lo, s_hi)
         flat_pair_idx_np = precomputed["flat_pair_idx_np"]
         if flat_pair_idx_np.size > 0:
@@ -1736,14 +1317,8 @@ def _stage_chunk_resident(data: dict, s_start: int, s_end: int) -> dict:
 
 
 def prefetched_chunks(data: dict, ranges: list, pin_to_cpu: bool):
-    """Yield (s_start, s_end, chunk) tuples for each (s, e) in `ranges`.
-
-    Two modes by data-dict state:
-    1. GPU-resident (_gv_resident_gpu=True): on-device via
-       _stage_chunk_resident (no host↔GPU traffic; used when the grad
-       cache fits in VRAM).
-    2. In-RAM: _stage_disk_only (numpy) + _stage_finalize_tf (TF convert).
-    """
+    """Yield (s, e, chunk) per range: _stage_chunk_resident when
+    _gv_resident_gpu, else _stage_disk_only + _stage_finalize_tf."""
     if not ranges:
         return
 
@@ -1752,7 +1327,7 @@ def prefetched_chunks(data: dict, ranges: list, pin_to_cpu: bool):
             yield int(s), int(e), _stage_chunk_resident(data, int(s), int(e))
         return
 
-    # Pre-warm the chunk-index cache so staging never hits a TF op on miss.
+    # Pre-warm so staging never hits a TF op on a cache miss.
     idx_cache = get_chunk_index_cache()
     for _s, _e in ranges:
         idx_cache.get(data, _s, _e)
@@ -1764,19 +1339,8 @@ def prefetched_chunks(data: dict, ranges: list, pin_to_cpu: bool):
 
 
 def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray], allowed_Z: list[int | str], mode: str = "subset") -> tuple[list[Atoms], list[np.ndarray]]:
-    """Keep only structures whose atoms satisfy the species filter.
-
-    Args:
-        dataset           : list of ase.Atoms
-        dataset_types_int : list of ndarray — parallel to dataset
-        allowed_Z         : list of int or str — allowed atomic numbers (e.g. [6, 1, 8])
-                            or element symbols (e.g. ["C", "H", "O"])
-        mode              : "subset" = keep structures with only allowed species
-                            "exact"  = keep structures containing exactly all allowed species
-
-    Returns:
-        filtered_dataset, filtered_types_int : filtered parallel lists
-    """
+    """Keep structures whose species are a subset of (mode="subset") or exactly
+    (mode="exact") allowed_Z (atomic numbers or symbols)."""
     from ase.data import atomic_numbers
     allowed = set(atomic_numbers[z] if isinstance(z, str) else z for z in allowed_Z)
     filtered_dataset = []
@@ -1795,13 +1359,7 @@ def filter_by_species(dataset: list[Atoms], dataset_types_int: list[np.ndarray],
 
 def print_dipole_statistics(dataset: list[Atoms], cfg: TNEPconfig,
                             target_key: str = "dipole") -> None:
-    """Print min/max/mean/std of dipole targets across the dataset.
-
-    Args:
-        dataset    : list of ase.Atoms with info[target_key] = [3] array
-        cfg        : TNEPconfig — used to check unit conversion flag
-        target_key : str key in Atoms.info holding the dipole vector
-    """
+    """Print min/max/mean/std of the dipole targets (unit-converted per cfg)."""
     dipoles = np.array([_extract_target(s, target_key).numpy() for s in dataset])
     convert = getattr(cfg, "convert_dipole_to_eangstrom", True)
     factor = _dipole_conversion_factor(cfg.dipole_units) if convert else 1.0
@@ -1824,12 +1382,7 @@ def print_dipole_statistics(dataset: list[Atoms], cfg: TNEPconfig,
 
 
 def print_polarizability_statistics(dataset: list[Atoms], target_key: str = "pol") -> None:
-    """Print min/max/mean/std of polarizability targets across the dataset.
-
-    Args:
-        dataset    : list of ase.Atoms with info[target_key] = [6] or [9] array
-        target_key : str key in Atoms.info holding the polarizability tensor
-    """
+    """Print min/max/mean/std of the polarizability targets per Voigt component."""
     pols = np.array([_extract_target(s, target_key).numpy() for s in dataset])
     labels = ["xx", "yy", "zz", "xy", "yz", "zx"]
     print("=== Polarizability Target Statistics ===")

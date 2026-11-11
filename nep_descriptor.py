@@ -1,12 +1,11 @@
-"""GPUMD NEP descriptors, exactly (multi_descriptor_plan.md §0.3).
+"""GPUMD NEP descriptors, exactly: per-atom raw basis + the GPUMD contraction.
 
-NumPy reference for the per-atom raw basis and the GPUMD contraction.
-Constants and formulas are transcribed VERBATIM from GPUMD commit fee6340c,
-/home/reece/GPUMD/src/utilities/nep_utilities.cuh (C3B/C4B/C5B lines 19-46,
-Z_COEFFICIENT_L 48-65, find_fc 339-347, find_fc_and_fcp 349-361, find_fn
-500-517, find_fn_and_fnp 519-552, accumulate_s_one
-846-895, find_q_one 930-942, find_q 944-1000) and src/main_nep/nep.cu
-(neighbour list 60-100: x12 = x[n2] − x[n1]; radial 110-155; angular 157-215).
+Constants and formulas are transcribed verbatim from GPUMD commit fee6340c,
+src/utilities/nep_utilities.cuh (C3B/C4B/C5B 19-46, Z_COEFFICIENT_L 48-65,
+find_fc 339-347, find_fc_and_fcp 349-361, find_fn 500-517, find_fn_and_fnp
+519-552, accumulate_s_one 846-895, find_q_one 930-942, find_q 944-1000) and
+src/main_nep/nep.cu (neighbour list 60-100: x12 = x[n2] − x[n1]; radial
+110-155; angular 157-215).
 
 Layout per atom (float64 inside, float32 out):
     raw_r[i, t', k]     = Σ_{j∈t', r<rc_r} f_k(r_ij; rc_r)                  [T, K_r+1]
@@ -113,9 +112,7 @@ def fn_all(r, rc, K):
 def _real_harmonics(x, y, z, xp):
     """(P [P,24], dP [P,3,24]): P_c(r̂) in GPUMD s-index order (L=1: 0..2, L=2: 3..7,
     L=3: 8..14, L=4: 15..23) and ∂P_c/∂(x̂, ŷ, ẑ) with the unit-vector components as
-    FREE variables (the caller applies (I − r̂r̂ᵀ)/r for a Cartesian derivative).
-    Z-polynomial part: d/dz Σ Z[n1][n2] z^n2; complex part: d/dx (x+iy)^n1 =
-    n1 (x+iy)^(n1−1), d/dy (x+iy)^n1 = i·n1 (x+iy)^(n1−1)."""
+    FREE variables (the caller applies (I − r̂r̂ᵀ)/r for a Cartesian derivative)."""
     one, zero = xp.ones_like(z), xp.zeros_like(z)
     P, dP = [], []
     for L in range(1, 5):
@@ -213,22 +210,11 @@ def find_q_tf(s, four_body, five_body):
 
 
 def q3b_from_gram_tf(G, c_a, Zf, num_types, p_idx, q_idx, n_pairs):
-    """The L = 1..4 block from the data-static Gram (see nep_gram_on).
-
-        q[c, a, L, n] = \u03a3_{p\u2264q} c_a[c, t_a, p, n]\u00b7c_a[c, t_a, q, n]\u00b7G[a, L, pq]
-
-    One GEMM per centre type over the packed pair axis — no [C, N, n, 24]
-    intermediate. The weights and the triangular multiplicity are already
-    folded into G by angular_gram_numpy.
-
-    Args:
-        G       : [N, 4\u00b7P] float32 Gram block of nep_raw
-        c_a     : [T, T, n+1, K+1] or per-candidate [C, T, T, n+1, K+1]
-        Zf      : [N] int centre types
-        p_idx, q_idx : [P] packed upper-triangular indices (gram_pairs)
-        n_pairs : P, static
-    Returns [(C,) N, 4, n+1] — l-major, ready to flatten like find_q's output.
-    """
+    """The L = 1..4 block from the data-static Gram G [N, 4·P] (see nep_gram_on):
+    q[c, a, L, n] = Σ_{p≤q} c_a[c, t_a, p, n]·c_a[c, t_a, q, n]·G[a, L, pq],
+    one GEMM per centre type over the packed pair axis (no [C, N, n, 24] intermediate).
+    c_a is [T, T, n+1, K+1] or per-candidate [C, T, T, n+1, K+1]; p_idx/q_idx from
+    gram_pairs. Returns [(C,) N, 4, n+1], l-major like find_q's output."""
     per_cand = len(c_a.shape) == 5
     if not per_cand:
         c_a = c_a[tf.newaxis]
@@ -251,14 +237,13 @@ def q3b_from_gram_tf(G, c_a, Zf, num_types, p_idx, q_idx, n_pairs):
 
 
 # ── bookkeeping ────────────────────────────────────────────────────────────
-# nep_descriptor="sum": the two expert ANNs' weights (2-body on the radial
-# block, 3-body on the angular block), in SNES / Adam / save order.
+# nep_descriptor="sum": the 2-body (radial) and 3-body (angular) expert ANN
+# weights, in SNES / Adam / save order.
 EXPERT_WEIGHTS = ("W0_r", "b0_r", "W1_r", "W0_a", "b0_a", "W1_a")
 
 
 def validate_nep_cfg(cfg):
-    """Every NEP cfg guard in one place; returns cfg.nep_descriptor.
-    Field checks run in every mode; mode-specific guards only when on."""
+    """Every NEP cfg guard in one place; returns cfg.nep_descriptor."""
     if int(cfg.nep_l_max) != 4:
         raise ValueError(f"cfg.nep_l_max={cfg.nep_l_max}: GPUMD supports only 4.")
     if cfg.nep_five_body and not cfg.nep_four_body:
@@ -270,28 +255,15 @@ def validate_nep_cfg(cfg):
         if int(getattr(cfg, k)) < 0:
             raise ValueError(f"cfg.{k} must be >= 0.")
     mode = str(getattr(cfg, "nep_descriptor", "off"))
-    if mode not in ("off", "concat", "replace", "sum", "gap_sum"):
+    if mode not in ("off", "concat", "replace", "sum"):
         raise ValueError(
-            f"cfg.nep_descriptor={mode!r}; expected 'off', 'concat', 'replace', "
-            f"'sum' or 'gap_sum'.")
+            f"cfg.nep_descriptor={mode!r}; expected 'off', 'concat', 'replace' or 'sum'.")
     if mode == "off":
         return mode
-    if mode == "gap_sum":
-        # GAP 2b/3b distance descriptors as the two experts (gap_descriptor.py):
-        # no NEP header, no c tensors; the centres must be resolved before
-        # the model is built (MasterTNEP selects them on the training frames).
-        from gap_descriptor import validate_gap_cfg
-        validate_gap_cfg(cfg)
-        if cfg.gap2b_centres is None or cfg.gap3b_centres is None:
-            raise ValueError(
-                "cfg.nep_descriptor='gap_sum' needs cfg.gap2b_centres / gap3b_centres "
-                "(gap_descriptor.select_centres on the training frames; the "
-                "training driver does this when they are None).")
-    from data import descriptor_gradients_needed   # lazy: data imports nep_descriptor (Task 5)
+    from data import descriptor_gradients_needed   # lazy: data imports nep_descriptor
     if descriptor_gradients_needed(cfg):
-        # Phase B (plan §B.2/§B.4): per-candidate NEP pair forces exist for the
-        # tnep DIPOLE readout only; PES / polarisability need forces on both
-        # atoms and virials, "sum" would need de_dq through the experts.
+        # NEP pair forces exist for the tnep dipole readout only; PES / polarisability
+        # need both-atom forces and virials, "sum" would need de_dq through the experts.
         if not (int(cfg.target_mode) == 1 and str(cfg.dipole_readout) == "tnep"
                 and mode in ("concat", "replace")):
             raise NotImplementedError(
@@ -324,13 +296,11 @@ def nep_dim(cfg):
 
 
 def gpumd_num_params(cfg, soap_dim=0):
-    """GPUMD's number_of_variables (parameters.cu:203-235) for this header:
-    NEP4 (one typed ANN per species), one hidden layer, no charge mode —
-    ANN = T·(dim+2)·H + 1 shared bias, c = T²·[(n_r+1)(K_r+1) + (n_a+1)(K_a+1)].
-    Equals SNES.dim for nep_descriptor="replace" + dipole_readout="tnep" with
-    mixing / learned SOAP basis off (descriptor_scale is a pure W0
-    reparameterisation: zero parameters, identity holds under minmax). soap_dim
-    adds the SOAP columns of "concat" to dim (the ANN input width)."""
+    """GPUMD's number_of_variables (parameters.cu:203-235): NEP4 typed ANNs, one hidden
+    layer, no charge mode — ANN = T·(dim+2)·H + 1, c = T²·[(n_r+1)(K_r+1) + (n_a+1)(K_a+1)].
+    Equals SNES.dim for "replace" + dipole_readout="tnep" with mixing / learned basis
+    off (descriptor_scale is a zero-parameter W0 reparameterisation). soap_dim adds the
+    SOAP columns of "concat" to the ANN input width."""
     T, H = int(cfg.num_types), int(cfg.num_neurons)
     ann = T * (nep_dim(cfg) + int(soap_dim) + 2) * H + 1
     c = T * T * ((cfg.nep_n_max_radial + 1) * (cfg.nep_basis_size_radial + 1)
@@ -339,16 +309,9 @@ def gpumd_num_params(cfg, soap_dim=0):
 
 
 def nep_raw_width(cfg):
-    """Width of data["nep_raw"]: the NEP basis, or q2 ‖ q3 under "gap_sum".
-
-    Two NEP layouts, picked by nep_gram_on(cfg):
+    """Width of data["nep_raw"], by nep_gram_on(cfg):
         gram off : raw_r [T, K_r+1] ‖ raw_a [T, K_a+1, 24]
-        gram on  : raw_r [T, K_r+1] ‖ G [4, P]     (the 3-body Gram block)
-    They are mutually exclusive — when the Gram carries the angular
-    information the model never needs raw_a, and vice versa."""
-    if str(getattr(cfg, "nep_descriptor", "off")) == "gap_sum":
-        from gap_descriptor import gap_dim
-        return int(gap_dim(cfg))
+        gram on  : raw_r [T, K_r+1] ‖ G [4, P]     (the 3-body Gram block)"""
     T = int(cfg.num_types)
     w_r = T * (cfg.nep_basis_size_radial + 1)
     if nep_gram_on(cfg):
@@ -362,32 +325,24 @@ def nep_gram_dim(cfg):
 
 
 def gram_pairs(cfg):
-    """(p, q) upper-triangular index pairs over the D angular channels, and
-    the packing multiplicity (2 off the diagonal: G is symmetric)."""
+    """(p, q) upper-triangular pairs over the D angular channels and the packing
+    multiplicity (2 off-diagonal: G is symmetric)."""
     iu = np.triu_indices(nep_gram_dim(cfg))
     return iu[0], iu[1], np.where(iu[0] == iu[1], 1.0, 2.0)
 
 
 def nep_gram_on(cfg):
-    """True when the 3-body invariants can be read off a DATA-STATIC Gram
-    matrix instead of rebuilding the per-candidate s tensor.
+    """True when the 3-body invariants come from a data-static Gram instead of the
+    per-candidate s tensor. q[.., L] = Σ_m w_m·s[.., m]² is quadratic in s and s is
+    linear in c_a, so
 
-    q[.., L] = \u03a3_m w_m\u00b7s[.., m]\u00b2 is QUADRATIC in s, and s is linear in
-    c_a, so the whole L = 1..4 block factorises as
+        q[c, a, n, L] = Σ_{p≤q} c_a[c, t_a, p, n]·c_a[c, t_a, q, n]·G[a, L, pq],
+        G[a, L, pq]   = Σ_{m ∈ block L} w_m·raw_a[a, p, m]·raw_a[a, q, m],
 
-        q[c, a, n, L] = \u03a3_{p\u2264q} c_a[c, t_a, p, n]\u00b7c_a[c, t_a, q, n]\u00b7G[a, L, pq],
-        G[a, L, pq]   = \u03a3_{m \u2208 block L} w_m\u00b7raw_a[a, p, m]\u00b7raw_a[a, q, m],
-
-    and G depends on geometry alone — it is built once with the descriptors
-    and the per-candidate cost collapses to one GEMM per centre type, with no
-    [C, N, n, 24] intermediate at all (that tensor is ~8\u00d7 the Gram block and
-    was the whole cost of the NEP path).
-
-    Not available when:
-      * nep_four_body / nep_five_body — those columns are cubic / quartic in
-        s, with no quadratic Gram form;
-      * the tnep pair-force readout, which needs s itself for the forces.
-    """
+    with G geometry-only: built once, one GEMM per centre type per candidate, no
+    [C, N, n, 24] intermediate (~8× the Gram block; the whole NEP-path cost).
+    Off for nep_four_body / nep_five_body (cubic / quartic in s, no Gram form) and
+    for the tnep pair-force readout (needs s itself)."""
     mode = str(getattr(cfg, "nep_descriptor", "off"))
     if mode not in ("concat", "replace", "sum"):
         return False
@@ -406,9 +361,8 @@ def nep_gram_n_pairs(cfg):
 
 
 def angular_gram_numpy(raw_a, cfg, dtype=np.float32):
-    """G[a, L, pq] packed to [N, 4\u00b7P] from raw_a [N, D, 24].
-    The find_q weights (C3B, doubled off m = 0) and the off-diagonal 2 of the
-    triangular packing are folded in, so the model side is a plain dot."""
+    """G[a, L, pq] packed to [N, 4·P] from raw_a [N, D, 24]; the find_q weights
+    (C3B, doubled off m = 0) and the off-diagonal 2 are folded in."""
     p, q, mult = gram_pairs(cfg)
     out = []
     for L in range(1, 5):
@@ -433,19 +387,17 @@ def nep_slices(cfg):
 
 # ── raw builder + pair stream ──────────────────────────────────────────────
 def nep_pair_list(atoms, cfg):
-    """(i, j, D) from ONE ase call at max(rc_r, rc_a): D = r_j − r_i including the
-    image offset (image-exact — NOT MIC: rc_r = 8 Å exceeds L/2 for the water box),
-    zero-length self entries dropped, sorted by centre i (ase returns pairs sorted
-    by i; masking keeps that order). Shared by nep_raw_numpy and nep_pairs_numpy."""
+    """(i, j, D) from one ase call at max(rc_r, rc_a): D = r_j − r_i with image offset
+    (image-exact, NOT MIC: rc_r = 8 Å exceeds L/2 for the water box), zero-length self
+    entries dropped, sorted by centre i."""
     i, j, D = neighbor_list("ijD", atoms, max(float(cfg.nep_rc_radial), float(cfg.nep_rc_angular)))
     keep = np.linalg.norm(D, axis=1) > 0.0
     return i[keep], j[keep], D[keep]
 
 
 def nep_raw_numpy(atoms, types_int, cfg, pairs=None, dtype=np.float32):
-    """[N, W_raw] float32 = flatten([raw_r [N,T,K_r+1] ‖ raw_a [N,T,K_a+1,24]]),
-    or raw_r ‖ G when nep_gram_on(cfg) — see nep_raw_width for the two layouts.
-    (dtype=np.float64 keeps the float64 accumulation — FD tests)."""
+    """[N, W_raw] float32 = flatten([raw_r ‖ raw_a]), or raw_r ‖ G when nep_gram_on(cfg)
+    (see nep_raw_width). dtype=np.float64 keeps the float64 accumulation for FD tests."""
     N, T = len(atoms), int(cfg.num_types)
     Kr, Ka = int(cfg.nep_basis_size_radial), int(cfg.nep_basis_size_angular)
     rc_r, rc_a = float(cfg.nep_rc_radial), float(cfg.nep_rc_angular)
@@ -465,9 +417,6 @@ def nep_raw_numpy(atoms, types_int, cfg, pairs=None, dtype=np.float32):
     np.add.at(raw_a, (i[m], tj[m]), fn_all(r[m], rc_a, Ka)[:, :, None] * P[:, None, :])
 
     if nep_gram_on(cfg):
-        # The 3-body Gram replaces the angular basis: same information for
-        # every consumer that exists in this mode, 1/8 of the per-candidate
-        # work (nep_gram_on). Built here, once per dataset.
         ang = angular_gram_numpy(raw_a.reshape(N, T * (Ka + 1), NUM_ABC), cfg,
                                  dtype=np.float64)
     else:
@@ -475,8 +424,7 @@ def nep_raw_numpy(atoms, types_int, cfg, pairs=None, dtype=np.float32):
     return np.concatenate([raw_r.reshape(N, -1), ang], 1).astype(dtype)
 
 
-# The five per-pair keys every forward site threads (data dict → predict_batch
-# / predict_batch_candidates kwargs); nep_struct_ptr is the CSR pointer only.
+# Per-pair keys every forward site threads (data dict → predict_batch kwargs).
 NEP_PAIR_KW = ("nep_pair_atom", "nep_pair_gidx", "nep_pair_struct", "nep_pair_D", "nep_pair_ang")
 
 
@@ -486,12 +434,10 @@ def nep_pair_kwargs(d):
 
 
 def nep_pairs_numpy(atoms, cfg, pairs=None):
-    """Image-exact pair stream for the Phase B force contraction (plan §B.3), keyed as
-    in the data dict: nep_pair_atom [P] int32, nep_pair_gidx [P] int32,
-    nep_pair_D [P,3] float32 (r_j − r_i incl. image), nep_pair_ang [P] bool (r < rc_a).
-    nep_pair_ang is computed from the float64 D and is AUTHORITATIVE: the in-graph
-    basis must use it as the angular mask, never re-derive r < rc_a from the float32 D.
-    No basis values stored — Task 11 computes fn/fnp/P/∇P in-graph from D."""
+    """Image-exact pair stream for the force contraction, keyed as in the data dict:
+    nep_pair_atom / nep_pair_gidx [P] int32, nep_pair_D [P,3] float32 (r_j − r_i incl.
+    image), nep_pair_ang [P] bool (r < rc_a). nep_pair_ang comes from the float64 D and
+    is AUTHORITATIVE: never re-derive r < rc_a from the float32 D in-graph."""
     i, j, D = nep_pair_list(atoms, cfg) if pairs is None else pairs
     return dict(nep_pair_atom=i.astype(np.int32), nep_pair_gidx=j.astype(np.int32),
                 nep_pair_D=D.astype(np.float32),
@@ -499,8 +445,8 @@ def nep_pairs_numpy(atoms, cfg, pairs=None):
 
 
 def nep_contract_numpy(raw, types_int, c_r, c_a, cfg):
-    """[N, dim_nep]: GPUMD's contraction of the raw basis with c_r [T,T,n_r+1,K_r+1],
-    c_a [T,T,n_a+1,K_a+1] (index [t_centre, t_neighbour, n, k]). Reference for the TF twin."""
+    """[N, dim_nep]: GPUMD contraction with c_r [T,T,n_r+1,K_r+1], c_a [T,T,n_a+1,K_a+1]
+    (index [t_centre, t_neighbour, n, k]). NumPy reference for the TF twin."""
     N, T = raw.shape[0], int(cfg.num_types)
     Kr, Ka = int(cfg.nep_basis_size_radial), int(cfg.nep_basis_size_angular)
     raw = np.asarray(raw, dtype=np.float64)

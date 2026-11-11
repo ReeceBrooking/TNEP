@@ -18,7 +18,7 @@ from ase.neighborlist import neighbor_list
 import data
 import gap_dipole
 import gap_models as gm
-from TNEPconfig import GAPconfig
+from gap_config import GAPconfig
 
 WATER_XYZ = os.path.join(ROOT, "datasets", "train_waterbulk.xyz")
 
@@ -37,16 +37,13 @@ def _cfg(**kw):
     cfg.total_N = 6
     # Pin ALL readout fields so working-tree experiment defaults never leak.
     cfg.dipole_readout = "neighbor"
-    cfg.dipole_rc = 3.0
     cfg.dipole_channels = 1
     cfg.dipole_radial = "screened"
     cfg.dipole_zeta = -2.0
-    cfg.dipole_cutoff = None                     # resolves to "cubic"
+    cfg.dipole_cutoff = None                     # resolves to "cosine2"
     cfg.dipole_species_pairs = "off"
     cfg.dipole_gauss_sigma_scale = 1.0
-    cfg.pol_field_groups, cfg.pol_field_scale = [], None
-    # gap_2b/gap_3b/nep_descriptor need no pinning: GAPconfig has no ANN
-    # knobs at all, and its NEP-input fields are frozen constants.
+    cfg.dipole_unit_vector = False               # the identity tests hand-build d-geometry columns; û is tested explicitly
     # Descriptor geometry and compression are GAPconfig knobs the user tunes
     # in the working tree (alpha_max, l_max, compress_mode, sigmas, cutoffs);
     # pin them so a live default cannot change dim_q or the kernel under this
@@ -58,16 +55,6 @@ def _cfg(**kw):
     cfg.atom_sigma_t = 0.5
     cfg.rcut_hard, cfg.rcut_soft = 3.5, 3.0
     cfg.gap_delta_soap = 1.0
-    cfg.gap_delta_2b = 1.0
-    cfg.gap_delta_3b = 1.0
-    # The GAP 2b/3b block too: centres, widths, cutoffs and the on/off flags.
-    cfg.gap_2b = False
-    cfg.gap_3b = False
-    cfg.gap2b_rcut, cfg.gap3b_rcut = 3.5, 3.5
-    cfg.gap_buffer = 0.5
-    cfg.gap2b_n_centres, cfg.gap2b_sigma = 20, 0.3
-    cfg.gap3b_n_centres, cfg.gap3b_sigma = 50, [0.5, 0.5, 0.5]
-    cfg.gap2b_centres = cfg.gap3b_centres = None
     cfg.gap_sparse_per_species = 40
     cfg.gap_kernel_power = 2
     cfg.gap_sigma = 1e-3
@@ -102,19 +89,18 @@ def test_predict_identity(fitted):
     ti = np.array([m.cfg.types.index(int(z)) for z in at.numbers])
     D = np.asarray(m.builder.build_descriptors(
         [at], calc_gradients=False)[0][0], dtype=np.float64)
-    rc, zeta = float(m.cfg.dipole_rc), float(m.cfg.dipole_zeta)
+    rc, zeta = float(m.cfg.rcut_hard), float(m.cfg.dipole_zeta)
     i, j, Dv = neighbor_list("ijD", at, rc)
     keep = i != j
     i, d = i[keep], -Dv[keep].astype(np.float64)    # d = r_i − r_j
     r = np.linalg.norm(d, axis=1)
-    x = r / rc
-    w = r ** (zeta - 1.0) * (1.0 - 3.0 * x ** 2 + 2.0 * x ** 3)
+    w = r ** (zeta - 1.0) * ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
     v = np.zeros((len(at), 3))
     np.add.at(v, i, w[:, None] * d)
     mu_ref = np.zeros(3)
     for a in range(len(at)):
         s = sum(m.alpha[ti[a]][k]
-                * float(D[a] @ m.sparse_desc[ti[a]][k]) ** m.xi[0]
+                * float(D[a] @ m.sparse_desc[ti[a]][k]) ** m.xi
                 for k in range(len(m.alpha[ti[a]])))
         mu_ref += s * v[a]
     assert np.allclose(mu, mu_ref, atol=1e-6 * max(np.linalg.norm(mu), 1.0))
@@ -137,7 +123,7 @@ def test_chebyshev_pair_identity(tmp_path):
     ti = np.array([m.cfg.types.index(int(z)) for z in at.numbers])
     D = np.asarray(m.builder.build_descriptors(
         [at], calc_gradients=False)[0][0], dtype=np.float64)
-    C, T, rc = 3, len(m.cfg.types), float(m.cfg.dipole_rc)
+    C, T, rc = 3, len(m.cfg.types), float(m.cfg.rcut_hard)
     i, j, Dv = neighbor_list("ijD", at, rc)
     keep = i != j
     i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)  # d = r_i − r_j
@@ -154,7 +140,7 @@ def test_chebyshev_pair_identity(tmp_path):
         t = ti[a]
         beta = m.alpha[t].reshape(-1, C * T)         # [M_t, K], k = n·T + t′
         for mm in range(beta.shape[0]):
-            ker = float(D[a] @ m.sparse_desc[t][mm]) ** m.xi[0]
+            ker = float(D[a] @ m.sparse_desc[t][mm]) ** m.xi
             for n in range(C):
                 for tp in range(T):
                     mu_ref += ker * beta[mm, n * T + tp] * v[a, :, n, tp]
@@ -253,84 +239,8 @@ def test_determinism(tmp_path):
         assert np.array_equal(a1, a2)
 
 
-# ── pair columns strictly subsume "off": ON fit recovers an OFF model ──────
-
-def test_pair_columns_subsume_off(tmp_path):
-    frames = read(WATER_XYZ, index="0:6")
-    for f in frames:
-        f.calc = None                # else write() collides with info key
-        f.info["dipole"] = np.zeros(3)   # OFF-fit targets are irrelevant
-    p0 = str(tmp_path / "zeros.xyz")
-    write(p0, frames)
-    kw = dict(total_N=None, gap_sparse_per_species=8, gap_sigma=1e-7,
-              dipole_radial="chebyshev", dipole_cutoff="cosine2",
-              dipole_channels=2)
-    with _chdir(tmp_path):
-        off = gap_dipole.fit_gap_dipole(
-            _cfg(data_path=p0, dipole_species_pairs="off", **kw))
-    rng = np.random.default_rng(1)
-    off = replace(off, site_alpha={**off.site_alpha, "soap": [rng.normal(size=len(a)) for a in off.alpha]})
-    mu_off = gap_dipole.predict(off, frames)
-    for f, mu in zip(frames, mu_off):
-        f.info["dipole"] = mu
-    p1 = str(tmp_path / "off_targets.xyz")
-    write(p1, frames)
-    with _chdir(tmp_path):
-        on = gap_dipole.fit_gap_dipole(
-            _cfg(data_path=p1, dipole_species_pairs="ordered", **kw))
-    assert np.allclose(gap_dipole.predict(on, frames), mu_off,
-                       atol=1e-8 * max(np.abs(mu_off).max(), 1.0))
 
 
-# ── sum-of-kernels: ξ list column blocks ───────────────────────────────────
-
-def test_sum_kernel_identity(tmp_path):
-    """predict() with ξ=[1,3] vs hand-rolled numpy: own kernel powers, own
-    block order (species → ξ → (m, k))."""
-    with _chdir(tmp_path):
-        m = gap_dipole.fit_gap_dipole(
-            _cfg(**CHEB_PAIRS, gap_kernel_power=[1, 3],
-                 gap_sparse_per_species=8))
-    at = read(WATER_XYZ, index="10")
-    mu = gap_dipole.predict(m, [at])[0]
-    ti = np.array([m.cfg.types.index(int(z)) for z in at.numbers])
-    D = np.asarray(m.builder.build_descriptors(
-        [at], calc_gradients=False)[0][0], dtype=np.float64)
-    C, T, rc = 3, len(m.cfg.types), float(m.cfg.dipole_rc)
-    i, j, Dv = neighbor_list("ijD", at, rc)
-    keep = i != j
-    i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)
-    r = np.linalg.norm(d, axis=1)
-    fc = ((1.0 + np.cos(np.pi * r / rc)) / 2.0) ** 2
-    Tn = np.cos(np.arange(C)[None, :] * np.arccos(2.0 * r / rc - 1.0)[:, None])
-    v = np.zeros((len(at), 3, C, T))
-    for p in range(len(i)):
-        for n in range(C):
-            v[i[p], :, n, ti[j[p]]] += Tn[p, n] * fc[p] * d[p]
-    K = C * T
-    mu_ref = np.zeros(3)
-    for a in range(len(at)):
-        t = ti[a]
-        M_t = len(m.sparse_desc[t])
-        beta = m.alpha[t].reshape(2, M_t, K)         # ξ-major, then (m, k)
-        for x, xi in enumerate((1, 3)):              # own powers
-            for mm in range(M_t):
-                ker = float(D[a] @ m.sparse_desc[t][mm]) ** xi
-                for n in range(C):
-                    for tp in range(T):
-                        mu_ref += (ker * beta[x, mm, n * T + tp]
-                                   * v[a, :, n, tp])
-    assert np.allclose(mu, mu_ref, atol=1e-6 * max(np.linalg.norm(mu), 1.0))
-
-
-def test_sum_kernel_singleton_list_equals_int(tmp_path):
-    """Falsifier for the normalization path: ξ=[2] must equal ξ=2 EXACTLY."""
-    with _chdir(tmp_path):
-        m_int = gap_dipole.fit_gap_dipole(_cfg(gap_kernel_power=2))
-        m_list = gap_dipole.fit_gap_dipole(_cfg(gap_kernel_power=[2]))
-    assert m_list.xi == m_int.xi == (2,)
-    for a1, a2 in zip(m_int.alpha, m_list.alpha):
-        assert np.array_equal(a1, a2)
 
 
 # ── multi-scale second cutoff ──────────────────────────────────────────────
@@ -345,7 +255,7 @@ def test_multiscale_exact_recovery_known_alpha(tmp_path):
     p0 = str(tmp_path / "zeros.xyz")
     write(p0, frames)
     kw = dict(total_N=None, gap_sparse_per_species=8, gap_sigma=1e-7,
-              gap_extra_rcut=4.5, gap_kernel_power=[1, 2], **CHEB_PAIRS)
+              gap_extra_rcut=4.5, **CHEB_PAIRS)
     with _chdir(tmp_path):
         base = gap_dipole.fit_gap_dipole(_cfg(data_path=p0, **kw))
     assert base.builder2 is not None and base.alpha2 is not None
@@ -381,8 +291,8 @@ def test_multiscale_off_by_default(tmp_path):
     (dict(dipole_channels=0), "dipole_channels"),
     (dict(dipole_readout="tnep"), "dipole_readout"),
     (dict(target_mode=0), "target_mode"),
-    (dict(gap_kernel_power=[0]), "gap_kernel_power"),
-    (dict(gap_kernel_power=[]), "gap_kernel_power"),
+    (dict(gap_kernel_power=0), "gap_kernel_power"),
+    (dict(gap_kernel_power=[2]), "gap_kernel_power"),
     (dict(gap_extra_rcut=-1.0), "gap_extra_rcut"),
     # frozen on the class; this pins the guard against instance mutation
     (dict(nep_descriptor="concat"), "nep_descriptor"),
@@ -424,7 +334,7 @@ def test_run_record(tmp_path):
     assert rec["gap"]["sparse_per_species"] == 10
     assert set(rec["gap"]["M_per_species"]["soap"]) == {"8", "1"}
     assert rec["gap"]["radial"] == "screened"
-    assert rec["gap"]["cutoff"] == "cubic"
+    assert rec["gap"]["cutoff"] == "cosine2"
     assert rec["gap"]["channels"] == 1
     assert rec["gap"]["pair_columns"] is False
     assert rec["gap"]["n_columns"] == sum(rec["gap"]["M_per_species"]["soap"].values())
@@ -446,17 +356,17 @@ def test_fit_is_gap_fit_sparse_gp(tmp_path):
     dataset = [dataset[k] for k in cfg.indices]
     tis = data.assign_type_indices(dataset, cfg.types)
     descs = gap_dipole._descriptors(model.builder, dataset)
-    deltas = gap_dipole._deltas(cfg)
+    delta = float(cfg.gap_delta_soap)
     Phi = np.stack([gap_dipole._phi_frame(
-        [(descs[f], model.sparse_desc, gap_dipole._v_atoms(dataset[f], tis[f], cfg), deltas[0])],
-        tis[f], model.xi, None, deltas[1:]) for f in range(len(dataset))])
+        [(descs[f], model.sparse_desc, gap_dipole._v_atoms(dataset[f], tis[f], cfg), delta)],
+        tis[f], model.xi) for f in range(len(dataset))])
     Phi_flat = Phi.reshape(-1, Phi.shape[-1])
     mu = gap_dipole._targets(dataset, cfg)
     K = Phi.shape[-1] // sum(len(sd) for sd in model.sparse_desc)       # readout columns per sparse point
     w = np.repeat(1.0 / (cfg.gap_sigma * np.sqrt([len(a) for a in dataset])), 3)
     pen = []
     for Dm in model.sparse_desc:                                        # one block per species (one ξ)
-        Kmm = deltas[0] ** 2 * (Dm @ Dm.T) ** model.xi[0] + cfg.gap_sparse_jitter * np.eye(len(Dm))
+        Kmm = delta ** 2 * (Dm @ Dm.T) ** model.xi + cfg.gap_sparse_jitter * np.eye(len(Dm))
         pen.append(np.kron(np.linalg.cholesky(Kmm).T, np.eye(K)))
     n_cols = Phi_flat.shape[1]
     R = np.zeros((n_cols, n_cols)); o = 0
@@ -498,23 +408,19 @@ def test_configs_are_independent():
     assert not issubclass(TNEPconfig, GAPconfig)
     assert GAPconfig.__bases__ == (object,) == TNEPconfig.__bases__
     # Every field GAPconfig declares also exists on TNEPconfig (duplicates,
-    # not renames), bar two deliberate exceptions: descriptor_self_batch_size,
-    # which data.py reads via getattr and TNEPconfig never declared, and the
-    # gap_delta_* amplitudes, which are GAP-only hyperparameters of the summed
-    # kernel model and have no ANN counterpart.
-    gap_only = {"descriptor_self_batch_size", "gap_delta_soap",
-                "gap_delta_2b", "gap_delta_3b", "gap_sigma", "gap_sparse_jitter",
+    # not renames), bar the GAP-only kernel-fit knobs below.
+    gap_only = {"gap_delta_soap", "gap_sigma", "gap_sparse_jitter",
                 # polarisability kernel-group knobs of the linear fit
-                "gap_group_delta", "gap_lambda_shear", "gap_cross_channels",
+                "gap_lambda_shear", "gap_cross_channels",
                 "gap_site_models", "gap_model_delta", "gap_site_channels",
-                "gap_site_lmax", "gap_cross_lmax", "gap_site_rcut", "gap_angular_cross",
-                "gap_triplet_tensor",
-                "pol_field_groups", "pol_field_scale", "pol_induced_alpha"}
+                "gap_site_lmax", "gap_cross_lmax", "dipole_unit_vector"}
     missing = (set(GAPconfig.__annotations__)
                - set(TNEPconfig.__annotations__) - gap_only)
     assert not missing, missing
-    for f in ("gap_delta_soap", "gap_delta_2b", "gap_delta_3b"):
-        assert hasattr(GAPconfig, f) and not hasattr(TNEPconfig, f)
+    assert hasattr(GAPconfig, "gap_delta_soap") and not hasattr(TNEPconfig, "gap_delta_soap")
+    # ANN-input modes are frozen plain attributes, not fields
+    for f in ("nep_descriptor", "dipole_readout", "scale_targets", "dipole_rij_power"):
+        assert hasattr(GAPconfig, f) and f not in GAPconfig.__annotations__
 
 
 # ── polarisability (target_mode=2): rank-2 kernel, 6 Voigt rows per frame ──
@@ -547,7 +453,7 @@ def test_pol_exact_recovery_known_alpha(tmp_path):
     at = frames[2]
     ti = np.array([refit.cfg.types.index(int(z)) for z in at.numbers])
     D = np.asarray(refit.builder.build_descriptors([at], calc_gradients=False)[0][0])
-    rc, C = float(refit.cfg.dipole_rc), 3
+    rc, C = float(refit.cfg.rcut_hard), 3
     i, j, Dv = neighbor_list("ijD", at, rc)
     keep = i != j
     i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)
@@ -564,7 +470,7 @@ def test_pol_exact_recovery_known_alpha(tmp_path):
               np.einsum("pdg,pn->pdgn", geom, R).reshape(len(r), 6, 2 * C))
     a_ref = np.zeros(6)
     for n in range(len(at)):
-        k = (D[n] @ refit.sparse_desc[ti[n]].T) ** refit.xi[0]      # [M]
+        k = (D[n] @ refit.sparse_desc[ti[n]].T) ** refit.xi         # [M]
         s = (refit.alpha[ti[n]].reshape(len(k), -1) * k[:, None]).sum(0)  # [2C·T']
         a_ref += W[n].reshape(6, -1) @ s
     assert np.allclose(gap_dipole.predict(refit, [at])[0], a_ref,
@@ -580,14 +486,13 @@ POL_KW = dict(target_mode=2, dipole_radial="chebyshev", dipole_channels=3,
 def test_pol_cross_group_identity_and_column_count(tmp_path):
     """_cross_group == hand-rolled sym(v^a⊗v^b) − tr/3 over channel pairs of the
     species-resolved dipole kernel; the design gains K₁(K₁+1)/2 columns per
-    sparse point and the fit runs end to end with group δ and λ_shear set."""
+    sparse point and the fit runs end to end with λ_shear set."""
     at = read(WATER_XYZ, index="4")
-    cfg = _cfg(**POL_KW, gap_cross_channels=2, gap_group_delta=[1.0, 2.0, 0.5],
-               gap_lambda_shear=2.0)
+    cfg = _cfg(**POL_KW, gap_cross_channels=2, gap_lambda_shear=2.0)
     cfg.types, cfg.num_types = [8, 1], 2    # collect() normally sets these
     ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
     X = gap_dipole._cross_group(gap_dipole._cross_vectors(at, ti, cfg))   # [N, 6, K_x]
-    rc, Cx, T = float(cfg.dipole_rc), 2, 2
+    rc, Cx, T = float(cfg.rcut_hard), 2, 2
     i, j, Dv = neighbor_list("ijD", at, rc)
     keep = i != j
     i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)
@@ -611,17 +516,15 @@ def test_pol_cross_group_identity_and_column_count(tmp_path):
     assert X.shape == (len(at), 6, K1 * (K1 + 1) // 2)
     assert np.allclose(X, ref, atol=2e-5 * np.abs(ref).max())      # V is staged in float32
     assert np.allclose(X[:, :3].sum(1), 0.0, atol=2e-5 * np.abs(ref).max())   # traceless
-    # Group δ scale the two bond groups, the cross group rides behind them.
+    # The two bond groups come first, the cross group rides behind them.
     vfull = gap_dipole._v_atoms(at, ti, cfg)
     cfg0 = _cfg(**POL_KW); cfg0.types, cfg0.num_types = [8, 1], 2
     base = gap_dipole._v_atoms(at, ti, cfg0)
     assert vfull.shape[2] == gap_dipole._n_vcols(cfg) == 2 * 3 * T + K1 * (K1 + 1) // 2
-    assert np.allclose(vfull[:, :, :6], base[:, :, :6] * 1.0)
-    assert np.allclose(vfull[:, :, 6:12], base[:, :, 6:12] * 2.0)
-    assert np.allclose(vfull[:, :, 12:], 0.5 * X)
+    assert np.allclose(vfull[:, :, :12], base)
+    assert np.allclose(vfull[:, :, 12:], X)
     with _chdir(tmp_path):
         m = gap_dipole.fit_gap_dipole(_cfg(**POL_KW, gap_cross_channels=2,
-                                           gap_group_delta=[1.0, 2.0, 0.5],
                                            gap_lambda_shear=2.0, gap_sparse_per_species=6))
         rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
     assert rec["gap"]["cross_channels"] == 2 and rec["gap"]["lambda_shear"] == 2.0
@@ -631,7 +534,6 @@ def test_pol_cross_group_identity_and_column_count(tmp_path):
 
 @pytest.mark.parametrize("kw,msg", [
     (dict(target_mode=1, gap_cross_channels=-1), "gap_cross_channels"),
-    (dict(target_mode=2, gap_group_delta=[1.0, 1.0]), "gap_group_delta"),
     (dict(target_mode=2, gap_lambda_shear=0.0), "gap_lambda_shear"),
 ])
 def test_pol_group_validation_raises(kw, msg):
@@ -648,7 +550,7 @@ def test_dipole_cross_group_identity_and_fit(tmp_path):
     cfg.types, cfg.num_types = [8, 1], 2
     ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
     W = gap_dipole._cross_group_dipole(at, ti, cfg)                 # [N, 3, K₁²]
-    rc, Cx, T = float(cfg.dipole_rc), 2, 2
+    rc, Cx, T = float(cfg.rcut_hard), 2, 2
     i, j, Dv = neighbor_list("ijD", at, rc)
     keep = i != j
     i, j, d = i[keep], j[keep], -Dv[keep].astype(np.float64)
@@ -675,9 +577,9 @@ def test_dipole_cross_group_identity_and_fit(tmp_path):
 # ── site models (gap_site_models) ───────────────────────────────────────────
 
 def test_site_model_fields_are_gap_only_and_validated():
-    from TNEPconfig import GAPconfig, TNEPconfig
+    from TNEPconfig import TNEPconfig
     for f in ("gap_site_models", "gap_model_delta", "gap_site_channels", "gap_site_lmax",
-              "gap_cross_lmax", "gap_site_rcut"):
+              "gap_cross_lmax"):
         assert hasattr(GAPconfig, f) and not hasattr(TNEPconfig, f)
     assert GAPconfig.gap_site_models == ["soap"]            # default = today's model
     with pytest.raises(ValueError, match="gap_site_models"):
@@ -694,9 +596,6 @@ def test_site_model_fields_are_gap_only_and_validated():
         gap_dipole._validate(_cfg(gap_site_models=["3b"], dipole_radial="chebyshev", dipole_channels=3))
     with pytest.raises(ValueError, match="multi-channel radial"):
         gap_dipole._validate(_cfg(gap_site_models=["2b"]))          # _cfg default radial is "screened"
-    for rc in (-1.0, 5.0):                                           # ≤ 0, and set without 2b/3b
-        with pytest.raises(ValueError, match="gap_site_rcut"):
-            gap_dipole._validate(_cfg(gap_site_models=["soap"], gap_site_rcut=rc))
     gap_dipole._validate(_cfg(gap_site_models=["soap", "2b", "3b"], dipole_radial="chebyshev",
                               dipole_channels=3, gap_cross_channels=2,
                               gap_model_delta={"soap": 1.0, "2b": 0.5, "3b": 0.1}))
@@ -790,220 +689,16 @@ def test_site_models_3b_alone_dipole_runs_and_record(tmp_path):
     assert isinstance(us, float) and us > 0
 
 
-# ── long-range polarisability columns (pol_field_groups, data.py) ──────────
-
-SPCE = {8: -0.8476, 1: 0.4238}
-
-
-def _voigt_mat(W):
-    """Voigt [N, 6, G] → [N, 3, 3, G]."""
-    M = np.zeros((W.shape[0], 3, 3) + W.shape[2:])
-    M[:, 0, 0], M[:, 1, 1], M[:, 2, 2] = W[:, 0], W[:, 1], W[:, 2]
-    M[:, 0, 1] = M[:, 1, 0] = W[:, 3]; M[:, 1, 2] = M[:, 2, 1] = W[:, 4]; M[:, 0, 2] = M[:, 2, 0] = W[:, 5]
-    return M
-
-
-def test_pol_grad_group_is_minus_q_T_by_finite_differences():
-    """∇E_i = −Σ_j q_j T_ij (data.ewald_dipole_tensor) against central
-    differences of data.ewald_field under ±1e-4 Å displacements of atom i,
-    traceless parts (the full tensors differ by an isotropic self term:
-    the own Gaussian cloud's k = 0-cell residual on T's diagonal)."""
-    for at in read(WATER_XYZ, index="0:6"):
-        q = np.array([SPCE[int(z)] for z in at.numbers])
-        G = -np.einsum("j,jab->ab", q, data.ewald_dipole_tensor(at)[0])
-        fd = np.zeros((3, 3))
-        for a in range(3):
-            p, m = at.copy(), at.copy()
-            p.positions[0, a] += 1e-4; m.positions[0, a] -= 1e-4
-            fd[:, a] = (data.ewald_field(p, q)[0] - data.ewald_field(m, q)[0]) / 2e-4
-        dev = lambda M: M - np.trace(M) / 3 * np.eye(3)
-        assert np.abs(dev(G) - dev(fd)).max() < 1e-4 * np.abs(fd).max()
-        assert np.abs(dev(G) + dev(fd)).max() > 0.5 * np.abs(fd).max()      # the sign is live
-
-
-@pytest.mark.parametrize("group", data.POL_FIELD_GROUPS)
-def test_pol_field_group_equivariance(group):
-    """Every site tensor rotates as Q W Qᵀ under a random proper rotation of the
-    frame and is unchanged by a (wrapped) translation."""
-    from scipy.spatial.transform import Rotation
-    at = read(WATER_XYZ, index="3")
-    cfg = _cfg(**POL_SITE, dipole_field_charges=SPCE, pol_field_groups=[group])
-    cfg.types, cfg.num_types = [8, 1], 2
-    ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
-    rng = np.random.default_rng(1)
-    Q = Rotation.random(random_state=rng).as_matrix()
-    rot = at.copy(); rot.set_cell(at.cell.array @ Q.T); rot.positions = at.positions @ Q.T
-    tr = at.copy(); tr.positions += rng.uniform(-5.0, 5.0, 3); tr.wrap()
-    f = lambda a: data.pol_field_groups(a, ti, cfg, gap_dipole._cross_vectors(a, ti, cfg))
-    W, Wr, Wt = f(at), f(rot), f(tr)
-    assert W.shape == (len(at), 6, data.pol_group_width(cfg))
-    M = _voigt_mat(W)
-    tol = (1e-6 if group == "cross" else 1e-8) * np.abs(W).max()     # cross vectors are staged float32
-    assert np.abs(np.einsum("ab,nbcg,dc->nadg", Q, M, Q) - _voigt_mat(Wr)).max() < tol
-    assert np.abs(W - Wt).max() < 1e-8 * np.abs(W).max()
-
-
-def test_pol_induced_group_is_traceless_gap_ewald_tensor():
-    import gap_ewald
-    assert gap_ewald.induced_site_tensors is data.induced_site_tensors    # moved, re-exported
-    at = read(WATER_XYZ, index="2")
-    cfg = _cfg(**POL_SITE, dipole_field_charges=SPCE, pol_field_groups=["induced"])
-    cfg.types, cfg.num_types = [8, 1], 2
-    W = gap_ewald.induced_site_tensors(at, {8: 1.45, 1: 0.0})
-    iso = W[:, :3].mean(1, keepdims=True)
-    ref = W - np.concatenate([iso.repeat(3, 1), np.zeros((len(at), 3))], 1)
-    assert np.array_equal(data.pol_field_groups(at, None, cfg, None)[:, :, 0], ref)
-
-
-def test_pol_field_groups_column_count_fit_and_pinned_scale(tmp_path):
+def test_unit_vector_geometry_used_by_fit_and_predict():
+    """dipole_unit_vector: the fit's design matrix (V from data.assemble_data_dict) and predict (_v_atoms / gap_gpu)
+    must use the same bond geometry. 2026-10-28: the fit path once ignored the flag → 900 % test RRMSE."""
+    import tempfile
     frames = read(WATER_XYZ, index="0:6")
-    for f in frames:
-        f.calc = None
-    p0 = str(tmp_path / "pol0.xyz"); write(p0, frames)
-    groups = ["induced", "grad", "cross", "quad", "qeq"]
-    kw = dict(POL_SITE, total_N=None, gap_sparse_per_species=6, gap_sigma=1e-7,
-              dipole_field_charges=SPCE, pol_field_groups=groups)
-    with _chdir(tmp_path):
-        m = gap_dipole.fit_gap_dipole(_cfg(data_path=p0, **kw))
-        rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
-    T, C, Cx = 2, 3, 2
-    K1 = Cx * T
-    assert gap_dipole._n_vcols(m.cfg) == 2 * C * T + K1 * (K1 + 1) // 2 + (1 + 1 + 2 * Cx + 2 + 2)
-    assert [a.size for a in m.alpha] == [6 * gap_dipole._n_vcols(m.cfg)] * T
-    assert gap_dipole.predict(m, frames).shape == (6, 6)
-    scale = m.cfg.pol_field_scale
-    assert list(scale) == groups and all(isinstance(x, float) and x > 0 for x in scale.values())
-    assert rec["gap"]["pol_field_groups"] == groups and rec["gap"]["pol_field_scale"] == scale
-    assert rec["config"]["pol_field_scale"] == scale
-    # fit and predict share one geometry path (scale pinned): a known α* is recovered
-    rng = np.random.default_rng(0)
-    star = replace(m, site_alpha={"soap": [rng.normal(size=a.size) for a in m.alpha]})
-    a_star = gap_dipole.predict(star, frames)
-    for f, a in zip(frames, a_star):
-        f.info["pol"] = a
-    p1 = str(tmp_path / "pol1.xyz"); write(p1, frames)
-    with _chdir(tmp_path):
-        refit = gap_dipole.fit_gap_dipole(_cfg(data_path=p1, **kw))
-    assert refit.cfg.pol_field_scale == scale
-    assert np.allclose(gap_dipole.predict(refit, frames), a_star,
-                       atol=1e-8 * max(np.abs(a_star).max(), 1.0))
+    tmp = os.path.join(tempfile.mkdtemp(), "six.xyz"); write(tmp, frames)
+    kw = dict(data_path=tmp, total_N=None, target_mode=2, dipole_channels=3, dipole_radial="chebyshev",
+              dipole_species_pairs="symmetric", gap_sparse_per_species=8, gap_sigma=0.1)
+    unit = gap_dipole.fit_gap_dipole(_cfg(dipole_unit_vector=True, **kw)); plain = gap_dipole.fit_gap_dipole(_cfg(dipole_unit_vector=False, **kw))
+    np.testing.assert_allclose(unit.train_pred, gap_dipole.predict(unit, frames), rtol=1e-6, atol=1e-6)   # fit == predict
+    assert np.abs(unit.train_pred - plain.train_pred).max() > 1e-3                                       # and the flag acts
 
 
-# ── angular-cross polarisability group (gap_angular_cross) ──────────────────
-
-def test_angular_cross_group_equivariance_and_structure():
-    """Every column tensor rotates as Q W Qᵀ; isotropic columns ∝ I, traceless
-    ones have zero trace, all symmetric by construction (Voigt)."""
-    from scipy.spatial.transform import Rotation
-    at = read(WATER_XYZ, index="3")
-    cfg = _cfg(**dict(POL_SITE, gap_cross_lmax=2), gap_angular_cross=True)
-    cfg.types, cfg.num_types = [8, 1], 2
-    ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
-    Q = Rotation.random(random_state=np.random.default_rng(1)).as_matrix()
-    rot = at.copy(); rot.set_cell(at.cell.array @ Q.T); rot.positions = at.positions @ Q.T
-    f = lambda a: gap_dipole._angular_cross_group(gm.angular_cross_vector(a, ti, cfg),
-                                                  gap_dipole._cross_vectors(a, ti, cfg), cfg)
-    W, Wr = f(at), f(rot)
-    Cx, L = 2, 2
-    G = Cx ** 3 * L
-    assert W.shape == (len(at), 6, 2 * G)
-    tol = 1e-6 * np.abs(W).max()                                      # cross vectors are staged float32
-    assert np.abs(np.einsum("ab,nbcg,dc->nadg", Q, _voigt_mat(W), Q) - _voigt_mat(Wr)).max() < tol
-    iso, tr = W[:, :, :G], W[:, :, G:]
-    assert np.abs(iso[:, 3:]).max() == 0.0 and np.allclose(iso[:, :3], iso[:, :1], atol=1e-10)
-    assert np.abs(tr[:, :3].sum(1)).max() < 1e-10 * np.abs(W).max()
-
-
-def test_angular_cross_group_width_fit_and_record(tmp_path):
-    for Cx, L in ((2, 2), (3, 1)):
-        kw = dict(POL_SITE, gap_cross_channels=Cx, gap_cross_lmax=L, num_types=2)
-        off = gap_dipole._n_vcols(_cfg(**kw))
-        on = gap_dipole._n_vcols(_cfg(**kw, gap_angular_cross=True))
-        assert on - off == 2 * Cx ** 3 * L
-    frames = read(WATER_XYZ, index="0:6")
-    with _chdir(tmp_path):
-        m = gap_dipole.fit_gap_dipole(_cfg(**POL_SITE, gap_angular_cross=True,
-                                           gap_sparse_per_species=6))
-        rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
-    assert rec["gap"]["angular_cross"] is True
-    assert gap_dipole.predict(m, frames).shape == (6, 6)
-
-
-@pytest.mark.parametrize("kw,msg", [
-    (dict(target_mode=1, gap_cross_channels=2, gap_angular_cross=True), "target_mode"),
-    (dict(POL_KW, gap_cross_channels=0, gap_angular_cross=True), "gap_cross_channels"),
-    (dict(POL_KW, gap_cross_channels=2, gap_cross_lmax=0, gap_angular_cross=True), "gap_cross_lmax"),
-])
-def test_angular_cross_validation_raises(kw, msg):
-    with pytest.raises(ValueError, match=msg):
-        gap_dipole._validate(_cfg(**kw))
-
-
-# ── triplet-tensor polarisability group (gap_triplet_tensor) ────────────────
-
-TT_KW = dict(POL_KW, gap_triplet_tensor=True, gap3b_kernel="exp", gap3b_n_centres=5)
-TT_CENTRES = [[3.0, 0.0, 1.5], [4.0, 0.5, 2.5], [5.0, 1.0, 3.0], [4.5, 0.2, 4.0], [3.5, 2.0, 2.0]]
-
-
-def test_triplet_tensor_group_equivariance_structure_and_hand_loop():
-    """Every column tensor rotates as Q W Qᵀ and is translation invariant (pure
-    float64); isotropic columns ∝ I, traceless ones trace-free; and one centre
-    equals a direct loop over the j < k triplets with the 3b kernel and cutoffs."""
-    from scipy.spatial.transform import Rotation
-    from gap_descriptor import f_cut
-    at = read(WATER_XYZ, index="3")
-    cfg = _cfg(**TT_KW, gap3b_centres=TT_CENTRES)
-    cfg.types, cfg.num_types = [8, 1], 2
-    ti = np.array([cfg.types.index(int(z)) for z in at.numbers])
-    Q = Rotation.random(random_state=np.random.default_rng(1)).as_matrix()
-    rot = at.copy(); rot.set_cell(at.cell.array @ Q.T); rot.positions = at.positions @ Q.T
-    sh = at.copy(); sh.positions += [0.37, -1.2, 2.9]
-    f = lambda a: gap_dipole._triplet_tensor_group(a, ti, cfg)
-    W = f(at)
-    assert W.shape == (len(at), 6, 10)
-    assert np.abs(np.einsum("ab,nbcg,dc->nadg", Q, _voigt_mat(W), Q) - _voigt_mat(f(rot))).max() < 1e-10
-    assert np.abs(f(sh) - W).max() < 1e-10
-    iso, tr = W[:, :, :5], W[:, :, 5:]
-    assert np.abs(iso[:, 3:]).max() == 0.0 and np.allclose(iso[:, :3], iso[:, :1], atol=1e-12)
-    assert np.abs(tr[:, :3].sum(1)).max() < 1e-10
-    # hand loop, atom 0, centre s = 1: W = Σ_{j<k} f(r_ij) f(r_ik) exp(-½|(q−Q_s)/σ|²) sym(d_ij⊗d_ik)
-    i0, s = 0, 1
-    ii, D = neighbor_list("iD", at, 3.5)
-    Ds = [d for i, d in zip(ii, D) if i == i0 and 0 < np.linalg.norm(d) < 3.5]
-    M = np.zeros((3, 3))
-    for a in range(len(Ds)):
-        for b in range(a + 1, len(Ds)):
-            ra, rb = np.linalg.norm(Ds[a]), np.linalg.norm(Ds[b])
-            q = np.array([ra + rb, (ra - rb) ** 2, np.linalg.norm(Ds[b] - Ds[a])])
-            k = np.exp(-0.5 * np.sum(((q - TT_CENTRES[s]) / 0.5) ** 2))
-            M += f_cut(ra, 3.5, 0.5) * f_cut(rb, 3.5, 0.5) * k * 0.5 * (np.outer(Ds[a], Ds[b]) + np.outer(Ds[b], Ds[a]))
-    assert np.allclose(_voigt_mat(W)[i0, :, :, s] + _voigt_mat(W)[i0, :, :, 5 + s], M, atol=1e-12)
-
-
-def test_triplet_tensor_group_width_fit_and_record(tmp_path):
-    assert gap_dipole._n_vcols(_cfg(**TT_KW, num_types=2)) - gap_dipole._n_vcols(_cfg(**POL_KW, num_types=2)) == 10
-    frames = read(WATER_XYZ, index="0:6")
-    with _chdir(tmp_path):
-        m = gap_dipole.fit_gap_dipole(_cfg(**TT_KW, gap_sparse_per_species=6))
-        rec = json.load(open(sorted(__import__("glob").glob("GAP/*.json"))[-1]))
-    assert rec["gap"]["triplet_tensor"] is True
-    assert np.shape(rec["gap"]["gap3b_centres"]) == (5, 3) and rec["config"]["gap3b_centres"] == m.cfg.gap3b_centres
-    assert gap_dipole.predict(m, frames).shape == (6, 6)
-
-
-def test_triplet_tensor_validation_raises():
-    with pytest.raises(ValueError, match="target_mode"):
-        gap_dipole._validate(_cfg(**dict(TT_KW, target_mode=1)))
-
-
-@pytest.mark.parametrize("kw,msg", [
-    (dict(target_mode=1, pol_field_groups=["quad"], dipole_field_charges=SPCE), "target_mode=2"),
-    (dict(POL_KW, pol_field_groups=["bogus"], dipole_field_charges=SPCE), "subset"),
-    (dict(POL_KW, pol_field_groups=["quad", "quad"], dipole_field_charges=SPCE), "repeats"),
-    (dict(POL_KW, pol_field_groups=["cross"], dipole_field_charges=SPCE, gap_cross_channels=0),
-     "gap_cross_channels"),
-    (dict(POL_KW, pol_field_groups=["quad"]), "dipole_field_charges"),
-])
-def test_pol_field_groups_validation_raises(kw, msg):
-    with pytest.raises(ValueError, match=msg):
-        gap_dipole._validate(_cfg(**kw))

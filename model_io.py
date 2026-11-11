@@ -15,25 +15,17 @@ _W_PRE_REMOVED = (
     "build. Its W0 lives at the contracted width and cannot be mapped onto "
     "this model. The model must be retrained.")
 
-# Backward-compat: if a saved model predates a config field, the live
-# TNEPconfig class default may have drifted since it was trained, silently
-# changing behaviour on load. For each field here, when the saved config
-# lacks it, restore the value it implicitly had before the field existed.
-# Fields whose default already matches are kept listed so a future
-# default-flip can't silently regress old loads.
-# (The `_cr_*` CR-FM-NES keys are deliberately NOT here — they're `snes`
-# group datasets, not config fields; their absence just means the model
-# wasn't trained with that feature.)
+# Backward-compat: a saved config lacking a field gets the value it implicitly
+# had before the field existed, not the (possibly drifted) class default.
+# Fields whose default already matches stay listed so a future flip can't
+# regress old loads. (`_cr_*` CR-FM-NES keys are snes datasets, not config.)
 _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
-    # Pre-existence: only the N=2 dipole path existed (Xu et al. JCTC 2024);
-    # class default is now 0.
+    # Only the N=2 dipole path existed (Xu et al. JCTC 2024); class default now 0.
     "dipole_rij_power": 2,
     # Pre-existence: only the TNEP-form readout existed.
     "dipole_readout": "tnep",
-    "dipole_rc": None,
-    # Architecture-affecting fields (silent-mismatch danger zone): a
-    # pre-mixing model has no U_pair, so letting the True default through
-    # would build a mixing layer with random weights and mis-predict.
+    # Architecture-affecting: a pre-mixing model has no U_pair, so the True
+    # default would build a mixing layer with random weights.
     "descriptor_mixing": False,
     "descriptor_mixing_per_type": False,
     "descriptor_mixing_regularizer": "off",
@@ -44,8 +36,7 @@ _LEGACY_FIELD_DEFAULTS: dict[str, object] = {
     "dipole_zeta": -2.0,
     # Pre-existence: no gaussian radial; scale unused elsewhere.
     "dipole_gauss_sigma_scale": 1.0,
-    # Pre-existence: cutoff hard-wired per radial family; None resolves to
-    # exactly that (resolved_dipole_cutoff).
+    # Cutoff was hard-wired per radial family; None resolves to that.
     "dipole_cutoff": None,
     # Pre-existence: no species-pair table (legacy bool False ≡ "off").
     "dipole_species_pairs": "off",
@@ -72,29 +63,21 @@ def _apply_legacy_field_defaults(cfg: TNEPconfig,
     for field, legacy in _LEGACY_FIELD_DEFAULTS.items():
         if field not in saved:
             setattr(cfg, field, legacy)
-    # Legacy bool dipole_species_pairs (pre-3-value saves): False→"off",
-    # True→"symmetric" (model init normalizes too; this keeps cfg clean for
-    # re-saves and validation before a model exists).
+    # Legacy bool dipole_species_pairs: False→"off", True→"symmetric".
     sp = getattr(cfg, "dipole_species_pairs", "off")
     cfg.dipole_species_pairs = {False: "off", True: "symmetric"}.get(sp, sp)
 
 
 def setup_run_directory(cfg: TNEPconfig) -> str:
-    """Create a timestamped run directory (with plots/ and a human-readable
-    config.txt) and set cfg.save_path/save_plots in place.
-
-    The base directory is taken from cfg.save_path — the timestamped run dir is
-    created under `dirname(cfg.save_path)`, so save_path='myruns/auto' saves under
-    myruns/, and the default 'models/auto' saves under models/. Requires cfg.dim_q
-    (call after descriptor building). Returns the run dir path.
+    """Create n{neurons}_q{dim_q}_pop{pop}_{timestamp}/ (with plots/ and a
+    human-readable config.txt) under dirname(cfg.save_path) (default models/),
+    and set cfg.save_path/save_plots in place. Requires cfg.dim_q. Returns the path.
     """
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pop = cfg.pop_size if cfg.pop_size is not None else "auto"
     dir_name = f"n{cfg.num_neurons}_q{cfg.dim_q}_pop{pop}_{timestamp}"
-    # Honor the user's chosen base directory (the part before the trailing
-    # 'auto'); fall back to models/ when save_path has no directory component.
     base_dir = os.path.dirname(cfg.save_path) if cfg.save_path else ""
     run_dir = os.path.join(base_dir or "models", dir_name)
     plots_dir = os.path.join(run_dir, "plots")
@@ -141,14 +124,11 @@ def _generate_model_filename(cfg: TNEPconfig) -> str:
 
 
 def _serialize_config(cfg: TNEPconfig) -> dict:
-    """Convert TNEPconfig to a JSON-serialisable dict.
-
-    Walks `__annotations__` (not just `vars(cfg)`) so fields left at their
-    class default are captured too — otherwise a restore would pick up the
-    current class default and mismatch the saved architecture/μ.
+    """TNEPconfig → JSON-serialisable dict. Walks __annotations__ (not just
+    vars(cfg)) so fields left at the class default are captured — else a restore
+    would pick up the current class default and mismatch the saved μ.
     """
-    # Annotated class fields + any runtime extras stashed on the instance
-    # (type_map, indices, dim_q, ... — set at data-load time, no class default).
+    # Annotated fields + runtime extras on the instance (type_map, indices, dim_q, ...).
     field_names = set(getattr(type(cfg), "__annotations__", {}).keys())
     field_names.update(k for k in vars(cfg).keys() if not k.startswith("_"))
 
@@ -180,22 +160,17 @@ def _serialize_config(cfg: TNEPconfig) -> dict:
 
 def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
                label: str | None = None) -> None:
-    """Save trained TNEP weights + config to an HDF5 (.h5) file.
+    """Save TNEP weights + config to HDF5.
 
     Layout: top-level attrs (target_mode, num_types, num_neurons, dim_q,
-    elements); /weights (W0,b0,W1,b1 [+ c_pair, U_pair, ...]); /descriptor
-    (z_to_type_index); /config (TNEPconfig as JSON string).
+    elements); /weights (W0, b0, W1, b1 [+ c_pair, U_pair, M_radial, c_r, c_a,
+    experts, sum_delta]); /descriptor/z_to_type_index; /config (TNEPconfig JSON).
+    path None or ending "auto" → {dataset}_{elements}_{mode}.h5; label is a
+    suffix before .h5.
 
-    Cayley note: under descriptor_mixing_regularizer=="cayley" the saved
-    U_pair holds the dense reconstructed V, not the skew-symmetric A SNES
-    searched — fine for inference, but Cayley fine-tuning must resume from the
-    .h5_checkpoint (which persists A in μ), since A is unrecoverable from V.
-
-    Args:
-        model : trained TNEP model
-        cfg   : TNEPconfig used for training
-        path  : output file path. None or ending "auto" = auto-generate.
-        label : optional suffix before .h5 (e.g. "best_val", "final_gen")
+    Cayley note: under descriptor_mixing_regularizer=="cayley" U_pair holds the
+    dense V, not the skew A SNES searched — fine for inference, but Cayley
+    fine-tuning must resume from the checkpoint (A is unrecoverable from V).
     """
     if path is None or path.endswith("auto"):
         directory = os.path.dirname(path) if path and os.path.dirname(path) else "."
@@ -211,7 +186,7 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         [[z, idx] for idx, z in enumerate(cfg.types)], dtype=np.int32)
 
     with h5py.File(path, "w") as f:
-        # Top-level metadata — visible via `h5ls -v model.h5` without loading weights
+        # h5ls-visible metadata
         f.attrs["target_mode"] = cfg.target_mode
         f.attrs["num_types"] = cfg.num_types
         f.attrs["num_neurons"] = cfg.num_neurons
@@ -224,20 +199,16 @@ def save_model(model: TNEP, cfg: TNEPconfig, path: str | None = None,
         wg.create_dataset("b0", data=model.b0.numpy())
         wg.create_dataset("W1", data=model.W1.numpy())
         wg.create_dataset("b1", data=model.b1.numpy())
-        # Neighbor readout: learned species-pair coefficient table (only when
-        # learnable; frozen c ≡ 1 is rebuilt at load, not stored).
+        # Species-pair table only when learnable (frozen c ≡ 1 is rebuilt at load).
         if model._neighbor_readout and model._c_learnable:
             wg.create_dataset("c_pair", data=model.c_pair.numpy())
-        # Optional descriptor-mixing layer, stored only when trained with
-        # cfg.descriptor_mixing=True. Dataset "U_pair" holds the residual
-        # V = U - I; loaders fall back to V=0 (U_full=I, no-op) when absent.
+        # Mixing layer: "U_pair" holds the residual V = U − I; absent → V = 0 (no-op).
         if getattr(model, "descriptor_mixing", False) and model.U_pair is not None:
             wg.create_dataset("U_pair", data=model.U_pair.numpy())
         # Learned radial basis coefficients (cfg.radial_basis_size).
         if getattr(model, "M_radial", None) is not None:
             wg.create_dataset("M_radial", data=model.M_radial.numpy())
-        # NEP contraction coefficients (cfg.nep_descriptor != "off") and the
-        # "sum"-mode expert ANNs.
+        # NEP contraction coefficients and "sum"-mode expert ANNs.
         if getattr(model, "c_r", None) is not None:
             wg.create_dataset("c_r", data=model.c_r.numpy())
             wg.create_dataset("c_a", data=model.c_a.numpy())
@@ -278,8 +249,7 @@ def save_history(history: dict, cfg: TNEPconfig) -> None:
     int_cols = {"generation"}
 
     n_rows = len(history["generation"])
-    # Pad short columns with NaN (resumed histories may have new keys
-    # that only started accumulating partway through).
+    # NaN-pad short columns (resumed histories may lack new keys early on).
     padded = {}
     for c in cols:
         col = history.get(c, [])
@@ -365,17 +335,16 @@ def save_checkpoint(path: str, cfg: TNEPconfig, state: dict,
 
 
 def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
-    """Load a training checkpoint. Returns `(cfg, resume_state)`: `cfg` is
-    the fully-restored config (architecture, indices, run params) exactly as
-    when written, and `resume_state` carries the SNES + history fields to
-    continue from `last_gen + 1`. Any caller-passed cfg is ignored.
+    """Load a training checkpoint → (cfg, resume_state): cfg fully restored as
+    written (any caller cfg is ignored); resume_state holds the SNES + history
+    fields to continue from last_gen + 1.
     """
     cfg = TNEPconfig()
     with h5py.File(path, "r") as f:
         config_dict = json.loads(f["config"][()])
         for k, v in config_dict.items():
-            if k in ("descriptor_mean", "type_map"):
-                # Legacy / re-derived below.
+            if k in ("descriptor_mean", "type_map", "dipole_rc"):
+                # Legacy / re-derived below (dipole_rc removed: r_c = rcut_hard).
                 continue
             setattr(cfg, k, v)
         _apply_legacy_field_defaults(cfg, config_dict.keys())
@@ -416,9 +385,8 @@ def load_checkpoint(path: str) -> tuple[TNEPconfig, dict]:
                                       for tk in hg["timing"]}
             else:
                 history[k] = list(hg[k][:])
-    # NaN-back-pad metric keys added since the checkpoint was written
-    # (best_rrmse, avg_rrmse, L_orth) to the generation length, else
-    # downstream zip() against generation silently truncates.
+    # NaN-back-pad metric keys added since the checkpoint was written, else
+    # zip() against generation silently truncates.
     n_rows = len(history.get("generation", []))
     for k in ("best_rrmse", "avg_rrmse", "L_orth"):
         if k not in history:
@@ -435,9 +403,8 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
                   M_radial=None, c_r=None, c_a=None, experts=None,
                   sum_delta=None) -> None:
     if model._neighbor_readout:
-        # Clean break: the multi-channel readout changed the tail layout
-        # (W1 [T, H, C]; c_pair when dipole_species_pairs). Old neighbor-mode
-        # saves cannot be mapped — fail loudly. tnep-mode saves unaffected.
+        # The multi-channel readout changed the tail layout (W1 [T, H, C]); old
+        # neighbor-mode saves cannot be mapped — fail loudly.
         if tuple(np.shape(W1)) != tuple(model.W1.shape) or (
                 model._c_learnable and c_pair is None):
             raise ValueError(
@@ -452,16 +419,17 @@ def _load_weights(model: TNEP, cfg: TNEPconfig, W0, b0, W1, b1,
     model.W0.assign(W0)
     model.b0.assign(b0)
     model.W1.assign(W1)
+    if tuple(np.shape(b1)) != tuple(model.b1.shape):
+        # Saves from before the per-type site bias hold a scalar b1 that the
+        # neighbor readout never read: zero is the exact equivalent.
+        b1 = np.zeros(model.b1.shape, dtype=np.float32)
     model.b1.assign(b1)
-    # Optional V_pair restore (h5 dataset "U_pair" holds V = U - I). When
-    # absent (pre-mixing or mixing-disabled runs), keep TNEP.__init__'s
-    # zero-init V (U_full = I, no-mixing path).
+    # "U_pair" holds V = U − I; absent → keep TNEP.__init__'s zero V (no mixing).
     if (U_pair is not None
             and getattr(model, "descriptor_mixing", False)
             and model.U_pair is not None):
         if tuple(U_pair.shape) != tuple(model.U_pair.shape):
-            # Hard fail rather than silently dropping learned U_pair (which
-            # would masquerade as training from scratch).
+            # Hard fail rather than silently dropping learned U_pair.
             raise ValueError(
                 f"saved U_pair shape {tuple(U_pair.shape)} != "
                 f"model.U_pair shape {tuple(model.U_pair.shape)}. "
@@ -573,11 +541,10 @@ def _load_model_h5(path: str) -> TNEP:
         config_dict["radial_basis_norm"] = "l2" if config_dict.pop("radial_basis_normalize") else "none"
     for k, v in config_dict.items():
         if k == "descriptor_mean":
-            # Legacy field — descriptor scaling was removed; ignore.
+            # Legacy field (descriptor scaling removed).
             continue
         if k == "type_map":
-            # JSON gives str keys; the authoritative int-keyed type_map was
-            # already built from descriptor/z_to_type_index above.
+            # JSON str keys; int-keyed type_map already built from z_to_type_index.
             continue
         setattr(cfg, k, v)
     _apply_legacy_field_defaults(cfg, config_dict.keys())
@@ -622,9 +589,7 @@ def _load_model_npz(path: str) -> TNEP:
 
     if "W_pre_angular" in data.files:
         raise ValueError(_W_PRE_REMOVED.format(path=path))
-    # Cross-check descriptor_mixing vs saved weights: mismatch (mixing on
-    # but no U_pair, or vice versa) fails loud instead of silently
-    # mis-predicting with random weights.
+    # descriptor_mixing and a saved U_pair must agree, else fail loud.
     has_U_pair = "U_pair" in data.files
     if bool(getattr(cfg, "descriptor_mixing", False)) and not has_U_pair:
         raise ValueError(
@@ -657,14 +622,7 @@ def _load_model_npz(path: str) -> TNEP:
 
 
 def load_model(path: str) -> TNEP:
-    """Load a trained TNEP model from an HDF5 (.h5) or legacy NumPy (.npz) file.
-
-    Args:
-        path : path to saved model file
-
-    Returns:
-        model : TNEP model with loaded weights and reconstructed TNEPconfig
-    """
+    """Load a trained TNEP model from .h5 (or legacy .npz)."""
     if path.endswith(".npz"):
         return _load_model_npz(path)
     return _load_model_h5(path)
