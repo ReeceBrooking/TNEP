@@ -129,9 +129,20 @@ class GAPconfig:
     # angular power spectrum Σ R_n(r_ij) R_n'(r_ik) P_l(cos θ_jik) (gap_models.py).
     # soap/2b read out through the bond basis (+ field channel), 3b through its own
     # angular kernel (gap_cross_lmax) — the only way 3b keeps an uncontracted bond vector.
+    # "tnep" = QUIP gap_fit's dipole model as a site model (TEST, dipole only): the dipole is the
+    # self derivative of the site energy, μ = Σ_i ∂U_i/∂r_i with U_i = δ² Σ_m α_m (q̂_i·q̂_m)^ξ on the
+    # SOAP descriptor (gap_fit_module.F90: gp_addFunctionDerivative with the ii(n) == ci gradient
+    # row only, no distance weighting). One column per sparse point:
+    #   Φ[:, m] = δ² ξ Σ_i (q̂_i·q̂_m)^(ξ−1) (q̂_m · G_i),  G_i = ∂q̂_i/∂r_i  (gap_tnep_rij_power = 0, QUIP)
+    # gap_tnep_rij_power = N ≥ 1 swaps in the Xu et al. 2024 weighting G_i = Σ_{j≠i} |r_ij|^N ∂q̂_i/∂r_j
+    # (N = 2 is their eq. 3; sign absorbed by α). Needs quippy gradients.
     gap_site_models: list[str] = ["soap"]
     # Relative amplitude δ per site model (× gap_delta_soap); keys must cover gap_site_models.
-    gap_model_delta: dict = {"soap": 1.0, "2b": 1.0, "3b": 1.0}
+    # "charge" (dipole, molecules only) = point charges on the nuclei projected to neutrality,
+    # μ_q = Σ_i q_i (r_i − r̄) with q_i the SOAP site scalar: the global lever arm a bond sum lacks.
+    # "charge_2b" = the same point-charge form with q_i from the 2b (radial-distribution) kernel.
+    gap_model_delta: dict = {"soap": 1.0, "2b": 1.0, "3b": 1.0, "tnep": 1.0, "charge": 1.0, "charge_2b": 1.0}
+    gap_tnep_rij_power: int = 0
     # Radial channels C and Legendre order L of the 2b/3b DESCRIPTORS (the
     # readout channels stay dipole_channels). Width: 2b T·C, 3b T(T+1)/2·C²·(L+1).
     gap_site_channels: int = 6

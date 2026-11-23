@@ -408,7 +408,8 @@ def test_configs_are_independent():
                 # polarisability kernel-group knobs of the linear fit
                 "gap_lambda_shear", "gap_cross_channels",
                 "gap_site_models", "gap_model_delta", "gap_site_channels",
-                "gap_site_lmax", "gap_cross_lmax", "dipole_unit_vector"}
+                "gap_site_lmax", "gap_cross_lmax", "dipole_unit_vector",
+                "gap_tnep_rij_power"}
     missing = (set(GAPconfig.__annotations__)
                - set(TNEPconfig.__annotations__) - gap_only)
     assert not missing, missing
@@ -697,3 +698,115 @@ def test_unit_vector_geometry_used_by_fit_and_predict():
     assert np.abs(unit.train_pred - plain.train_pred).max() > 1e-3                                       # and the flag acts
 
 
+
+
+# ── tnep (QUIP dipole model) site block: predict vs hand-rolled μ = Σ_i ∂U_i/∂r_i ──
+
+@pytest.mark.parametrize("xi,rij_power", [(2, 0), (1, 0), (2, 2)])
+def test_tnep_site_model_identity(tmp_path, xi, rij_power):
+    cfg = _cfg(dipole_radial="chebyshev", dipole_cutoff="cosine2", dipole_channels=2, gap_tnep_rij_power=rij_power,
+               gap_site_models=["tnep"], gap_sparse_per_species=5, gap_kernel_power=xi, total_N=3)
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(cfg)
+    at = read(WATER_XYZ, index="7")
+    mu = gap_dipole.predict(m, [at])[0]
+    ti = np.array([m.cfg.types.index(int(z)) for z in at.numbers])
+    D, grads, gidx = m.builder.build_descriptors([at], calc_gradients=True)
+    D = np.asarray(D[0], dtype=np.float64); cell = np.asarray(at.cell.array); inv = np.linalg.inv(cell)
+    delta2 = (cfg.gap_delta_soap * cfg.gap_model_delta["tnep"]) ** 2
+    assert all(a.size == len(s) for a, s in zip(m.site_alpha["tnep"], m.site_sparse["tnep"]))
+    mu_ref = np.zeros(3)
+    for i in range(len(at)):
+        g = np.asarray(grads[0][i], dtype=np.float64); j = np.asarray(gidx[0][i])
+        if rij_power == 0:
+            G_i = g[np.flatnonzero(j == i)[0]]                                          # ∂q_i/∂r_i [3, Q]
+        else:
+            ds = (at.positions[j] - at.positions[i]) @ inv; ds -= np.round(ds)
+            w = np.sum((ds @ cell) ** 2, axis=1) ** (rij_power / 2.0) * (j != i)
+            G_i = np.einsum("m,msq->sq", w, g)                                          # Σ_j |r_ij|^N ∂q_i/∂r_j
+        S, A = m.site_sparse["tnep"][ti[i]], m.site_alpha["tnep"][ti[i]]
+        dU_dq = delta2 * xi * sum(A[k] * float(D[i] @ S[k]) ** (xi - 1) * S[k] for k in range(len(S)))
+        mu_ref += G_i @ dU_dq
+    assert np.allclose(mu, mu_ref, rtol=1e-8, atol=1e-10)
+
+
+# ── primal (streamed normal equations) and dual solves give the same model ──
+
+def test_primal_and_dual_solves_agree(tmp_path, monkeypatch):
+    import gap_dipole
+    kw = dict(dipole_radial="chebyshev", dipole_cutoff="cosine2", dipole_channels=2,
+              dipole_species_pairs="symmetric", gap_sparse_per_species=3, total_N=8)
+    with _chdir(tmp_path):
+        monkeypatch.setattr(gap_dipole, "_primal", lambda n, r: True); m_p = gap_dipole.fit_gap_dipole(_cfg(**kw))
+        monkeypatch.setattr(gap_dipole, "_primal", lambda n, r: False); m_d = gap_dipole.fit_gap_dipole(_cfg(**kw))
+    for t in range(m_p.cfg.num_types):
+        assert np.allclose(m_p.alpha[t], m_d.alpha[t], rtol=1e-6, atol=1e-9)
+    assert np.allclose(m_p.train_pred, m_d.train_pred, rtol=1e-8, atol=1e-10)
+    frames = [read(WATER_XYZ, index=i) for i in range(2)]
+    assert np.allclose(gap_dipole.predict(m_p, frames), gap_dipole.predict(m_d, frames), rtol=1e-8)
+
+
+def test_predict_std_matches_dense_posterior(tmp_path):
+    """predict_std = sqrt(diag(Φ_w (Φ_wᵀΦ_w + I)⁻¹ Φ_wᵀ)) with Φ_w built explicitly from the
+    training frames; training-frame std sits below the prior std sqrt(diag(Φ_w Φ_wᵀ))."""
+    import gap_dipole
+    kw = dict(dipole_radial="chebyshev", dipole_cutoff="cosine2", dipole_channels=2, gap_sparse_per_species=3, total_N=6)
+    with _chdir(tmp_path):
+        m = gap_dipole.fit_gap_dipole(_cfg(**kw))
+    assert m.posterior is not None
+    train = [read(WATER_XYZ, index=int(k)) for k in m.cfg.indices]
+    rows = [gap_dipole._whiten(r, m.factors, False) for r in gap_dipole._phi_rows(m, train)]
+    w = [1.0 / (m.cfg.gap_sigma * np.sqrt(len(a))) for a in train]
+    A = sum(wi ** 2 * r.T @ r for wi, r in zip(w, rows)) + np.eye(rows[0].shape[1])
+    probe = [read(WATER_XYZ, index=i) for i in range(2)] + train[:2]
+    std = gap_dipole.predict_std(m, probe)
+    for s, r in zip(std, [gap_dipole._whiten(r, m.factors, False) for r in gap_dipole._phi_rows(m, probe)]):
+        assert np.allclose(s, np.sqrt(np.diag(r @ np.linalg.solve(A, r.T))), rtol=1e-8)
+        assert np.all(s < np.sqrt(np.diag(r @ r.T)))
+
+
+def test_given_sparse_set_and_sparse_score(tmp_path):
+    """fit(site_sparse=model.site_sparse) reproduces the FPS fit; sparse_score ∈ [0,1], ≈0 on the sparse points."""
+    import gap_dipole
+    kw = dict(dipole_radial="chebyshev", dipole_cutoff="cosine2", dipole_channels=2, gap_sparse_per_species=3, total_N=6)
+    with _chdir(tmp_path):
+        m1 = gap_dipole.fit_gap_dipole(_cfg(**kw))
+        m2 = gap_dipole.fit_gap_dipole(_cfg(**kw), site_sparse=m1.site_sparse)
+    for a1, a2 in zip(m1.alpha, m2.alpha):
+        assert np.allclose(a1, a2)
+    frames = [read(WATER_XYZ, index=int(k)) for k in m1.cfg.indices[:2]]
+    sc = np.concatenate(gap_dipole.sparse_score(m1, frames))
+    assert np.all((sc >= 0) & (sc <= 1))
+    D = np.concatenate(gap_dipole._descriptors(m1.builder, frames)); S = np.concatenate(m1.sparse_desc)
+    on_sparse = np.isclose(np.abs(D @ S.T).max(axis=1), 1.0, atol=1e-6)      # atoms that ARE sparse points
+    assert on_sparse.any() and np.all(sc[on_sparse] < 1e-6)
+
+
+def test_charge_site_model_is_projected_point_charges(tmp_path):
+    """charge block = Σ_i (q_i − q̄) r_i with q_i the SOAP site scalar; translation invariant; molecules only."""
+    mol = os.path.join(tmp_path, "mol.xyz")
+    frames = read(WATER_XYZ, index=":8")
+    for a in frames:
+        a.set_pbc(False); a.set_cell(None)
+    write(mol, frames)
+    kw = dict(data_path=mol, dipole_radial="chebyshev", dipole_cutoff="cosine2", dipole_channels=2,
+              gap_site_models=["soap", "charge"], gap_sparse_per_species=3, total_N=6)
+    with _chdir(tmp_path):
+        model = gap_dipole.fit_gap_dipole(_cfg(**kw))
+    test = [read(mol, index=int(k)) for k in model.cfg.indices[:2]]
+    no_charge = replace(model, site_alpha={**model.site_alpha, "charge": [np.zeros_like(a) for a in model.site_alpha["charge"]]})
+    charge_part = gap_dipole.predict(model, test) - gap_dipole.predict(no_charge, test)
+    delta2 = (model.cfg.gap_delta_soap * model.cfg.gap_model_delta["charge"]) ** 2
+    for a, got in zip(test, charge_part):
+        ti = np.asarray(data.assign_type_indices([a], model.cfg.types)[0])
+        D = gap_dipole._descriptors(model.builder, [a])[0]
+        q = np.zeros(len(a))
+        for t, (Dm, al) in enumerate(zip(model.site_sparse["charge"], model.site_alpha["charge"])):
+            q[ti == t] = delta2 * (D[ti == t] @ Dm.T) ** model.xi @ al
+        assert np.allclose(got, (q - q.mean()) @ a.positions, atol=1e-10)
+    shifted = [a.copy() for a in test]
+    for a in shifted:
+        a.translate([3.0, -7.0, 11.0])
+    assert np.allclose(gap_dipole.predict(model, shifted), gap_dipole.predict(model, test), atol=1e-10)
+    with pytest.raises(ValueError, match="non-periodic"):
+        gap_dipole.predict(model, [read(WATER_XYZ, index=0)])

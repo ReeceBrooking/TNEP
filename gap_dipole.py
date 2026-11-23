@@ -32,6 +32,8 @@ from dataclasses import dataclass
 
 import numpy as np
 from ase import Atoms
+from scipy.linalg import cho_factor, cho_solve, solve_triangular
+from scipy.linalg.blas import dsyrk
 from ase.io import read
 
 import data as tnep_data
@@ -59,6 +61,8 @@ class GapDipoleModel:
     sparse_desc2: list[np.ndarray] | None = None
     alpha2: list[np.ndarray] | None = None
     train_pred: np.ndarray | None = None   # Φα on the training frames, [F, D] (fit order)
+    factors: list | None = None            # prior Cholesky blocks (_prior_factors), for predict_std
+    posterior: tuple | None = None         # cho_factor of the whitened precision Φ_wᵀΦ_w + I (primal fits only)
 
     @property
     def sparse_desc(self) -> list[np.ndarray]:
@@ -117,10 +121,12 @@ def _validate(cfg: GAPconfig) -> None:
         (str(cfg.nep_descriptor) == "off",
          "GAP mode needs nep_descriptor='off' (NEP inputs are not part of "
          "the kernel fit)"),
-        (bool(cfg.gap_site_models) and set(cfg.gap_site_models) <= {"soap", "2b", "3b"}
+        (bool(cfg.gap_site_models) and set(cfg.gap_site_models) <= {"soap", "2b", "3b", "tnep", "charge", "charge_2b"}
          and len(set(cfg.gap_site_models)) == len(cfg.gap_site_models),
-         f"gap_site_models must be a non-empty subset of soap/2b/3b without repeats, "
+         f"gap_site_models must be a non-empty subset of soap/2b/3b/tnep/charge/charge_2b without repeats, "
          f"got {cfg.gap_site_models!r}"),
+        (not {"charge", "charge_2b"} & set(cfg.gap_site_models) or int(cfg.target_mode) == 1,
+         "the charge site model (Σ_i q_i (r_i − r̄)) is dipole-only"),
         (set(cfg.gap_site_models) <= set(cfg.gap_model_delta)
          and all(float(cfg.gap_model_delta[m]) > 0 for m in cfg.gap_site_models),
          "gap_model_delta needs a positive entry for every entry of gap_site_models"),
@@ -133,29 +139,36 @@ def _validate(cfg: GAPconfig) -> None:
          "3b dipole kernel needs gap_cross_lmax >= 1 (l = 0 collapses to the one-hop basis)"),
         (set(cfg.gap_site_models) <= {"soap"} or cfg.dipole_radial != "screened",
          "2b/3b site models need a multi-channel radial (screened is single-channel)"),
+        ("tnep" not in cfg.gap_site_models or int(cfg.target_mode) == 1,
+         "the tnep (derivative) site model is dipole-only"),
+        (int(cfg.gap_tnep_rij_power) >= 0, "gap_tnep_rij_power must be >= 0"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     if bad:
         raise ValueError("fit_gap_dipole config violation: " + "; ".join(bad))
 
 
-def _descriptors(builder, frames: list[Atoms]) -> list[np.ndarray]:
+def _descriptors(builder, frames: list[Atoms], chunk: int = 256) -> list[np.ndarray]:
     """SOAP descriptors, no gradients, float64. Asserts ‖D‖ ≈ 1 (both
-    builders already unit-normalize; we must NOT renormalize)."""
-    if type(builder).__name__ == "DescriptorBuilderGPUTF":
-        # flat output with the TF NL: build_descriptors' per-atom packing and
-        # brute-force NumPy NL cost ~300 ms/frame for data we never read.
-        desc = [f[0] for f in builder.build_descriptors_flat(frames, calc_gradients=False, use_tf_nl=True)]
-    else:
-        desc, _, _ = builder.build_descriptors(frames, calc_gradients=False)
+    builders already unit-normalize; we must NOT renormalize). Built `chunk`
+    frames per call: one call over 16k molecules holds ~3× the arrays' size in
+    quippy-side scratch; chunking releases it (the ~4.5 kB/atom quippy leak stays)."""
     out = []
-    for D in desc:
-        D = np.asarray(D, dtype=np.float64)
-        norms = np.linalg.norm(D, axis=1)
-        assert np.allclose(norms, 1.0, atol=1e-3), (
-            f"descriptors not unit-normalized "
-            f"(max |norm-1| = {np.abs(norms - 1.0).max():.3g})")
-        out.append(D)
+    for c0 in range(0, len(frames), chunk):
+        sub = frames[c0:c0 + chunk]
+        if type(builder).__name__ == "DescriptorBuilderGPUTF":
+            # flat output with the TF NL: build_descriptors' per-atom packing and
+            # brute-force NumPy NL cost ~300 ms/frame for data we never read.
+            desc = [f[0] for f in builder.build_descriptors_flat(sub, calc_gradients=False, use_tf_nl=True)]
+        else:
+            desc, _, _ = builder.build_descriptors(sub, calc_gradients=False)
+        for D in desc:
+            D = np.asarray(D, dtype=np.float64)
+            norms = np.linalg.norm(D, axis=1)
+            assert np.allclose(norms, 1.0, atol=1e-3), (
+                f"descriptors not unit-normalized "
+                f"(max |norm-1| = {np.abs(norms - 1.0).max():.3g})")
+            out.append(D)
     return out
 
 
@@ -261,16 +274,59 @@ def _v_atoms(atoms: Atoms, ti: np.ndarray, cfg: GAPconfig) -> np.ndarray:
 
 def _site_descriptor(name: str, builder, frames: list[Atoms], tis: list, cfg: GAPconfig) -> list[np.ndarray]:
     """Per-frame descriptors of one site model (all unit rows): SOAP from the
-    builder, 2b/3b from gap_models (already normalised there)."""
-    if name == "soap":
+    builder (soap and tnep), 2b/3b from gap_models (already normalised there)."""
+    if name in ("soap", "tnep", "charge"):
         return _descriptors(builder, frames)
-    fn = gm.two_body_descriptor if name == "2b" else gm.three_body_descriptor
+    fn = gm.two_body_descriptor if name in ("2b", "charge_2b") else gm.three_body_descriptor
     return [fn(a, ti, cfg) for a, ti in zip(frames, tis)]
 
 
-def _site_geometry(name: str, frames: list[Atoms], tis: list, cfg: GAPconfig, bond_v: list) -> list:
+def _tnep_geometry(builder, frames: list[Atoms], cfg: GAPconfig) -> list[np.ndarray]:
+    """Derivative-block geometry per frame [N, 3, Q]: gap_tnep_rij_power = 0 → the self
+    gradient ∂q_i/∂r_i of the SOAP descriptor (QUIP's dipole model: the quippy gradient row
+    whose neighbour index is the centre); N ≥ 1 → Σ_{j≠i} |r_ij|^N ∂q_i/∂r_j (Xu et al.
+    2024, minimum-image r_ij, exact for r_c ≤ L/2). One quippy call per frame (gradients
+    are ~10× the descriptor cost; never held for the whole set)."""
+    N_pow = int(cfg.gap_tnep_rij_power)
+    out = []
+    for a in frames:
+        _, grads, gidx = builder.build_descriptors([a], calc_gradients=True)
+        cell = np.asarray(a.cell.array, dtype=np.float64); inv = np.linalg.inv(cell)
+        pos = np.asarray(a.positions, dtype=np.float64)
+        G = []
+        for i in range(len(a)):
+            g = np.asarray(grads[0][i], dtype=np.float64)             # [M_i, 3, Q]
+            j = np.asarray(gidx[0][i], dtype=int)
+            if N_pow == 0:
+                w = (j == i).astype(np.float64)
+            else:
+                ds = (pos[j] - pos[i]) @ inv; ds -= np.round(ds)       # fractional MIC
+                w = np.sum((ds @ cell) ** 2, axis=1) ** (N_pow / 2.0) * (j != i)
+            G.append(np.einsum("m,msq->sq", w, g) if len(g) else np.zeros((3, 0)))
+        out.append(np.stack(G))
+    return out
+
+
+def _charge_geometry(atoms: Atoms) -> np.ndarray:
+    """Point-charge lever arm [N, 3, 1]: r_i − r̄ (plain mean). Σ_i q_i (r_i − r̄) ≡ Σ_i (q_i − q̄) r_i,
+    i.e. the site scalar q_i = δ² Σ_m α_m k(q̂_i, q̂_m)^ξ projected to neutrality — PaiNN's
+    charge term with one-hop kernel charges. Molecules only: the periodic dipole is defined
+    modulo the polarization quantum, so absolute positions have no meaning under PBC."""
+    pos = np.asarray(atoms.positions, dtype=np.float64)
+    extent, L = pos.max(axis=0) - pos.min(axis=0), np.linalg.norm(atoms.cell.array, axis=1)
+    if np.any(atoms.pbc & ~(extent < 0.5 * L)):          # vacuum-padded box = isolated molecule, whole, no images in reach
+        raise ValueError("the charge site model needs non-periodic frames (or a molecule in a vacuum-padded box)")
+    return (pos - pos.mean(axis=0))[:, :, None]
+
+
+def _site_geometry(name: str, builder, frames: list[Atoms], tis: list, cfg: GAPconfig, bond_v: list) -> list:
     """Per-frame readout geometry [N, D, K_model]: the bond basis (+ field
-    channel) for soap/2b; the angular kernel for 3b."""
+    channel) for soap/2b; the angular kernel for 3b; the derivative kernel for tnep;
+    the centred position for charge."""
+    if name == "tnep":
+        return _tnep_geometry(builder, frames, cfg)
+    if name in ("charge", "charge_2b"):       # charge_2b: same lever arm, q_i from the 2b kernel
+        return [_charge_geometry(a) for a in frames]
     if name != "3b":
         return bond_v
     fn = gm.angular_cross_tensor if int(cfg.target_mode) == 2 else gm.angular_cross_vector
@@ -283,20 +339,26 @@ def _site_terms(cfg: GAPconfig, builder, frames: list[Atoms], tis: list, vs: lis
     in cfg.gap_site_models order — THE per-model inputs shared by fit and
     predict. `descs` reuses already-built SOAP descriptors."""
     d_soap = float(cfg.gap_delta_soap)
-    return {m: (descs if m == "soap" and descs is not None
+    return {m: (descs if m in ("soap", "tnep", "charge") and descs is not None
                 else _site_descriptor(m, builder, frames, tis, cfg),
-                _site_geometry(m, frames, tis, cfg, vs),
-                d_soap * float(cfg.gap_model_delta[m]))
+                _site_geometry(m, builder, frames, tis, cfg, vs),
+                d_soap * float(cfg.gap_model_delta[m]),
+                *([True] if m == "tnep" else []))      # tnep: derivative block (flag read by _phi_frame)
             for m in cfg.gap_site_models}
 
 
 def _frame_scales(site: dict, site_sparse: dict, f: int, descs2, sparse_desc2, v, d_soap) -> list:
     """_phi_frame's scales for frame f: one entry per site model, then the
     extra SOAP scale (gap_extra_rcut) reading out through the bond basis v."""
-    scales = [(d[f], site_sparse[m], g[f], dm) for m, (d, g, dm) in site.items()]
+    scales = [(d[f], site_sparse[m], g[f], dm, *rest) for m, (d, g, dm, *rest) in site.items()]
     if descs2 is not None:
         scales.append((descs2[f], sparse_desc2, v, d_soap))
     return scales
+
+
+def _primal(n_columns: int, n_rows: int) -> bool:
+    """Solve the [n, n] normal equations (streamed Φ) rather than the [DF, DF] dual."""
+    return n_columns < n_rows
 
 
 def _fps(D: np.ndarray, M: int, rng: np.random.Generator) -> np.ndarray:
@@ -316,15 +378,21 @@ def _phi_frame(scales: list, ti: np.ndarray, xi: int) -> np.ndarray:
     predict. scales = [(D, sparse_desc, v, delta)] per site model (then the extra
     SOAP scale); each model's kernel couples its own descriptors to its own sparse
     points, reads out through its v [N, D, K] and carries δ² on its columns
-    (gap.f90 `delta**2 * alphas * kernel`). Block order: model → species → (m, k)."""
+    (gap.f90 `delta**2 * alphas * kernel`). Block order: model → species → (m, k).
+    A fifth tuple entry True marks the QUIP dipole (tnep) block: v is the self gradient
+    ∂q_i/∂r_i [N, 3, Q] and the column of sparse point m is δ²·ξ·Σ_i (q_i·q_m)^(ξ−1)·(q_m·∂q_i/∂r_i),
+    K = 1 (gap_fit: function-derivative observation on the kernel's descriptor derivative)."""
     cols = []
-    for D, sparse_desc, vm, dm in scales:
+    for D, sparse_desc, vm, dm, *deriv in scales:
         n_rows = vm.shape[1]             # 3 (dipole) or 6 (polarisability)
         for t, Dm in enumerate(sparse_desc):
             sel = ti == t
-            G = D[sel] @ Dm.T                           # [n_t, M_t] Gram
             vt = vm[sel]
-            vflat = vt.reshape(len(vt), -1)             # [n_t, D·K]
+            G = D[sel] @ Dm.T                           # [n_t, M_t] Gram
+            if deriv:
+                cols.append(dm ** 2 * xi * np.einsum("nm,nsq,mq->sm", G ** (xi - 1), vt, Dm))   # [3, M_t]
+                continue
+            vflat = vt.reshape(len(vt), n_rows * vt.shape[2])   # [n_t, D·K] (explicit: n_t may be 0)
             # Σ_n G^ξ[n,m]·v[n,x,k] as ONE GEMM: [M_t, D·K] → [D, M_t·K]
             cols.append(dm ** 2 * ((G ** xi).T @ vflat).reshape(-1, n_rows, vt.shape[2])
                         .transpose(1, 0, 2).reshape(n_rows, -1))           # [D, M_t·K]
@@ -340,10 +408,11 @@ def _prior_factors(cfg: GAPconfig, scale_sparse: list, xi: int) -> list:
             for sparse_desc, dm, k in scale_sparse for Dm in sparse_desc]
 
 
-def _whiten(X: np.ndarray, factors: list, solve_with_transpose: bool) -> np.ndarray:
+def _whiten(X: np.ndarray, factors: list, solve_with_transpose: bool, out: np.ndarray | None = None) -> np.ndarray:
     """Apply each block's prior factor along its sparse-point axis (X [R, n_columns]).
-    False: Φ → Φ·(L⁻ᵀ ⊗ I) (whitened coefficients β = (Lᵀ ⊗ I)·α); True: β → α."""
-    out, off = np.empty_like(X), 0
+    False: Φ → Φ·(L⁻ᵀ ⊗ I) (whitened coefficients β = (Lᵀ ⊗ I)·α); True: β → α.
+    out=X whitens in place (each block is consumed before it is written)."""
+    out, off = (np.empty_like(X) if out is None else out), 0
     for n, L in factors:
         M = len(L)
         n_vcols = n // M
@@ -387,9 +456,10 @@ def _resolve_seed(cfg: GAPconfig) -> None:
         cfg.seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
 
 
-def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
+def fit_gap_dipole(cfg: GAPconfig, site_sparse: dict | None = None) -> GapDipoleModel:
     """Fit on cfg.data_path, evaluate cfg.test_data_path, write a run record JSON
-    to GAP/. MUTATES cfg: fills `seed` when None. Memory is linear in columns
+    to GAP/. MUTATES cfg: fills `seed` when None. `site_sparse` (model → per-species
+    [M_t, Q] unit-norm rows) replaces the FPS selection, e.g. an actively grown set. Memory is linear in columns
     (Φ ~1.7 GB at F=1500, 48k columns); gap_extra_rcut ≈ 2× build/fit/predict."""
     _validate(cfg)
     t0 = time.time()
@@ -433,7 +503,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
 
     models = list(cfg.gap_site_models)
     site = _site_terms(cfg, builder, dataset, tis, vs, descs)
-    site_sparse = {m: _fps_per_species(d, M_req[m]) for m, (d, _, _) in site.items()}
+    site_sparse = site_sparse or {m: _fps_per_species(d, M_req[m]) for m, (d, *_) in site.items()}
     builder2 = descs2 = sparse_desc2 = None
     if cfg.gap_extra_rcut is not None:
         # second SOAP scale for the KERNEL only (v untouched), same soft/hard buffer
@@ -446,7 +516,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
 
     d_soap = float(cfg.gap_delta_soap)
     # (sparse set, δ, readout width K_model) per site model, then the extra scale
-    scale_sparse = [(site_sparse[m], dm, g[0].shape[2]) for m, (_, g, dm) in site.items()]
+    scale_sparse = [(site_sparse[m], dm, 1 if m == "tnep" else g[0].shape[2]) for m, (_, g, dm, *_) in site.items()]
     if descs2 is not None:
         scale_sparse.append((sparse_desc2, d_soap, n_vcols))
     sizes = [[len(s) for s in group] for group, _, _ in scale_sparse]
@@ -455,31 +525,43 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     blocks = [len(Dm) * k for group, _, k in scale_sparse for Dm in group]
     n_columns = sum(blocks)
 
-    # Φ frame-by-frame — the full N_envs × M kernel never exists.
-    F = len(dataset)
-    D = mu.shape[1]                      # 3 (dipole) or 6 (polarisability)
-    Phi = np.empty((F, D, n_columns))
-    for f in range(F):
-        scales = _frame_scales(site, site_sparse, f, descs2, sparse_desc2, vs[f], d_soap)
-        Phi[f] = _phi_frame(scales, tis[f], xi)
-    Phi_flat = Phi.reshape(D * F, n_columns)
-
     # gap_fit's estimator: minimise Σ_obs ((Φα − μ)/σ_obs)² + αᵀ·K_MM·α, σ_obs =
     # σ·√N_atoms (gap_fit_module.F90:1149). gap_fit QR-solves the augmented system;
-    # here the same minimiser is taken in whitened β = (Lᵀ ⊗ I)·α (penalty ‖β‖²)
-    # and solved in the dual: the Gram is [DF, DF] regardless of n_columns.
+    # here the same minimiser is taken in whitened β = (Lᵀ ⊗ I)·α (penalty ‖β‖²).
+    # Primal ([n, n] normal equations, Φ streamed in chunks so memory is independent
+    # of F) when n_columns < D·F, else the dual ([DF, DF]) with Φ materialised.
+    F = len(dataset)
+    D = mu.shape[1]                      # 3 (dipole) or 6 (polarisability)
     sigma = float(cfg.gap_sigma)
     row_w = np.repeat(1.0 / (sigma * np.sqrt([len(a) for a in dataset])), D)
     if D == 6 and float(cfg.gap_lambda_shear) != 1.0:
         # GPUMD lambda_shear: off-diagonal rows fitted with σ/λ_shear.
         row_w = row_w * np.tile([1.0] * 3 + [float(cfg.gap_lambda_shear)] * 3, F)
     factors = _prior_factors(cfg, scale_sparse, xi)
-    Phi_w = _whiten(Phi_flat, factors, False) * row_w[:, None]
     mu_w = mu.reshape(-1) * row_w
-    G = Phi_w @ Phi_w.T                                  # [DF, DF]
-    G[np.diag_indices_from(G)] += 1.0
-    beta = Phi_w.T @ np.linalg.solve(G, mu_w)
-    alpha_flat = _whiten(beta[None], factors, True)[0]
+    phi = lambda f: _phi_frame(_frame_scales(site, site_sparse, f, descs2, sparse_desc2, vs[f], d_soap), tis[f], xi)
+    if _primal(n_columns, D * F):
+        A, b = np.zeros((n_columns, n_columns), order="F"), np.zeros(n_columns)   # upper triangle only (dsyrk → cho_factor)
+        step = max(1, int(1.2e8 // (D * n_columns * 8)))              # ~100 MB of Φ rows per chunk
+        for s0 in range(0, F, step):
+            Pc = np.concatenate([phi(f) for f in range(s0, min(F, s0 + step))])   # [D·chunk, n]
+            Pc = _whiten(Pc, factors, False, out=Pc); Pc *= row_w[D * s0:D * s0 + len(Pc), None]
+            A = dsyrk(1.0, Pc.T, beta=1.0, c=A, lower=0, overwrite_c=True)   # A += PcᵀPc in place: no second n×n temporary
+            b += Pc.T @ mu_w[D * s0:D * s0 + len(Pc)]
+        A[np.diag_indices_from(A)] += 1.0
+        posterior = cho_factor(A, lower=False, overwrite_a=True)
+        alpha_flat = _whiten(cho_solve(posterior, b)[None], factors, True)[0]
+        train_pred = np.stack([phi(f) @ alpha_flat for f in range(F)])
+    else:
+        posterior = None
+        Phi_flat = np.concatenate([phi(f) for f in range(F)])          # [DF, n]
+        Phi_w = _whiten(Phi_flat, factors, False, out=Phi_flat)       # in place: Φα recovered from Φ_w·β below
+        Phi_w *= row_w[:, None]
+        G = Phi_w @ Phi_w.T
+        G[np.diag_indices_from(G)] += 1.0
+        beta = Phi_w.T @ np.linalg.solve(G, mu_w)
+        alpha_flat = _whiten(beta[None], factors, True)[0]
+        train_pred = ((Phi_w @ beta) / row_w).reshape(F, D)
     parts = np.split(alpha_flat, np.cumsum(blocks)[:-1])
     # every α group is one block per species
     groups = [parts[i:i + T] for i in range(0, len(parts), T)]
@@ -491,7 +573,7 @@ def fit_gap_dipole(cfg: GAPconfig) -> GapDipoleModel:
     model = GapDipoleModel(cfg=cfg, builder=builder, site_sparse=site_sparse,
                            site_alpha=site_alpha, xi=xi, builder2=builder2,
                            sparse_desc2=sparse_desc2, alpha2=alpha2,
-                           train_pred=(Phi_flat @ alpha_flat).reshape(F, D))
+                           train_pred=train_pred, factors=factors, posterior=posterior)
 
     train_rmse, train_r2 = _rmse_r2(model.train_pred, mu)
     metrics = {"train_rmse": train_rmse, "train_r2": train_r2,
@@ -564,24 +646,53 @@ def predict(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
     return _predict_numpy(model, frames)
 
 
-def _predict_numpy(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
-    """Through _phi_frame — the fit's own contraction (μ = Φα) — so fit and predict cannot drift."""
+def _phi_rows(model: GapDipoleModel, frames: list[Atoms], chunk: int = 256):
+    """Yield Φ_f [D, n_columns] per frame — the fit's own contraction, so fit and predict
+    cannot drift. Descriptors are built `chunk` frames at a time to bound memory."""
     cfg = model.cfg
-    models = list(cfg.gap_site_models)
-    tis = [np.asarray(t) for t in tnep_data.assign_type_indices(frames, cfg.types)]
-    vs = [_v_atoms(a, ti, cfg) for a, ti in zip(frames, tis)]
-    site = _site_terms(cfg, model.builder, frames, tis, vs)
-    descs2 = (_descriptors(model.builder2, frames)
-              if model.builder2 is not None else None)
-    alpha_flat = np.concatenate([a for m in models for a in model.site_alpha[m]] + list(model.alpha2 or []))
     d_soap = float(cfg.gap_delta_soap)
-    out = None
-    for f, (atoms, ti, v) in enumerate(zip(frames, tis, vs)):
-        scales = _frame_scales(site, model.site_sparse, f, descs2, model.sparse_desc2, v, d_soap)
-        row = _phi_frame(scales, ti, model.xi) @ alpha_flat
-        if out is None:
-            out = np.empty((len(frames), len(row)))     # D = 3 or 6
-        out[f] = row
+    for c0 in range(0, len(frames), chunk):
+        sub = frames[c0:c0 + chunk]
+        tis = [np.asarray(t) for t in tnep_data.assign_type_indices(sub, cfg.types)]
+        vs = [_v_atoms(a, ti, cfg) for a, ti in zip(sub, tis)]
+        site = _site_terms(cfg, model.builder, sub, tis, vs)
+        descs2 = _descriptors(model.builder2, sub) if model.builder2 is not None else None
+        for f, (ti, v) in enumerate(zip(tis, vs)):
+            yield _phi_frame(_frame_scales(site, model.site_sparse, f, descs2, model.sparse_desc2, v, d_soap), ti, model.xi)
+
+
+def _predict_numpy(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
+    models = list(model.cfg.gap_site_models)
+    alpha_flat = np.concatenate([a for m in models for a in model.site_alpha[m]] + list(model.alpha2 or []))
+    return np.stack([row @ alpha_flat for row in _phi_rows(model, frames)]) if frames else np.empty((0, 0))
+
+
+def predict_std(model: GapDipoleModel, frames: list[Atoms]) -> np.ndarray:
+    """Posterior (epistemic) std per target component, [F, D], in target units:
+    diag(Φ_w·(Φ_wᵀΦ_w + I)⁻¹·Φ_wᵀ) with Φ_w the prior-whitened rows. Primal fits only
+    (model.posterior); the sparse-GP "free" uncertainty for active learning."""
+    L, lower = model.posterior
+    rows = np.concatenate([_whiten(r, model.factors, False) for r in _phi_rows(model, frames)])   # [F·D, n]
+    Z = solve_triangular(L, rows.T, lower=lower, trans=int(not lower), check_finite=False)       # one LAPACK call: L is copied once, not per frame
+    return np.sqrt((Z ** 2).sum(axis=0)).reshape(len(frames), -1)
+
+
+def sparse_score(model: GapDipoleModel, frames: list[Atoms]) -> list[np.ndarray]:
+    """Per-atom distance from the SOAP sparse set, in [0, 1]: 1 − k_iS·K_SS⁻¹·k_Si with
+    k = (q̂_i·q̂_m)^ξ (k_ii = 1). The DTC predictive variance over δ² (FLARE++ Ṽ): noise- and
+    δ-free, falls only when a sparse point lands nearby. Active-learning selection score."""
+    cfg, xi, jit = model.cfg, model.xi, float(model.cfg.gap_sparse_jitter)
+    tis = [np.asarray(t) for t in tnep_data.assign_type_indices(frames, cfg.types)]
+    Ls = [np.linalg.cholesky((S @ S.T) ** xi + jit * np.eye(len(S))) for S in model.sparse_desc]
+    out = []
+    for D, ti in zip(_descriptors(model.builder, frames), tis):
+        sc = np.ones(len(D))
+        for t, (S, L) in enumerate(zip(model.sparse_desc, Ls)):
+            sel = ti == t
+            if sel.any():
+                Z = solve_triangular(L, (S @ D[sel].T) ** xi, lower=True)
+                sc[sel] = np.maximum(1.0 - (Z ** 2).sum(axis=0), 0.0)
+        out.append(sc)
     return out
 
 
