@@ -1,227 +1,186 @@
-# TNEP — Tensorial Neuroevolution Potential
+# TNEP — dipole and polarisability models for IR / Raman spectra
 
-A TensorFlow implementation of the Tensorial NEP (TNEP) framework for machine learning models of atomic potential energy surfaces (PES), dipole moments, and polarizabilities. This work is based on the methodology introduced in:
+Machine-learning models of the dipole moment and polarisability of bulk water,
+used to compute IR and Raman spectra from MD trajectories. Two model families
+share one descriptor and readout pipeline:
 
-> Xu et al., *Tensorial Properties via the Neuroevolution Potential Framework: Fast Simulation of Infrared and Raman Spectra*, J. Chem. Theory Comput. **2024**, 20, 3273–3284. https://doi.org/10.1021/acs.jctc.3c01343
+- **GAP (production)** — a sparse-kernel (gap_fit-style) fit on a *neighbour-basis
+  readout*: every atom gets kernel-predicted site scalars that weight its bond
+  vectors, so the dipole is linear in the kernel coefficients and the fit is a
+  single linear solve. `gap_dipole.py`.
+- **TNEP ANN (reference)** — the Tensorial NEP of Xu et al. (JCTC 2024, 20, 3273):
+  per-species single-hidden-layer networks on SOAP-turbo descriptors, trained with
+  SNES. Kept for comparison; not the production path. `MasterTNEP.py`.
+
+### Production models (bulk water, 500 training frames, 500 test frames)
+
+| Target | Model | Test RRMSE |
+|---|---|---|
+| Dipole | SOAP-7 + 2-body site model + 2-channel cross group | 1.45–1.47 % |
+| Polarisability | SOAP-7 (4.0 Å) + 3-body site model + second SOAP scale 6 Å + 4-channel cross group, λ_shear 2 | 13.0 % diag / 13.9 % off-diag |
+
+RRMSE = RMSE / std of the test labels, per component. The TNEP ANN of the paper
+scores 16.3 / 20.4 % on the same polarisability test set. The exact settings of
+both rows live in `diagnostics/gap_experiments/gap_scan.py` (`MU`, `POL`, `ROWS`).
 
 ---
 
-## Overview
-
-TNEP extends the NEP (Neuroevolution Potential) framework to predict not just scalar energies (rank-0 tensors) but also rank-1 tensors (dipole moments) and rank-2 tensors (polarizability). This enables the simulation of infrared (IR) and Raman spectra from molecular dynamics trajectories at a fraction of the cost of ab initio MD.
-
-The model uses **SOAP-turbo** descriptors to encode local atomic environments, and is trained using a **Separable Natural Evolution Strategy (SNES)** — a gradient-free black-box optimiser well suited to neural network weight optimisation.
-
-### Current status
-
-| Target | Status |
-|---|---|
-| PES (energy + forces) | ✅ Implemented (`target_mode = 0`) |
-| Dipole moment | ✅ Implemented (`target_mode = 1`) |
-| Polarizability | ✅ Implemented (`target_mode = 2`) |
-
----
-
-## Repository Structure
+## Repository structure
 
 ```
 TNEP/
-├── MasterTNEP.py        # Entry point — train_model() and process_trajectory()
-├── TNEP.py              # Core model: per-type ANN, predict_batch (COO), score
-├── TNEPconfig.py        # Configuration dataclass — all hyperparameters in one place
-├── GAPconfig.py         # Config for the GAP kernel fit — independent duplicate of the shared fields
-├── DescriptorBuilder.py # SOAP-turbo descriptor + gradient computation via quippy
-├── SNES.py              # Separable Natural Evolution Strategy optimiser
-├── data.py              # Loading, filtering, splitting, COO pad-and-stack
-├── spectroscopy.py      # IR/Raman spectrum + trajectory inference (streaming batches)
-├── plotting.py          # Fitness curves, correlation plots, spectra
-├── model_io.py          # Model save/load (HDF5; legacy .npz still loadable)
-├── datasets/            # Training and trajectory data (extxyz)
-└── models/              # Auto-created run directories with config, history, plots
+├── gap_dipole.py        # GAP fit + prediction (fit_gap_dipole, predict); writes a run record to GAP/
+├── gap_config.py        # GAPconfig: all knobs of the GAP fit (independent of TNEPconfig)
+├── gap_models.py        # 2b / 3b site descriptors and the angular cross group
+├── gap_gpu.py           # TF evaluation of a fitted GAP model (trajectories)
+├── data.py              # Dataset loading, neighbour-basis readout geometry (V), COO packing
+├── DescriptorBuilder.py # SOAP-turbo via quippy (CPU) …
+├── DescriptorBuilderGPU_tf.py   # … and the native TF port (descriptor_mode=1)
+├── descriptor_layout.py # Descriptor column layout shared by the ANN and the builders
+├── spectroscopy.py      # IR / Raman spectra from dipole or polarisability time series
+├── MasterTNEP.py        # ANN entry point: train_model, test_model, process_trajectory
+├── TNEP.py, SNES.py, adam.py, nep_descriptor.py, TNEPconfig.py   # ANN model, optimisers, config
+├── model_io.py, plotting.py
+├── tests/               # pytest suite
+├── scripts/             # smoke_train.py (ANN smoke), plot_thermo.py
+├── diagnostics/         # gap_experiments/gap_scan.py (production rows + ladders), small probes
+├── datasets/            # extxyz data (local, not tracked)
+├── GAP/                 # fit run records (JSON, not tracked)
+└── models/              # ANN run directories (not tracked)
 ```
 
 ---
 
-## Dependencies
-
-| Package | Purpose |
-|---|---|
-| `tensorflow` | Neural network, tensor operations |
-| `numpy` | Numerical computing |
-| `h5py` | HDF5 model checkpoints |
-| `ase` | Reading extxyz datasets |
-| `quippy-ase` | SOAP-turbo descriptors and descriptor gradients |
-| `matplotlib` | Plotting |
-| `tqdm` | Progress bars |
+## Install
 
 ```bash
-pip install tensorflow numpy h5py ase quippy-ase matplotlib tqdm
+pip install tensorflow numpy scipy h5py ase quippy-ase matplotlib tqdm pytest
 ```
 
-> **Note:** `quippy-ase` requires a working installation of [QUIP/GAP](https://github.com/libAtoms/QUIP). See the [quippy documentation](https://quippy.readthedocs.io) for platform-specific build instructions.
+`quippy-ase` needs a working [QUIP](https://github.com/libAtoms/QUIP) build. The
+GPU descriptor builder (`descriptor_mode=1`) replaces quippy for `basis="poly3"`
+and `compress_mode` "trivial" / "none".
 
 ---
 
-## Configuration
-
-All hyperparameters are defined in `TNEPconfig.py`. Selected defaults shown below — see the source file for the full list of options.
+## GAP fit
 
 ```python
-# Data
-data_path        = "datasets/train_waterbulk.xyz"
-test_data_path   = "datasets/test_waterbulk.xyz"   # None = split from data_path
-allowed_species  = ["C", "H", "O"]                  # Filter by atomic species
-filter_mode      = "subset"                          # "subset" or "exact"
-target_mode      = 1                                 # 0=PES, 1=Dipole, 2=Polarizability
-total_N          = 1000                              # Cap on training structures (None = all)
-test_ratio       = 0.3
+from gap_config import GAPconfig
+import gap_dipole as gd
 
-# Model
-num_neurons      = 30
-activation       = "tanh"
-init_sigma       = 0.1
+cfg = GAPconfig()
+cfg.data_path, cfg.test_data_path = "datasets/train_waterbulk.xyz", "datasets/test_waterbulk.xyz"
+cfg.target_mode = 1                       # 1 = dipole, 2 = polarisability
+cfg.rcut_hard, cfg.rcut_soft = 3.5, 3.0   # SOAP and readout cutoff
+cfg.l_max = cfg.alpha_max = 7
+cfg.dipole_channels, cfg.dipole_radial, cfg.dipole_cutoff = 10, "chebyshev_warped", "cosine2"
+cfg.gap_sparse_per_species, cfg.gap_sigma = 250, 3e-3
 
-# SNES training
-pop_size         = 80
-num_generations  = 60000
-batch_size       = None        # None = full train set per generation
-eta_sigma        = None        # None = auto from problem dimension
-patience         = None        # Early stopping (None = disabled)
-
-# SOAP-turbo descriptor
-l_max            = 4
-alpha_max        = 4
-rcut_hard        = 6.0         # Hard cutoff (Å)
-rcut_soft        = 5.5         # Soft cutoff (Å)
-basis            = "poly3"
-
-# Regularisation
-toggle_regularization    = True
-lambda_1                 = 0.001    # L1
-lambda_2                 = 0.001    # L2
-per_type_regularization  = True     # Per-element ranking (GPUMD NEP4 style)
-
-# Target scaling (dipole only)
-scale_targets    = True        # Train against per-atom dipole; recovered at inference
-dipole_units     = "e*bohr"    # "e*angstrom", "e*bohr", or "debye"
-
-# Memory / parallelism
-pin_data_to_cpu          = True   # Required when full dataset doesn't fit on GPU
-num_descriptor_workers   = None   # None = auto from SLURM or cpu_count // 2
-
-# Output
-save_path        = "models/auto"   # Auto-creates run dir with timestamp
-plot_interval    = 10000           # Periodic plots every N generations
+model = gd.fit_gap_dipole(cfg)            # also writes GAP/<record>.json (config + metrics)
+mu = gd.predict(model, frames)            # [F, 3]  (or [F, 6] Voigt for target_mode=2)
 ```
 
----
+`GAPconfig` defaults are a small, fast configuration, not the production model;
+copy the `MU` / `POL` dictionaries in `gap_scan.py` for those. Models are not
+persisted (a fit takes minutes); the JSON record reproduces one.
 
-## Dataset Format
+**Readout.** For atom *i* with bond vectors **d**ᵢⱼ, radial channels *k* and
+cutoff *f_c*:
 
-Training data must be in **extxyz** format readable by ASE.
+```
+v_i[:, k] = Σ_j R_k(r_ij) f_c(r_ij) d_ij            (species-resolved under dipole_species_pairs)
+μ         = Σ_i Σ_k s_i^k v_i[:, k],   s_i^k = Σ_m α_m^k (q̂_i · q̂_m)^ξ
+```
 
-| Mode | Required field |
-|---|---|
-| PES (`target_mode=0`) | `energy=...` in header; `force` per-atom column (optional but recommended); optional `virial` for stress |
-| Dipole (`target_mode=1`) | `dipole="..."` in header (3-vector) |
-| Polarizability (`target_mode=2`) | `pol="..."` in header (6-component Voigt: xx,yy,zz,xy,yz,zx) |
+The polarisability uses the same fit with six Voigt rows and two kernel groups
+per channel (isotropic |d|² I and traceless d⊗d − |d|² I/3). Optional column
+groups: `gap_site_models` (2b / 3b kernels summed with SOAP), `gap_cross_channels`
+(two-neighbour cross terms), `gap_extra_rcut` (a second SOAP scale for the
+kernel), `gap_lambda_shear` (off-diagonal weight).
 
-Override the default key with `cfg.target_key = "mu"` for non-standard labels.
-
----
-
-## Usage
-
-### Training
-
-Edit `TNEPconfig.py` (or pass a `TNEPconfig` instance), then run:
+**Scans.** `gap_scan.py` runs one fit per process, driven by environment variables:
 
 ```bash
-python MasterTNEP.py
+PS_PROP=mu  PS_ROW="soap+2b +cross2" PS_SIGMA=0.003 PS_FIT=500 python diagnostics/gap_experiments/gap_scan.py
+PS_PROP=pol PS_LIST=1 python diagnostics/gap_experiments/gap_scan.py      # list row tags
 ```
 
-This loads the dataset, builds SOAP descriptors, splits into train/test/val, trains via SNES, scores both the final-generation and best-validation models, and saves everything to `models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/`:
+---
 
-- `config.txt` — hyperparameters used for the run
-- `history.csv` — per-generation losses, regularisation, σ stats
-- `*_best_val.h5` and `*_final_gen.h5` — model checkpoints (HDF5)
-- `plots/` — fitness curves, correlation plots, σ history, timing breakdown
+## Spectra
 
-### Inference / Spectroscopy
+`spectroscopy.py` turns a per-frame time series into a spectrum:
 
 ```python
-from MasterTNEP import process_trajectory
-from model_io import load_model
-
-model = load_model("models/.../train_waterbulk_O_H_dipole_best_val.h5")
-result = process_trajectory(
-    model, "datasets/water_bulk_traj.xyz",
-    dt_fs=1.0, batch_size=100, save_plots="plots", pin_to_cpu=True,
-)
+from spectroscopy import ir_spectrum_from_file, raman_spectrum_from_file
+ir_spectrum_from_file("plots/traj_dipoles.npy", dt_fs=1.0)              # ω²-weighted dipole ACF
+raman_spectrum_from_file("plots/traj_polarizabilities.npy", dt_fs=1.0)  # VV / VH from iso / aniso ACFs
 ```
 
-The trajectory is streamed in `batch_size`-frame chunks: descriptors are built, packed to COO, run through `predict_batch`, appended, and discarded before the next batch — peak memory is `O(batch_size)` rather than `O(all_frames)`. Outputs are saved alongside the spectrum:
-
-- `<name>_dipoles.txt` (or `_polarizabilities.txt`) — predictions per frame
-- `ir_spectrum.png`, `power_spectrum.png` (mode 1) or `raman_spectrum.png` (mode 2)
+IR uses the cosine transform of the dipole autocorrelation; Raman the isotropic
+(Tr α / 3) and anisotropic parts, with the classical ω² footing by default.
+`scripts/raman_gap_gpumd_traj.py` (untracked) shows the full path from a GPUMD
+trajectory through a GAP polarisability model to the `.npy` file.
 
 ---
 
-## Model Architecture
+## Dataset format
 
-Each atom's local environment is encoded as a SOAP descriptor vector **q**. A single hidden-layer neural network maps **q** to a per-atom scalar output *Uᵢ*:
+extxyz readable by ASE. Labels in the frame header:
 
-```
-qᵢ → [W0, b0] → tanh → [W1] → Uᵢ
-```
+| target_mode | key | shape |
+|---|---|---|
+| 1 dipole | `dipole` | 3 |
+| 2 polarisability | `pol` | 6 Voigt (xx, yy, zz, xy, yz, zx) |
+| 0 PES (ANN only) | `energy`, per-atom `force` | — |
 
-Per-element weight matrices give each species its own network parameters. The total property is assembled from atomic contributions:
-
-- **Energy** — sum of site energies; forces from descriptor gradients via the chain rule
-- **Dipole** (rank-1) — `μ = -Σᵢ Σⱼ |rᵢⱼ|² · (∂Uᵢ/∂rᵢⱼ)` (eq. 3 of the paper)
-- **Polarizability** (rank-2) — dual-ANN: scalar branch contributes the diagonal isotropic part, tensor branch contributes the anisotropic virial-like part (eq. 4)
-
-Internally, descriptor gradients are stored in **COO sparse format** (`grad_values [P,3,Q]` + `pair_struct [P]` + `pair_atom [P]` + `pair_gidx [P]`), avoiding the dense `[B, A_max, M_max, 3, Q]` allocation that would otherwise dominate memory.
+Override with `cfg.target_key`. Dipoles default to e·bohr (`dipole_units`);
+polarisability labels in `*_waterbulk_chi.xyz` are the susceptibility form
+V(ε−1)/4π used for the production numbers.
 
 ---
 
-## Training Algorithm (SNES)
+## ANN path (reference)
 
-Rather than gradient descent, the model is trained using a **Separable Natural Evolution Strategy** (Schaul, 2011). Per generation:
+```bash
+python MasterTNEP.py        # trains with the defaults in TNEPconfig.py
+```
 
-1. Sample a population of `pop_size` perturbed parameter vectors from a diagonal Gaussian
-2. Evaluate each candidate on a batch of training structures (forward pass only)
-3. Update the distribution mean and per-parameter σ based on fitness rankings
+`train_model` builds descriptors, trains with SNES (`cfg.optimizer="adam"` for an
+autodiff trainer), scores, and saves to `models/n{neurons}_q{dim_q}_pop{pop}_{timestamp}/`
+(config, history, HDF5 checkpoints, plots). `process_trajectory(model, path)`
+streams a trajectory through the model and writes the spectrum. The committed
+`TNEPconfig` defaults are the last experiment's values, not a tuned baseline.
 
-When `per_type_regularization=True`, fitness is ranked per element type — driving per-type natural-gradient updates in the GPUMD NEP4 style.
-
-This avoids backpropagation through the descriptor computation and is naturally batchable across the population dimension.
+```bash
+python scripts/smoke_train.py --generations 20 --frames 8   # end-to-end ANN smoke
+```
 
 ---
 
-## Vibrational Spectra
+## Tests
 
-Once trained, TNEP models predict properties along MD trajectories to simulate vibrational spectra:
+```bash
+python -m pytest tests          # ~1 min on CPU
+```
 
-- **IR** — `σ(ω) ∝ ω² · M(ω)` where M(ω) is the cosine transform of the dipole autocorrelation function (Wiener–Khinchin via FFT, then DCT)
-- **Raman** — separate cosine transforms of the isotropic γ(t) = Tr(α)/3 and anisotropic β(t) = α − γI ACFs, combined into VV (polarised) and VH (depolarised) intensities with a Bose–Einstein occupation factor
-
-This enables nanosecond-scale sampling that would be prohibitive with ab initio MD.
+Covers the neighbour-basis readout contracts in `data.py`, the GAP fit
+(identities against hand-built columns, rotation covariance, GPU vs NumPy
+prediction) and the spectrum routines.
 
 ---
 
 ## Citation
 
-If you use this code, please cite the original TNEP paper:
+The ANN reference implementation follows:
 
 ```bibtex
 @article{xu2024tnep,
   title={Tensorial Properties via the Neuroevolution Potential Framework: Fast Simulation of Infrared and Raman Spectra},
   author={Xu, Nan and Rosander, Petter and Sch{\"a}fer, Christian and Lindgren, Eric and {\"O}sterbacka, Nicklas and Fang, Mandi and Chen, Wei and He, Yi and Fan, Zheyong and Erhart, Paul},
   journal={Journal of Chemical Theory and Computation},
-  volume={20},
-  pages={3273--3284},
-  year={2024},
+  volume={20}, pages={3273--3284}, year={2024},
   doi={10.1021/acs.jctc.3c01343}
 }
 ```

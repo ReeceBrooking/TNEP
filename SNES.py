@@ -703,7 +703,6 @@ class SNES:
         # validate() at μ, the same estimator as val_fitness.
         train_rmse = float('inf')
         sigma_min = sigma_max = sigma_mean = sigma_median = float(cfg.init_sigma)
-        # Last finite RRMSE values, carried so the history series stays finite.
 
         # SIGTERM (Slurm walltime): flip a flag so the in-flight gen finishes,
         # then checkpoint and break. Hooked only with save_path; restored at exit.

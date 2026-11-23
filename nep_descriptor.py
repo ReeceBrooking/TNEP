@@ -14,7 +14,7 @@ Layout per atom (float64 inside, float32 out):
 Contraction (GPUMD nep.cu, c tensors learned in-model):
     q_r[i, n]  = Σ_{t',k} c_r[t_i, t', n, k] · raw_r[i, t', k]
     s[i, n, c] = Σ_{t',k} c_a[t_i, t', n, k] · raw_a[i, t', k, c]
-    q_a = find_q(s)  → [L=1..4, (4-body), (5-body)] per n
+    q_a = find_q_tf(s)  → [L=1..4, (4-body), (5-body)] per n
 Descriptor order (parameters.cu:203-211): [q_r] ‖ angular l-major
 (ln = l·(n_max_a+1) + n) ‖ 4-body ‖ 5-body.
 """
@@ -188,7 +188,7 @@ def q3b_from_gram_tf(G, c_a, Zf, num_types, p_idx, q_idx, n_pairs):
     q[c, a, L, n] = Σ_{p≤q} c_a[c, t_a, p, n]·c_a[c, t_a, q, n]·G[a, L, pq],
     one GEMM per centre type over the packed pair axis (no [C, N, n, 24] intermediate).
     c_a is [T, T, n+1, K+1] or per-candidate [C, T, T, n+1, K+1]; p_idx/q_idx from
-    gram_pairs. Returns [(C,) N, 4, n+1], l-major like find_q's output."""
+    gram_pairs. Returns [(C,) N, 4, n+1], l-major like find_q_tf's output."""
     per_cand = len(c_a.shape) == 5
     if not per_cand:
         c_a = c_a[tf.newaxis]

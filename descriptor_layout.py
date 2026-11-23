@@ -9,8 +9,6 @@ from __future__ import annotations
 import numpy as np
 
 
-# Reference-fixture SOAP params (mirror TNEPconfig defaults; keep stable).
-
 def build_overlap_matrix_poly3(alpha_max: int) -> np.ndarray:
     """Poly3 overlap S[i,j] = sqrt((5+2i)(5+2j))/(5+i+j), 1-indexed, [α, α]; SPD for α ≲ 10."""
     a = np.arange(1, alpha_max + 1, dtype=np.float64)            # 1-indexed

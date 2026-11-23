@@ -25,7 +25,7 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--readout", choices=["neighbor", "tnep"], default="neighbor")
     p.add_argument("--rij-power", type=int, default=2, help="tnep readout: |r_ij|^N weight")
-    p.add_argument("--nep", choices=["off", "concat", "replace", "sum", "gap_sum"], default="off")
+    p.add_argument("--nep", choices=["off", "concat", "replace", "sum"], default="off")
     p.add_argument("--head", choices=["vector", "scalar"], default="vector")
     p.add_argument("--scale", choices=["off", "block", "channel", "minmax"], default="off")
     p.add_argument("--norm", choices=["l2", "none"], default="l2")
@@ -35,7 +35,7 @@ def main(argv=None) -> None:
     p.add_argument("--no-mirror", action="store_true",
                    help="cfg.mirrored_sampling=False (GPUMD's i.i.d. sampler)")
     p.add_argument("--sum-delta-learn", action="store_true",
-                   help='sum / gap_sum: train the 3 per-expert amplitudes')
+                   help='sum: train the 3 per-expert amplitudes')
     p.add_argument("--generations", type=int, default=6)
     p.add_argument("--frames", type=int, default=12)
     p.add_argument("--pop", type=int, default=8)

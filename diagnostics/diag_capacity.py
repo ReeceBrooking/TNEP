@@ -11,7 +11,7 @@ import numpy as np
 from ase.io import read
 from ase.neighborlist import neighbor_list
 
-RC = 4.0          # user's config: dipole_rc=None -> inherits rcut_hard=4.0
+RC = 4.0          # user's config: readout r_c = rcut_hard = 4.0
 BINS = [(0.0, 1.2), (1.2, 2.2), (2.2, 3.0), (3.0, RC)]
 
 def fc(r, rc=RC):
@@ -26,7 +26,6 @@ print(f"target per-component std: {mu.std(axis=0)}, |mu| mean {np.linalg.norm(mu
 
 T = {8: 0, 1: 1}  # O, H
 feats = []        # [F, 3, 2*nbins]  per-type-per-bin geometry vectors
-oracle_res = []
 for f in frames:
     i, j, D = neighbor_list("ijD", f, RC)                    # ordered pairs, D = r_j - r_i
     r = np.linalg.norm(D, axis=1)

@@ -1,6 +1,6 @@
 """Plot a TurboGAP thermo.log (Step, Time, Temperature, E_kin, E_pot, Pressure).
 
-Usage: python plot_thermo.py [path/to/thermo.log]
+Usage: python scripts/plot_thermo.py [path/to/thermo.log]
 Default: datasets/turbogap_waterbulk/thermo.log. Saves <log>_plot.png.
 """
 import sys
